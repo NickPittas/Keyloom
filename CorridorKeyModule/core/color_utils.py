@@ -197,42 +197,324 @@ def dilate_mask(mask, radius):
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         return cv2.dilate(mask, kernel)
 
-def refiner_additive_guard(model_alpha, hint_mask, shell_px=4):
+_GUARD_PROPAGATION_KERNEL = 9
+_GUARD_MAX_ITERS = 256
+
+
+_UNPROBED = object()
+_RECONSTRUCT_DEVICE = _UNPROBED
+
+
+def _reconstruct_device():
+    """Torch device for the reconstruction loop, or None for the CPU path.
+
+    Cached after the first probe. The loop is pure max/min selection, so
+    CUDA and MPS produce the same values as the cv2 implementation; the
+    probe only decides where the iterations run, never what they compute.
     """
-    Per-pixel max of model alpha and hint, except in a thin shell just
-    outside the model's solid silhouette.
+    global _RECONSTRUCT_DEVICE
+    if _RECONSTRUCT_DEVICE is not _UNPROBED:
+        return _RECONSTRUCT_DEVICE
+    device = None
+    try:
+        import torch
 
-    The plain max() guard protects guide detail the refiner erodes (hair
-    wisps), but it also burns the hint's edge over-coverage into the
-    output: alpha hints routinely extend 1-3px past the true subject edge
-    (generator slack, hint resizing), and max() resurrects that band even
-    though the model correctly rejected it. Once the garbage matte clears
-    the surrounding gunk, the band reads as a ~1px white outline around
-    the subject.
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None \
+                and torch.backends.mps.is_available():
+            device = "mps"
+    except Exception:
+        device = None
+    _RECONSTRUCT_DEVICE = device
+    return device
 
-    Inside the shell (within shell_px of the solid body) the model's edge
-    is trusted as-is; beyond it the additive guard applies in full, so
-    detached hair strands and wisps stay protected.
+
+def _geodesic_reconstruct_cpu(marker, mask, max_iters=_GUARD_MAX_ITERS):
+    """Reference cv2 implementation of the reconstruction loop."""
+    import cv2
+
+    k = _GUARD_PROPAGATION_KERNEL
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    current = np.minimum(marker, mask)
+    for _ in range(int(max_iters)):
+        grown = np.minimum(cv2.dilate(current, kernel), mask)
+        if np.array_equal(grown, current):
+            break
+        current = grown
+    return current
+
+
+def _reconstruct_torch_tensors(marker_t, mask_t, max_iters=_GUARD_MAX_ITERS):
+    """The reconstruction loop on [1, 1, H, W] torch tensors.
+
+    Dilation by a k x k rectangle is exactly ``max_pool2d`` with stride 1
+    and k//2 padding (implicit -inf padding matches cv2.dilate's constant
+    border for dilation), so each iteration is the same selection the cv2
+    path performs. Convergence is checked every few iterations to avoid a
+    device sync per pass; extra passes after the fixed point are no-ops.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    k = _GUARD_PROPAGATION_KERNEL
+    current = torch.minimum(marker_t, mask_t)
+    check_every = 4
+    for i in range(int(max_iters)):
+        grown = torch.minimum(
+            F.max_pool2d(current, k, stride=1, padding=k // 2), mask_t)
+        if (i + 1) % check_every == 0 and torch.equal(grown, current):
+            return grown
+        current = grown
+    return current
+
+
+def _geodesic_reconstruct_torch(marker, mask, device,
+                                max_iters=_GUARD_MAX_ITERS):
+    """Numpy-in, numpy-out wrapper around ``_reconstruct_torch_tensors``."""
+    import torch
+
+    mask_t = torch.from_numpy(mask).to(device)[None, None]
+    marker_t = torch.from_numpy(marker).to(device)[None, None]
+    out = _reconstruct_torch_tensors(marker_t, mask_t, max_iters)
+    return out[0, 0].cpu().numpy()
+
+
+def _geodesic_reconstruct(marker, mask, max_iters=_GUARD_MAX_ITERS):
+    """Grayscale morphological reconstruction of ``mask`` from ``marker``.
+
+    Repeats ``g = min(dilate(g), mask)`` until it stops changing. Every
+    pixel ends up at the largest value reachable from the marker without
+    ever exceeding the mask along the way, so a region cut off from the
+    marker by a dark gap is clamped to that gap's value.
+
+    Each pass propagates by the structuring element's radius, so a wider
+    element reaches convergence in proportionally fewer passes. The width
+    also sets how large a dark gap the fill can step over, which only ever
+    makes the guard more permissive, never less: stepping a gap can restore
+    hint detail, and it cannot create one.
+
+    ``max_iters`` bounds the work. Convergence normally arrives well inside
+    it; stopping early only under-fills structures far from the marker and
+    can never open a gap.
+
+    Runs on the GPU when torch has one available (the iterations are plain
+    max/min selections, so the result matches the cv2 path); any failure on
+    the device path falls back to the cv2 implementation rather than
+    failing the frame.
+    """
+    device = _reconstruct_device()
+    if device is not None:
+        try:
+            return _geodesic_reconstruct_torch(marker, mask, device,
+                                               max_iters)
+        except Exception:
+            global _RECONSTRUCT_DEVICE
+            _RECONSTRUCT_DEVICE = None
+    return _geodesic_reconstruct_cpu(marker, mask, max_iters)
+
+
+# Long edge the reconstruction is computed at. The suppression weight it
+# produces is smooth and is upsampled back, so running it on a reduced copy
+# costs a fraction of full resolution without changing which regions survive.
+_GUARD_RECONSTRUCT_LONG_EDGE = 1024
+
+# Alpha above which the model is treated as vouching for a pixel, so the hint
+# is allowed to build on it. Deliberately near zero: the refiner thins hair
+# rather than erasing it, and a trace of alpha is enough corroboration.
+_GUARD_MODEL_SUPPORT = 0.02
+
+
+def refiner_additive_guard(model_alpha, hint_mask):
+    """
+    Raise the model's alpha towards the hint, but only where the hint is
+    corroborated by the model's own prediction.
+
+    The refiner was trained to tighten rough green-screen alphas, so when it
+    is fed an already-good guide (GVM Auto, VideoMaMa, BiRefNet) it can erode
+    wispy hair the guide captured correctly. A per-pixel max with the hint
+    restores that detail: the guard may add confidence, never subtract it.
+
+    A plain max also drags in whatever the hint got wrong, so the hint's
+    contribution is first restricted to what morphological reconstruction can
+    reach. Reconstruction starts from every pixel the model itself vouches
+    for: the subject's solid body, plus anywhere the model kept even a trace
+    of alpha. Hair connected to the subject survives, and so does a fly-away
+    strand separated from it by a gap, as long as the model left some alpha
+    on the strand for the fill to start from. Spill and stray blobs that the
+    model drove to zero everywhere have nothing to start from, so they are
+    suppressed instead of being burned in.
+
+    Reconstruction replaces an earlier fixed-radius trust shell that switched
+    hard between "use the model" and "use the hint". That switch could leave a
+    dark ring, with opaque alpha on both sides, tracing the subject at a
+    constant offset once the hint over-covered the edge by more than the
+    shell's width (issue #179). Reconstruction does not switch, so it cannot
+    print that ring: anything it restores it reaches by filling through, and a
+    region it cannot reach is clamped down to the gap that blocked it rather
+    than left bright behind a dark band. The fill does step over gaps narrower
+    than its structuring element, which only restores more of the hint. Being
+    topological rather than metric, it needs no radius to tune and so no
+    resolution scaling.
+
+    The tradeoff this accepts: hint over-coverage that is contiguous with the
+    subject is no longer trimmed, so the matte sits very slightly wider than
+    the model alone would put it, in line with the hint. That is the softer of
+    the two failure modes. The shell traded it for a hard dark ring offset
+    from the edge, which is far more damaging in a composite than a marginally
+    generous edge.
 
     model_alpha: float alpha [H, W] or [H, W, 1], model prediction.
     hint_mask: float alpha hint, same spatial size.
-    shell_px: width of the trust-the-model shell around the solid body.
     """
     if hint_mask is None:
         return model_alpha
 
+    is_3d = model_alpha.ndim == 3
+    m2 = model_alpha[:, :, 0] if is_3d else model_alpha
+    h2 = hint_mask[:, :, 0] if hint_mask.ndim == 3 else hint_mask
+    m2 = np.ascontiguousarray(m2, dtype=np.float32)
+    h2 = np.ascontiguousarray(h2, dtype=np.float32)
+
+    # The guard is a handful of full-frame elementwise passes plus the
+    # reconstruction loop; on a GPU the whole thing is one upload and one
+    # download. Any device failure falls back to the cv2 path rather than
+    # failing the frame.
+    device = _reconstruct_device()
+    if device is not None:
+        try:
+            return _guard_apply_torch(model_alpha, m2, h2, is_3d, device)
+        except Exception as exc:
+            import logging
+
+            global _RECONSTRUCT_DEVICE
+            _RECONSTRUCT_DEVICE = None
+            logging.getLogger(__name__).warning(
+                "Refiner guard GPU path failed (%s: %s); using the CPU "
+                "path for the rest of this session", type(exc).__name__, exc)
+    return _guard_apply_cpu(model_alpha, m2, h2, is_3d)
+
+
+def _guard_apply_cpu(model_alpha, m2, h2, is_3d):
+    """Reference cv2/numpy implementation of the guard."""
     import cv2
 
-    m2 = model_alpha[:, :, 0] if model_alpha.ndim == 3 else model_alpha
-    solid = (m2 > 0.5).astype(np.uint8)
-    k = 2 * int(shell_px) + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    shell = (cv2.dilate(solid, kernel) > 0) & (solid == 0)
-    if model_alpha.ndim == 3:
-        shell = shell[:, :, np.newaxis]
+    # Everything the guard is allowed to reach, and the seeds it starts from:
+    # every pixel the model itself vouched for, however faintly. A fly-away
+    # strand the model kept a trace of seeds its own fill even with no path
+    # back to the body; spill the model zeroed out seeds nothing.
+    ceiling = np.maximum(m2, h2)
+    supported = m2 > _GUARD_MODEL_SUPPORT
+    if not supported.any():
+        # The model found no foreground at all, so there is nothing to
+        # corroborate the hint. Trust the model.
+        return model_alpha
 
-    guarded = np.maximum(model_alpha, hint_mask)
-    return np.where(shell, model_alpha, guarded)
+    h, w = m2.shape[:2]
+    long_edge = max(h, w)
+    if long_edge > _GUARD_RECONSTRUCT_LONG_EDGE:
+        scale = _GUARD_RECONSTRUCT_LONG_EDGE / float(long_edge)
+        small = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+        ceiling_s = cv2.resize(ceiling, small, interpolation=cv2.INTER_AREA)
+        # Grow the seeds by the sampling step before dropping resolution, so a
+        # one pixel strand still lands on a seed. Averaging would dilute it
+        # away and lose the very detail the guard exists to protect.
+        step = max(1, int(np.ceil(1.0 / scale)))
+        grown = cv2.dilate(supported.astype(np.uint8),
+                           cv2.getStructuringElement(cv2.MORPH_RECT,
+                                                     (2 * step + 1, 2 * step + 1)))
+        supported_s = cv2.resize(grown, small,
+                                 interpolation=cv2.INTER_NEAREST) > 0
+    else:
+        ceiling_s, supported_s = ceiling, supported
+
+    marker_s = np.where(supported_s, ceiling_s, 0.0).astype(np.float32)
+    reachable_s = _geodesic_reconstruct_cpu(marker_s, ceiling_s)
+
+    # Fraction of the hint's proposal that survived, as a smooth 0-1 weight.
+    weight_s = np.divide(reachable_s, np.maximum(ceiling_s, 1e-6),
+                         dtype=np.float32)
+    np.clip(weight_s, 0.0, 1.0, out=weight_s)
+
+    if weight_s.shape != m2.shape:
+        # Widen the weight by one reduced-resolution pixel before upsampling.
+        # Bilinear interpolation otherwise samples a hair-width structure
+        # according to where it happens to fall between samples, which makes
+        # how much of a strand is restored depend on sub-pixel phase and
+        # shimmer as the subject moves. Widening only ever admits more of the
+        # hint, so it cannot reintroduce a gap.
+        weight_s = cv2.dilate(weight_s,
+                              cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+        weight = cv2.resize(weight_s, (w, h), interpolation=cv2.INTER_LINEAR)
+    else:
+        weight = weight_s
+
+    # Additive by construction: the guard can only ever raise alpha.
+    boost = np.maximum(h2 - m2, 0.0) * weight
+    if is_3d:
+        boost = boost[:, :, np.newaxis]
+    return np.clip(model_alpha + boost, 0.0, 1.0)
+
+
+def _guard_apply_torch(model_alpha, m2, h2, is_3d, device):
+    """The guard on a torch device, mirroring ``_guard_apply_cpu`` stage for
+    stage. Elementwise passes, the seed dilation (max_pool2d == rectangular
+    cv2.dilate), and the reconstruction loop are exact selections. The seed
+    downsample grid and the area/bilinear resamples can differ from cv2 at
+    float rounding level; measured divergence stays orders of magnitude
+    below one 8-bit alpha step (see the equivalence tests).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    t_m = torch.from_numpy(m2).to(device)[None, None]
+    t_h = torch.from_numpy(h2).to(device)[None, None]
+
+    ceiling = torch.maximum(t_m, t_h)
+    supported = t_m > _GUARD_MODEL_SUPPORT
+    if not bool(supported.any()):
+        return model_alpha
+
+    h, w = m2.shape[:2]
+    long_edge = max(h, w)
+    if long_edge > _GUARD_RECONSTRUCT_LONG_EDGE:
+        scale = _GUARD_RECONSTRUCT_LONG_EDGE / float(long_edge)
+        sw = max(1, int(round(w * scale)))
+        sh = max(1, int(round(h * scale)))
+        ceiling_s = F.interpolate(ceiling, size=(sh, sw), mode="area")
+        # Grow the seeds by the sampling step before dropping resolution, so
+        # a one pixel strand still lands on a seed (same rationale as the
+        # cv2 path).
+        step = max(1, int(np.ceil(1.0 / scale)))
+        grown = F.max_pool2d(supported.float(), 2 * step + 1,
+                             stride=1, padding=step)
+        supported_s = F.interpolate(grown, size=(sh, sw),
+                                    mode="nearest-exact") > 0
+    else:
+        ceiling_s, supported_s = ceiling, supported
+
+    marker_s = torch.where(supported_s, ceiling_s,
+                           torch.zeros_like(ceiling_s))
+    reachable_s = _reconstruct_torch_tensors(marker_s, ceiling_s)
+
+    weight_s = torch.clamp(
+        reachable_s / torch.clamp_min(ceiling_s, 1e-6), 0.0, 1.0)
+
+    if weight_s.shape[-2:] != (h, w):
+        # Widen by one reduced-resolution pixel before upsampling, exactly
+        # as the cv2 path does, so strand restoration does not depend on
+        # sub-pixel phase.
+        weight_s = F.max_pool2d(weight_s, 3, stride=1, padding=1)
+        weight = F.interpolate(weight_s, size=(h, w), mode="bilinear",
+                               align_corners=False)
+    else:
+        weight = weight_s
+
+    boost = torch.clamp_min(t_h - t_m, 0.0) * weight
+    out = torch.clamp(t_m + boost, 0.0, 1.0)[0, 0].cpu().numpy()
+    if is_3d:
+        out = out[:, :, np.newaxis]
+    return out
 
 def apply_garbage_matte(predicted_matte, hint_mask, dilation_px, feather_px=3,
                         hint_threshold=0.1):
