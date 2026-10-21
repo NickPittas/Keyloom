@@ -42,9 +42,14 @@ def _cache_key(
     target_size: tuple[int, int] | None = None,
 ) -> str:
     """Cache key combining path, mode and target size for display transforms."""
+    try:
+        st = os.stat(path)
+        rev = f"{st.st_mtime_ns}-{st.st_size}"
+    except (OSError, ValueError, TypeError):
+        rev = "missing"
     if target_size is None:
-        return f"{mode.value}:{int(input_exr_is_linear)}:{path}"
-    return f"{mode.value}:{int(input_exr_is_linear)}:{target_size[0]}x{target_size[1]}:{path}"
+        return f"{mode.value}:{int(input_exr_is_linear)}:{rev}:{path}"
+    return f"{mode.value}:{int(input_exr_is_linear)}:{target_size[0]}x{target_size[1]}:{rev}:{path}"
 
 
 def _fit_size(width: int, height: int, target_size) -> tuple[int, int] | None:

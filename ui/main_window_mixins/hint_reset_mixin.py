@@ -172,6 +172,10 @@ class HintResetMixin:
         if self._current_clip is not clip:
             return
         viewer = self._dual_viewer
+        from ui.preview import display_transform
+        display_transform.clear_cache()
+        viewer.input_viewer.invalidate_cache()
+        viewer.output_viewer.invalidate_cache()
         viewer.refresh_generated_assets()
         for name in ("_refresh_export_thumbnail",):
             fn = getattr(self, name, None)

@@ -90,6 +90,9 @@ class _Viewer:
         self.annotation_model = AnnotationModel()
         self._split_view = None
 
+    def invalidate_cache(self):
+        pass
+
 
 class _Host(HintResetMixin):
     def __init__(self, clip, busy=False):
