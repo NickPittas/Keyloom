@@ -37,18 +37,48 @@ class _FatSlider(QSlider):
         base.setBottom(self.height())
         return base
 
+    _scrubbing = False
+
+    def _value_from_pos(self, pos) -> int | None:
+        """Map a widget position to a slider value (clamped), or None."""
+        groove = self._groove_rect()
+        if groove.width() <= 0:
+            return None
+        ratio = (pos.x() - groove.x()) / groove.width()
+        ratio = max(0.0, min(1.0, ratio))
+        return self.minimum() + round(ratio * (self.maximum() - self.minimum()))
+
     def mousePressEvent(self, event):
-        """Jump slider to click position anywhere in the expanded groove."""
-        if event.button() == Qt.LeftButton:
-            groove = self._groove_rect()
-            if groove.width() > 0:
-                ratio = (event.position().x() - groove.x()) / groove.width()
-                ratio = max(0.0, min(1.0, ratio))
-                value = self.minimum() + round(ratio * (self.maximum() - self.minimum()))
+        """Jump to click position and begin a drag-scrub."""
+        if event.button() == Qt.LeftButton and self.isEnabled():
+            value = self._value_from_pos(event.position())
+            if value is not None:
                 self.setValue(value)
+                self.setSliderDown(True)
+                self._scrubbing = True
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._scrubbing and (event.buttons() & Qt.LeftButton):
+            value = self._value_from_pos(event.position())
+            if value is not None:
+                self.setValue(value)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._scrubbing and event.button() == Qt.LeftButton:
+            value = self._value_from_pos(event.position())
+            if value is not None:
+                self.setValue(value)
+            self.setSliderDown(False)
+            self._scrubbing = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class CoverageBar(QWidget):
