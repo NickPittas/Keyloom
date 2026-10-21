@@ -1,7 +1,8 @@
-"""Frame scrubber timeline with transport controls, coverage overlay, and debounced frame loading.
+"""Frame scrubber timeline with transport controls and coverage overlay.
 
-Horizontal slider + frame counter + step buttons. Emits frame_changed only
-after a debounce period (50ms) to coalesce rapid scrubbing events.
+Horizontal slider + frame counter + step buttons. User navigation emits
+``frame_changed`` immediately; playback is clock-driven (FPS) and requests
+frames through ``playback_requested``.
 
 Helper widgets (CoverageBar, MarkerOverlay, _FatSlider) live in
 ``ui.widgets.timeline_widgets`` to keep this module focused on FrameScrubber.
@@ -9,7 +10,9 @@ Helper widgets (CoverageBar, MarkerOverlay, _FatSlider) live in
 from __future__ import annotations
 
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QToolTip
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QSettings
+import math
+
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QSettings, QElapsedTimer
 
 from ui.widgets.timeline_widgets import _FatSlider, CoverageBar, MarkerOverlay
 
@@ -17,7 +20,9 @@ from ui.widgets.timeline_widgets import _FatSlider, CoverageBar, MarkerOverlay
 class FrameScrubber(QWidget):
     """Frame navigation scrubber with transport controls, coverage bar, and debounced output."""
 
-    frame_changed = Signal(int)      # emitted after debounce, stem index
+    frame_changed = Signal(int)      # immediate user navigation, stem index
+    playback_requested = Signal(int, int)  # (target index, loop cycle counter)
+    playback_state_changed = Signal(bool)
     in_point_changed = Signal(int)   # in-point set at stem index
     out_point_changed = Signal(int)  # out-point set at stem index
     range_cleared = Signal()         # in/out range cleared
@@ -127,17 +132,20 @@ class FrameScrubber(QWidget):
         self._end_btn.clicked.connect(self._go_end)
         row.addWidget(self._end_btn)
 
-        # Debounce timer (50ms, Codex recommendation)
-        self._debounce = QTimer(self)
-        self._debounce.setSingleShot(True)
-        self._debounce.setInterval(50)
-        self._debounce.timeout.connect(self._emit_frame)
-
-        # Playback timer — slow stepping (PNG decode is too heavy for realtime)
+        # Playback clock: target frame derives from elapsed time, not tick count
+        self._elapsed = QElapsedTimer()
+        self._elapsed.start()
+        self._clock = lambda: self._elapsed.elapsed()
+        self._fps = 24.0
         self._playback_timer = QTimer(self)
-        self._playback_timer.setInterval(333)  # ~3 frames per second
+        self._playback_timer.setTimerType(Qt.PreciseTimer)
         self._playback_timer.timeout.connect(self._playback_tick)
         self._playing = False
+        self._anchor_index = 0
+        self._anchor_ms = 0
+        self._last_emitted: tuple[int, int] | None = None
+        # Also emit frame_changed on each playback tick (legacy consumers).
+        self._legacy_playback_emit = True
 
         self._total = 0
         self._suppress_signal = False
@@ -175,7 +183,8 @@ class FrameScrubber(QWidget):
 
     def set_range(self, total_frames: int) -> None:
         """Configure scrubber for a clip with total_frames stems."""
-        if self._playing:
+        changed = total_frames != self._total
+        if self._playing and changed:
             self._stop_playback()
         self._total = total_frames
         enabled = total_frames > 0
@@ -188,6 +197,8 @@ class FrameScrubber(QWidget):
         self._next_btn.setEnabled(enabled)
         self._end_btn.setEnabled(enabled)
         self._update_label()
+        if self._playing:
+            self._reanchor()
 
     def set_frame(self, index: int) -> None:
         """Set current frame without emitting signal (external update)."""
@@ -195,6 +206,8 @@ class FrameScrubber(QWidget):
         self._slider.setValue(index)
         self._suppress_signal = False
         self._update_label()
+        if self._playing:
+            self._reanchor()
 
     def set_coverage(self, alpha: list[bool], inference: list[bool]) -> None:
         """Update the coverage overlay lanes."""
@@ -234,6 +247,7 @@ class FrameScrubber(QWidget):
         self._in_point = None
         self._out_point = None
         self._sync_markers()
+        self._range_refreshed()
         self.range_cleared.emit()
 
     def get_in_out(self) -> tuple[int | None, int | None]:
@@ -247,34 +261,35 @@ class FrameScrubber(QWidget):
     def _sync_markers(self) -> None:
         """Push current in/out state to marker overlay."""
         self._marker_overlay.set_in_out(self._in_point, self._out_point, self._total)
+        self._range_refreshed()
+
+    def _range_refreshed(self) -> None:
+        """Range changed: keep playing, re-anchored inside the new range."""
+        if self._playing:
+            self._reanchor()
 
     def _on_in_dragged(self, frame: int) -> None:
         """Handle in-point drag from overlay."""
         self._in_point = frame
+        self._range_refreshed()
         self.in_point_changed.emit(frame)
 
     def _on_out_dragged(self, frame: int) -> None:
         """Handle out-point drag from overlay."""
         self._out_point = frame
+        self._range_refreshed()
         self.out_point_changed.emit(frame)
 
     def _on_marker_scrub(self, frame: int) -> None:
-        """While dragging a marker, move the playhead and debounce the frame load."""
-        self._suppress_signal = True
+        """While dragging a marker, move the playhead and emit immediately."""
         self._slider.setValue(frame)
-        self._suppress_signal = False
-        self._update_label()
-        # Use the same debounce as normal scrubbing (50ms) to avoid flooding
-        self._debounce.start()
 
     def _on_slider_changed(self, value: int) -> None:
         self._update_label()
         if not self._suppress_signal:
-            # Restart debounce timer (latest request wins)
-            self._debounce.start()
-
-    def _emit_frame(self) -> None:
-        self.frame_changed.emit(self._slider.value())
+            if self._playing:
+                self._reanchor()
+            self.frame_changed.emit(value)
 
     def _update_label(self) -> None:
         current = self._slider.value() + 1 if self._total > 0 else 0
@@ -302,45 +317,90 @@ class FrameScrubber(QWidget):
         else:
             self._start_playback()
 
+    def set_fps(self, fps: float) -> None:
+        """Set playback rate; non-finite or non-positive falls back to 24."""
+        try:
+            value = float(fps)
+        except (TypeError, ValueError):
+            value = 0.0
+        if not math.isfinite(value) or value <= 0:
+            value = 24.0
+        self._fps = value
+        self._playback_timer.setInterval(max(4, int(1000 / value / 2)))
+        if self._playing:
+            self._reanchor()
+
+    def is_playing(self) -> bool:
+        return self._playing
+
+    def stop_playback(self) -> None:
+        if self._playing:
+            self._stop_playback()
+
+    def _play_range(self) -> tuple[int, int]:
+        hi_max = max(0, self._total - 1)
+        if self._in_point is not None and self._out_point is not None:
+            lo = max(0, min(self._in_point, self._out_point))
+            hi = min(hi_max, max(self._in_point, self._out_point))
+            return min(lo, hi), hi
+        return 0, hi_max
+
+    def _loop_enabled(self) -> bool:
+        return QSettings().value("playback/loop", True, type=bool)
+
+    def _reanchor(self) -> None:
+        lo, hi = self._play_range()
+        self._anchor_index = min(max(self._slider.value(), lo), hi)
+        self._anchor_ms = self._clock()
+        self._last_emitted = None
+
     def _start_playback(self) -> None:
         if self._total <= 1:
             return
         self._playing = True
-        self._play_btn.setText("\u275A\u275A")  # ❚❚ (pause icon)
+        self._reanchor()
+        self._play_btn.setText("\u275A\u275A")  # pause icon
         self._play_btn.setToolTip(self.tr("Pause (Space)"))
+        self.set_fps(self._fps)
         self._playback_timer.start()
+        self.playback_state_changed.emit(True)
 
     def _stop_playback(self) -> None:
         self._playing = False
         self._playback_timer.stop()
-        self._play_btn.setText("\u25B6")  # ▶ (play icon)
+        self._play_btn.setText("\u25B6")  # play icon
         self._play_btn.setToolTip(self.tr("Play (Space)"))
+        self.playback_state_changed.emit(False)
 
     def _playback_tick(self) -> None:
-        """Advance one frame during playback. Loops within in/out range if set."""
-        loop_enabled = QSettings().value("playback/loop", True, type=bool)
-
-        current = self._slider.value()
-
-        # Determine playback bounds
-        if self._in_point is not None and self._out_point is not None:
-            lo, hi = self._in_point, self._out_point
+        """Move to the frame the clock says we should be at (skipping if late)."""
+        if not self._playing:
+            return
+        lo, hi = self._play_range()
+        span = hi - lo + 1
+        elapsed = max(0, self._clock() - self._anchor_ms)
+        advanced = int(elapsed * self._fps / 1000.0)
+        raw = (self._anchor_index - lo) + advanced
+        if self._loop_enabled():
+            cycle = raw // span
+            idx = lo + raw % span
+            stop = False
         else:
-            lo, hi = 0, self._slider.maximum()
-
-        next_frame = current + 1
-        if next_frame > hi:
-            if loop_enabled:
-                next_frame = lo
-            else:
-                self._stop_playback()
-                return
-
-        # Suppress debounce during playback — emit frame_changed directly
-        self._suppress_signal = True
-        self._slider.setValue(next_frame)
-        self._suppress_signal = False
-        self.frame_changed.emit(next_frame)
+            cycle = 0
+            stop = raw >= span - 1 and advanced > 0
+            idx = hi if raw >= span else lo + raw
+        key = (idx, cycle)
+        if key != self._last_emitted:
+            self._last_emitted = key
+            self._suppress_signal = True
+            self._slider.setValue(idx)
+            self._suppress_signal = False
+            self._update_label()
+            self.playback_requested.emit(idx, cycle)
+            if self._legacy_playback_emit:
+                self.frame_changed.emit(idx)
+        if stop:
+            self._stop_playback()
 
     def wheelEvent(self, event) -> None:
         """Scroll wheel scrubs frames: scroll up = forward, scroll down = back.
