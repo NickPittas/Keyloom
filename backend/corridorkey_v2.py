@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -10,6 +11,8 @@ from pathlib import Path
 
 from .errors import CorridorKeyError
 from .v2_paths import V2AssetPaths, get_v2_asset_paths, validate_v2_assets
+
+logger = logging.getLogger(__name__)
 
 _PRODUCTS = ("alpha", "fg", "checker", "cutout")
 _ENV_KEYS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
@@ -178,7 +181,8 @@ class CorridorKeyV2Engine:
         _free_gpu_memory()
 
     def build_inference_config(self, params, *, outputs, temp_dir, frame_dir_fps=24.0,
-                               shape_hw=None, num_frames=None, budget_gb=None):
+                               shape_hw=None, num_frames=None, budget_gb=None,
+                               first_frame_path=None):
         from CorridorKeyV2.corridorkey.runtime import InferenceConfig
 
         outs = set(outputs)
@@ -203,7 +207,27 @@ class CorridorKeyV2Engine:
         cfg.num_frames = -1
         cfg.start_mode = "begin"
         cfg.stage2_batch = 1
-        if params.vram_profile == "auto":
+        preset = getattr(params, "temporal_window", "auto")
+        if preset != "auto":
+            from .v2_temporal import estimate_temporal_window
+
+            chunk, stride = (int(x) for x in preset.split("/"))
+            cfg.auto_vram = False
+            cfg.low_vram = params.vram_profile == "low"
+            cfg.hann_chunk, cfg.hann_stride = chunk, stride
+            if shape_hw is not None and num_frames and budget_gb is not None:
+                est = estimate_temporal_window(
+                    shape_hw[1], shape_hw[0], num_frames, preset,
+                    params.vram_profile, budget_gb)
+                if est.over_budget:
+                    msg = (f"Temporal window {preset} ({'low' if cfg.low_vram else 'normal'} "
+                           f"VRAM) is estimated to need {est.required_gib:.1f} GiB "
+                           f"(peak {est.peak_gib:.1f} GiB) but only ~{est.budget_gib:.1f} "
+                           "GiB of GPU memory is available; inference may run out of memory.")
+                    if est.caveat:
+                        msg += " " + est.caveat
+                    self.last_warnings.append(msg)
+        elif params.vram_profile == "auto":
             cfg.auto_vram = True
         else:
             if shape_hw is None or num_frames is None or budget_gb is None:
@@ -217,11 +241,14 @@ class CorridorKeyV2Engine:
                     f"Low VRAM profile: even a 1-frame window may not fit in the "
                     f"~{budget_gb:.1f} GB of free GPU memory; using the smallest window "
                     "(1 frame). Inference may run out of memory.")
+        if (first_frame_path and not params.input_is_linear
+                and str(first_frame_path).lower().endswith(".exr")):
+            self.last_warnings.append(
+                "EXR input frames are being treated as display-coded and clipped to "
+                "[0, 1]. For scene-linear HDR EXR plates, enable Input is Linear.")
         return cfg
 
-    def _probe_low_vram(self, input_path, params, frame_dir_fps):
-        import torch
-
+    def _probe_clip(self, input_path, params, frame_dir_fps):
         from CorridorKeyV2.corridorkey import video_io
         from CorridorKeyV2.corridorkey.runtime import InferenceConfig
 
@@ -238,9 +265,11 @@ class CorridorKeyV2Engine:
                 model_scale=1.0, linear_brightness=d.linear_brightness,
                 linear_contrast=d.linear_contrast,
                 linear_contrast_pivot=d.linear_contrast_pivot)
-        free_bytes, _ = torch.cuda.mem_get_info()
-        budget = (free_bytes + torch.cuda.memory_reserved()) / 2**30
-        return tuple(meta["shape_hw"]), int(meta["num_frames"]), budget
+        from .v2_temporal import query_vram_budget_gib
+
+        paths = meta.get("frame_paths") or ()
+        return (tuple(meta["shape_hw"]), int(meta["num_frames"]),
+                query_vram_budget_gib(), str(paths[0]) if paths else None)
 
     def run_clip(self, input_path, output_dir, params, *, outputs, temp_dir,
                  frame_dir_fps=24.0, hint_video_path=None, ffmpeg_bin="ffmpeg",
@@ -255,12 +284,16 @@ class CorridorKeyV2Engine:
         from CorridorKeyV2.corridorkey.video_io import WriterConfig, raw_clip_name
 
         extra = {}
-        if params.vram_profile != "auto":
-            shape_hw, n, budget = self._probe_low_vram(input_path, params, frame_dir_fps)
-            extra = {"shape_hw": shape_hw, "num_frames": n, "budget_gb": budget}
+        manual = getattr(params, "temporal_window", "auto") != "auto"
+        if params.vram_profile != "auto" or manual or os.path.isdir(str(input_path)):
+            shape_hw, n, budget, first = self._probe_clip(input_path, params, frame_dir_fps)
+            extra = {"shape_hw": shape_hw, "num_frames": n, "budget_gb": budget,
+                     "first_frame_path": first}
         cfg = self.build_inference_config(
             params, outputs=outputs, temp_dir=temp_dir,
             frame_dir_fps=frame_dir_fps, **extra)
+        for w in self.last_warnings:
+            logger.warning(w)
         cfg.initial_hint_index = eng_index
         cfg.hint_frame_indices = eng_sparse
         rt.configure_low_vram_inference(self._model, rt.InferenceConfig(
