@@ -64,11 +64,14 @@ def stitch_video(
     else:
         pix_fmt = "yuv420p"
 
-    # EXR frames are linear float — tell FFmpeg to apply sRGB gamma
     cmd = [ffmpeg, "-framerate", str(fps), "-start_number", str(start_number)]
+    cmd.extend(["-i", in_dir + "/" + pattern])
     if is_exr:
-        cmd.extend(["-apply_trc", "iec61966_2_1"])
-    cmd.extend(["-i", in_dir + "/" + pattern, "-c:v", codec])
+        # EXR frames are linear float: encode with sRGB gamma. zscale replaces the
+        # EXR decoder's -apply_trc option, which FFmpeg 9 removed.
+        cmd.extend(["-vf", ("zscale=tin=linear:t=iec61966-2-1:pin=709:p=709"
+                            ":min=gbr:m=gbr:rin=full:r=full")])
+    cmd.extend(["-c:v", codec])
     if is_mov:
         cmd.extend(["-profile:v", "4444", "-qscale:v", "9", "-vendor", "apl0"])
     else:

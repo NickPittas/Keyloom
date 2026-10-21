@@ -1001,3 +1001,29 @@ class TestRepairSafetyHelpers:
     def test_find_staged_dir_none_when_binaries_missing(self, tmp_path):
         (tmp_path / "extract").mkdir()
         assert _discovery._find_staged_ffmpeg_dir(str(tmp_path / "extract")) is None
+
+
+def test_stitch_exr_to_prores4444_without_apply_trc(tmp_path):
+    """FFmpeg 9 removed -apply_trc; EXR export must still produce a ProRes 4444 with alpha."""
+    import shutil
+
+    import numpy as np
+    import pytest
+
+    from backend.ffmpeg_tools.stitching import stitch_video
+    from backend.frame_io import write_exr
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg not installed")
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    img = np.full((32, 48, 4), 0.25, np.float32)
+    for i in range(2):
+        assert write_exr(str(frames / f"frame_{i:06d}.exr"), img, compression="zip")
+    out = tmp_path / "out.mov"
+    stitch_video(str(frames), str(out), pattern="frame_%06d.exr")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name,pix_fmt",
+         "-of", "csv=p=0", str(out)], capture_output=True, text=True, check=True)
+    codec, pix_fmt = probe.stdout.strip().split(",")
+    assert codec == "prores" and pix_fmt.startswith("yuva444")
