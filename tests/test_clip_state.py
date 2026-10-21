@@ -10,6 +10,7 @@ from backend.clip_state import (
     ClipEntry,
     ClipState,
     PipelineRoute,
+    can_run_inference,
     classify_pipeline_route,
     scan_clips_dir,
     scan_project_clips,
@@ -66,10 +67,10 @@ class TestClipStateTransitions:
         with pytest.raises(InvalidStateTransitionError):
             clip.transition_to(ClipState.ERROR)
 
-    def test_raw_to_complete_invalid(self):
+    def test_raw_to_complete_hint_free(self):
         clip = self._make_clip(ClipState.RAW)
-        with pytest.raises(InvalidStateTransitionError):
-            clip.transition_to(ClipState.COMPLETE)
+        clip.transition_to(ClipState.COMPLETE)
+        assert clip.state == ClipState.COMPLETE
 
     def test_raw_to_error_on_gvm_failure(self):
         """Phase 2: RAW clips can error when GVM fails."""
@@ -89,10 +90,16 @@ class TestClipStateTransitions:
         clip.transition_to(ClipState.RAW)
         assert clip.state == ClipState.RAW
 
-    def test_masked_to_complete_invalid(self):
+    def test_masked_to_complete_hint_free(self):
         clip = self._make_clip(ClipState.MASKED)
-        with pytest.raises(InvalidStateTransitionError):
-            clip.transition_to(ClipState.COMPLETE)
+        clip.transition_to(ClipState.COMPLETE)
+        assert clip.state == ClipState.COMPLETE
+
+    def test_complete_to_raw_and_masked_for_hint_free_rerun(self):
+        for target in (ClipState.RAW, ClipState.MASKED):
+            clip = self._make_clip(ClipState.COMPLETE)
+            clip.transition_to(target)
+            assert clip.state == target
 
     def test_set_error_stores_message(self):
         clip = self._make_clip(ClipState.READY)
@@ -594,3 +601,117 @@ class TestScanProjectClips:
             assert clips[0].in_out_range is not None
             assert clips[0].in_out_range.in_point == 5
             assert clips[0].in_out_range.out_point == 20
+
+
+# --- CorridorKey v2: hint-free routing and manifest-based COMPLETE ---
+
+def _touch(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b"x")
+
+
+def _make_hintfree_clip(root, n=3, manifest=None, out_ext="exr", out_dirs=("FG", "Matte")):
+    for i in range(n):
+        _touch(os.path.join(root, "Input", f"f{i:03d}.png"))
+        for d in out_dirs:
+            _touch(os.path.join(root, "Output", d, f"f{i:03d}.{out_ext}"))
+    if manifest is not None:
+        with open(os.path.join(root, "Output", ".corridorkey_manifest.json"), "w") as f:
+            json.dump(manifest, f)
+    clip = ClipEntry(name="c", root_path=root)
+    clip.find_assets()
+    return clip
+
+
+def _v2(**kw):
+    m = {"version": 2, "engine": "corridorkey-v2", "enabled_outputs": ["fg", "matte"],
+         "formats": {"fg": "exr", "matte": "exr"}, "params": {}, "source_stems": None,
+         "frame_range": None, "complete": True, "alpha_convention": {}}
+    m.update(kw)
+    return m
+
+
+class TestHintFreeRouting:
+    def _clip(self, state, with_input=True):
+        clip = ClipEntry(name="c", root_path="/tmp/nonexistent_c")
+        clip.state = state
+        if with_input:
+            clip.input_asset = ClipAsset("/tmp/x", "sequence")
+        return clip
+
+    def test_route_hint_off(self, tmp_path):
+        for state in (ClipState.RAW, ClipState.MASKED, ClipState.READY, ClipState.COMPLETE):
+            clip = self._clip(state)
+            clip.root_path = str(tmp_path)
+            (tmp_path / "annotations.json").write_text('{"a": [1, 2, 3]}')
+            assert classify_pipeline_route(clip, use_alpha_hint=False) == PipelineRoute.INFERENCE_ONLY
+        for state in (ClipState.EXTRACTING, ClipState.ERROR):
+            assert classify_pipeline_route(self._clip(state), use_alpha_hint=False) == PipelineRoute.SKIP
+
+    def test_route_hint_on_unchanged(self):
+        assert classify_pipeline_route(self._clip(ClipState.RAW)) == PipelineRoute.GVM_PIPELINE
+        assert classify_pipeline_route(self._clip(ClipState.READY), True) == PipelineRoute.INFERENCE_ONLY
+
+    def test_can_run_inference(self):
+        alpha = ClipAsset("/tmp/a", "sequence")
+        for state in (ClipState.RAW, ClipState.MASKED, ClipState.READY, ClipState.COMPLETE):
+            assert can_run_inference(self._clip(state), False)
+        for state in (ClipState.EXTRACTING, ClipState.ERROR):
+            assert not can_run_inference(self._clip(state), False)
+        assert not can_run_inference(self._clip(ClipState.RAW, with_input=False), False)
+        raw = self._clip(ClipState.RAW)
+        assert not can_run_inference(raw, True)
+        raw.alpha_asset = alpha
+        assert not can_run_inference(raw, True)  # RAW state still not runnable
+        raw.state = ClipState.READY
+        assert can_run_inference(raw, True)
+        no_alpha = self._clip(ClipState.READY)
+        assert not can_run_inference(no_alpha, True)
+
+
+class TestV2ManifestComplete:
+    def test_complete_without_alpha_after_rescan(self, tmp_path):
+        clip = _make_hintfree_clip(str(tmp_path), manifest=_v2())
+        assert clip.alpha_asset is None
+        assert clip.state == ClipState.COMPLETE
+        assert len(clip.completed_stems()) == 3
+
+    def test_manifest_incomplete_not_complete(self, tmp_path):
+        clip = _make_hintfree_clip(str(tmp_path), manifest=_v2(complete=False))
+        assert clip.state == ClipState.RAW
+
+    def test_frame_range_not_complete(self, tmp_path):
+        clip = _make_hintfree_clip(str(tmp_path), manifest=_v2(frame_range=[0, 2]))
+        assert clip.state == ClipState.RAW
+
+    def test_v1_manifest_ignored(self, tmp_path):
+        m = {"version": 1, "enabled_outputs": ["fg", "matte"]}
+        clip = _make_hintfree_clip(str(tmp_path), manifest=m)
+        assert clip.completed_stems() == set()
+        assert clip.state == ClipState.RAW
+
+    def test_no_manifest_ignored(self, tmp_path):
+        clip = _make_hintfree_clip(str(tmp_path), manifest=None)
+        assert clip.completed_stems() == set()
+        assert clip.state == ClipState.RAW
+
+    def test_wrong_extension_not_counted(self, tmp_path):
+        m = _v2(formats={"fg": "png", "matte": "png"})
+        clip = _make_hintfree_clip(str(tmp_path), manifest=m)
+        assert clip.completed_stems() == set()
+        assert clip.state == ClipState.RAW
+
+    def test_extension_case_insensitive(self, tmp_path):
+        clip = _make_hintfree_clip(str(tmp_path), manifest=_v2(), out_ext="EXR")
+        assert len(clip.completed_stems()) == 3
+
+    def test_source_stems_intersection(self, tmp_path):
+        clip = _make_hintfree_clip(str(tmp_path), manifest=_v2(source_stems=["f000", "f001"]))
+        assert clip.completed_stems() == {"f000", "f001"}
+        assert clip.state == ClipState.RAW  # 2 < 3 input frames
+
+    def test_missing_output_dir_empty(self, tmp_path):
+        m = _v2(enabled_outputs=["fg", "comp"], formats={"fg": "exr", "comp": "png"})
+        clip = _make_hintfree_clip(str(tmp_path), manifest=m)
+        assert clip.completed_stems() == set()

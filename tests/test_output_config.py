@@ -11,17 +11,13 @@ class TestInferenceParams:
         params = InferenceParams(
             input_is_linear=True,
             despill_strength=0.8,
-            auto_despeckle=False,
-            despeckle_size=200,
-            refiner_scale=2.5,
+            use_alpha_hint=True,
+            hint_quality=0.7,
+            carry_hint=False,
+            vram_profile="low",
         )
-        d = params.to_dict()
-        restored = InferenceParams.from_dict(d)
-        assert restored.input_is_linear is True
-        assert restored.despill_strength == 0.8
-        assert restored.auto_despeckle is False
-        assert restored.despeckle_size == 200
-        assert restored.refiner_scale == 2.5
+        restored = InferenceParams.from_dict(params.to_dict())
+        assert restored == params
 
     def test_from_dict_ignores_unknown_keys(self):
         d = {"input_is_linear": True, "future_field": 42}
@@ -33,23 +29,18 @@ class TestInferenceParams:
         params = InferenceParams()
         assert params.input_is_linear is False
         assert params.despill_strength == 0.5
-        assert params.refiner_scale == 1.0
-        assert params.despeckle_dilation == 25
-        assert params.despeckle_blur == 5
+        assert params.use_alpha_hint is False
+        assert params.hint_quality == 0.95
+        assert params.carry_hint is True
+        assert params.vram_profile == "auto"
 
-    def test_despeckle_advanced_roundtrip(self):
-        params = InferenceParams(despeckle_dilation=10, despeckle_blur=15)
-        d = params.to_dict()
-        restored = InferenceParams.from_dict(d)
-        assert restored.despeckle_dilation == 10
-        assert restored.despeckle_blur == 15
-
-    def test_old_session_missing_advanced_fields(self):
-        """Old session data without new fields gets defaults."""
-        d = {"input_is_linear": False, "despill_strength": 1.0}
+    def test_old_session_legacy_keys_ignored(self):
+        """Old v1 session data: legacy keys filtered, defaults applied."""
+        d = {"input_is_linear": False, "despill_strength": 1.0,
+             "refiner_scale": 2.0, "auto_despeckle": False}
         params = InferenceParams.from_dict(d)
-        assert params.despeckle_dilation == 25
-        assert params.despeckle_blur == 5
+        assert params.despill_strength == 1.0
+        assert not hasattr(params, "refiner_scale")
 
 
 class TestOutputConfig:
@@ -99,7 +90,8 @@ class TestManifestResume:
 
         # Write manifest with only FG+Comp enabled
         manifest = {
-            "version": 1,
+            "version": 2,
+            "engine": "corridorkey-v2",
             "enabled_outputs": ["fg", "comp"],
             "formats": {"fg": "exr", "comp": "png"},
             "params": {},
@@ -115,7 +107,7 @@ class TestManifestResume:
         assert "frame_001" in stems
 
     def test_completed_stems_fallback_no_manifest(self, tmp_path):
-        """Without manifest, falls back to FG+Matte intersection."""
+        """Without a v2 manifest, nothing counts as resumable (v1 outputs ignored)."""
         from backend.clip_state import ClipEntry
 
         clip = ClipEntry(name="TestClip", root_path=str(tmp_path))
@@ -130,9 +122,7 @@ class TestManifestResume:
         open(os.path.join(fg_dir, "frame_002.exr"), 'w').close()
         # frame_002 missing from matte — not complete
 
-        stems = clip.completed_stems()
-        assert "frame_001" in stems
-        assert "frame_002" not in stems
+        assert clip.completed_stems() == set()
 
     def test_completed_count_matches_stems(self, tmp_path):
         from backend.clip_state import ClipEntry
@@ -147,6 +137,11 @@ class TestManifestResume:
         for stem in ["frame_001", "frame_002", "frame_003"]:
             open(os.path.join(fg_dir, f"{stem}.exr"), 'w').close()
             open(os.path.join(matte_dir, f"{stem}.exr"), 'w').close()
+
+        with open(os.path.join(out, ".corridorkey_manifest.json"), 'w') as f:
+            json.dump({"version": 2, "engine": "corridorkey-v2",
+                       "enabled_outputs": ["fg", "matte"],
+                       "formats": {"fg": "exr", "matte": "exr"}}, f)
 
         assert clip.completed_frame_count() == 3
         assert len(clip.completed_stems()) == 3

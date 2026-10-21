@@ -54,10 +54,12 @@ class ClipState(Enum):
 # Valid transitions: from_state -> set of allowed to_states
 _TRANSITIONS: dict[ClipState, set[ClipState]] = {
     ClipState.EXTRACTING: {ClipState.RAW, ClipState.ERROR},
-    ClipState.RAW: {ClipState.MASKED, ClipState.READY, ClipState.ERROR},
-    ClipState.MASKED: {ClipState.READY, ClipState.ERROR},
+    # RAW/MASKED -> COMPLETE: hint-free CorridorKey v2 inference finishes directly.
+    ClipState.RAW: {ClipState.MASKED, ClipState.READY, ClipState.COMPLETE, ClipState.ERROR},
+    ClipState.MASKED: {ClipState.READY, ClipState.COMPLETE, ClipState.ERROR},
     ClipState.READY: {ClipState.COMPLETE, ClipState.ERROR},
-    ClipState.COMPLETE: {ClipState.READY},  # reprocess with different params
+    # reprocess with different params (READY with a hint; RAW/MASKED hint-free)
+    ClipState.COMPLETE: {ClipState.READY, ClipState.RAW, ClipState.MASKED},
     ClipState.ERROR: {ClipState.RAW, ClipState.MASKED, ClipState.READY, ClipState.EXTRACTING},
 }
 
@@ -84,12 +86,32 @@ def mask_sequence_is_videomama_ready(root_path: str) -> bool:
     return data.get("source") in {"sam2", "imported"}
 
 
-def classify_pipeline_route(clip: "ClipEntry") -> PipelineRoute:
+def can_run_inference(clip: "ClipEntry", use_alpha_hint: bool) -> bool:
+    """Return True if CorridorKey inference can run on the clip.
+
+    Hint off: any clip with an input and not EXTRACTING/ERROR.
+    Hint on: needs an AlphaHint and READY/COMPLETE state.
+    """
+    if not use_alpha_hint:
+        return (clip.input_asset is not None
+                and clip.state not in (ClipState.EXTRACTING, ClipState.ERROR))
+    return (clip.alpha_asset is not None
+            and clip.state in (ClipState.READY, ClipState.COMPLETE))
+
+
+def classify_pipeline_route(clip: "ClipEntry", use_alpha_hint: bool = True) -> PipelineRoute:
     """Determine the full-pipeline route for a clip.
+
+    When ``use_alpha_hint`` is False, annotations, masks and existing hints
+    are ignored: EXTRACTING/ERROR -> SKIP, everything else -> INFERENCE_ONLY.
 
     For RAW clips, checks for annotations.json on disk to decide
     between GVM (automatic) and VideoMaMa (annotation-based) paths.
     """
+    if not use_alpha_hint:
+        if clip.state in (ClipState.EXTRACTING, ClipState.ERROR):
+            return PipelineRoute.SKIP
+        return PipelineRoute.INFERENCE_ONLY
     ann_path = os.path.join(clip.root_path, "annotations.json")
     has_annotations = os.path.isfile(ann_path) and os.path.getsize(ann_path) > 2
     mask_ready = mask_sequence_is_videomama_ready(clip.root_path)
@@ -373,41 +395,43 @@ class ClipEntry:
         return len(self.completed_stems())
 
     def completed_stems(self) -> set[str]:
-        """Return set of frame stems that have all enabled outputs complete.
+        """Return frame stems whose enabled outputs all exist (v2 manifest only).
 
-        Reads the run manifest to determine which outputs to check.
-        Falls back to FG+Matte intersection if no manifest exists.
+        v1 outputs / missing manifests are not resume data -> empty set.
+        A stem counts only if ``<stem>.<format>`` exists in each enabled
+        output dir, using the manifest's format extension.
         """
         manifest = self._read_manifest()
-        if manifest:
-            enabled = manifest.get("enabled_outputs", [])
-        else:
-            enabled = ["fg", "matte"]
-
+        if not manifest or manifest.get("engine") != "corridorkey-v2":
+            return set()
+        enabled = manifest.get("enabled_outputs", [])
+        formats = manifest.get("formats", {}) or {}
         dir_map = {
             "fg": os.path.join(self.output_dir, "FG"),
             "matte": os.path.join(self.output_dir, "Matte"),
             "comp": os.path.join(self.output_dir, "Comp"),
             "processed": os.path.join(self.output_dir, "Processed"),
         }
-
         stem_sets = []
         for output_name in enabled:
             d = dir_map.get(output_name)
-            if d and os.path.isdir(d):
-                stems = {os.path.splitext(f)[0] for f in os.listdir(d) if _is_image_file(f)}
-                stem_sets.append(stems)
-            else:
-                # Required dir missing → no complete frames
+            if not d or not os.path.isdir(d):
                 return set()
-
+            ext = str(formats.get(output_name, "")).lower().lstrip(".")
+            if not ext:
+                return set()
+            stems = set()
+            for f in os.listdir(d):
+                stem, fext = os.path.splitext(f)
+                if fext.lower().lstrip(".") == ext:
+                    stems.add(stem)
+            stem_sets.append(stems)
         if not stem_sets:
             return set()
-
-        # Intersection: frame complete only if ALL enabled outputs exist
-        result = stem_sets[0]
-        for s in stem_sets[1:]:
-            result &= s
+        result = set.intersection(*stem_sets)
+        source_stems = manifest.get("source_stems")
+        if isinstance(source_stems, list):
+            result &= set(source_stems)
         return result
 
     def _read_manifest(self) -> Optional[dict]:
@@ -603,11 +627,16 @@ class ClipEntry:
           RAW       — frame sequence exists, no alpha/mask/output
         """
         # Check COMPLETE first: outputs exist and cover all input frames
-        if self.alpha_asset is not None and self.input_asset is not None:
-            completed = self.completed_stems()
-            if completed and len(completed) >= self.input_asset.frame_count:
-                self.state = ClipState.COMPLETE
-                return
+        # (v2 manifest complete, full range; AlphaHint not required)
+        if self.input_asset is not None:
+            manifest = self._read_manifest()
+            if (manifest and manifest.get("engine") == "corridorkey-v2"
+                    and manifest.get("complete") is True
+                    and manifest.get("frame_range") is None):
+                completed = self.completed_stems()
+                if completed and len(completed) >= self.input_asset.frame_count:
+                    self.state = ClipState.COMPLETE
+                    return
 
         # READY: AlphaHint must cover the processing range
         # If in/out markers are set, alpha only needs to cover that range.
