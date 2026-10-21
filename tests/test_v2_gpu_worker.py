@@ -216,3 +216,24 @@ def test_close_while_busy_asks_and_no_keeps_window(monkeypatch):
     monkeypatch.setattr(mw, "QMessageBox", box)
     mw.MainWindow.closeEvent(fake, types.SimpleNamespace(ignore=lambda: ignored.append(1)))
     assert ignored == [1] and saved == []
+
+
+def test_phase_status_emitted_on_phase_change():
+    from ui.workers.gpu_job_worker import PHASE_PREFIX
+    svc = FakeService(work=0)
+    svc.progress_calls = [
+        {"c": 1, "t": 4, "phase": "stage1"},
+        {"c": 2, "t": 4, "phase": "stage1"},
+        {"c": 1, "t": 4, "phase": "stage2"},
+        {"c": 1, "t": 4, "phase": "publish"},
+    ]
+    w = GPUJobWorker(svc)
+    msgs = []
+    w.status_update.connect(lambda j, m: msgs.append(m))
+    job = _job()
+    svc.job_queue.submit(job)
+    svc.job_queue.start_job(job)
+    w._process_job_inner(job)
+    phase_msgs = [m for m in msgs if m.startswith(PHASE_PREFIX)]
+    assert len(phase_msgs) == 3  # one per phase change, not per tick
+    assert len({m for m in phase_msgs}) == 3

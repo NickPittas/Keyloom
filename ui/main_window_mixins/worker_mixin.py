@@ -86,6 +86,10 @@ class WorkerMixin:
             return
         if self._active_job_id is None:
             self._active_job_id = job_id
+        from ui.workers.gpu_job_worker import PHASE_PREFIX
+        if message.startswith(PHASE_PREFIX):
+            self._status_bar.set_progress_phase(message[len(PHASE_PREFIX):])
+            return
         from ui.state_labels import backend_status_text
         self._status_bar.set_phase(backend_status_text(message))
 
@@ -349,7 +353,7 @@ class WorkerMixin:
         self._pipeline_steps.clear()
         self._pipeline_settings.clear()
         self._queue_panel.refresh()
-        # NOTE: Do NOT call unload_engines() here — it kills the inference
-        # engine that live preview depends on.  Model switching is already
-        # handled by _ensure_model() when a different model type is needed.
+        # NOTE: Do NOT call unload_engines() here — engines stay loaded so the
+        # next whole-clip job reuses them.  Model switching is already handled
+        # by _ensure_model() when a different model type is needed.
         logger.info("All jobs completed, queue idle")

@@ -110,8 +110,9 @@ class ClipMixin:
         batch_count = len(clips)
         if batch_count > 1:
             # Check if any clip needs alpha generation (pipeline mode)
+            use_hint = self._param_panel.get_params().use_alpha_hint
             needs_pipeline = any(
-                classify_pipeline_route(c) not in (
+                classify_pipeline_route(c, use_alpha_hint=use_hint) not in (
                     PipelineRoute.INFERENCE_ONLY, PipelineRoute.SKIP)
                 for c in clips
             )

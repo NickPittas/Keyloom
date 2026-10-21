@@ -182,3 +182,42 @@ def test_blue_clip_no_download_offer(clip, monkeypatch):
     ClipMixin._detect_and_apply_screen_color(win, clip)
     assert seen == ["blue"]
     assert clip_mixin is not None
+
+
+def test_selection_changed_honours_use_alpha_hint_toggle():
+    seen = []
+    flags = []
+    clips = [SimpleNamespace(name="a"), SimpleNamespace(name="b")]
+
+    def _route(c, use_alpha_hint=True):
+        flags.append(use_alpha_hint)
+        return clip_mixin.PipelineRoute.SKIP
+
+    win = SimpleNamespace(
+        _param_panel=SimpleNamespace(
+            get_params=lambda: InferenceParams(use_alpha_hint=False)),
+        _status_bar=SimpleNamespace(
+            update_button_state=lambda **kw: seen.append(kw)),
+    )
+    orig = clip_mixin.classify_pipeline_route
+    clip_mixin.classify_pipeline_route = _route
+    try:
+        ClipMixin._on_selection_changed(win, clips)
+    finally:
+        clip_mixin.classify_pipeline_route = orig
+    assert flags == [False, False]
+    assert seen[0]["needs_pipeline"] is False
+
+
+def test_worker_status_phase_prefix_sets_progress_phase():
+    from ui.workers.gpu_job_worker import PHASE_PREFIX
+    calls = []
+    win = SimpleNamespace(
+        _cancel_requested_job_id=None, _active_job_id="j",
+        _status_bar=SimpleNamespace(
+            set_progress_phase=lambda t: calls.append(("pp", t)),
+            set_phase=lambda t: calls.append(("p", t))),
+    )
+    WorkerMixin._on_worker_status(win, "j", PHASE_PREFIX + "Stage 1")
+    WorkerMixin._on_worker_status(win, "j", "Loading model...")
+    assert calls[0] == ("pp", "Stage 1") and calls[1][0] == "p"

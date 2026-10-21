@@ -269,6 +269,7 @@ class StatusBar(QWidget):
         self._last_fps = 0.0
         self._job_label = label
         self._phase = ""  # phase text shown during loading (e.g. "Loading frames...")
+        self._progress_phase = ""  # label before the frame counter (e.g. "Stage 1")
 
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
@@ -286,7 +287,7 @@ class StatusBar(QWidget):
         self._last_total = total
         if fps > 0:
             self._last_fps = fps
-        # Clear phase text once real frame progress flows
+        # Clear loading-phase text once real frame progress flows
         if total > 0 and current > 0:
             self._phase = ""
 
@@ -309,6 +310,8 @@ class StatusBar(QWidget):
 
             elapsed_str = _fmt_duration(elapsed)
             label = f"{self._job_label}  " if self._job_label else ""
+            if self._progress_phase:
+                label += f"{self._progress_phase}  "
             if total >= 1_000_000:
                 current_text = _fmt_bytes(current)
                 total_text = _fmt_bytes(total)
@@ -329,6 +332,7 @@ class StatusBar(QWidget):
         self._progress.setValue(0)
         self._frame_label.setText("")
         self._phase = ""
+        self._progress_phase = ""
         self._warning_count = 0
         self._warnings.clear()
         self._warn_btn.setText("")
@@ -365,6 +369,10 @@ class StatusBar(QWidget):
         frame progress data arrives via update_progress().
         """
         self._phase = phase
+
+    def set_progress_phase(self, phase: str) -> None:
+        """Set the label shown before the frame counter (e.g. "Stage 1")."""
+        self._progress_phase = phase
 
     def _on_tick(self) -> None:
         """Called every second to update the elapsed display."""

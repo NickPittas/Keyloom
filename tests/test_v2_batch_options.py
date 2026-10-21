@@ -98,7 +98,7 @@ from types import SimpleNamespace
 
 from backend import InferenceParams, OutputConfig
 from backend.clip_state import ClipAsset, ClipEntry, ClipState
-from backend.job_queue import GPUJobQueue
+from backend.job_queue import GPUJob, GPUJobQueue, JobStatus
 from ui.main_window_mixins.batch_pipeline_mixin import BatchPipelineMixin
 from ui.widgets.batch_pipeline_dialog import BatchClipConfig
 
@@ -220,3 +220,20 @@ def test_mixin_extract_finished_uses_settings_frozen_at_submit(_app):
     h._on_batch_extract_finished("c")
     job = h._service.job_queue.next_job()
     assert job.params["_inference_params"].despill_strength == 0.2
+
+
+def test_clear_pipeline_cancels_queued_and_running_batch_jobs(_app):
+    h = _Host(_entry(ClipState.RAW), _cfg(JobType.INFERENCE, False, HINT_NONE_V2))
+    q = h._service.job_queue
+    running = GPUJob(job_type=JobType.INFERENCE, clip_name="c")
+    queued = GPUJob(job_type=JobType.GVM_ALPHA, clip_name="c")
+    other = GPUJob(job_type=JobType.INFERENCE, clip_name="other")
+    for j in (running, queued, other):
+        assert q.submit(j)
+    q.start_job(running)
+    h._pipeline_steps["c"] = [JobType.INFERENCE]
+    h._pipeline_settings["c"] = {}
+    h._cancel_batch_jobs({"c"})
+    assert running.is_cancelled
+    assert queued.status == JobStatus.CANCELLED
+    assert other.status == JobStatus.QUEUED

@@ -7,6 +7,8 @@ import os
 from PySide6.QtCore import Slot
 from PySide6.QtWidgets import QDialog, QInputDialog, QMessageBox
 
+from backend.job_queue import JobStatus
+
 from . import _tr
 
 logger = logging.getLogger(__name__)
@@ -65,12 +67,24 @@ class BatchPipelineMixin:
 
         self._run_batch_import_and_process(configs, dialog)
 
+    def _cancel_batch_jobs(self, clip_names: set[str]) -> None:
+        """Cancel queued and running jobs for the given batch clips.
+
+        Queued jobs are removed; a running job gets a cooperative cancel
+        request (the worker finalises it).
+        """
+        queue = self._service.job_queue
+        for job in queue.all_jobs_snapshot:
+            if job.clip_name in clip_names and job.status in (
+                    JobStatus.QUEUED, JobStatus.RUNNING):
+                queue.cancel_job(job)
+
     @Slot()
     def _on_batch_clear_requested(self, dialog) -> None:
         """Handle Clear Pipeline button. Always confirms before clearing."""
         from PySide6.QtWidgets import QMessageBox
 
-        msg = (_tr("Cancel all pending batch jobs and clear the pipeline?")
+        msg = (_tr("Cancel all queued and running batch jobs and clear the pipeline?")
                if self._batch_configs
                else _tr("Clear the current batch folder and clip list?"))
         reply = QMessageBox.question(
@@ -81,6 +95,7 @@ class BatchPipelineMixin:
             return
 
         if self._batch_configs:
+            self._cancel_batch_jobs(set(self._batch_configs))
             for clip_name in list(self._batch_configs.keys()):
                 self._batch_pending_extractions.pop(clip_name, None)
                 self._pipeline_steps.pop(clip_name, None)

@@ -222,7 +222,7 @@ class BatchPipelineDialog(QDialog):
         # Buttons
         btn_row = QHBoxLayout()
         self._clear_btn = QPushButton(self.tr("Clear Pipeline"))
-        self._clear_btn.setToolTip(self.tr("Cancel all pending batch jobs and reset."))
+        self._clear_btn.setToolTip(self.tr("Cancel all queued and running batch jobs and reset."))
         self._clear_btn.setVisible(False)
         self._clear_btn.clicked.connect(self.clear_requested.emit)
         btn_row.addWidget(self._clear_btn)

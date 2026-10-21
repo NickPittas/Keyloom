@@ -20,7 +20,7 @@ import tempfile
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QThread, Signal, QMutex, QWaitCondition
+from PySide6.QtCore import QCoreApplication, QThread, Signal, QMutex, QWaitCondition
 
 from backend import (
     CorridorKeyService,
@@ -39,6 +39,22 @@ from backend.errors import JobCancelledError, CorridorKeyError
 from ui.workers.job_helpers import create_job_snapshot
 
 logger = logging.getLogger(__name__)
+
+# status_update messages starting with this prefix carry a *progress phase*
+# label (shown next to the frame counter), not a loading-phase message.
+PHASE_PREFIX = "\x00phase:"
+
+
+def _phase_label(phase: str) -> str:
+    """User-facing label for a service progress phase (None if unknown)."""
+    tr = QCoreApplication.translate
+    return {
+        "rvm": tr("GPUJobWorker", "Video matting (RVM)"),
+        "vfm": tr("GPUJobWorker", "Foreground model (VFM)"),
+        "stage1": tr("GPUJobWorker", "Stage 1 - windows"),
+        "stage2": tr("GPUJobWorker", "Stage 2 - refine"),
+        "publish": tr("GPUJobWorker", "Writing frames"),
+    }.get(phase, "")
 
 
 class GPUJobWorker(QThread):
@@ -209,7 +225,15 @@ class GPUJobWorker(QThread):
         if clip is None or params is None:
             raise CorridorKeyError(f"Job [{job.id}] for '{job.clip_name}' missing clip or params snapshot")
 
+        last_phase: list[str | None] = [None]
+
         def on_progress(clip_name: str, current: int, total: int, **kwargs) -> None:
+            phase = kwargs.get("phase")
+            if phase and phase != last_phase[0]:
+                last_phase[0] = phase
+                label = _phase_label(phase)
+                if label:
+                    self.status_update.emit(job.id, PHASE_PREFIX + label)
             self.progress.emit(job.id, clip_name, current, total, kwargs.get("fps", 0.0))
 
             # Only "publish" ticks mean frames hit disk; other phases
