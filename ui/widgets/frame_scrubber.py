@@ -151,6 +151,8 @@ class FrameScrubber(QWidget):
         self._suppress_signal = False
         self._in_point: int | None = None
         self._out_point: int | None = None
+        self._keyframes: list[int] = []
+        self._slider_base_tip = self._slider.toolTip()
 
     def resizeEvent(self, event) -> None:
         """Keep marker overlay sized to the center column."""
@@ -187,6 +189,9 @@ class FrameScrubber(QWidget):
         if self._playing and changed:
             self._stop_playback()
         self._total = total_frames
+        if changed:
+            self._keyframes = []
+            self._push_keyframes()
         enabled = total_frames > 0
         self._slider.setEnabled(enabled)
         self._slider.setMaximum(max(0, total_frames - 1))
@@ -208,6 +213,24 @@ class FrameScrubber(QWidget):
         self._update_label()
         if self._playing:
             self._reanchor()
+
+    def set_keyframes(self, indices) -> None:
+        """Show non-interactive hint keyframe ticks at absolute frame indices."""
+        valid = set()
+        for i in indices or ():
+            if isinstance(i, bool) or not isinstance(i, int):
+                continue
+            if 0 <= i < self._total:
+                valid.add(i)
+        self._keyframes = sorted(valid)
+        self._push_keyframes()
+
+    def _push_keyframes(self) -> None:
+        self._marker_overlay.set_keyframes(self._keyframes, self._total)
+        tip = self._slider_base_tip
+        if self._keyframes:
+            tip += self.tr("\n\u25C6 Cyan diamonds: hint keyframes")
+        self._slider.setToolTip(tip)
 
     def set_coverage(self, alpha: list[bool], inference: list[bool]) -> None:
         """Update the coverage overlay lanes."""

@@ -203,6 +203,8 @@ class MarkerOverlay(QWidget):
     MARKER_WIDTH = 2  # px bracket line width
     MARKER_COLOR = QColor(255, 242, 3)      # Brand yellow
     DIM_COLOR = QColor(0, 0, 0, 120)        # Semi-transparent dim
+    KEYFRAME_COLOR = QColor(0, 229, 255)    # Cyan hint keyframe ticks
+    KEYFRAME_SIZE = 4                       # diamond half-size, px
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -210,6 +212,7 @@ class MarkerOverlay(QWidget):
         self._out_point: int | None = None
         self._total: int = 0
         self._dragging: str | None = None  # None | 'in' | 'out'
+        self._keyframes: list[int] = []
         # Start transparent — slider gets all events by default
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
@@ -223,6 +226,32 @@ class MarkerOverlay(QWidget):
         self._in_point = None
         self._out_point = None
         self.update()
+
+    def set_keyframes(self, indices, total: int | None = None) -> None:
+        """Set non-interactive hint keyframe ticks (absolute frame indices)."""
+        if total is not None:
+            self._total = total
+        self._keyframes = list(indices)
+        self.update()
+
+    def _paint_keyframes(self, painter: QPainter) -> None:
+        n = self._total
+        if n <= 0 or not self._keyframes:
+            return
+        w = self.width()
+        cy = self.KEYFRAME_SIZE + 1
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setBrush(self.KEYFRAME_COLOR)
+        painter.setPen(Qt.NoPen)
+        r = self.KEYFRAME_SIZE
+        for idx in self._keyframes:
+            if not 0 <= idx < n:
+                continue
+            x = int(idx * w / n)
+            painter.drawPolygon(QPolygonF([
+                QPointF(x, cy - r), QPointF(x + r, cy),
+                QPointF(x, cy + r), QPointF(x - r, cy),
+            ]))
 
     def _frame_to_x(self, frame: int) -> int:
         if self._total <= 0:
@@ -255,6 +284,10 @@ class MarkerOverlay(QWidget):
 
     def paintEvent(self, event) -> None:
         if self._in_point is None or self._out_point is None or self._total <= 0:
+            if self._keyframes and self._total > 0:
+                painter = QPainter(self)
+                self._paint_keyframes(painter)
+                painter.end()
             return
 
         painter = QPainter(self)
@@ -302,6 +335,7 @@ class MarkerOverlay(QWidget):
         ])
         painter.drawPolygon(out_tri)
 
+        self._paint_keyframes(painter)
         painter.end()
 
     def _become_interactive(self) -> None:
