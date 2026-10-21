@@ -13,7 +13,7 @@
 ## CorridorKey 2.0 behaviour
 
 - Whole-clip inference (`backend/service/core.py`): every run infers the entire clip. Inference settings (`InferenceParams`, `ui/widgets/parameter_panel.py`): optional AlphaHint source (GVM / BiRefNet / VideoMaMa / MatAnyone2) with quality, carry hint, VRAM profile (auto / low), despill strength, and cutout linear (shown disabled).
-- Outputs: `FG/`, `Matte/`, `Comp/`, `Processed/` folders as EXR or PNG, plus the manifest `.corridorkey_manifest.json`. The In/Out range only limits which frames are written; resume re-publishes only frames missing from a compatible earlier run.
+- Outputs: `FG/`, `Matte/`, `Comp/`, `Processed/` folders as EXR or PNG, plus the manifest `.corridorkey_manifest.json`. The In/Out range only limits which frames are written; resume re-publishes only frames missing from a compatible earlier run. Separate In/Out runs do not add up to a finished clip — run the full clip (or Resume) to mark it complete.
 - Progress is shown per phase. Cancel is cooperative (stops after the current GPU step); quitting during a job asks first.
 - CLI: `python clip_manager.py --action run_inference [--non-interactive]`.
 - Not available: live single-frame re-key, parallel clips, model resolution/backend settings, MLX, and automatic updates (disabled; `3-update.sh` / `3-update.bat` refuse to run, the Update button is hidden). Update by `git pull` from your own remote.
