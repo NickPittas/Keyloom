@@ -354,3 +354,14 @@ Runtime data, **not checked-in assets**: `<each clip>/.corridorkey_hint_keyframe
 1. **EXR sampling (Q1):** accepted as proposed. Sample the first, middle and last source frames (deduplicated) and read the raw RGB. Take the maximum over the finite colour samples, decoding one image at a time in the worker. Do no whole-clip scan and never change the colour space automatically; the notice only suggests a switch.
 2. **Marks lifecycle (Q2):** accepted as proposed. Regenerating, replacing or importing an AlphaHint keeps the marked positions while the source index and stem identity are unchanged. Reset Hint, tray Clear Alpha and tray Clear All clear the marks. Marks are never deleted silently when a generator completes normally.
 3. **Temporal influence:** the interpretation is accepted. "Frames before k" means those frames get no explicit hint slots; the model may still be influenced within the window that contains k. No reverse pass and no second pass.
+
+## Review amendments (binding, from plan review)
+
+1. **Task 2 — one meaning for matte channels.** The sparse keyframe reader loads every file through `read_hint_image`, the same semantics as the reference hint: uint8/uint16 are normalised, RGBA uses the alpha channel, values are clamped to [0,1]. It must not use the BGR→gray path of `preprocess_hint_frame`.
+   - Task 2 adds a test where a staged RGBA PNG with different alpha and RGB conditions on alpha.
+   - Task 7 still stages single-channel PNGs.
+2. **Task 1 — log messages.** Replace the "loaded initial frame-1 hint" log in `load_initial_hint_frame` with an index-aware message, alongside the settings-log index line.
+3. **Contract B — when k is validated.** Validate k right after `T_all` is known and before any writer or memmap is created. Leftover empty `output_dir`/`temp_dir` folders after a rejected k are acceptable.
+4. **Tasks 17/18 — which frame is "current".** Take the frame index from the viewer that is actually presenting. In INPUT-only view that is the input viewer, not `DualViewerPanel.current_stem_index`, which returns the output viewer.
+   - The alternative is to prove that the input and output indices stay in sync in every view mode, with a test.
+5. **Task 5 — sidecar writes.** Write the temp file in the same directory as the sidecar (the clip root), then `os.replace` it.
