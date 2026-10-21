@@ -108,8 +108,8 @@ class PlaybackPresenter:
             self._last = None  # loop wrap: frames behind are fair game again
         self._cycle = cycle
         self._target = index
-        lo, hi = self._scrubber._play_range()
-        loop = (lo, hi) if self._scrubber._loop_enabled() else None
+        lo, hi = self._scrubber.play_range()
+        loop = (lo, hi) if self._scrubber.loop_enabled() else None
         for v in self._viewers:
             v.set_playback_hints(loop)
             v.prepare_frame(index)
@@ -130,13 +130,7 @@ class PlaybackPresenter:
         would shift the clock back to the (older) presented frame and cause
         slow motion; the clock must keep following wall time.
         """
-        sc = self._scrubber
-        sc._suppress_signal = True
-        try:
-            sc._slider.setValue(index)
-        finally:
-            sc._suppress_signal = False
-        sc._update_label()
+        self._scrubber.show_presented_frame(index)
 
     def _present(self) -> None:
         if self._busy or self._target is None:
@@ -144,7 +138,7 @@ class PlaybackPresenter:
         self._busy = True
         try:
             target = self._target
-            lo, hi = self._scrubber._play_range()
+            lo, hi = self._scrubber.play_range()
             floor = lo if self._last is None else max(lo, self._last)
             stop_at = max(floor, target - self.SCAN_LIMIT)
             best = None

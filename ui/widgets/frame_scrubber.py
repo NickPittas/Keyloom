@@ -337,6 +337,21 @@ class FrameScrubber(QWidget):
         if self._playing:
             self._stop_playback()
 
+    def show_presented_frame(self, index: int) -> None:
+        """Move slider/label silently WITHOUT re-anchoring the playback clock."""
+        self._suppress_signal = True
+        try:
+            self._slider.setValue(index)
+        finally:
+            self._suppress_signal = False
+        self._update_label()
+
+    def play_range(self) -> tuple[int, int]:
+        return self._play_range()
+
+    def loop_enabled(self) -> bool:
+        return self._loop_enabled()
+
     def _play_range(self) -> tuple[int, int]:
         hi_max = max(0, self._total - 1)
         if self._in_point is not None and self._out_point is not None:

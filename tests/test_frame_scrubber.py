@@ -176,3 +176,20 @@ def test_legacy_frame_changed_flag():
     s._playback_tick()
     assert s.frames == [3]
     assert s.playback_log[-1][0] == 5
+
+
+def test_show_presented_frame_does_not_reanchor():
+    s, c = make(total=100000, fps=24.0)
+    play(s)
+    c.ms = 1000
+    s._playback_tick()
+    assert s.playback_log[-1][0] == 24
+    s.playback_log.clear()
+    s.frames.clear()
+    s.show_presented_frame(5)
+    assert s._slider.value() == 5
+    assert s.frames == [] and s.playback_log == []
+    c.ms = 2000
+    s._playback_tick()
+    assert s.playback_log[-1][0] == 48
+    s.stop_playback()
