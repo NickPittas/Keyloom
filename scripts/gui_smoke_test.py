@@ -162,10 +162,9 @@ for mode in ViewMode:
 
 # --- 9. Helper Classes ---
 print("[9] Checking helper classes...")
-from ui.main_window import _Toast, _MuteOverlay, _UpdateChecker
+from ui.main_window import _Toast, _MuteOverlay
 check("_Toast class exists", _Toast is not None)
 check("_MuteOverlay class exists", _MuteOverlay is not None)
-check("_UpdateChecker class exists", _UpdateChecker is not None)
 
 # --- 10. Standalone Functions ---
 print("[10] Checking standalone functions...")

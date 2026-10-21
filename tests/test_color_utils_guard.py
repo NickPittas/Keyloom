@@ -271,7 +271,7 @@ def test_lanczos_upscale_overshoot_is_clamped():
     """The engine clamps alpha after INTER_LANCZOS4 (issue #179 follow-up).
 
     Mirrors the resize-then-clamp sequence in
-    CorridorKeyModule/inference_engine.py and its MLX counterpart. Without
+    the (removed) v1 inference engine. Without
     the clamp a hard alpha edge upscales to values above 1.0.
     """
     small = np.zeros((64, 64), np.float32)

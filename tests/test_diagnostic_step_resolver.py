@@ -56,7 +56,8 @@ class TestGpuRequiredResolution:
         text = _text(steps)
         assert "venv" not in text
         assert "installer" in text
-        assert "releases" in text
+        # Private fork: point at the fork README, never upstream v1 releases.
+        assert "readme" in text and "releases" not in text
 
     def test_dev_with_nvidia_keeps_venv_guidance(self):
         """Developers running from a git clone should still see the

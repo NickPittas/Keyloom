@@ -43,7 +43,7 @@ def _configure_runtime_backends() -> None:
 
     # ── CUDA / cuDNN global settings ──
     # These must be set once before any inference.  Previously they lived inside
-    # CorridorKeyEngine._load_model() which only runs lazily on first inference,
+    # the engine model-load path which only runs lazily on first inference,
     # so the first batch of frames ran without TF32 tensor-core acceleration.
     try:
         import torch

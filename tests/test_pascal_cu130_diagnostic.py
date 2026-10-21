@@ -330,8 +330,9 @@ class TestDiagnosticRegistered:
     def test_steps_mention_full_installer_url(self):
         diag = next(d for d in _DIAGNOSTICS if d.id == "pascal-cu130-mismatch")
         joined = " ".join(diag.steps).lower()
-        assert "github.com" in joined
-        assert "releases" in joined
+        # Private fork: point at the fork README, never upstream v1 releases.
+        assert "github.com" not in joined
+        assert "readme" in joined
         assert "installer" in joined
 
 

@@ -10,6 +10,17 @@ SKIP_PREFIXES = (
     "scripts", "tests", "CorridorKeyModule.core", "gvm_core",
     "VideoMaMaInferenceModule", "modules", "docker", "clip_manager",
     "sam2_tracker", "main",
+    # Vendored CorridorKey 2.0 engine + MoGe: imported explicitly below.
+    "CorridorKeyV2",
+    # macOS-only (raises ImportError elsewhere).
+    "backend.service.apple_vision",
+)
+
+EXPLICIT = (
+    "backend.corridorkey_v2",
+    "CorridorKeyV2.corridorkey.runtime",
+    "CorridorKeyModule.core.chroma_key",
+    "CorridorKeyModule.core.color_utils",
 )
 
 errors = []
@@ -28,6 +39,13 @@ for root, dirs, files in os.walk("."):
             ok += 1
         except Exception as e:
             errors.append((module, f"{type(e).__name__}: {str(e)[:200]}"))
+
+for module in EXPLICIT:
+    try:
+        importlib.import_module(module)
+        ok += 1
+    except Exception as e:
+        errors.append((module, f"{type(e).__name__}: {str(e)[:200]}"))
 
 print(f"Imported {ok} modules successfully")
 if errors:
