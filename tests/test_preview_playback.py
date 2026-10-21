@@ -126,7 +126,8 @@ def test_split_left_decodes_off_gui_thread_and_sides_are_correct(env):
     vp = _make(env)
     vp.set_split_mode(True)
     vp.navigate_to_frame(3)
-    assert _wait(lambda: _red(vp, split=True) == 3)
+    assert _wait(lambda: _red(vp, split=True) == 3
+                 and vp._split_view._left_image is not None)
     left = vp._split_view._left_image
     assert QColor(left.pixel(0, 0)).green() == 128  # INPUT on the left
     assert QColor(vp._split_view._right_image.pixel(0, 0)).green() == 0
