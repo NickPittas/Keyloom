@@ -53,6 +53,16 @@ def _configure_runtime_backends() -> None:
     except ImportError:
         pass  # torch not installed – CPU-only environment
 
+    # Linux: the preview QThreadPool already fans out one decode per core, so
+    # keep OpenCV single-threaded (measured: single decode <=8% slower,
+    # 24-frame throughput ~4% faster). Set once at startup, never per job.
+    if sys.platform.startswith("linux"):
+        try:
+            import cv2
+            cv2.setNumThreads(1)
+        except Exception as exc:
+            logger.debug(f"OpenCV thread tuning skipped: {exc}")
+
     if sys.platform != "win32":
         return
 
