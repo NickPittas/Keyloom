@@ -78,12 +78,13 @@ def _self(clips, hint=False, current=None, selected=1):
 @pytest.fixture
 def boxes(monkeypatch):
     log = {"warning": [], "info": []}
-    monkeypatch.setattr(
-        QMessageBox, "warning", staticmethod(lambda *a, **k: log["warning"].append(a[2])),
+    # Patch the module reference, not the Shiboken class: restoring static
+    # methods on QMessageBox itself segfaults the interpreter at exit.
+    box = types.SimpleNamespace(
+        warning=lambda *a, **k: log["warning"].append(a[2]),
+        information=lambda *a, **k: log["info"].append(a[2]),
     )
-    monkeypatch.setattr(
-        QMessageBox, "information", staticmethod(lambda *a, **k: log["info"].append(a[2])),
-    )
+    monkeypatch.setattr(inference_mixin, "QMessageBox", box)
     return log
 
 
@@ -280,7 +281,11 @@ def test_live_reprocess_removed():
     assert not hasattr(InferenceMixin, "_on_reprocess_result")
 
 
-def test_session_live_preview_ignored():
+def test_session_live_preview_ignored(monkeypatch):
+    from ui.main_window_mixins import session_mixin
+    # QTimer.singleShot without a QCoreApplication segfaults at interpreter exit.
+    monkeypatch.setattr(session_mixin, "QTimer",
+                        types.SimpleNamespace(singleShot=lambda *a, **k: None))
     applied = {}
     s = types.SimpleNamespace(
         _param_panel=types.SimpleNamespace(

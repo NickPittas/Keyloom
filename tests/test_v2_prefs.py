@@ -8,15 +8,25 @@ from PySide6.QtWidgets import QApplication
 from ui.widgets import preferences_dialog as pd
 
 
+# Module-level reference: a QApplication that gets garbage-collected while
+# widgets are alive crashes the interpreter at exit.
+_APP = QApplication.instance() or QApplication([])
+
+
 @pytest.fixture
 def qapp_settings(tmp_path):
-    app = QApplication.instance() or QApplication([])
+    app = _APP
     old = (QCoreApplication.organizationName(), QCoreApplication.applicationName())
     QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path))
     QSettings.setDefaultFormat(QSettings.IniFormat)
     QCoreApplication.setOrganizationName("TestOrg")
     QCoreApplication.setApplicationName("TestApp")
     yield app
+    # Destroy dialogs before interpreter teardown (late native destruction segfaults).
+    import shiboken6
+    for w in QApplication.topLevelWidgets():
+        if isinstance(w, pd.PreferencesDialog):
+            shiboken6.delete(w)
     QCoreApplication.setOrganizationName(old[0])
     QCoreApplication.setApplicationName(old[1])
 
