@@ -88,3 +88,135 @@ def test_mixed_per_clip_round_trip(_app):
     d._per_clip_combos[2].setCurrentText(LABEL)
     cfgs = d.get_batch_config()
     assert [c.use_alpha_hint for c in cfgs] == [False, True, False, True]
+
+
+# ---------------------------------------------------------------------------
+# Batch mixin wiring
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+from backend import InferenceParams, OutputConfig
+from backend.clip_state import ClipAsset, ClipEntry, ClipState
+from backend.job_queue import GPUJobQueue
+from ui.main_window_mixins.batch_pipeline_mixin import BatchPipelineMixin
+from ui.widgets.batch_pipeline_dialog import BatchClipConfig
+
+
+class _Dlg:
+    def __init__(self):
+        self.errors, self.running = {}, []
+
+    def set_clip_error(self, name, msg=""):
+        self.errors[name] = msg
+
+    def set_clip_running(self, name):
+        self.running.append(name)
+
+    def enter_processing_mode(self, _clips):
+        pass
+
+
+class _Host(BatchPipelineMixin):
+    def __init__(self, clip, config):
+        self._init_batch_pipeline()
+        self._batch_dialog = _Dlg()
+        self._batch_configs = {clip.name: config}
+        self._clip_model = SimpleNamespace(clips=[clip])
+        self._service = SimpleNamespace(job_queue=GPUJobQueue())
+        self._pipeline_steps = {}
+        self._pipeline_settings = {}
+        self._param_panel = SimpleNamespace(
+            get_params=lambda: InferenceParams(use_alpha_hint=True),
+            get_output_config=OutputConfig,
+        )
+        self._start_worker_if_needed = lambda *a, **k: None
+
+
+def _entry(state, alpha=False):
+    c = ClipEntry(name="c", root_path="/tmp/c", state=state)
+    c.input_asset = ClipAsset("/tmp/c/Input", "sequence")
+    if alpha:
+        c.alpha_asset = ClipAsset("/tmp/c/AlphaHint", "sequence")
+    return c
+
+
+def _cfg(job_type, use_hint, method):
+    return BatchClipConfig(
+        clip_info=_clip("c"), alpha_job_type=job_type,
+        use_alpha_hint=use_hint, hint_method=method,
+    )
+
+
+def test_mixin_no_hint_raw_queues_inference_only(_app):
+    h = _Host(_entry(ClipState.RAW), _cfg(JobType.INFERENCE, False, HINT_NONE_V2))
+    clip = h._clip_model.clips[0]
+    job, steps, settings = h._create_batch_job(
+        clip, h._batch_configs["c"], InferenceParams(use_alpha_hint=True), OutputConfig())
+    assert job.job_type == JobType.INFERENCE
+    assert job.params["_inference_params"].use_alpha_hint is False
+    assert steps == [] and settings is None
+    assert job.params["_output_config"] is not None
+
+
+def test_mixin_existing_hint_ready(_app):
+    h = _Host(_entry(ClipState.READY, alpha=True),
+              _cfg(JobType.INFERENCE, True, HINT_EXISTING))
+    job, steps, _ = h._create_batch_job(
+        h._clip_model.clips[0], h._batch_configs["c"],
+        InferenceParams(use_alpha_hint=False), OutputConfig())
+    assert job.job_type == JobType.INFERENCE
+    assert job.params["_inference_params"].use_alpha_hint is True and steps == []
+
+
+def test_mixin_existing_hint_missing_errors(_app):
+    h = _Host(_entry(ClipState.RAW), _cfg(JobType.INFERENCE, True, HINT_EXISTING))
+    job, steps, settings = h._create_batch_job(
+        h._clip_model.clips[0], h._batch_configs["c"],
+        InferenceParams(), OutputConfig())
+    assert job is None and steps == [] and settings is None
+    assert "No AlphaHint" in h._batch_dialog.errors["c"]
+
+
+@pytest.mark.parametrize("jt", [JobType.GVM_ALPHA, JobType.BIREFNET_ALPHA])
+def test_mixin_generator_chains_with_frozen_settings(_app, jt):
+    h = _Host(_entry(ClipState.RAW), _cfg(jt, True, "generated"))
+    h._submit_batch_jobs()
+    assert h._pipeline_steps["c"] == [JobType.INFERENCE]
+    s = h._pipeline_settings["c"]
+    assert s["params"].use_alpha_hint is True
+    assert set(s) == {"params", "output_config", "frame_range"}
+
+
+def test_mixin_complete_rerun_no_hint(_app):
+    h = _Host(_entry(ClipState.COMPLETE), _cfg(JobType.INFERENCE, False, HINT_NONE_V2))
+    h._submit_batch_jobs()
+    assert h._batch_dialog.errors == {}
+    assert h._batch_dialog.running == ["c"]
+
+
+def test_mixin_extract_finished_no_hint(_app):
+    clip = _entry(ClipState.RAW)
+    h = _Host(clip, _cfg(JobType.INFERENCE, False, HINT_NONE_V2))
+    h._batch_pending_extractions["c"] = h._batch_configs["c"]
+    h._on_batch_extract_finished("c")
+    assert h._batch_dialog.errors == {} and clip.is_processing
+
+
+def test_mixin_extract_finished_uses_settings_frozen_at_submit(_app):
+    clip = _entry(ClipState.EXTRACTING)
+    h = _Host(clip, _cfg(JobType.INFERENCE, False, HINT_NONE_V2))
+    h._param_panel = SimpleNamespace(
+        get_params=lambda: InferenceParams(despill_strength=0.2),
+        get_output_config=OutputConfig,
+    )
+    h._submit_batch_jobs()
+    assert "c" in h._batch_pending_extractions
+    h._param_panel = SimpleNamespace(
+        get_params=lambda: InferenceParams(despill_strength=0.9),
+        get_output_config=OutputConfig,
+    )
+    clip.state = ClipState.RAW
+    h._on_batch_extract_finished("c")
+    job = h._service.job_queue.next_job()
+    assert job.params["_inference_params"].despill_strength == 0.2

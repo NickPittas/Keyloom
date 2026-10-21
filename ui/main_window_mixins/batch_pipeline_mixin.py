@@ -84,6 +84,7 @@ class BatchPipelineMixin:
             for clip_name in list(self._batch_configs.keys()):
                 self._batch_pending_extractions.pop(clip_name, None)
                 self._pipeline_steps.pop(clip_name, None)
+                self._pipeline_settings.pop(clip_name, None)
             self._batch_configs.clear()
             logger.info("Batch pipeline cleared")
 
@@ -224,9 +225,12 @@ class BatchPipelineMixin:
 
         params = self._param_panel.get_params()
         output_config = self._param_panel.get_output_config()
+        # Frozen for clips submitted later, after their extraction finishes.
+        self._batch_frozen_settings = (params, output_config)
 
         self._batch_pending_extractions.clear()
         self._pipeline_steps.clear()
+        self._pipeline_settings.clear()
 
         # Switch dialog to processing mode (it stays open in place)
         if self._batch_dialog:
@@ -249,7 +253,8 @@ class BatchPipelineMixin:
                     self._batch_dialog.set_clip_running(clip.name)
                 continue
 
-            job, next_steps = self._create_batch_job(clip, config, params, output_config)
+            job, next_steps, settings = self._create_batch_job(
+                clip, config, params, output_config)
             if job is None:
                 continue
 
@@ -257,6 +262,8 @@ class BatchPipelineMixin:
                 clip.set_processing(True)
                 if next_steps:
                     self._pipeline_steps[clip.name] = next_steps
+                    if settings is not None:
+                        self._pipeline_settings[clip.name] = settings
                 if first_job_id is None:
                     first_job_id = job.id
                 queued += 1
@@ -272,40 +279,61 @@ class BatchPipelineMixin:
         )
 
     def _create_batch_job(self, clip, config, params, output_config):
-        """Create a GPU job + next_steps for a single batch clip.
+        """Create a GPU job for a single batch clip.
 
-        Returns (job, next_steps) or (None, []) if the clip can't be processed.
+        Returns (job, next_steps, frozen_settings). On failure returns
+        (None, [], None) after marking the clip as errored in the dialog.
+        ``frozen_settings`` is non-None only when a generator job chains into
+        INFERENCE; the caller stores it in ``self._pipeline_settings``.
         """
-        from backend.clip_state import ClipState
+        import dataclasses
+
+        from backend.clip_state import can_run_inference
         from backend.job_queue import JobType
-        from ui.workers.job_helpers import create_job_snapshot
+        from ui.workers.job_helpers import (
+            clip_frame_range, create_inference_job, create_job_snapshot,
+            reset_complete_state,
+        )
 
         job = None
         next_steps: list[JobType] = []
+        settings = None
+        job_type = config.alpha_job_type
 
-        if config.alpha_job_type == JobType.INFERENCE:
-            # AlphaHint already present, go straight to CK
-            if clip.state == ClipState.COMPLETE:
-                clip.transition_to(ClipState.READY)
-            job = create_job_snapshot(clip, params)
-            job.params["_output_config"] = output_config
-        elif config.alpha_job_type in (JobType.VIDEOMAMA_ALPHA, JobType.MATANYONE2_ALPHA):
-            # MaskHint path: run mask refinement, then inference
-            job = create_job_snapshot(clip, job_type=config.alpha_job_type)
-            next_steps = [JobType.INFERENCE]
-        elif config.alpha_job_type == JobType.GVM_ALPHA:
-            # No hint: GVM -> inference
-            job = create_job_snapshot(clip, job_type=JobType.GVM_ALPHA)
-            next_steps = [JobType.INFERENCE]
-        elif config.alpha_job_type == JobType.BIREFNET_ALPHA:
-            # No hint: BiRefNet -> inference
+        if job_type == JobType.INFERENCE:
+            use_hint = bool(config.use_alpha_hint)
+            if use_hint and not can_run_inference(clip, True):
+                if self._batch_dialog:
+                    self._batch_dialog.set_clip_error(
+                        clip.name, "No AlphaHint found for this clip.")
+                return None, [], None
+            reset_complete_state(clip)
+            if not can_run_inference(clip, use_hint):
+                if self._batch_dialog:
+                    self._batch_dialog.set_clip_error(
+                        clip.name, "Clip cannot run inference.")
+                return None, [], None
+            p = dataclasses.replace(params, use_alpha_hint=use_hint)
+            job = create_inference_job(
+                clip, p, output_config, frame_range=clip_frame_range(clip))
+        elif job_type in (JobType.VIDEOMAMA_ALPHA, JobType.MATANYONE2_ALPHA,
+                          JobType.GVM_ALPHA):
+            job = create_job_snapshot(clip, job_type=job_type)
+        elif job_type == JobType.BIREFNET_ALPHA:
             job = create_job_snapshot(
                 clip, job_type=JobType.BIREFNET_ALPHA,
                 birefnet_usage=config.birefnet_usage,
             )
-            next_steps = [JobType.INFERENCE]
 
-        return job, next_steps
+        if job is not None and job_type != JobType.INFERENCE:
+            next_steps = [JobType.INFERENCE]
+            settings = {
+                "params": dataclasses.replace(params, use_alpha_hint=True),
+                "output_config": output_config,
+                "frame_range": clip_frame_range(clip),
+            }
+
+        return job, next_steps, settings
 
     # ------------------------------------------------------------------
     # Signal handlers for batch progress
@@ -318,10 +346,13 @@ class BatchPipelineMixin:
             return
 
         from backend.clip_state import ClipState
-        from ui.workers.job_helpers import create_job_snapshot
 
-        params = self._param_panel.get_params()
-        output_config = self._param_panel.get_output_config()
+        frozen = getattr(self, "_batch_frozen_settings", None)
+        if frozen is not None:
+            params, output_config = frozen
+        else:
+            params = self._param_panel.get_params()
+            output_config = self._param_panel.get_output_config()
 
         # Find the updated clip
         clip = None
@@ -329,17 +360,20 @@ class BatchPipelineMixin:
             if c.name == clip_name:
                 clip = c
                 break
-        if clip is None or clip.state not in (ClipState.RAW, ClipState.READY):
+        if clip is None or clip.state in (ClipState.EXTRACTING, ClipState.ERROR):
             logger.warning(f"Batch: clip {clip_name} not ready after extraction")
             if self._batch_dialog:
                 self._batch_dialog.set_clip_error(clip_name, "Not ready after extraction")
             return
 
-        job, next_steps = self._create_batch_job(clip, config, params, output_config)
+        job, next_steps, settings = self._create_batch_job(
+            clip, config, params, output_config)
         if job and self._service.job_queue.submit(job):
             clip.set_processing(True)
             if next_steps:
                 self._pipeline_steps[clip.name] = next_steps
+                if settings is not None:
+                    self._pipeline_settings[clip.name] = settings
             self._start_worker_if_needed(job.id, job_label="Batch Pipeline")
             logger.info(f"Batch: submitted GPU job for {clip_name} after extraction")
 
