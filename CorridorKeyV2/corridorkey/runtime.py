@@ -501,14 +501,21 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             cradio_map = np.memmap(foundation_paths["cradio"], dtype=np.float32,
                                    mode="r", shape=tuple(foundation_paths["cradio_shape"]))
 
-    reader = reader_cls(str(source), meta)
     sparse = hint_frame_indices is not None
-    if sparse:
-        _validate_sparse_hint_request(full_hint_video_path, hint_frame_indices)
-        hint_reader = make_hint_reader(
-            full_hint_video_path, meta, frame_indices=hint_frame_indices)
-    else:
-        hint_reader = make_hint_reader(full_hint_video_path, meta)
+    reader = hint_reader = None
+    try:
+        if sparse:
+            hint_frame_indices = tuple(hint_frame_indices)
+            _validate_sparse_hint_request(full_hint_video_path, hint_frame_indices)
+            hint_reader = make_hint_reader(
+                full_hint_video_path, meta, frame_indices=hint_frame_indices)
+        else:
+            hint_reader = make_hint_reader(full_hint_video_path, meta)
+        reader = reader_cls(str(source), meta)
+    except BaseException:
+        _run_cleanups(
+            [r.close for r in (reader, hint_reader) if r is not None], False)
+        raise
     carry_cache = {}
     stage2_frame_cache = {}
 
@@ -845,8 +852,13 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             raise ValueError(
                 f"initial_hint_index must be an int in [0, {T_all - 1}] "
                 f"(source has {T_all} frames), got {k!r}")
+    sparse_indices = None
     if cfg.hint_frame_indices is not None:
-        _validate_sparse_hint_request(hint_video_path, cfg.hint_frame_indices)
+        sparse_indices = tuple(cfg.hint_frame_indices)
+        _validate_sparse_hint_request(hint_video_path, sparse_indices)
+        # Constructor validates filenames/indices only (no image decode).
+        make_hint_reader(hint_video_path, meta,
+                         frame_indices=sparse_indices).close()
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
         apply_auto_vram(cfg, (H, W), T_all)
@@ -905,7 +917,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 sf.write(f"Hint Video: {hint_video_path}\n")
                 if cfg.hint_frame_indices is not None:
                     sf.write("Hint Frame Indices (0-based): "
-                             f"{list(cfg.hint_frame_indices)}\n")
+                             f"{list(sparse_indices)}\n")
                 sf.write(f"Hint Quality (Trust): {cfg.hint_quality}\n")
                 sf.write(f"Carry Hint: {cfg.carry_hint}\n")
                 sf.write(f"Carry Hint Quality: {cfg.carry_hint_quality}\n")
@@ -1002,7 +1014,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             baton_path=baton_path, initial_hint=initial_hint,
             initial_hint_quality=cfg.hint_quality,
             initial_hint_index=cfg.initial_hint_index,
-            hint_frame_indices=cfg.hint_frame_indices,
+            hint_frame_indices=sparse_indices,
             full_hint_video_path=hint_video_path,
             full_hint_quality=cfg.hint_quality,
             rvm_path=rvm_feat_path, foundation_paths=foundation_paths,

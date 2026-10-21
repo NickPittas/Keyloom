@@ -35,5 +35,5 @@
    - Why: sparse keyframe hints with real absolute timing. Tests: `tests/test_v2_sparse_hint_reader.py`.
 5. `corridorkey/runtime.py` — sparse keyframe hints in Hann stage 1 (EZ-CorridorKey2).
    - New `InferenceConfig.hint_frame_indices` (None = dense) and keyword-only `hint_frame_indices` on `hann_stage1_stream`; forwarded by `run_inference` and logged in the settings file. Sparse mode uses `window_with_presence`: only explicit keyframe slots get hint/`hint_quality`/presence; others are zero hint, quality 0. Carry only fills gaps (never overwrites explicit slots); indexed initial hint still overrides; windows with no hint at all keep quality -1.
-   - `run_inference` preflights sparse requests (needs a hint PNG directory, non-empty indices) before writers/memmaps; invalid requests raise `ValueError`. Dense/no-hint behaviour unchanged.
+   - `run_inference` preflights sparse requests (needs a hint PNG directory, non-empty indices) before writers/memmaps; the complete index/filename set is also validated (hint reader constructed and closed) as soon as the frame count is known; invalid requests raise `ValueError`. `hann_stage1_stream` closes any already-created reader if a later reader constructor fails. Dense/no-hint behaviour unchanged.
    - Tests: `tests/test_v2_sparse_hann.py`.

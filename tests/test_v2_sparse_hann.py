@@ -169,6 +169,8 @@ def test_run_inference_forwarding_settings_and_validation(monkeypatch, tmp_path)
         raise Stop
 
     monkeypatch.setattr(rt, "hann_stage1_stream", fake_stream)
+    monkeypatch.setattr(rt, "make_hint_reader",
+                        lambda *a, **k: _SparseReader(()))
     monkeypatch.setattr(rt, "_phase1_setup", lambda *a, **k: None)
     m = nn.Module()
     m.foundations = nn.Module()
@@ -184,3 +186,79 @@ def test_run_inference_forwarding_settings_and_validation(monkeypatch, tmp_path)
     assert got["hint_frame_indices"] == (2, 4)
     log = (tmp_path / "out" / "c_settings.txt").read_text()
     assert "Hint Frame Indices (0-based): [2, 4]" in log
+
+
+@pytest.mark.parametrize("idx", [(1, T + 5), (1, 1), (-1,)])
+def test_run_inference_rejects_bad_index_set_before_setup(monkeypatch, tmp_path, idx):
+    from CorridorKeyV2.corridorkey import video_io
+    meta = {"num_frames": T, "shape_hw": (H, W), "output_hw": (H, W),
+            "native_fps": 24.0}
+    monkeypatch.setattr(rt, "probe_video_meta", lambda *a, **kw: dict(meta))
+    hd = tmp_path / "h"
+    hd.mkdir()
+    for i in (0, 1):
+        (hd / f"{i}.png").write_bytes(b"x")
+    called = []
+    monkeypatch.setattr(rt, "make_hint_reader", video_io.make_hint_reader)
+    monkeypatch.setattr(rt, "ThreadedVideoWriter",
+                        lambda *a, **k: called.append("w"))
+    monkeypatch.setattr(rt, "_phase1_setup",
+                        lambda *a, **k: called.append("setup"))
+    cfg = rt.InferenceConfig(temp_dir=tmp_path / "tmp", hint_frame_indices=idx)
+    with pytest.raises(ValueError):
+        rt.run_inference(nn.Module(), str(tmp_path / "c.mp4"),
+                         str(tmp_path / "out"), cfg, rt.WriterConfig(),
+                         initial_hint_path=None, hint_video_path=str(hd))
+    assert not called
+
+
+def test_source_reader_closed_when_hint_constructor_fails(tmp_path, monkeypatch):
+    closed = []
+
+    class Src(_Reader):
+        def close(self):
+            closed.append("src")
+
+    def boom(*a, **k):
+        raise ValueError("bad hint dir")
+
+    monkeypatch.setattr(rt, "make_hint_reader", boom)
+    model = nn.Module()
+    model.stage1 = _Stage1()
+    model.foundations = _Foundations()
+    with pytest.raises(ValueError, match="bad hint dir"):
+        rt.hann_stage1_stream(
+            model, "x", {"num_frames": T, "shape_hw": (H, W)}, reader_cls=Src,
+            reader_kind="video", chunk=4, stride=2, baton_path=tmp_path / "b.f16",
+            initial_hint=None, initial_hint_quality=0.8, initial_hint_index=0,
+            full_hint_video_path=str(tmp_path), full_hint_quality=HQ,
+            rvm_path=None, foundation_paths=None, carry_hint_from_aux=False,
+            carry_hint_quality=CQ, on_baton_frames=lambda f: None,
+            hint_frame_indices=iter([1]))
+
+
+def test_hint_reader_closed_when_source_constructor_fails(tmp_path, monkeypatch):
+    closed = []
+
+    class HR(_SparseReader):
+        def close(self):
+            closed.append("hint")
+
+    class Bad:
+        def __init__(self, *a):
+            raise RuntimeError("bad src")
+
+    monkeypatch.setattr(rt, "make_hint_reader", lambda *a, **k: HR([1]))
+    model = nn.Module()
+    model.stage1 = _Stage1()
+    model.foundations = _Foundations()
+    with pytest.raises(RuntimeError, match="bad src"):
+        rt.hann_stage1_stream(
+            model, "x", {"num_frames": T, "shape_hw": (H, W)}, reader_cls=Bad,
+            reader_kind="video", chunk=4, stride=2, baton_path=tmp_path / "b.f16",
+            initial_hint=None, initial_hint_quality=0.8, initial_hint_index=0,
+            full_hint_video_path=str(tmp_path), full_hint_quality=HQ,
+            rvm_path=None, foundation_paths=None, carry_hint_from_aux=False,
+            carry_hint_quality=CQ, on_baton_frames=lambda f: None,
+            hint_frame_indices=(1,))
+    assert closed == ["hint"]
