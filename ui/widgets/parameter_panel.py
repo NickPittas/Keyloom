@@ -81,6 +81,7 @@ class ParameterPanel(QWidget):
     screen_color_changed = Signal(str)  # "green" or "blue" — UI accent swap
     gvm_requested = Signal()      # GVM AUTO button clicked
     reset_hint_requested = Signal()  # RESET HINT button clicked
+    hint_keyframe_toggle_requested = Signal()  # Mark/Unmark keyframe clicked
     birefnet_requested = Signal(str)  # BiRefNet button clicked, emits model variant name
     videomama_requested = Signal() # VIDEOMAMA button clicked
     matanyone2_requested = Signal()  # MatAnyone2 button clicked
@@ -99,6 +100,12 @@ class ParameterPanel(QWidget):
 
         # Signal suppression flag (Codex: block signals during session restore)
         self._suppress_signals = False
+        # Hint-keyframe state (context pushed by the app; no disk/model access)
+        self._temporal_window = "auto"  # until a temporal-window combo exists (task14)
+        self._kf_count = 0
+        self._kf_ctx = dict(has_clip=False, frame_available=False,
+                            is_marked=False, error=None)
+        self._kf_mutation_enabled = True
 
         # Wrap all controls in a scroll area so they never squish below
         # their natural size — panel scrolls instead of compressing.
@@ -523,41 +530,55 @@ class ParameterPanel(QWidget):
         self._color_space.currentIndexChanged.connect(self._emit_changed)
         inf_grid.addWidget(self._color_space, 1, 1)
 
-        # Row 2: Use AlphaHint + hint quality
-        self._use_alpha_hint = QCheckBox(self.tr("Use AlphaHint"))
-        self._use_alpha_hint.setChecked(False)
-        self._use_alpha_hint.setToolTip(
+        # Row 2: Hint mode + hint quality
+        self._hint_mode = QComboBox()
+        self._hint_mode.addItem(self.tr("None"), "none")
+        self._hint_mode.addItem(self.tr("Full AlphaHint"), "full")
+        self._hint_mode.addItem(self.tr("Keyframes (0)"), "keyframes")
+        self._hint_mode.setToolTip(
             self.tr(
-                "Feed the clip's external AlphaHint (GVM, BiRefNet, VideoMaMa,\n"
-                "MatAnyone2, chroma key, imported) to CorridorKey 2.0.\n"
-                "Off = CorridorKey 2.0 keys the clip on its own."
+                "None = CorridorKey 2.0 keys the clip on its own.\n"
+                "Full AlphaHint = feed the clip's external AlphaHint to every frame.\n"
+                "Keyframes = use only the frames you mark as hints."
             )
         )
-        self._use_alpha_hint.stateChanged.connect(self._on_use_alpha_hint_toggled)
-        inf_grid.addWidget(self._use_alpha_hint, 2, 0)
+        self._hint_mode.currentIndexChanged.connect(self._on_hint_mode_changed)
+        inf_grid.addWidget(self._hint_mode, 2, 0)
         self._hint_quality = _no_scroll_wheel(QDoubleSpinBox())
         self._hint_quality.setRange(0.0, 1.0)
         self._hint_quality.setSingleStep(0.05)
         self._hint_quality.setDecimals(2)
         self._hint_quality.setValue(0.95)
-        self._hint_quality.setEnabled(False)
+        self._hint_quality.setEnabled(False)  # None mode
         self._hint_quality.setToolTip(
             self.tr("How much CorridorKey 2.0 trusts the external AlphaHint (0.00-1.00).")
         )
         self._hint_quality.valueChanged.connect(self._emit_changed)
         inf_grid.addWidget(self._hint_quality, 2, 1)
 
-        # Row 3: Carry hint + carry quality
+        # Row 3: Mark / Unmark keyframe
+        self._hint_keyframe_btn = QPushButton(self.tr("Mark keyframe"))
+        self._hint_keyframe_btn.setEnabled(False)
+        self._hint_keyframe_btn.clicked.connect(
+            lambda _checked=False: self.hint_keyframe_toggle_requested.emit()
+        )
+        inf_grid.addWidget(self._hint_keyframe_btn, 3, 0, 1, 2)
+        self._refresh_hint_keyframe_ui()
+
+        # Row 4: Carry hint + carry quality
         self._carry_hint = QCheckBox(self.tr("Carry hint"))
         self._carry_hint.setChecked(True)
         self._carry_hint.setToolTip(
             self.tr(
-                "Carry the previous frame's result forward as the hint\n"
-                "for the next frame (temporal consistency)."
+                "Reuse the model's own predictions where overlapping Hann\n"
+                "windows share frames (temporal consistency). It is not general\n"
+                "previous-frame tracking. Applies in every hint mode, including\n"
+                "None, which still carries internal predictions. With a window\n"
+                "of 1/1 there is no overlap, so nothing is carried."
             )
         )
         self._carry_hint.stateChanged.connect(self._on_carry_hint_toggled)
-        inf_grid.addWidget(self._carry_hint, 3, 0)
+        inf_grid.addWidget(self._carry_hint, 4, 0)
         self._carry_hint_quality = _no_scroll_wheel(QDoubleSpinBox())
         self._carry_hint_quality.setRange(0.0, 1.0)
         self._carry_hint_quality.setSingleStep(0.05)
@@ -567,23 +588,23 @@ class ParameterPanel(QWidget):
             self.tr("How much CorridorKey 2.0 trusts the carried hint (0.00-1.00).")
         )
         self._carry_hint_quality.valueChanged.connect(self._emit_changed)
-        inf_grid.addWidget(self._carry_hint_quality, 3, 1)
+        inf_grid.addWidget(self._carry_hint_quality, 4, 1)
 
-        # Row 4: VRAM profile
+        # Row 5: VRAM profile
         self._vram_label = QLabel(self.tr("VRAM"))
         _vram_tip = self.tr(
             "Auto picks the largest processing window that fits free GPU memory. "
             "Low VRAM trades speed for memory."
         )
         self._vram_label.setToolTip(_vram_tip)
-        inf_grid.addWidget(self._vram_label, 4, 0)
+        inf_grid.addWidget(self._vram_label, 5, 0)
         self._vram_profile = QComboBox()
         self._vram_profile.addItems([self.tr("Auto"), self.tr("Low VRAM")])
         self._vram_profile.setToolTip(_vram_tip)
         self._vram_profile.currentIndexChanged.connect(self._emit_changed)
-        inf_grid.addWidget(self._vram_profile, 4, 1)
+        inf_grid.addWidget(self._vram_profile, 5, 1)
 
-        # Row 5: Cutout linear (permanently disabled)
+        # Row 6: Cutout linear (permanently disabled)
         self._cutout_linear = QCheckBox(self.tr("Cutout linear"))
         self._cutout_linear.setChecked(False)
         self._cutout_linear.setEnabled(False)
@@ -593,7 +614,7 @@ class ParameterPanel(QWidget):
                 "Processed EXR stays linear, PNG stays sRGB."
             )
         )
-        inf_grid.addWidget(self._cutout_linear, 5, 0, 1, 2)
+        inf_grid.addWidget(self._cutout_linear, 6, 0, 1, 2)
 
         inf_layout.addLayout(inf_grid)
 
@@ -751,9 +772,65 @@ class ParameterPanel(QWidget):
         if not self._suppress_signals:
             self.params_changed.emit()
 
-    def _on_use_alpha_hint_toggled(self, state: int) -> None:
-        self._hint_quality.setEnabled(self._use_alpha_hint.isChecked())
+    def _hint_mode_id(self) -> str:
+        return self._hint_mode.currentData() or "none"
+
+    def _on_hint_mode_changed(self, _index: int = 0) -> None:
+        self._refresh_hint_mode_state()
         self._emit_changed()
+
+    def _refresh_hint_mode_state(self) -> None:
+        mode = self._hint_mode_id()
+        self._hint_quality.setEnabled(mode in ("full", "keyframes"))
+        invalid = mode == "keyframes" and self._kf_count == 0
+        self._hint_mode.setProperty("invalid", invalid)
+        self._hint_mode.style().unpolish(self._hint_mode)
+        self._hint_mode.style().polish(self._hint_mode)
+
+    def _refresh_hint_keyframe_ui(self) -> None:
+        c = self._kf_ctx
+        n = self._kf_count
+        self._hint_mode.setItemText(2, self.tr("Keyframes (%d)") % n)
+        item = self._hint_mode.model().item(2)
+        if item is not None:
+            tip = "" if n > 0 else self.tr("Mark at least one keyframe to use this mode.")
+            item.setEnabled(n > 0)
+            item.setToolTip(tip)
+        self._refresh_hint_mode_state()
+        marked = bool(c["is_marked"])
+        self._hint_keyframe_btn.setText(
+            self.tr("Unmark keyframe") if marked else self.tr("Mark keyframe")
+        )
+        allowed = (
+            bool(c["has_clip"])
+            and (bool(c["frame_available"]) or marked)
+            and self._kf_mutation_enabled
+        )
+        self._hint_keyframe_btn.setEnabled(allowed)
+        if c["error"]:
+            tip = str(c["error"])
+        elif not c["has_clip"]:
+            tip = self.tr("No clip loaded.")
+        elif not marked and not c["frame_available"]:
+            tip = self.tr("No matte available on this frame to mark.")
+        else:
+            tip = self.tr("Mark or unmark the current frame as a hint keyframe.")
+        self._hint_keyframe_btn.setToolTip(tip)
+
+    def set_hint_keyframe_context(self, *, has_clip: bool, frame_available: bool,
+                                  is_marked: bool, count: int,
+                                  error: str | None = None) -> None:
+        """Update keyframe label/count/tooltip/enable state. Never emits."""
+        self._kf_ctx = dict(has_clip=bool(has_clip),
+                            frame_available=bool(frame_available),
+                            is_marked=bool(is_marked), error=error)
+        self._kf_count = max(0, int(count))
+        self._refresh_hint_keyframe_ui()
+
+    def set_hint_keyframe_mutation_enabled(self, enabled: bool) -> None:
+        """Busy gate for the mark button (separate from clip/frame context)."""
+        self._kf_mutation_enabled = bool(enabled)
+        self._refresh_hint_keyframe_ui()
 
     def _on_carry_hint_toggled(self, state: int) -> None:
         self._carry_hint_quality.setEnabled(self._carry_hint.isChecked())
@@ -783,7 +860,8 @@ class ParameterPanel(QWidget):
         """Snapshot current parameter values into an InferenceParams."""
         return InferenceParams(
             input_is_linear=self._color_space.currentIndex() == 1,
-            use_alpha_hint=self._use_alpha_hint.isChecked(),
+            hint_mode=self._hint_mode_id(),
+            temporal_window=self._temporal_window,
             hint_quality=round(self._hint_quality.value(), 2),
             carry_hint=self._carry_hint.isChecked(),
             carry_hint_quality=round(self._carry_hint_quality.value(), 2),
@@ -834,9 +912,11 @@ class ParameterPanel(QWidget):
         self._suppress_signals = True
         try:
             self._color_space.setCurrentIndex(1 if params.input_is_linear else 0)
-            self._use_alpha_hint.setChecked(params.use_alpha_hint)
+            idx = self._hint_mode.findData(params.hint_mode)
+            self._hint_mode.setCurrentIndex(idx if idx >= 0 else 0)
+            self._temporal_window = params.temporal_window
             self._hint_quality.setValue(params.hint_quality)
-            self._hint_quality.setEnabled(params.use_alpha_hint)
+            self._refresh_hint_mode_state()
             self._carry_hint.setChecked(params.carry_hint)
             self._carry_hint_quality.setValue(params.carry_hint_quality)
             self._carry_hint_quality.setEnabled(params.carry_hint)

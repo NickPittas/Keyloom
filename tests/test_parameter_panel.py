@@ -65,7 +65,7 @@ def test_quality_controls_enabled_state():
     panel = ParameterPanel()
     assert not panel._hint_quality.isEnabled()
     assert panel._carry_hint_quality.isEnabled()
-    panel._use_alpha_hint.setChecked(True)
+    panel._hint_mode.setCurrentIndex(1)
     panel._carry_hint.setChecked(False)
     assert panel._hint_quality.isEnabled()
     assert not panel._carry_hint_quality.isEnabled()
@@ -98,7 +98,7 @@ def test_new_controls_emit_params_changed():
     panel = ParameterPanel()
     fired: list[int] = []
     panel.params_changed.connect(lambda: fired.append(1))
-    panel._use_alpha_hint.setChecked(True)
+    panel._hint_mode.setCurrentIndex(1)
     panel._hint_quality.setValue(0.5)
     panel._carry_hint.setChecked(False)
     panel._vram_profile.setCurrentIndex(1)
