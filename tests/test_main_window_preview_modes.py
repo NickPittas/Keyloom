@@ -28,6 +28,7 @@ def _window(current_name="shot"):
     window._clip_model = type("M", (), {"clips": [_Clip()]})()
     window._current_clip = type("C", (), {"name": current_name})()
     window._sam2_preview_qimage = lambda f, m: "qimg"
+    window._sam2_preview_job_id = "job-3"
     return window
 
 
@@ -86,6 +87,18 @@ def test_sam2_preview_no_keeps_refining(monkeypatch):
         inference_mixin.QMessageBox, "question",
         staticmethod(lambda *a, **k: inference_mixin.QMessageBox.No),
     )
-    MainWindow._on_sam2_preview_result(window, "job-4", _result())
+    MainWindow._on_sam2_preview_result(window, "job-3", _result())
     assert submitted == []
     assert len(messages) == 1
+
+
+def test_stale_sam2_preview_job_id_is_ignored(monkeypatch):
+    window = _window()
+    asked = []
+    monkeypatch.setattr(
+        inference_mixin.QMessageBox, "question",
+        staticmethod(lambda *a, **k: asked.append(1)),
+    )
+    MainWindow._on_sam2_preview_result(window, "stale", _result())
+    assert asked == []
+    assert window._dual_viewer.previews == []

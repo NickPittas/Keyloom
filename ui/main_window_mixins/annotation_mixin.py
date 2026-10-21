@@ -139,6 +139,7 @@ class AnnotationMixin:
         job.params["_frame_index"] = max(0, self._dual_viewer.current_stem_index)
         if not self._service.job_queue.submit(job):
             return
+        self._sam2_preview_job_id = job.id
 
         self._start_worker_if_needed(job.id, job_label="Track Preview")
 

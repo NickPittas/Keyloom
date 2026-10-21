@@ -89,6 +89,8 @@ class InferenceMixin:
         """Handle a SAM2 Track Mask preview result."""
         if not isinstance(result, dict):
             return
+        if job_id != getattr(self, "_sam2_preview_job_id", None):
+            return
 
         if result.get("kind") == "sam2_preview":
             clip_name = result.get("clip_name")
