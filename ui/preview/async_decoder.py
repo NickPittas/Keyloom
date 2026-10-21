@@ -72,6 +72,15 @@ def max_inflight() -> int:
     return max(1, min(preview_thread_count(), MAX_INFLIGHT_DECODES))
 
 
+# Slots prefetch may never take, so a user seek never queues behind a full
+# prefetch backlog (two panes x two lanes).
+FOREGROUND_RESERVE = 4
+
+
+def max_prefetch_inflight() -> int:
+    return max(1, max_inflight() - FOREGROUND_RESERVE)
+
+
 class _Gate:
     """Counts submitted-but-not-finished tasks. Released by the worker."""
 
@@ -408,7 +417,8 @@ class AsyncDecoder(QObject):
 
     def _pump(self) -> None:
         while not self._closed and (self._fg or self._prefetch):
-            if not _GATE.try_acquire(max_inflight()):
+            limit = max_inflight() if self._fg else max_prefetch_inflight()
+            if not _GATE.try_acquire(limit):
                 return
             nxt = self._next_request()
             if nxt is None:
