@@ -154,27 +154,6 @@ def get_gvm_processor(device='cuda'):
     except Exception as e:
         raise RuntimeError(f"Failed to initialize GVM Processor: {e}")
 
-def get_corridor_key_engine(device='cuda'):
-    try:
-        from CorridorKeyModule.inference_engine import CorridorKeyEngine
-        
-        # Auto-detect checkpoint
-        ckpt_dir = os.path.join(BASE_DIR, "CorridorKeyModule/checkpoints")
-        ckpt_files = glob.glob(os.path.join(ckpt_dir, "*.pth"))
-        
-        if len(ckpt_files) == 0:
-            raise FileNotFoundError(f"No .pth checkpoint found in {ckpt_dir}")
-        elif len(ckpt_files) > 1:
-            raise ValueError(f"Multiple checkpoints found in {ckpt_dir}. Please ensure only one exists: {[os.path.basename(f) for f in ckpt_files]}")
-            
-        ckpt_path = ckpt_files[0]
-        logger.info(f"Using checkpoint: {os.path.basename(ckpt_path)}")
-        
-        return CorridorKeyEngine(checkpoint_path=ckpt_path, device=device, img_size=2048)
-    except Exception as e:
-        logger.error(f"Failed to initialize CorridorKey Engine: {e}")
-        sys.exit(1)
-
 def generate_alphas(clips):
     clips_to_process = [c for c in clips if c.alpha_asset is None]
     
@@ -478,240 +457,94 @@ def run_videomama(clips, chunk_size=50):
             import traceback
             traceback.print_exc()
 
-def run_inference(clips):
-    ready_clips = [c for c in clips if c.input_asset and c.alpha_asset]
-    
-    if not ready_clips:
-        logger.info("No clips found with both Input and Alpha assets. Run generate_coarse_alpha first?")
-        return
+def _ask_inference_params():
+    """Prompt for the settings CorridorKey 2.0 supports; returns InferenceParams."""
+    from backend.service import InferenceParams
 
-    logger.info(f"Found {len(ready_clips)} clips ready for inference.")
-    
-    # --- User Prompts ---
-    print("\n--- Inference Settings ---")
-    
-    # 1. Gamma Prompt
-    user_input_is_linear = False
-    gamma_choice = input("Is the input sequence Linear (l) or sRGB (s)? [l/s]: ").strip().lower()
-    if gamma_choice == 'l':
-        user_input_is_linear = True
-        logger.info("User selected: Linear Input")
-    else:
-        logger.info("User selected: sRGB Input (or default)")
-        
-    # 2. Despill Prompt
-    despill_val = input("Enter Despill Strength (0-10, 10 is max despill) [default 10]: ").strip()
-    try:
-        despill_int = int(despill_val)
-        despill_int = max(0, min(10, despill_int))
-    except ValueError:
-        despill_int = 10
-    
-    despill_strength = despill_int / 10.0
-    logger.info(f"User selected: Despill Strength {despill_int}/10 ({despill_strength})")
-    # 3. Auto-Despeckle Prompt
-    auto_despeckle = True
-    despeckle_size = 400
-    despeckle_choice = input("Enable Auto-Despeckle (removes tracking dots in Processed/Comp)? [Y/n]: ").strip().lower()
-    if despeckle_choice == 'n':
-        auto_despeckle = False
-        logger.info("User selected: Auto-Despeckle OFF")
-    else:
-        logger.info("User selected: Auto-Despeckle ON (default)")
-        size_val = input("Enter Auto-Despeckle Size (min pixels for a spot) [default 400]: ").strip()
+    defaults = InferenceParams()
+    print("\n--- Inference Settings (CorridorKey 2.0) ---")
+
+    gamma_choice = input("Is the input sequence Linear (l) or sRGB (s)? [l/s, default s]: ").strip().lower()
+    input_is_linear = gamma_choice == 'l'
+
+    despill_strength = defaults.despill_strength
+    despill_val = input(f"Enter Despill Strength (0-1) [default {defaults.despill_strength}]: ").strip()
+    if despill_val:
         try:
-            val_int = int(size_val)
-            despeckle_size = max(0, val_int)
+            despill_strength = max(0.0, min(1.0, float(despill_val)))
         except ValueError:
-            despeckle_size = 400
-        logger.info(f"User selected: Auto-Despeckle Size {despeckle_size}px")
-        
-    # 4. Refiner Strength Prompt
-    refiner_val = input("Enter Refiner Strength (multiplier) [default 1.0] (experimental): ").strip()
-    if refiner_val == "":
-        refiner_scale = 1.0
-    else:
-        try:
-            refiner_scale = float(refiner_val)
-        except ValueError:
-            refiner_scale = 1.0
-    logger.info(f"User selected: Refiner Strength {refiner_scale}")
+            logger.warning(f"Invalid despill value '{despill_val}', using {defaults.despill_strength}")
+
+    hint_choice = input("Use AlphaHint (external coarse alpha) if present? [y/N]: ").strip().lower()
+    use_alpha_hint = hint_choice == 'y'
+
+    vram_choice = input("VRAM profile (auto/low) [default auto]: ").strip().lower()
+    vram_profile = 'low' if vram_choice == 'low' else 'auto'
 
     print("--------------------------\n")
-    
-    # Ensure Output Directory exists
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return InferenceParams(
+        input_is_linear=input_is_linear,
+        despill_strength=despill_strength,
+        use_alpha_hint=use_alpha_hint,
+        vram_profile=vram_profile,
+    )
 
-    import torch
-    import numpy as np
-    
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    engine = get_corridor_key_engine(device=device)
 
-    for clip in ready_clips:
+def run_inference(clips, params=None, interactive=True):
+    """Key clips with CorridorKey 2.0 through the shared CorridorKeyService.
+
+    One service (one resident model) is reused for all clips. A failing clip is
+    reported and the next clip still runs. Returns the number of failed clips.
+    """
+    from backend.clip_state import ClipEntry as BackendClipEntry
+    from backend.errors import CorridorKeyError
+    from backend.service import CorridorKeyService, InferenceParams, OutputConfig
+
+    runnable = [c for c in clips if c.input_asset]
+    if not runnable:
+        logger.info("No clips with an Input asset found.")
+        return 0
+    logger.info(f"Found {len(runnable)} clips for inference.")
+
+    if params is None:
+        params = _ask_inference_params() if interactive else InferenceParams()
+
+    try:
+        service = CorridorKeyService()
+    except Exception as e:
+        logger.error(f"Failed to initialize CorridorKey service: {e}")
+        return len(runnable)
+
+    failed = []
+    for clip in runnable:
         logger.info(f"Running Inference on: {clip.name}")
-        
-        # Setup Outputs in ClipFolder/Output/...
-        clip_out_root = os.path.join(clip.root_path, "Output")
-        fg_dir = os.path.join(clip_out_root, "FG")
-        matte_dir = os.path.join(clip_out_root, "Matte")
-        comp_dir = os.path.join(clip_out_root, "Comp")
-        proc_dir = os.path.join(clip_out_root, "Processed")
-        
-        for d in [fg_dir, matte_dir, comp_dir, proc_dir]:
-            os.makedirs(d, exist_ok=True)
-            
-        input_count = clip.input_asset.frame_count
-        alpha_count = clip.alpha_asset.frame_count
-        if input_count != alpha_count:
-            logger.warning(f"Clip '{clip.name}': frame count mismatch — input has {input_count}, alpha has {alpha_count}. Truncating to {min(input_count, alpha_count)}.")
-        num_frames = min(input_count, alpha_count)
-        skipped_frames = []
-        
-        input_cap = None
-        alpha_cap = None
-        input_files = []
-        alpha_files = []
-        
-        if clip.input_asset.type == 'video':
-            input_cap = cv2.VideoCapture(clip.input_asset.path)
-        else:
-            input_files = sorted([f for f in os.listdir(clip.input_asset.path) if is_image_file(f)])
-            
-        if clip.alpha_asset.type == 'video':
-            alpha_cap = cv2.VideoCapture(clip.alpha_asset.path)
-        else:
-            alpha_files = sorted([f for f in os.listdir(clip.alpha_asset.path) if is_image_file(f)])
-            
-        for i in range(num_frames):
-            if i % 10 == 0:
-                 print(f"  Frame {i}/{num_frames}...", end='\r')
-                 
-            # 1. Read Input
-            img_srgb = None
-            input_stem = f"{i:05d}"
-            
-            # Use the user-defined gamma
-            input_is_linear = user_input_is_linear
-            
-            if input_cap:
-                ret, frame = input_cap.read()
-                if not ret: break
-                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_srgb = img_rgb.astype(np.float32) / 255.0
-                input_stem = f"{i:05d}" 
-            else:
-                fpath = os.path.join(clip.input_asset.path, input_files[i])
-                input_stem = os.path.splitext(input_files[i])[0]
-                
-                is_exr = fpath.lower().endswith('.exr')
-                if is_exr:
-                    img_linear = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
-                    if img_linear is None:
-                        logger.warning(f"Clip '{clip.name}': failed to read input frame {i} ({fpath}), skipping.")
-                        skipped_frames.append(i)
-                        continue
-                    img_linear_rgb = cv2.cvtColor(img_linear, cv2.COLOR_BGR2RGB)
-                    # Support overriding EXR behavior if user picked 's'
-                    img_srgb = np.maximum(img_linear_rgb, 0.0) 
-                else:
-                    img_bgr = cv2.imread(fpath)
-                    if img_bgr is None:
-                        logger.warning(f"Clip '{clip.name}': failed to read input frame {i} ({fpath}), skipping.")
-                        skipped_frames.append(i)
-                        continue
-                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                    img_srgb = img_rgb.astype(np.float32) / 255.0
-            
-            # 2. Read Alpha (Mask)
-            mask_linear = None
-            if alpha_cap:
-                ret, frame = alpha_cap.read()
-                if not ret: break
-                mask_linear = frame[:, :, 2].astype(np.float32) / 255.0 
-            else:
-                fpath = os.path.join(clip.alpha_asset.path, alpha_files[i])
-                mask_in = cv2.imread(fpath, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_UNCHANGED)
-                
-                if mask_in is None:
-                    logger.warning(f"Clip '{clip.name}': failed to read alpha frame {i} ({fpath}), skipping.")
-                    skipped_frames.append(i)
-                    continue
-                
-                if mask_in.ndim == 3:
-                     # Always extract first channel regardless of channel count (3ch, 4ch, 2ch EXR)
-                     mask_linear = mask_in[:, :, 0]
-                else:
-                    mask_linear = mask_in
-                
-                if mask_linear.dtype == np.uint8:
-                    mask_linear = mask_linear.astype(np.float32) / 255.0
-                elif mask_linear.dtype == np.uint16:
-                    mask_linear = mask_linear.astype(np.float32) / 65535.0
-                else:
-                    mask_linear = mask_linear.astype(np.float32)
-
-            if mask_linear.shape[:2] != img_srgb.shape[:2]:
-                 mask_linear = cv2.resize(mask_linear, (img_srgb.shape[1], img_srgb.shape[0]), interpolation=cv2.INTER_LINEAR)
-            
-            # 3. Process
-            USE_STRAIGHT_MODEL = True
-            res = engine.process_frame(
-                img_srgb, 
-                mask_linear, 
-                input_is_linear=input_is_linear, 
-                fg_is_straight=USE_STRAIGHT_MODEL,
-                despill_strength=despill_strength,
-                auto_despeckle=auto_despeckle,
-                despeckle_size=despeckle_size,
-                refiner_scale=refiner_scale
+        try:
+            entry = BackendClipEntry(name=clip.name, root_path=clip.root_path)
+            entry.find_assets()
+            results = service.run_inference(
+                entry, params, output_config=OutputConfig(),
+                on_progress=lambda name, cur, total, **k: print(f"  {k.get('phase', 'frame')} {cur}/{total}...", end='\r'),
+                on_warning=lambda msg: logger.warning(f"Clip '{clip.name}': {msg}"),
+                on_status=lambda msg: logger.info(f"Clip '{clip.name}': {msg}"),
             )
-            
-            pred_fg = res['fg'] # sRGB
-            pred_alpha = res['alpha'] # Linear
-            
-            # 4. Save (EXR DWAB Half-Float via OpenEXR library)
-            from backend.frame_io import write_exr_dwab
-
-            # Save FG
-            # pred_fg is RGB 0-1 float. Convert to BGR for write_exr_dwab
-            fg_bgr = cv2.cvtColor(pred_fg, cv2.COLOR_RGB2BGR)
-            fg_path = os.path.join(fg_dir, f"{input_stem}.exr")
-            if not write_exr_dwab(fg_path, fg_bgr):
-                logger.error(f"Clip '{clip.name}': failed to write FG frame {i} ({fg_path})")
-
-            # Save Matte
-            if pred_alpha.ndim == 3: pred_alpha = pred_alpha[:, :, 0]
-            # Matte is single channel linear float
-            matte_path = os.path.join(matte_dir, f"{input_stem}.exr")
-            if not write_exr_dwab(matte_path, pred_alpha):
-                logger.error(f"Clip '{clip.name}': failed to write Matte frame {i} ({matte_path})")
-
-            # 5. Generate Reference Comp
-            comp_srgb = res['comp']
-            # Save Comp (PNG 8-bit)
-            comp_bgr = cv2.cvtColor((np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
-            comp_path = os.path.join(comp_dir, f"{input_stem}.png")
-            if not cv2.imwrite(comp_path, comp_bgr):
-                logger.error(f"Clip '{clip.name}': failed to write Comp frame {i} ({comp_path})")
-
-            # 6. Save Processed (RGBA EXR)
-            if 'processed' in res:
-                # Result is RGBA
-                proc_rgba = res['processed']
-                # Convert to BGRA for write_exr_dwab
-                proc_bgra = cv2.cvtColor(proc_rgba, cv2.COLOR_RGBA2BGRA)
-                proc_path = os.path.join(proc_dir, f"{input_stem}.exr")
-                if not write_exr_dwab(proc_path, proc_bgra):
-                    logger.error(f"Clip '{clip.name}': failed to write Processed frame {i} ({proc_path})")
-
+        except CorridorKeyError as e:
+            print("")
+            logger.error(f"Clip '{clip.name}' failed: {e}")
+            failed.append(clip.name)
+            continue
+        except Exception as e:
+            print("")
+            logger.error(f"Clip '{clip.name}' failed unexpectedly: {e}")
+            failed.append(clip.name)
+            continue
         print("")
-        if input_cap: input_cap.release()
-        if alpha_cap: alpha_cap.release()
-        if skipped_frames:
-            logger.warning(f"Clip '{clip.name}': {len(skipped_frames)} frame(s) skipped due to read failures: {skipped_frames[:20]}{'...' if len(skipped_frames) > 20 else ''}")
-        logger.info(f"Clip {clip.name} Complete. Processed {num_frames - len(skipped_frames)}/{num_frames} frames.")
+        ok = sum(1 for r in results if r.success)
+        logger.info(f"Clip {clip.name} Complete. Processed {ok}/{len(results)} frames.")
+
+    if failed:
+        logger.error(f"{len(failed)} clip(s) failed: {', '.join(failed)}")
+    return len(failed)
+
 
 def organize_target(target_dir):
     """
@@ -1075,6 +908,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CorridorKey Clip Manager")
     parser.add_argument("--action", choices=['generate_alphas', 'run_inference', 'list', 'wizard'], required=True)
     parser.add_argument("--win_path", help=r"Windows Path (example: V:\...) for Wizard Mode", default=None)
+    parser.add_argument("--non-interactive", action="store_true", help="Skip inference prompts and use CorridorKey 2.0 defaults")
     
     args = parser.parse_args()
     
@@ -1085,7 +919,7 @@ if __name__ == "__main__":
         generate_alphas(clips)
     elif args.action == 'run_inference':
         clips = scan_clips()
-        run_inference(clips)
+        sys.exit(1 if run_inference(clips, interactive=not args.non_interactive) else 0)
     elif args.action == 'wizard':
         if not args.win_path:
             print("Error: --win_path required for wizard.")
