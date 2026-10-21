@@ -47,6 +47,9 @@ class V2PreparedInput:
     fps: float
     staged_input: bool
     hint_path: str | None      # None when hints off
+    initial_hint_path: str | None = None       # single-mark reference matte file
+    initial_hint_index: int = 0                # absolute source index of that mark
+    hint_frame_indices: tuple[int, ...] | None = None  # sparse marks (absolute, sorted)
 
 
 # --------------------------------------------------------------------- helpers
@@ -162,14 +165,19 @@ def validate_dense_hint_alignment(clip, source_stems: list[str]) -> list[str]:
     return ordered
 
 
-def _match_hints(files: list[str], source_stems: list[str]) -> list[str]:
-    total = len(source_stems)
+def _hint_by_stem(files: list[str]) -> dict[str, list[str]]:
     by_stem: dict[str, list[str]] = {}
     for f in files:
         m = _HINT_RE.match(_stem(f))
         by_stem.setdefault((m.group("prefix") if m else _stem(f)).lower(), []).append(f)
         if m:  # also reachable by its exact (suffixed) stem
             by_stem.setdefault(_stem(f).lower(), []).append(f)
+    return by_stem
+
+
+def _match_hints(files: list[str], source_stems: list[str]) -> list[str]:
+    total = len(source_stems)
+    by_stem = _hint_by_stem(files)
     ordered = [_pick(by_stem.get(s.lower(), [])) for s in source_stems]
     if all(o is None for o in ordered):
         ordered = _match_by_ordinal(files, total)
@@ -246,6 +254,108 @@ def _prepare_hint(clip, input_stems: list[str], staging: Path, check_cancel) -> 
     return str(dst)
 
 
+def _resolve_selected(files: list[str], source_stems: list[str],
+                      indices: list[int]) -> dict[int, str]:
+    """Selected-frame lookup with the dense policies (exact stem, verified legacy ordinal).
+
+    Only the selected frames must resolve; unselected files are ignored.
+    """
+    by_stem = _hint_by_stem(files)
+    exact_any = any(s.lower() in by_stem for s in source_stems)
+    ordinal = {} if exact_any else dict(enumerate(_match_by_ordinal(files, len(source_stems))))
+    out: dict[int, str] = {}
+    for k in indices:
+        stem = source_stems[k]
+        try:
+            found = _pick(by_stem.get(stem.lower(), [])) if exact_any else ordinal.get(k)
+        except V2InputError as exc:
+            raise V2InputError(f"AlphaHint for keyframe {k} (frame '{stem}'): {exc}") from None
+        if found is None:
+            raise V2InputError(
+                f"No AlphaHint matte found for keyframe {k} (frame '{stem}') — generate or "
+                "import a matte for that frame, or unmark it.")
+        out[k] = found
+    return out
+
+
+def _matte_plane(img: np.ndarray, label: str) -> np.ndarray:
+    """Single-channel matte (engine hint semantics) as uint8/uint16 for PNG staging."""
+    if img.ndim == 3:
+        img = img[:, :, 3] if img.shape[2] == 4 else img[:, :, 0]
+    if img.dtype in (np.uint8, np.uint16):
+        return np.ascontiguousarray(img)
+    if np.issubdtype(img.dtype, np.floating):
+        f = np.nan_to_num(img.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+        return np.rint(np.clip(f, 0.0, 1.0) * 65535.0).astype(np.uint16)
+    raise V2InputError(f"Unsupported AlphaHint pixel format {img.dtype} in {label}.")
+
+
+def _write_matte(img, want, label: str, dst: str) -> None:
+    if img is None:
+        raise V2InputError(f"Could not read AlphaHint {label}.")
+    got = (int(img.shape[1]), int(img.shape[0]))
+    if want is not None and tuple(want) != got:
+        raise V2InputError(
+            f"AlphaHint {label} is {got[0]}x{got[1]} but the input is {want[0]}x{want[1]} — "
+            "regenerate the AlphaHint at the clip resolution.")
+    if not imwrite_unicode(dst, _matte_plane(img, label)):
+        raise V2InputError(f"Could not write staged AlphaHint '{dst}'.")
+
+
+def _prepare_keyframe_hint(clip, stems: list[str], staging: Path, check_cancel):
+    marks, err = clip.hint_keyframes, clip.hint_keyframes_error
+    if err:
+        raise V2InputError(f"Keyframes are unusable: {err}")
+    if not marks:
+        raise V2InputError("Keyframes mode needs at least one marked frame.")
+    try:
+        idx = sorted({int(k) for k in marks})
+    except (TypeError, ValueError):
+        raise V2InputError("Keyframes contain non-integer frame indices.") from None
+    if idx[0] < 0 or idx[-1] >= len(stems):
+        bad = idx[0] if idx[0] < 0 else idx[-1]
+        raise V2InputError(
+            f"Keyframe {bad} is outside the clip (0-{len(stems) - 1}) — unmark it.")
+    asset = clip.alpha_asset
+    if asset is None:
+        raise V2InputError(_NO_HINT_MSG)
+    want = clip.input_asset.get_dimensions()
+    dst = staging / "hint"
+    shutil.rmtree(dst, ignore_errors=True)
+    os.makedirs(dst, exist_ok=True)
+    paths = {k: str(dst / f"{k:06d}.png") for k in idx}
+    if asset.asset_type == "video":
+        got = _video_frame_count(asset.path)
+        if got <= idx[-1]:
+            raise V2InputError(
+                f"AlphaHint video has {got} frames but keyframe {idx[-1]} "
+                f"(frame '{stems[idx[-1]]}') is needed.")
+        cap = open_video(asset.path)
+        try:
+            if not cap.isOpened():
+                raise V2InputError(f"Could not open AlphaHint video '{asset.path}'.")
+            for k in idx:
+                if check_cancel is not None:
+                    check_cancel()
+                cap.set(cv2.CAP_PROP_POS_FRAMES, k)
+                ok, frame = cap.read()
+                _write_matte(frame if ok else None, want,
+                             f"video frame {k} (frame '{stems[k]}')", paths[k])
+        finally:
+            cap.release()
+    else:
+        chosen = _resolve_selected(asset.get_frame_files(), stems, idx)
+        for k in idx:
+            if check_cancel is not None:
+                check_cancel()
+            src = os.path.join(asset.path, chosen[k])
+            _write_matte(imread_unicode(src, cv2.IMREAD_UNCHANGED), want,
+                         f"frame '{chosen[k]}' (keyframe {k})", paths[k])
+    if len(idx) == 1:
+        return V2PreparedInput("", [], 0, 0.0, False, None, paths[idx[0]], idx[0], None)
+    return V2PreparedInput("", [], 0, 0.0, False, str(dst), None, 0, tuple(idx))
+
+
 def _prepare_sequence(clip, staging: Path, check_cancel) -> tuple[str, list[str], bool]:
     asset = clip.input_asset
     ez = asset.get_frame_files()
@@ -261,8 +371,14 @@ def _prepare_sequence(clip, staging: Path, check_cancel) -> tuple[str, list[str]
 
 
 def prepare_v2_inputs(clip, *, use_alpha_hint: bool, staging_dir: str | Path,
-                      check_cancel=None) -> V2PreparedInput:
-    """Resolve input (and optional dense hint) paths for ``run_inference``."""
+                      check_cancel=None, hint_mode: str | None = None) -> V2PreparedInput:
+    """Resolve input (and optional dense/sparse hint) paths for ``run_inference``.
+
+    ``hint_mode`` (none/full/keyframes) wins when given; otherwise ``use_alpha_hint``.
+    """
+    mode = hint_mode if hint_mode is not None else ("full" if use_alpha_hint else "none")
+    if mode not in ("none", "full", "keyframes"):
+        raise V2InputError(f"Unknown hint mode '{mode}'.")
     asset = clip.input_asset
     if asset is None:
         raise V2InputError("This clip has no input media.")
@@ -277,7 +393,12 @@ def prepare_v2_inputs(clip, *, use_alpha_hint: bool, staging_dir: str | Path,
         else:
             path, stems, staged = _prepare_sequence(clip, staging, check_cancel)
             fps = _DEFAULT_FPS
-        hint = _prepare_hint(clip, stems, staging, check_cancel) if use_alpha_hint else None
+        if mode == "keyframes":
+            kf = _prepare_keyframe_hint(clip, stems, staging, check_cancel)
+            return V2PreparedInput(path, stems, len(stems), fps, staged, kf.hint_path,
+                                   kf.initial_hint_path, kf.initial_hint_index,
+                                   kf.hint_frame_indices)
+        hint = _prepare_hint(clip, stems, staging, check_cancel) if mode == "full" else None
         return V2PreparedInput(path, stems, len(stems), fps, staged, hint)
     except BaseException:
         for p, existed in zip(created, pre_existing):
