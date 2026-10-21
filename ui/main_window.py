@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QFileDialog, QInputDialog, QGraphicsOpacityEffect,
     QPushButton,
 )
-from PySide6.QtCore import Qt, Slot, QTimer, QPropertyAnimation, QEasingCurve, QSettings, QThread, Signal
+from PySide6.QtCore import Qt, Slot, QTimer, QPropertyAnimation, QEasingCurve, QSettings, QThread, Signal, QCoreApplication
 from PySide6.QtGui import QKeySequence, QAction, QImage, QPainter
 
 from backend import (
@@ -357,12 +357,6 @@ class MainWindow(
         self._thumb_gen = ThumbnailGenerator(self)
         self._thumb_gen.thumbnail_ready.connect(self._clip_model.set_thumbnail)
 
-        # Reprocess debounce timer (200ms, Codex: coalesce stale requests)
-        self._reprocess_timer = QTimer(self)
-        self._reprocess_timer.setSingleShot(True)
-        self._reprocess_timer.setInterval(200)
-        self._reprocess_timer.timeout.connect(self._do_reprocess)
-
         # Live selected-clip refresh: coalesce worker progress into a cheap UI-only
         # asset rescan so the scrubber and mode buttons update while frames are written.
         self._live_asset_refresh_timer = QTimer(self)
@@ -383,7 +377,6 @@ class MainWindow(
         # Workers
         self._gpu_worker = GPUJobWorker(
             self._service,
-            max_workers=1,
             parent=self,
         )
         self._gpu_monitor = GPUMonitor(interval_ms=2000, parent=self)
@@ -585,7 +578,7 @@ class MainWindow(
         self._gpu_worker.status_update.connect(self._on_worker_status)
         self._gpu_worker.error.connect(self._on_worker_error)
         self._gpu_worker.queue_empty.connect(self._on_queue_empty)
-        self._gpu_worker.reprocess_result.connect(self._on_reprocess_result)
+        self._gpu_worker.sam2_preview_result.connect(self._on_reprocess_result)
 
         # GPU monitor -> top bar widgets (not status bar)
         self._gpu_monitor.vram_updated.connect(self._update_vram)
@@ -853,28 +846,55 @@ class MainWindow(
         elif video_files:
             self._on_tray_files_imported(video_files)
 
+    def _retry_close(self) -> None:
+        """Poll until the GPU worker thread has exited, then finish closing."""
+        if self._gpu_worker.isRunning():
+            return
+        self._close_poll_timer.stop()
+        self.close()
+
     def closeEvent(self, event) -> None:
         """Clean shutdown — auto-save session, stop workers, unload engines."""
         if self._skip_shutdown_cleanup:
             super().closeEvent(event)
             return
-        # Save annotation and holdout strokes before closing
-        self._auto_save_annotations()
-        self._auto_save_holdout()
-        # Auto-save session on close
-        if self._clips_dir:
-            try:
-                self._on_save_session()
-            except Exception:
-                pass
+        if getattr(self, "_close_pending", False):
+            # Re-entered from the poll timer (or a repeated close click)
+            if self._gpu_worker.isRunning():
+                event.ignore()
+                return
+        else:
+            # Save annotation and holdout strokes before closing
+            self._auto_save_annotations()
+            self._auto_save_holdout()
+            # Auto-save session on close
+            if self._clips_dir:
+                try:
+                    self._on_save_session()
+                except Exception:
+                    pass
 
-        self._gpu_monitor.stop()
-        if self._extract_worker.isRunning():
-            self._extract_worker.stop()
-            self._extract_worker.wait(5000)
-        if self._gpu_worker.isRunning():
-            self._gpu_worker.stop()
-            self._gpu_worker.wait(5000)
+            self._gpu_monitor.stop()
+            if self._extract_worker.isRunning():
+                self._extract_worker.stop()
+                self._extract_worker.wait(5000)
+            if self._gpu_worker.isRunning():
+                # Cooperative, non-blocking shutdown: request cancel, keep the
+                # window alive and re-try close once the GPU thread has exited.
+                # Never terminate the thread or unload models underneath it.
+                self._close_pending = True
+                self._gpu_worker.stop()
+                try:
+                    self._status_bar.set_message(QCoreApplication.translate(
+                        "MainWindow", "Stopping current GPU step before closing…"))
+                except Exception:
+                    pass
+                self._close_poll_timer = QTimer(self)
+                self._close_poll_timer.setInterval(200)
+                self._close_poll_timer.timeout.connect(self._retry_close)
+                self._close_poll_timer.start()
+                event.ignore()
+                return
         self._service.unload_engines()
         if self._debug_console is not None:
             self._debug_console.close_permanently()

@@ -77,7 +77,7 @@ class CancelMixin:
             self._status_bar.set_running(True)
             self._status_bar.set_stop_button_mode(force=True)
             self._status_bar.set_message(
-                _tr("Stop requested — waiting for current GPU step. "
+                _tr("Stopping current GPU step… "
                     "Press FORCE STOP to relaunch if it stays stuck.")
             )
         else:

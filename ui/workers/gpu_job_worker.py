@@ -1,25 +1,22 @@
-"""GPU worker — consumes jobs from GPUJobQueue with optional parallelism.
+"""GPU worker — consumes jobs from GPUJobQueue, strictly one at a time.
 
-Design decisions (from Codex review):
-- ONE dedicated QThread orchestrates job dispatch
-- INFERENCE jobs can run in parallel via ThreadPoolExecutor (configurable)
-- Non-inference jobs (GVM, VideoMaMa, SAM2) run inline after draining pool
+Design decisions:
+- ONE dedicated QThread runs every job inline, serially (CorridorKey 2.0
+  runs whole clips; there is no pool and no concurrent GPU work)
 - Emits signals AFTER releasing any locks (no deadlock risk)
-- Preview throttled to every N frames (configurable, default 5)
+- Progress carries the current phase's fraction; file previews are saved
+  only from "publish" phase ticks (frames actually written to disk)
 - Preview saved to temp file — QPixmap created on main thread only
 - All signals carry job.id (stable, assigned at creation time)
 - Job params are FROZEN SNAPSHOTS: paths + params dict, not live references
-- Cancel path uses queue.mark_cancelled() to properly clear running state
-- Model residency: service._ensure_model() unloads previous model type
-- Lock order: service._gpu_lock > job_queue._lock > never hold while joining
+- Cancellation is cooperative: stop() only flags the job; the service raises
+  JobCancelledError at its next check. stop() never blocks.
 """
 from __future__ import annotations
 
 import os
 import logging
 import tempfile
-import threading
-from concurrent.futures import Future, ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -43,135 +40,73 @@ from ui.workers.job_helpers import create_job_snapshot
 
 logger = logging.getLogger(__name__)
 
-# Job types that can be processed in parallel (stateless, shared engine)
-_PARALLEL_JOB_TYPES = frozenset({JobType.INFERENCE})
-
 
 class GPUJobWorker(QThread):
-    """GPU worker thread with optional parallel inference dispatch.
+    """GPU worker thread: runs queued jobs strictly one at a time.
 
     Signals carry job.id (stable, assigned at submit time) so the UI
     can ignore stale signals from previous selections or cancelled jobs.
-
-    Parallel mode (max_workers > 1):
-        INFERENCE jobs are submitted to a ThreadPoolExecutor so multiple
-        clips process concurrently.  The shared GPU lock in backend.service
-        serializes model access while CPU pre/post-processing overlaps.
-        Non-inference jobs (GVM, VideoMaMa, SAM2) drain the pool first,
-        then run inline to respect model residency.
     """
 
     # Signals — all carry job_id as first arg for stale detection
-    progress = Signal(str, str, int, int, float)  # job_id, clip_name, current_frame, total_frames, fps
+    progress = Signal(str, str, int, int, float)  # job_id, clip_name, current, total, fps (current phase fraction)
     preview_ready = Signal(str, str, int, str) # job_id, clip_name, frame_index, temp_file_path
     clip_finished = Signal(str, str, str)       # job_id, clip_name, job_type_value
     warning = Signal(str, str)                 # job_id, message
     status_update = Signal(str, str)           # job_id, status_text (phase label for status bar)
     error = Signal(str, str, str)              # job_id, clip_name, error_message
     queue_empty = Signal()                     # all jobs done
-    reprocess_result = Signal(str, object)     # job_id, result_dict (for preview display)
+    sam2_preview_result = Signal(str, object)  # job_id, result_dict (SAM2 prompt preview)
 
-    def __init__(self, service: CorridorKeyService, max_workers: int = 1, parent=None):
+    def __init__(self, service: CorridorKeyService, parent=None):
         super().__init__(parent)
         self._service = service
         self._queue = service.job_queue
         self._running = False
         self._mutex = QMutex()
         self._condition = QWaitCondition()
-        self._preview_interval = 5  # emit preview every N frames
+        self._preview_interval = 5  # emit preview every N published frames
         self._preview_dir = tempfile.mkdtemp(prefix="corridorkey_preview_")
-
-        # Parallel inference dispatch
-        self._max_workers = max(1, max_workers)
-        self._concurrency_sem = threading.Semaphore(self._max_workers)
-        # Wire engine pool size for frame-level parallelism
-        self._service.set_pool_size(self._max_workers)
-        self._pool: ThreadPoolExecutor | None = None
-        self._inflight: dict[str, Future] = {}  # job_id -> Future
-        self._inflight_lock = threading.Lock()
-        # When True, stop admitting new inference jobs to pool (drain for exclusive job)
-        self._draining = False
+        self._current_job_id: str | None = None
+        self._queue_empty_emitted = True
 
     @property
     def preview_dir(self) -> str:
         return self._preview_dir
 
     @property
-    def max_workers(self) -> int:
-        return self._max_workers
+    def current_job_id(self) -> str | None:
+        """ID of the job currently executing, or None."""
+        return self._current_job_id
 
-    def set_max_workers(self, n: int) -> None:
-        """Hot-update the concurrency limit (takes effect for next job batch).
-
-        Also updates the service engine pool size so parallel frame
-        processing uses the right number of engines.
-        """
-        n = max(1, min(n, 8))
-        if n == self._max_workers:
-            return
-        old = self._max_workers
-        self._max_workers = n
-        # Replace semaphore — safe because only the main loop acquires it
-        self._concurrency_sem = threading.Semaphore(n)
-        # Wire engine pool size for frame-level parallelism
-        self._service.set_pool_size(n)
-        logger.info(f"Parallel frames updated: {old} -> {n}")
+    def is_busy(self) -> bool:
+        """True while a job is executing."""
+        return self._current_job_id is not None
 
     def wake(self) -> None:
         """Wake the worker to check for new jobs."""
         self._condition.wakeOne()
 
     def stop(self) -> None:
-        """Signal the worker to stop after current jobs."""
+        """Request stop. Non-blocking: cancels queued/running jobs cooperatively."""
         self._running = False
         self._queue.cancel_all()
-        self._drain_pool()
         self._condition.wakeOne()
 
-    def _ensure_pool(self) -> ThreadPoolExecutor:
-        """Lazily create the thread pool."""
-        if self._pool is None:
-            # Pool size is the max we'd ever need; semaphore controls actual concurrency
-            self._pool = ThreadPoolExecutor(
-                max_workers=8,
-                thread_name_prefix="corridorkey-infer",
-            )
-        return self._pool
-
-    def _drain_pool(self) -> None:
-        """Wait for all in-flight inference jobs to complete.
-
-        IMPORTANT: Must NOT hold any queue lock while calling this (deadlock risk).
-        """
-        with self._inflight_lock:
-            futures = list(self._inflight.values())
-        for fut in futures:
-            try:
-                fut.result(timeout=600)  # 10min max per job
-            except Exception:
-                pass  # errors handled in _pool_job_done callback
-        with self._inflight_lock:
-            self._inflight.clear()
-
     def run(self) -> None:
-        """Main consumer loop — dispatches jobs to pool or runs inline."""
+        """Main consumer loop — runs each job inline, one at a time."""
         self._running = True
         self._queue_empty_emitted = True  # Start idle — no spurious emit on launch
-        logger.info("GPU worker started (max_workers=%d)", self._max_workers)
+        logger.info("GPU worker started")
 
         while self._running:
             job = self._queue.next_job()
 
             if job is None:
-                # Also check if all inflight are done for queue_empty signal
-                with self._inflight_lock:
-                    has_inflight = len(self._inflight) > 0
-                if not has_inflight and not self._queue.has_pending:
-                    if not self._queue_empty_emitted:
-                        self._queue_empty_emitted = True
-                        self.queue_empty.emit()
+                if not self._queue.has_pending and not self._queue_empty_emitted:
+                    self._queue_empty_emitted = True
+                    self.queue_empty.emit()
 
-                # Wait for new jobs
                 self._mutex.lock()
                 if self._running and not self._queue.has_pending:
                     self._condition.wait(self._mutex, 500)
@@ -179,54 +114,24 @@ class GPUJobWorker(QThread):
                 continue
 
             self._queue_empty_emitted = False  # Reset — will fire again when all done
-            if job.job_type in _PARALLEL_JOB_TYPES and self._max_workers > 1 and not self._draining:
-                # Submit inference job to thread pool
-                self._submit_to_pool(job)
-            else:
-                # Exclusive job (GVM, VideoMaMa, etc.) — drain pool first
-                if job.job_type not in _PARALLEL_JOB_TYPES:
-                    self._draining = True
-                    self._drain_pool()
-                    self._draining = False
-                self._process_job(job)
+            self._process_job(job)
 
-        # Shutdown
-        self._drain_pool()
-        if self._pool is not None:
-            self._pool.shutdown(wait=False)
-            self._pool = None
         logger.info("GPU worker stopped")
 
-    def _submit_to_pool(self, job: GPUJob) -> None:
-        """Submit an inference job to the thread pool."""
-        self._queue.start_job(job)
-        pool = self._ensure_pool()
-
-        def _run_in_pool() -> None:
-            self._concurrency_sem.acquire()
-            try:
-                self._process_job_inner(job)
-            finally:
-                self._concurrency_sem.release()
-                with self._inflight_lock:
-                    self._inflight.pop(job.id, None)
-                # Wake main loop to check for more work / queue_empty
-                self._condition.wakeOne()
-
-        future = pool.submit(_run_in_pool)
-        with self._inflight_lock:
-            self._inflight[job.id] = future
-
     def _process_job(self, job: GPUJob) -> None:
-        """Execute a single GPU job (inline path — marks start/complete)."""
+        """Execute a single GPU job inline (marks start/complete)."""
         self._queue.start_job(job)
-        self._process_job_inner(job)
+        self._current_job_id = job.id
+        try:
+            self._process_job_inner(job)
+        finally:
+            self._current_job_id = None
+        if not self._queue.has_pending and not self._queue_empty_emitted:
+            self._queue_empty_emitted = True
+            self.queue_empty.emit()
 
     def _process_job_inner(self, job: GPUJob) -> None:
-        """Execute a GPU job. Called from main loop (inline) or pool thread.
-
-        Assumes start_job() has already been called.
-        """
+        """Execute a GPU job. Assumes start_job() has already been called."""
         job_id = job.id
         logger.info(f">>> PROCESS_JOB START [{job_id}]: type={job.job_type.value}, clip={job.clip_name}")
 
@@ -295,14 +200,6 @@ class GPUJobWorker(QThread):
             self.error.emit(job_id, job.clip_name, msg)
             logger.exception(msg)
 
-        # Check if queue is empty and no inflight jobs
-        with self._inflight_lock:
-            has_inflight = len(self._inflight) > 0
-        if not self._queue.has_pending and not has_inflight:
-            if not self._queue_empty_emitted:
-                self._queue_empty_emitted = True
-                self.queue_empty.emit()
-
     def _run_inference(self, job: GPUJob) -> None:
         """Run CorridorKey inference for a single clip."""
         clip = job.params.get("_clip_snapshot")
@@ -315,8 +212,11 @@ class GPUJobWorker(QThread):
         def on_progress(clip_name: str, current: int, total: int, **kwargs) -> None:
             self.progress.emit(job.id, clip_name, current, total, kwargs.get("fps", 0.0))
 
-            # Throttled preview — every N frames, save a comp preview to temp
-            if current > 0 and current % self._preview_interval == 0:
+            # Only "publish" ticks mean frames hit disk; other phases
+            # (rvm/vfm/stage1/stage2) never produce a file preview.
+            if kwargs.get("phase") != "publish":
+                return
+            if current > 0 and (current % self._preview_interval == 0 or current == total):
                 self._save_preview(job.id, clip, current)
 
         def on_warning(message: str) -> None:
@@ -451,7 +351,7 @@ class GPUJobWorker(QThread):
             on_status=on_status,
         )
         if result is not None:
-            self.reprocess_result.emit(job.id, result)
+            self.sam2_preview_result.emit(job.id, result)
 
     def _run_videomama(self, job: GPUJob) -> None:
         """Run VideoMaMa guided alpha generation."""
@@ -531,26 +431,8 @@ class GPUJobWorker(QThread):
         )
 
     def _run_preview_reprocess(self, job: GPUJob) -> None:
-        """Run single-frame reprocess through GPU queue (Codex: no GPU bypass)."""
-        clip = job.params.get("_clip_snapshot")
-        params = job.params.get("_inference_params")
-        frame_index = job.params.get("_frame_index", 0)
-
-        if clip is None or params is None:
-            return
-
-        def on_status(message: str) -> None:
-            self.status_update.emit(job.id, message)
-
-        result = self._service.reprocess_single_frame(
-            clip=clip,
-            params=params,
-            frame_index=frame_index,
-            job=job,
-            on_status=on_status,
-        )
-        if result is not None:
-            self.reprocess_result.emit(job.id, result)
+        """Single-frame v1 re-key no longer exists in 2.0 — drop stale jobs."""
+        logger.info("Ignoring obsolete PREVIEW_REPROCESS job [%s]", job.id)
 
     def _save_preview(self, job_id: str, clip: ClipEntry, frame_index: int) -> None:
         """Save a downscaled preview of the latest comp frame to temp dir.
@@ -559,14 +441,18 @@ class GPUJobWorker(QThread):
         QPixmap off the GUI thread (Codex finding).
         """
         try:
-            comp_dir = os.path.join(clip.root_path, "Output", "Comp")
-            if not os.path.isdir(comp_dir):
-                return
-
-            # Find the most recently written comp frame (natural sort)
             from backend.natural_sort import natsorted
-            comp_files = natsorted(os.listdir(comp_dir))
-            if not comp_files:
+            out_dir = clip.output_dir
+            comp_dir = None
+            comp_files: list[str] = []
+            for sub in ("Comp", "Processed"):
+                cand = os.path.join(out_dir, sub)
+                if os.path.isdir(cand):
+                    files = natsorted(os.listdir(cand))
+                    if files:
+                        comp_dir, comp_files = cand, files
+                        break
+            if comp_dir is None:
                 return
 
             latest = os.path.join(comp_dir, comp_files[-1])
