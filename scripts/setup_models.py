@@ -4,9 +4,7 @@ Uses huggingface_hub for robust downloading with resume support,
 progress bars, and idempotent behavior (skips existing files).
 
 Usage:
-    python scripts/setup_models.py --corridorkey       # Required (383MB)
-    python scripts/setup_models.py --corridorkey-blue  # Blue screen variant (401MB)
-    python scripts/setup_models.py --corridorkey-mlx   # Apple Silicon MLX weights (2x 380MB)
+    python scripts/setup_models.py --corridorkey       # Required: CorridorKey 2.0 + foundation models (~5GB)
     python scripts/setup_models.py --sam2             # SAM2 Base+ (324MB)
     python scripts/setup_models.py --sam2 large       # SAM2 Large (898MB)
     python scripts/setup_models.py --gvm               # Optional (~6GB)
@@ -20,10 +18,8 @@ from __future__ import annotations
 
 import argparse
 import glob
-import hashlib
 import importlib.util
 import os
-import platform
 import shutil
 import sys
 import urllib.request
@@ -51,7 +47,7 @@ def _proxy_guard():
 def _data_root() -> Path:
     """Writable root for model downloads.
 
-    In dev mode: project root (checkpoints live in CorridorKeyModule/checkpoints/).
+    In dev mode: project root.
     In frozen PyInstaller builds: delegates to backend.project.get_data_dir().
     Falls back to standalone logic when backend is not importable (script run directly).
     """
@@ -81,49 +77,11 @@ def _data_root() -> Path:
 PROJECT_ROOT = _data_root()
 HF_CACHE_DIR = Path.home() / ".cache" / "huggingface" / "hub"
 
-# Built-in MLX engine weights (green + blue), hosted as GitHub release
-# assets on our repo. Replaces the external corridorkey-mlx package that
-# had quality complaints.
-_MLX_RELEASE_BASE = (
-    "https://github.com/edenaion/EZ-CorridorKey/releases/download/v2.1.0"
-)
-MLX_CHECKPOINTS = [
-    {
-        "url": f"{_MLX_RELEASE_BASE}/CorridorKey.mlx.safetensors",
-        "sha256_url": f"{_MLX_RELEASE_BASE}/CorridorKey.mlx.safetensors.sha256",
-        "filename": "CorridorKey.mlx.safetensors",
-        "local_dir": PROJECT_ROOT / "CorridorKeyModule" / "checkpoints",
-        "size_human": "380 MB",
-        "size_bytes": 398_847_216,
-    },
-    {
-        "url": f"{_MLX_RELEASE_BASE}/CorridorKeyBlue_1.0.mlx.safetensors",
-        "sha256_url": f"{_MLX_RELEASE_BASE}/CorridorKeyBlue_1.0.mlx.safetensors.sha256",
-        "filename": "CorridorKeyBlue_1.0.mlx.safetensors",
-        "local_dir": PROJECT_ROOT / "CorridorKeyModule" / "checkpoints",
-        "size_human": "380 MB",
-        "size_bytes": 398_847_216,
-    },
-]
-
 MODELS = {
     "corridorkey": {
-        "repo_id": "nikopueringer/CorridorKey_v1.0",
-        "filename": "CorridorKey_v1.0.pth",
-        "local_dir": PROJECT_ROOT / "CorridorKeyModule" / "checkpoints",
-        "check_glob": "*.pth",
-        "size_human": "383 MB",
-        "size_bytes": 400_000_000,
+        "size_human": "~5 GB",
+        "size_bytes": 5_500_000_000,
         "required": True,
-    },
-    "corridorkey-blue": {
-        "repo_id": "nikopueringer/CorridorKeyBlue_1.0",
-        "filename": "CorridorKeyBlue_1.0.pth",
-        "local_dir": PROJECT_ROOT / "CorridorKeyModule" / "checkpoints",
-        "check_file": "CorridorKeyBlue_1.0.pth",
-        "size_human": "401 MB",
-        "size_bytes": 420_000_000,
-        "required": False,
     },
     "gvm": {
         "repo_id": "geyongtao/gvm",
@@ -211,6 +169,8 @@ def tracker_dependency_installed() -> bool:
 
 def is_installed(name: str) -> bool:
     """Check if a model's weights are already downloaded."""
+    if name == "corridorkey":
+        return _v2_paths().v2_assets_ready()
     cfg = MODELS[name]
     local_dir = cfg["local_dir"]
     if "check_glob" in cfg:
@@ -251,131 +211,53 @@ def check_disk_space(needed_bytes: int, path: Path) -> bool:
     return usage.free > needed_bytes * 1.1
 
 
+def _v2_paths():
+    """Import backend.v2_paths (stdlib-only) from the project root."""
+    if str(_SCRIPT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_SCRIPT_ROOT))
+    from backend import v2_paths
+    return v2_paths
+
+
+def _load_v2_downloader():
+    """Load the vendored CorridorKeyV2/scripts/download_weights.py module."""
+    path = _v2_paths().get_v2_package_root() / "scripts" / "download_weights.py"
+    spec = importlib.util.spec_from_file_location("_ck_v2_download_weights", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def download_corridorkey() -> bool:
-    """Download the CorridorKey checkpoint (single file)."""
-    from huggingface_hub import hf_hub_download
-
-    cfg = MODELS["corridorkey"]
-    local_dir = cfg["local_dir"]
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"  Downloading CorridorKey checkpoint ({cfg['size_human']})...")
-    try:
-        downloaded = hf_hub_download(
-            repo_id=cfg["repo_id"],
-            filename=cfg["filename"],
-            local_dir=str(local_dir),
-        )
-        # huggingface_hub downloads to local_dir/filename
-        # The backend globs for *.pth, so the exact name doesn't matter
-        print(f"  Saved to: {downloaded}")
+    """Download CorridorKey 2.0 weights + C-RADIO, MoGe and RVM foundation models."""
+    v2 = _v2_paths()
+    if v2.v2_assets_ready():
+        print("  [OK] CorridorKey 2.0 already installed")
         return True
+    root = v2.get_v2_models_dir()
+    print(f"  Downloading CorridorKey 2.0 assets ({MODELS['corridorkey']['size_human']}) to {root}")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if not check_disk_space(MODELS["corridorkey"]["size_bytes"], root):
+            print("  [ERROR] Not enough disk space for CorridorKey 2.0")
+            return False
+        dl = _load_v2_downloader()
+        dl.download_corridorkey(root, dl.CORRIDORKEY_REPO, None)
+        dl.download_cradio(root)
+        dl.download_moge(root)
+        dl.download_rvm(root)
     except Exception as e:
         print(f"  [ERROR] Download failed: {e}")
-        print(f"  Manual download: https://huggingface.co/{cfg['repo_id']}")
+        print(f"  Manual download: https://huggingface.co/nikopueringer/CorridorKey2.0")
         return False
-
-
-def download_corridorkey_blue() -> bool:
-    """Download the CorridorKey Blue checkpoint (single file)."""
-    from huggingface_hub import hf_hub_download
-
-    cfg = MODELS["corridorkey-blue"]
-    local_dir = cfg["local_dir"]
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"  Downloading CorridorKey Blue checkpoint ({cfg['size_human']})...")
-    try:
-        downloaded = hf_hub_download(
-            repo_id=cfg["repo_id"],
-            filename=cfg["filename"],
-            local_dir=str(local_dir),
-        )
-        print(f"  Saved to: {downloaded}")
-        return True
-    except Exception as e:
-        print(f"  [ERROR] Download failed: {e}")
-        print(f"  Manual download: https://huggingface.co/{cfg['repo_id']}")
+    problems = v2.validate_v2_assets()
+    if problems:
+        print("  [ERROR] Assets incomplete after download:")
+        for p in problems:
+            print(f"    - {p}")
         return False
-
-
-def is_mlx_installed() -> bool:
-    """Check if both MLX .safetensors checkpoints are already present."""
-    return all(
-        (cfg["local_dir"] / cfg["filename"]).is_file() for cfg in MLX_CHECKPOINTS
-    )
-
-
-def _download_mlx_one(cfg: dict, reporthook=None) -> bool:
-    """Download one MLX checkpoint from GitHub Releases with SHA256 verify.
-
-    *reporthook* follows the urllib.request.urlretrieve contract so callers
-    (CLI progress, setup wizard progress bars) can plug their own. Does not
-    require huggingface_hub.
-    """
-    local_dir = cfg["local_dir"]
-    local_dir.mkdir(parents=True, exist_ok=True)
-    dest = local_dir / cfg["filename"]
-
-    if dest.is_file():
-        print(f"  [OK] {cfg['filename']} already installed")
-        return True
-
-    if not check_disk_space(cfg["size_bytes"], local_dir):
-        usage = shutil.disk_usage(local_dir)
-        free_gb = usage.free / (1024**3)
-        print(f"  [ERROR] Not enough disk space for {cfg['filename']} ({cfg['size_human']})")
-        print(f"  Available: {free_gb:.1f} GB")
-        return False
-
-    print(f"  Downloading {cfg['filename']} ({cfg['size_human']})...")
-    tmp_dest = dest.with_suffix(".safetensors.tmp")
-    try:
-        urllib.request.urlretrieve(cfg["url"], str(tmp_dest), reporthook=reporthook)
-        print()  # newline after progress
-
-        # Verify SHA256
-        try:
-            sha256_resp = urllib.request.urlopen(cfg["sha256_url"])
-            expected_hash = sha256_resp.read().decode().strip().split()[0]
-            actual_hash = hashlib.sha256(tmp_dest.read_bytes()).hexdigest()
-            if actual_hash != expected_hash:
-                print(f"  [ERROR] SHA256 mismatch!")
-                print(f"  Expected: {expected_hash}")
-                print(f"  Got:      {actual_hash}")
-                tmp_dest.unlink(missing_ok=True)
-                return False
-            print(f"  [OK] SHA256 verified")
-        except Exception as e:
-            print(f"  [WARN] Could not verify SHA256: {e}")
-            print("  Proceeding anyway (file downloaded successfully)")
-
-        tmp_dest.rename(dest)
-        print(f"  Saved to: {dest}")
-        return True
-    except Exception as e:
-        print(f"\n  [ERROR] Download failed: {e}")
-        print(f"  Manual download: {cfg['url']}")
-        print(f"  Place in: {local_dir}/")
-        tmp_dest.unlink(missing_ok=True)
-        return False
-
-
-def download_corridorkey_mlx() -> bool:
-    """Download both MLX checkpoints (green + blue) from GitHub Releases."""
-
-    def _progress(block_num, block_size, total_size):
-        downloaded = block_num * block_size
-        if total_size > 0:
-            pct = min(100, downloaded * 100 // total_size)
-            mb = downloaded / (1024 * 1024)
-            total_mb = total_size / (1024 * 1024)
-            print(f"\r  {mb:.0f}/{total_mb:.0f} MB ({pct}%)", end="", flush=True)
-
-    ok = True
-    for cfg in MLX_CHECKPOINTS:
-        ok = _download_mlx_one(cfg, reporthook=_progress) and ok
-    return ok
+    print(f"  Saved to: {root}")
+    return True
 
 
 def download_sam2(name: str) -> bool:
@@ -455,6 +337,10 @@ def download_model(name: str) -> bool:
     """Download a model's weights, skipping if already present."""
     cfg = MODELS[name]
 
+    if name == "corridorkey":
+        with _proxy_guard():
+            return download_corridorkey()
+
     if is_installed(name):
         print(f"  [OK] {name} weights already installed")
         return True
@@ -468,12 +354,7 @@ def download_model(name: str) -> bool:
         return False
 
     with _proxy_guard():
-        if name == "corridorkey":
-            return download_corridorkey()
-        elif name == "corridorkey-blue":
-            return download_corridorkey_blue()
-        else:
-            return download_repo(name)
+        return download_repo(name)
 
 
 def download_sam2_model(name: str) -> bool:
@@ -605,6 +486,16 @@ def check_all():
     print("\nModel Status:")
     print("-" * 50)
     for name, cfg in MODELS.items():
+        if name == "corridorkey":
+            v2 = _v2_paths()
+            problems = v2.validate_v2_assets()
+            mark = "[--]" if problems else "[OK]"
+            status = "NOT INSTALLED" if problems else "INSTALLED"
+            print(f"  {mark} CorridorKey 2.0 {cfg['size_human']:>8s}  {status} (required)")
+            print(f"       -> target: {v2.get_v2_models_dir()}")
+            for prob in problems:
+                print(f"       - {prob}")
+            continue
         installed = is_installed(name)
         status = "INSTALLED" if installed else "NOT INSTALLED"
         required = " (required)" if cfg["required"] else " (optional)"
@@ -629,13 +520,6 @@ def check_all():
     brn_status = "INSTALLED" if brn_installed else "NOT INSTALLED"
     print(f"  {brn_mark} birefnet     {BIREFNET_DEFAULT_CHECKPOINT['size_human']:>8s}  {brn_status} (optional)")
 
-    # MLX checkpoint (Apple Silicon only, but show status on all platforms)
-    mlx_installed = is_mlx_installed()
-    mlx_mark = "[OK]" if mlx_installed else "[--]"
-    mlx_status = "INSTALLED" if mlx_installed else "NOT INSTALLED"
-    mlx_note = " (Apple Silicon)" if sys.platform == "darwin" and platform.machine() == "arm64" else " (Apple Silicon only)"
-    print(f"  {mlx_mark} corridorkey-mlx {'2x 380 MB':>8s}  {mlx_status}{mlx_note}")
-
     tracker_installed = tracker_dependency_installed()
     tracker_mark = "[OK]" if tracker_installed else "[--]"
     tracker_status = "INSTALLED" if tracker_installed else "NOT INSTALLED"
@@ -654,9 +538,7 @@ def check_all():
 
 def main():
     parser = argparse.ArgumentParser(description="Download model weights for EZ-CorridorKey")
-    parser.add_argument("--corridorkey", action="store_true", help="Download CorridorKey checkpoint (383MB, required)")
-    parser.add_argument("--corridorkey-blue", action="store_true", help="Download CorridorKey Blue checkpoint (401MB, optional)")
-    parser.add_argument("--corridorkey-mlx", action="store_true", help="Download MLX checkpoints for Apple Silicon, green and blue (380MB each)")
+    parser.add_argument("--corridorkey", action="store_true", help="Download CorridorKey 2.0 weights + foundation models (~5GB, required)")
     parser.add_argument(
         "--sam2",
         nargs="?",
@@ -672,21 +554,17 @@ def main():
     parser.add_argument("--check", action="store_true", help="Check installation status")
     args = parser.parse_args()
 
-    mlx_flag = getattr(args, 'corridorkey_mlx', False)
-    blue_flag = getattr(args, 'corridorkey_blue', False)
-
     # Default to --check if no flags
-    if not any([args.corridorkey, blue_flag, mlx_flag, args.sam2, args.gvm, args.videomama, args.matanyone2, args.birefnet, args.all, args.check]):
+    if not any([args.corridorkey, args.sam2, args.gvm, args.videomama, args.matanyone2, args.birefnet, args.all, args.check]):
         args.check = True
 
     if args.check:
         check_all()
-        if not any([args.corridorkey, blue_flag, mlx_flag, args.sam2, args.gvm, args.videomama, args.matanyone2, args.birefnet, args.all]):
+        if not any([args.corridorkey, args.sam2, args.gvm, args.videomama, args.matanyone2, args.birefnet, args.all]):
             return
 
     targets = []
     sam2_targets: list[str] = []
-    download_mlx = False
     download_ma2 = False
     download_brn = False
     if args.all:
@@ -694,16 +572,9 @@ def main():
         sam2_targets = list(SAM2_MODELS.keys())
         download_ma2 = True
         download_brn = True
-        # --all on Apple Silicon auto-includes MLX weights
-        if sys.platform == "darwin" and platform.machine() == "arm64":
-            download_mlx = True
     else:
         if args.corridorkey:
             targets.append("corridorkey")
-        if blue_flag:
-            targets.append("corridorkey-blue")
-        if mlx_flag:
-            download_mlx = True
         if args.matanyone2:
             download_ma2 = True
         if args.birefnet:
@@ -718,13 +589,12 @@ def main():
         if args.videomama:
             targets.append("videomama")
 
-    if not targets and not sam2_targets and not download_mlx and not download_ma2 and not download_brn:
+    if not targets and not sam2_targets and not download_ma2 and not download_brn:
         return
 
     total_targets = (
         len(targets)
         + len(sam2_targets)
-        + (1 if download_mlx else 0)
         + (1 if download_ma2 else 0)
         + (1 if download_brn else 0)
     )
@@ -733,10 +603,6 @@ def main():
     for name in targets:
         print(f"[{name}]")
         results[name] = download_model(name)
-        print()
-    if download_mlx:
-        print("[corridorkey-mlx]")
-        results["corridorkey-mlx"] = download_corridorkey_mlx()
         print()
     if download_ma2:
         print("[matanyone2]")
