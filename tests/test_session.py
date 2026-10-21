@@ -92,3 +92,10 @@ class TestSessionData:
         with open(path, 'r') as f:
             loaded = json.load(f)
         assert loaded["test"] is True
+
+
+def test_session_legacy_params_hint_mode():
+    legacy = InferenceParams.from_dict({"use_alpha_hint": True, "gone": 1})
+    assert legacy.hint_mode == "full"
+    new = InferenceParams(hint_mode="keyframes", temporal_window="24/12")
+    assert InferenceParams.from_dict(new.to_dict()) == new

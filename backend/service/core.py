@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 VALID_VRAM_PROFILES = ("auto", "low")
 VALID_EXR_COMPRESSIONS = ("dwab", "piz", "zip", "none")
 VALID_OUTPUT_FORMATS = ("exr", "png")
+VALID_HINT_MODES = ("none", "full", "keyframes")
+VALID_TEMPORAL_WINDOWS = ("auto", "80/40", "48/24", "24/12", "8/4", "1/1")
 
 
 @dataclass
@@ -41,8 +43,22 @@ class InferenceParams:
     vram_profile: str = "auto"  # "auto" | "low"
     despill_strength: float = 0.5
     cutout_linear: bool = False  # carried to cfg; no effect on EXR output
+    hint_mode: str | None = None  # "none" | "full" | "keyframes"; None = from use_alpha_hint
+    temporal_window: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.hint_mode is None:
+            self.hint_mode = "full" if self.use_alpha_hint else "none"
+        elif self.hint_mode not in VALID_HINT_MODES:
+            raise ValueError(
+                f"hint_mode must be one of {VALID_HINT_MODES}, got {self.hint_mode!r}"
+            )
+        self.use_alpha_hint = self.hint_mode != "none"
+        if self.temporal_window not in VALID_TEMPORAL_WINDOWS:
+            raise ValueError(
+                f"temporal_window must be one of {VALID_TEMPORAL_WINDOWS}, "
+                f"got {self.temporal_window!r}"
+            )
         if self.vram_profile not in VALID_VRAM_PROFILES:
             raise ValueError(
                 f"vram_profile must be one of {VALID_VRAM_PROFILES}, got {self.vram_profile!r}"

@@ -78,3 +78,58 @@ def test_removed_api():
                  "_engine_screen_color", "_model_resolution", "_inference_backend"):
         assert not hasattr(svc, name), name
     assert not hasattr(CorridorKeyService, "VALID_MODEL_RESOLUTIONS")
+
+
+# --- hint_mode / temporal_window ---
+
+import dataclasses
+
+from backend.service.core import VALID_HINT_MODES, VALID_TEMPORAL_WINDOWS
+
+
+def test_hint_mode_defaults():
+    p = InferenceParams()
+    assert p.hint_mode == "none" and p.use_alpha_hint is False
+    assert p.temporal_window == "auto"
+
+
+def test_hint_mode_legacy_constructor_and_dicts():
+    assert InferenceParams(False, True).hint_mode == "full"
+    assert InferenceParams(use_alpha_hint=True).hint_mode == "full"
+    p = InferenceParams.from_dict({"use_alpha_hint": True, "retired": 1})
+    assert p.hint_mode == "full" and p.use_alpha_hint is True
+    assert InferenceParams.from_dict({"use_alpha_hint": False}).hint_mode == "none"
+
+
+def test_hint_mode_explicit_wins_over_stale_bool():
+    p = InferenceParams(use_alpha_hint=True, hint_mode="none")
+    assert p.hint_mode == "none" and p.use_alpha_hint is False
+    p = InferenceParams(use_alpha_hint=False, hint_mode="keyframes")
+    assert p.use_alpha_hint is True
+    p = InferenceParams.from_dict({"use_alpha_hint": True, "hint_mode": "none"})
+    assert p.hint_mode == "none"
+
+
+@pytest.mark.parametrize("mode", VALID_HINT_MODES)
+@pytest.mark.parametrize("win", VALID_TEMPORAL_WINDOWS)
+def test_hint_mode_window_roundtrip(mode, win):
+    p = InferenceParams(hint_mode=mode, temporal_window=win)
+    d = p.to_dict()
+    assert d["hint_mode"] == mode and d["temporal_window"] == win
+    assert "keyframes" not in d
+    assert InferenceParams.from_dict(d) == p
+
+
+def test_hint_mode_window_invalid():
+    with pytest.raises(ValueError):
+        InferenceParams(hint_mode="bogus")
+    with pytest.raises(ValueError):
+        InferenceParams(temporal_window="7/3")
+    with pytest.raises(ValueError):
+        InferenceParams(vram_profile="huge")
+
+
+def test_hint_mode_replace_explicit():
+    p = InferenceParams(hint_mode="full")
+    assert dataclasses.replace(p, hint_mode="none").use_alpha_hint is False
+    assert dataclasses.replace(p, hint_mode="keyframes").hint_mode == "keyframes"
