@@ -62,7 +62,7 @@ def _self(clips, hint=False, current=None, selected=1):
     s._param_panel = _Panel(hint)
     s._service = types.SimpleNamespace(job_queue=GPUJobQueue())
     s._current_clip = current
-    s._clip_model = types.SimpleNamespace(clips=clips)
+    s._clip_model = types.SimpleNamespace(clips=clips, update_clip_state=lambda *a: None)
     s._io_tray = types.SimpleNamespace(
         selected_count=lambda: selected, get_selected_clips=lambda: clips,
     )
@@ -189,6 +189,18 @@ def test_incomplete_alpha_cancel_and_not_offered_when_hint_off(monkeypatch, boxe
     s = _self([clip], hint=False, current=clip)
     InferenceMixin._on_run_inference(s)
     assert len(_jobs(s)) == 1
+
+
+def test_incomplete_alpha_rerun_gvm_from_ready(monkeypatch, boxes):
+    monkeypatch.setattr(inference_mixin, "QMessageBox", _FakeBox)
+    clip = _clip(state=ClipState.READY, alpha=True)
+    clip.alpha_asset.frame_count = 2
+    s = _self([clip], hint=True, current=clip)
+    _FakeBox.choice = "rerun"
+    InferenceMixin._on_run_inference(s)
+    (job,) = _jobs(s)
+    assert job.job_type == JobType.GVM_ALPHA
+    assert clip.state == ClipState.RAW
 
 
 def test_resume(boxes):

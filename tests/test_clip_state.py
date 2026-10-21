@@ -67,6 +67,11 @@ class TestClipStateTransitions:
         with pytest.raises(InvalidStateTransitionError):
             clip.transition_to(ClipState.ERROR)
 
+    def test_ready_to_raw_for_alpha_regeneration(self):
+        clip = self._make_clip(ClipState.READY)
+        clip.transition_to(ClipState.RAW)
+        assert clip.state == ClipState.RAW
+
     def test_raw_to_complete_hint_free(self):
         clip = self._make_clip(ClipState.RAW)
         clip.transition_to(ClipState.COMPLETE)

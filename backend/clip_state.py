@@ -57,7 +57,8 @@ _TRANSITIONS: dict[ClipState, set[ClipState]] = {
     # RAW/MASKED -> COMPLETE: hint-free CorridorKey v2 inference finishes directly.
     ClipState.RAW: {ClipState.MASKED, ClipState.READY, ClipState.COMPLETE, ClipState.ERROR},
     ClipState.MASKED: {ClipState.READY, ClipState.COMPLETE, ClipState.ERROR},
-    ClipState.READY: {ClipState.COMPLETE, ClipState.ERROR},
+    # READY -> RAW: discard a partial AlphaHint and regenerate it (Re-run GVM).
+    ClipState.READY: {ClipState.RAW, ClipState.COMPLETE, ClipState.ERROR},
     # reprocess with different params (READY with a hint; RAW/MASKED hint-free)
     ClipState.COMPLETE: {ClipState.READY, ClipState.RAW, ClipState.MASKED},
     ClipState.ERROR: {ClipState.RAW, ClipState.MASKED, ClipState.READY, ClipState.EXTRACTING},
