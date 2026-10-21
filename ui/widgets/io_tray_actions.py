@@ -18,20 +18,51 @@ import logging
 import os
 import shutil
 import sys
-import glob as glob_module
 
 from PySide6.QtWidgets import QMenu, QMessageBox, QFileDialog
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QAction, QDesktopServices
 
 from backend import ClipEntry, ClipState
-from backend.project import is_video_file
+from backend.hint_assets import clear_hint_assets
 
 logger = logging.getLogger(__name__)
 
 
 class IOTrayActionsMixin:
     """Mixin providing context menu and batch operations for IOTrayPanel."""
+
+    _hint_mutation_guard = None
+
+    def set_hint_mutation_guard(self, guard) -> None:
+        """Install a callable returning False while hints must not change (GPU busy)."""
+        self._hint_mutation_guard = guard
+
+    def _hint_mutation_ok(self) -> bool:
+        guard = self._hint_mutation_guard
+        if guard is None or guard():
+            return True
+        QMessageBox.information(
+            self, self.tr("Busy"),
+            self.tr("Can't clear hints while a GPU job is running or queued.\n"
+                    "Wait for it to finish or cancel it first."),
+        )
+        return False
+
+    def _clear_hints(self, clip: ClipEntry, failures: list[str], *,
+                     alpha: bool, masks: bool) -> None:
+        try:
+            clear_hint_assets(clip, clear_alpha=alpha, clear_masks=masks)
+        except OSError as e:
+            logger.warning("Hint clear failed for %s: %s", clip.name, e)
+            failures.append(f"{clip.name}: {e}")
+
+    def _warn_clear_failures(self, failures: list[str]) -> None:
+        if failures:
+            QMessageBox.warning(
+                self, self.tr("Clear incomplete"),
+                self.tr("Some files could not be deleted:\n") + "\n".join(failures),
+            )
 
     # ── Context menu (INPUT cards) ──
 
@@ -234,6 +265,8 @@ class IOTrayActionsMixin:
 
     def _clear_mask_batch(self, clips: list[ClipEntry]) -> None:
         """Delete VideoMamaMaskHint folder from disk for one or more clips."""
+        if not self._hint_mutation_ok():
+            return
         names = ", ".join(c.name for c in clips[:3])
         if len(clips) > 3:
             names += f" (+{len(clips) - 3} more)"
@@ -246,13 +279,9 @@ class IOTrayActionsMixin:
         if confirm != QMessageBox.Yes:
             return
 
+        failures: list[str] = []
         for clip in clips:
-            mask_dir = os.path.join(clip.root_path, "VideoMamaMaskHint")
-            if os.path.isdir(mask_dir):
-                shutil.rmtree(mask_dir, ignore_errors=True)
-            for candidate in glob_module.glob(os.path.join(clip.root_path, "VideoMamaMaskHint.*")):
-                if os.path.isfile(candidate) and is_video_file(candidate):
-                    os.remove(candidate)
+            self._clear_hints(clip, failures, alpha=False, masks=True)
             clip.mask_asset = None
             clip.find_assets()
             self._model.update_clip_state(clip.name, clip.state)
@@ -260,6 +289,7 @@ class IOTrayActionsMixin:
         self._model.layoutChanged.emit()
         if clips:
             self.clip_clicked.emit(clips[0])
+        self._warn_clear_failures(failures)
         logger.info(f"Cleared masks for {len(clips)} clip(s)")
         self._kick_extraction_if_needed(clips)
 
@@ -299,6 +329,8 @@ class IOTrayActionsMixin:
 
     def _clear_all_batch(self, clips: list[ClipEntry]) -> None:
         """Delete masks, alpha hints, and outputs for one or more clips."""
+        if not self._hint_mutation_ok():
+            return
         names = ", ".join(c.name for c in clips[:3])
         if len(clips) > 3:
             names += f" (+{len(clips) - 3} more)"
@@ -311,23 +343,11 @@ class IOTrayActionsMixin:
         if confirm != QMessageBox.Yes:
             return
 
+        failures: list[str] = []
         for clip in clips:
-            # Masks
-            mask_dir = os.path.join(clip.root_path, "VideoMamaMaskHint")
-            if os.path.isdir(mask_dir):
-                shutil.rmtree(mask_dir, ignore_errors=True)
-            for candidate in glob_module.glob(os.path.join(clip.root_path, "VideoMamaMaskHint.*")):
-                if os.path.isfile(candidate) and is_video_file(candidate):
-                    os.remove(candidate)
+            # Hints (masks + alpha)
+            self._clear_hints(clip, failures, alpha=True, masks=True)
             clip.mask_asset = None
-
-            # Alpha
-            alpha_dir = os.path.join(clip.root_path, "AlphaHint")
-            if os.path.isdir(alpha_dir):
-                shutil.rmtree(alpha_dir, ignore_errors=True)
-            for candidate in glob_module.glob(os.path.join(clip.root_path, "AlphaHint.*")):
-                if os.path.isfile(candidate) and is_video_file(candidate):
-                    os.remove(candidate)
             clip.alpha_asset = None
 
             # Outputs — clear all possible locations (current + default)
@@ -340,11 +360,14 @@ class IOTrayActionsMixin:
         self._model.layoutChanged.emit()
         if clips:
             self.clip_clicked.emit(clips[0])
+        self._warn_clear_failures(failures)
         logger.info(f"Cleared all generated data for {len(clips)} clip(s)")
         self._kick_extraction_if_needed(clips)
 
     def _clear_alpha_batch(self, clips: list[ClipEntry]) -> None:
         """Delete AlphaHint folder from disk for one or more clips."""
+        if not self._hint_mutation_ok():
+            return
         names = ", ".join(c.name for c in clips[:3])
         if len(clips) > 3:
             names += f" (+{len(clips) - 3} more)"
@@ -357,13 +380,9 @@ class IOTrayActionsMixin:
         if confirm != QMessageBox.Yes:
             return
 
+        failures: list[str] = []
         for clip in clips:
-            alpha_dir = os.path.join(clip.root_path, "AlphaHint")
-            if os.path.isdir(alpha_dir):
-                shutil.rmtree(alpha_dir, ignore_errors=True)
-            for candidate in glob_module.glob(os.path.join(clip.root_path, "AlphaHint.*")):
-                if os.path.isfile(candidate) and is_video_file(candidate):
-                    os.remove(candidate)
+            self._clear_hints(clip, failures, alpha=True, masks=False)
             clip.alpha_asset = None
             clip.find_assets()  # re-scan disk, updates alpha_asset and state
             self._model.update_clip_state(clip.name, clip.state)
@@ -373,6 +392,7 @@ class IOTrayActionsMixin:
         # (clears stale ALPHA button + scrubber coverage bar)
         if clips:
             self.clip_clicked.emit(clips[0])
+        self._warn_clear_failures(failures)
         logger.info(f"Cleared AlphaHint for {len(clips)} clip(s)")
         self._kick_extraction_if_needed(clips)
 

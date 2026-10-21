@@ -526,6 +526,7 @@ class MainWindow(
         self._param_panel.applevision_requested.connect(self._on_run_applevision)
         self._param_panel.gvm_requested.connect(self._on_run_gvm)
         self._param_panel.reset_hint_requested.connect(self._on_reset_hint)
+        self._io_tray.set_hint_mutation_guard(self._hint_mutation_allowed)
         self._io_tray.selection_changed.connect(self._refresh_hint_button_state)
         self._param_panel.birefnet_requested.connect(self._on_run_birefnet)
         self._param_panel.videomama_requested.connect(self._on_run_videomama)
