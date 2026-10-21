@@ -197,3 +197,22 @@ def test_retired_api_absent():
     w = GPUJobWorker(FakeService())
     for name in ("set_max_workers", "max_workers", "reprocess_result", "_drain_pool", "_pool"):
         assert not hasattr(w, name)
+
+
+def test_close_while_busy_asks_and_no_keeps_window(monkeypatch):
+    import types
+
+    from ui import main_window as mw
+
+    saved = []
+    ignored = []
+    fake = types.SimpleNamespace(
+        _skip_shutdown_cleanup=False,
+        _gpu_worker=types.SimpleNamespace(is_busy=lambda: True, isRunning=lambda: True),
+        _auto_save_annotations=lambda: saved.append(1),
+        tr=lambda s: s,
+    )
+    box = types.SimpleNamespace(question=lambda *a, **k: 2, Yes=1, No=2)
+    monkeypatch.setattr(mw, "QMessageBox", box)
+    mw.MainWindow.closeEvent(fake, types.SimpleNamespace(ignore=lambda: ignored.append(1)))
+    assert ignored == [1] and saved == []

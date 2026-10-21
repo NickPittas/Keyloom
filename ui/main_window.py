@@ -866,6 +866,15 @@ class MainWindow(
                 event.ignore()
                 return
         else:
+            if self._gpu_worker.is_busy():
+                reply = QMessageBox.question(
+                    self, self.tr("GPU Job Running"),
+                    self.tr("A GPU job is running. Stop it and quit?"),
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    event.ignore()
+                    return
             # Save annotation and holdout strokes before closing
             self._auto_save_annotations()
             self._auto_save_holdout()
