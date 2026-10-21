@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import shutil
@@ -241,13 +242,18 @@ class SAM2Tracker:
         from backend.net_proxy import friendly_proxy_error, sanitized_proxy_env
         try:
             with sanitized_proxy_env():
+                dl_kwargs = {}
+                # tqdm_class needs huggingface_hub>=1.0; CorridorKey 2.0 pins
+                # transformers<5, which keeps huggingface_hub on 0.x.
+                if "tqdm_class" in inspect.signature(hf_hub_download).parameters:
+                    dl_kwargs["tqdm_class"] = self._make_download_progress_class(
+                        on_progress=on_progress,
+                        on_status=on_status,
+                    )
                 ckpt_path = hf_hub_download(
                     repo_id=self.model_id,
                     filename=checkpoint_name,
-                    tqdm_class=self._make_download_progress_class(
-                        on_progress=on_progress,
-                        on_status=on_status,
-                    ),
+                    **dl_kwargs,
                 )
         except Exception as exc:
             friendly = friendly_proxy_error(exc)
