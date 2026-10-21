@@ -733,28 +733,48 @@ class ExrSequenceWriter:
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
+    def _write_item(self, idx0: int, arr: np.ndarray):
+        if self.clamp_half:
+            # float16 overflows to inf above 65504; keep half EXRs finite
+            arr = np.clip(arr, -65504.0, 65504.0)
+        for j in range(arr.shape[0]):
+            out_path = os.path.join(
+                self.dir_path, f"{self.frame_name}_{idx0 + j:06d}.exr")
+            frame = np.ascontiguousarray(arr[j])
+            if frame.shape[-1] == 1:
+                frame = frame[..., 0]
+            if not cv2.imwrite(out_path, frame, self.imwrite_params):
+                raise RuntimeError(f"cv2.imwrite failed: {out_path}")
+
     def _worker(self):
-        try:
-            while True:
-                item = self.q.get()
+        # Failure-safe: after the first error the worker keeps draining the
+        # queue (discarding items) until the None sentinel, so producers never
+        # block on a full queue.
+        while True:
+            item = self.q.get()
+            try:
                 if item is None:
-                    self.q.task_done()
                     return
-                idx0, arr = item
-                if self.clamp_half:
-                    # float16 overflows to inf above 65504; keep half EXRs finite
-                    arr = np.clip(arr, -65504.0, 65504.0)
-                for j in range(arr.shape[0]):
-                    out_path = os.path.join(
-                        self.dir_path, f"{self.frame_name}_{idx0 + j:06d}.exr")
-                    frame = np.ascontiguousarray(arr[j])
-                    if frame.shape[-1] == 1:
-                        frame = frame[..., 0]
-                    if not cv2.imwrite(out_path, frame, self.imwrite_params):
-                        raise RuntimeError(f"cv2.imwrite failed: {out_path}")
+                if self.err is None:
+                    try:
+                        self._write_item(*item)
+                    except BaseException as exc:
+                        self.err = exc
+            finally:
                 self.q.task_done()
-        except Exception as exc:
-            self.err = exc
+
+    def _put(self, item):
+        """Enqueue without ever blocking forever on a failed/dead worker."""
+        while True:
+            if self.err is not None:
+                raise self.err
+            try:
+                self.q.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                if not self.thread.is_alive():
+                    raise self.err or RuntimeError(
+                        f"EXR writer thread died: {self.dir_path}")
 
     def write_many(self, frames: np.ndarray):
         if self.err is not None:
@@ -766,14 +786,22 @@ class ExrSequenceWriter:
                 f"{self.channels} channels, got {arr.shape}")
         if arr.dtype != np.float32:
             raise ValueError(f"expected float32 frames, got {arr.dtype}")
-        self.q.put((self.frame_idx, arr))
+        self._put((self.frame_idx, arr))
         self.frame_idx += arr.shape[0]
 
     def write(self, frame: np.ndarray):
         self.write_many(frame[None])
 
     def release(self):
-        self.q.put(None)
+        if getattr(self, "_released", False):
+            return
+        self._released = True
+        while self.thread.is_alive():
+            try:
+                self.q.put(None, timeout=0.1)
+                break
+            except queue.Full:
+                continue
         self.thread.join()
         if self.err is not None:
             raise self.err

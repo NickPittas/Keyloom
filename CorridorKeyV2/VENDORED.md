@@ -11,4 +11,9 @@
 - Upstream `requirements.txt` lists `opencv-python`; this app uses a single `opencv-python-headless` install.
 
 ## Local patches to vendored code
-(none yet)
+1. `corridorkey/video_io.py` — `ExrSequenceWriter` failure-safe queue/shutdown (EZ-CorridorKey2).
+   - Worker keeps draining the queue after the first error (stored in `self.err`) until the sentinel, so producers never block on a full queue.
+   - New `_put()` enqueues with 0.1 s timeout loops and raises `self.err` (or RuntimeError if the thread died) instead of hanging.
+   - `release()` is idempotent; first call joins and re-raises the stored error, later calls are no-ops.
+   - Unchanged: naming `{frame_name}_{idx:06d}.exr`, half clamp ±65504, ZIP compression, dtype/channel validation.
+   - Tests: `tests/test_v2_exr_writer.py`.
