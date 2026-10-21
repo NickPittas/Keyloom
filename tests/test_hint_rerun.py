@@ -9,15 +9,18 @@ import types
 from typing import ClassVar
 
 import pytest
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from backend import ClipEntry, ClipState, JobType
 from backend.clip_state import MASK_TRACK_MANIFEST
 from backend.job_queue import GPUJobQueue
-from ui.main_window_mixins import hint_reset_mixin, model_run_mixin
+from ui.main_window_mixins import annotation_mixin, hint_reset_mixin, model_run_mixin
+from ui.main_window_mixins.annotation_mixin import AnnotationMixin
 from ui.main_window_mixins.chroma_key_mixin import ChromaKeyMixin
 from ui.main_window_mixins.hint_reset_mixin import HintResetMixin
 from ui.main_window_mixins.model_run_mixin import ModelRunMixin
+
+_APP = QApplication.instance() or QApplication([])
 
 
 def _touch(path, text="x"):
@@ -125,6 +128,7 @@ def box(monkeypatch):
     _Box.questions, _Box.warnings = [], []
     monkeypatch.setattr(hint_reset_mixin, "QMessageBox", _Box)
     monkeypatch.setattr(model_run_mixin, "QMessageBox", _Box)
+    monkeypatch.setattr(annotation_mixin, "QMessageBox", _Box)
 
 
 def _run(h, job_type):
@@ -283,3 +287,130 @@ def test_declined_guided_not_applicable_ready_without_mask(tmp_path):
     clip.state = ClipState.READY
     h = _Host(clip)
     assert not h._clip_has_videomama_ready_mask(clip)
+
+
+# ── SAM track vs. chroma/auto hints (Task 17) ──
+
+
+class _Panel:
+    def __getattr__(self, name):
+        if name.startswith("set_"):
+            return lambda *a, **k: None
+        raise AttributeError(name)
+
+    def get_params(self):
+        return types.SimpleNamespace()
+
+
+class _Model:
+    def has_annotations(self, *a):
+        return True
+
+
+class _TrackHost(AnnotationMixin, _Host):
+    def __init__(self, clip, busy=False):
+        super().__init__(clip, busy)
+        self._param_panel = _Panel()
+        iv = types.SimpleNamespace(annotation_model=_Model())
+        self._dual_viewer = types.SimpleNamespace(
+            input_viewer=iv, current_stem_index=0,
+        )
+        self.timers = []
+
+    def _auto_save_annotations(self):
+        pass
+
+    def _refresh_button_state(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _track_stubs(monkeypatch):
+    import ui.workers.gpu_job_worker as gw
+
+    def snap(clip, params, job_type=None, **k):
+        return types.SimpleNamespace(
+            id=f"{job_type.name}-{len(_Box.questions)}", job_type=job_type,
+            clip_name=clip.name, params={},
+        )
+
+    monkeypatch.setattr(gw, "create_job_snapshot", snap)
+    monkeypatch.setattr(
+        annotation_mixin.QTimer, "singleShot", staticmethod(lambda *a, **k: None),
+        raising=False,
+    )
+
+
+def _track_job_types(h):
+    return [j.job_type for j in h._service.job_queue.queue_snapshot]
+
+
+def test_chroma_ready_then_track_submits_sam_and_keeps_prompts(tmp_path):
+    clip = _make_clip(tmp_path, alpha=3, mask=False)
+    clip.state = ClipState.READY
+    h = _TrackHost(clip)
+    assert h._submit_sam2_track_job(clip) is True
+    assert len(_Box.questions) == 1
+    assert _track_job_types(h) == [JobType.SAM2_TRACK]
+    assert not os.path.exists(os.path.join(clip.root_path, "AlphaHint"))
+    assert os.path.exists(os.path.join(clip.root_path, "annotations.json"))
+    assert os.path.exists(os.path.join(clip.root_path, "Output", "FG", "frame_00000.png"))
+
+
+def test_track_rejected_confirm_leaves_files(tmp_path):
+    clip = _make_clip(tmp_path, alpha=3)
+    clip.state = ClipState.COMPLETE
+    _Box.answer = QMessageBox.No
+    h = _TrackHost(clip)
+    assert h._submit_sam2_track_job(clip) is False
+    assert _track_job_types(h) == []
+    assert os.path.exists(os.path.join(clip.root_path, "AlphaHint", "frame_00000.png"))
+    assert os.path.exists(os.path.join(clip.root_path, "VideoMamaMaskHint", "frame_00000.png"))
+
+
+def test_sam_masked_then_chroma_allowed(tmp_path):
+    clip = _make_clip(tmp_path, alpha=0, mask=True)
+    assert clip.state == ClipState.MASKED
+    h = _TrackHost(clip)
+    assert h._prepare_alpha_generator_run() is True
+
+
+def test_reset_keeping_prompts_then_track_allowed(tmp_path):
+    from backend.hint_assets import clear_hint_assets
+
+    clip = _make_clip(tmp_path, alpha=3)
+    clear_hint_assets(clip)
+    clip.mask_asset = clip.alpha_asset = None
+    clip.find_assets()
+    h = _TrackHost(clip)
+    assert h._submit_sam2_track_job(clip) is True
+    assert _Box.questions == []  # nothing to replace
+    assert _track_job_types(h) == [JobType.SAM2_TRACK]
+    assert os.path.exists(os.path.join(clip.root_path, "annotations.json"))
+
+
+def test_track_refused_when_busy_and_defers(tmp_path):
+    clip = _make_clip(tmp_path, alpha=3)
+    h = _TrackHost(clip, busy=True)
+    h._on_track_masks()
+    assert _track_job_types(h) == []
+    assert h._submit_sam2_track_job(clip) is False
+    assert h._pending_sam2_track == (clip, 0)  # deferred, not dropped
+    assert _Box.questions == []
+    assert os.path.exists(os.path.join(clip.root_path, "AlphaHint", "frame_00000.png"))
+
+
+def test_deferred_track_runs_when_idle_and_drops_stale(tmp_path):
+    clip = _make_clip(tmp_path, alpha=0, mask=True)
+    h = _TrackHost(clip, busy=True)
+    h._submit_sam2_track_job(clip)
+    h._gpu_worker.is_busy = lambda: False
+    h._retry_pending_sam2_track()
+    assert _track_job_types(h) == [JobType.SAM2_TRACK]
+    h2 = _TrackHost(clip, busy=True)
+    h2._submit_sam2_track_job(clip)
+    h2._gpu_worker.is_busy = lambda: False
+    h2._current_clip = None  # clip changed
+    h2._retry_pending_sam2_track()
+    assert _track_job_types(h2) == []
+    assert h2._pending_sam2_track is None

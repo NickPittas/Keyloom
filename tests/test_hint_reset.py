@@ -17,7 +17,8 @@ from PySide6.QtWidgets import QApplication
 from backend import ClipEntry, ClipState
 from backend.clip_state import MASK_TRACK_MANIFEST
 from backend.job_queue import GPUJobQueue
-from ui.main_window_mixins import hint_reset_mixin
+from ui.main_window_mixins import annotation_mixin, hint_reset_mixin
+from ui.main_window_mixins.annotation_mixin import AnnotationMixin
 from ui.main_window_mixins.hint_reset_mixin import HintResetMixin
 from ui.widgets.annotation_overlay import AnnotationModel
 from ui.widgets.parameter_panel import ParameterPanel
@@ -188,6 +189,7 @@ def fake_box(monkeypatch):
     _FakeBox.choice, _FakeBox.tick, _FakeBox.on_exec = "reset", False, None
     _FakeBox.warnings, _FakeBox.instances = [], []
     monkeypatch.setattr(hint_reset_mixin, "QMessageBox", _FakeBox)
+    monkeypatch.setattr(annotation_mixin, "QMessageBox", _FakeBox)
 
 
 def _paint(model, n=2):
@@ -353,3 +355,34 @@ def test_real_panel_reset_signal_and_track_gate():
     assert not panel._track_masks_btn.isEnabled()
     panel.set_track_enabled(True)
     assert panel._track_masks_btn.isEnabled()
+
+
+class _ClearHost(_Host, AnnotationMixin):
+    pass
+
+
+def test_clear_annotations_removes_masks_keeps_alpha_and_holdouts(tmp_path):
+    clip = _make_clip(tmp_path)
+    root = clip.root_path
+    h = _ClearHost(clip)
+    _paint(h.shared)
+    h.shared.save(root)
+    h._on_clear_annotations()
+    assert not os.path.exists(os.path.join(root, "VideoMamaMaskHint"))
+    assert not os.path.exists(os.path.join(root, MASK_TRACK_MANIFEST))
+    assert not os.path.exists(os.path.join(root, "annotations.json"))
+    assert os.path.exists(os.path.join(root, "AlphaHint", "frame_00000.png"))
+    assert os.path.exists(os.path.join(root, "holdout_strokes.json"))
+    assert clip.mask_asset is None and clip.alpha_asset is not None
+    assert ("set_videomama_enabled", False) in h._param_panel.calls
+    assert ("set_matanyone2_enabled", False) in h._param_panel.calls
+    assert h.annotation_updates == 1
+
+
+def test_clear_annotations_refused_when_busy(tmp_path):
+    clip = _make_clip(tmp_path)
+    h = _ClearHost(clip, busy=True)
+    _paint(h.shared)
+    h._on_clear_annotations()
+    assert os.path.exists(os.path.join(clip.root_path, "VideoMamaMaskHint"))
+    assert h.shared.has_annotations()

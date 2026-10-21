@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import os
-import shutil
 import logging
 
 import cv2
 import numpy as np
 from PySide6.QtWidgets import QMessageBox
 from PySide6.QtGui import QImage
+from PySide6.QtCore import QTimer
 
 from . import _tr
 
 from backend import ClipEntry
+from backend.hint_assets import clear_hint_assets
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,11 @@ class AnnotationMixin:
         clip = self._current_clip
         if clip is None:
             return
+        # Any new request supersedes a deferred full-track continuation
+        self._pending_sam2_track = None
+        if not self._hint_mutation_allowed():
+            self._refresh_hint_tools()
+            return
         self._auto_save_annotations()
         iv = self._dual_viewer.input_viewer
         model = iv.annotation_model
@@ -141,20 +147,41 @@ class AnnotationMixin:
         from ui.workers.gpu_job_worker import create_job_snapshot
         from backend import JobType
 
+        if self._current_clip is not clip:
+            return False
+        if not self._hint_mutation_allowed():
+            # The accepted preview job may not be terminal yet (result signal
+            # arrives before the worker finishes). Defer, never drop or overlap.
+            self._defer_sam2_track(clip)
+            return False
+        self._pending_sam2_track = None
+
         alpha_dir = os.path.join(clip.root_path, "AlphaHint")
-        if os.path.isdir(alpha_dir):
+        if clip.alpha_asset is not None or os.path.isdir(alpha_dir):
             reply = QMessageBox.question(
                 self, _tr("Replace Existing Alpha?"),
-                _tr("This clip already has an AlphaHint (from GVM or a previous run).\n\n"
+                _tr("This clip already has an AlphaHint (from GVM, chroma key or a previous run).\n\n"
                     "Tracking a new mask sequence will replace that alpha hint.\n\n"
                     "Remove existing AlphaHint and proceed?"),
             )
             if reply != QMessageBox.Yes:
                 return False
-            shutil.rmtree(alpha_dir, ignore_errors=True)
-            clip.alpha_asset = None
-            clip.find_assets()
+            if self._current_clip is not clip or not self._hint_mutation_allowed():
+                self._refresh_hint_tools()
+                return False
+            try:
+                clear_hint_assets(clip, clear_alpha=True, clear_masks=False)
+            except OSError as e:
+                logger.warning("Could not remove AlphaHint for %s: %s", clip.name, e)
+                QMessageBox.warning(
+                    self, _tr("Replace Existing Alpha?"),
+                    _tr("Could not delete the existing AlphaHint: %s") % e,
+                )
+                self._refresh_hint_tools()
+                return False
+            self._rescan_after_alpha_clear(clip)
             self._refresh_button_state()
+            self._refresh_hint_tools()
             logger.info("Removed existing AlphaHint/ before SAM2 tracking")
 
         job = create_job_snapshot(clip, self._param_panel.get_params(), job_type=JobType.SAM2_TRACK)
@@ -164,6 +191,37 @@ class AnnotationMixin:
         clip.set_processing(True)
         self._start_worker_if_needed(job.id, job_label="Track Mask")
         return True
+
+    _SAM2_DEFER_MS = 200
+    _SAM2_DEFER_MAX = 150  # ~30 s
+
+    def _defer_sam2_track(self, clip: ClipEntry) -> None:
+        """Remember an accepted full track and retry once the queue is idle."""
+        self._pending_sam2_track = (clip, 0)
+        QTimer.singleShot(self._SAM2_DEFER_MS, self._retry_pending_sam2_track)
+
+    def _retry_pending_sam2_track(self) -> None:
+        pending = getattr(self, "_pending_sam2_track", None)
+        if not pending:
+            return
+        clip, tries = pending
+        if self._current_clip is not clip:
+            self._pending_sam2_track = None  # stale: clip changed
+            return
+        if not self._hint_mutation_allowed():
+            if tries + 1 >= self._SAM2_DEFER_MAX:
+                self._pending_sam2_track = None
+                self._refresh_hint_tools()
+                QMessageBox.warning(
+                    self, _tr("Track Mask"),
+                    _tr("Another job is still running. Run Track Mask again when it finishes."),
+                )
+                return
+            self._pending_sam2_track = (clip, tries + 1)
+            QTimer.singleShot(self._SAM2_DEFER_MS, self._retry_pending_sam2_track)
+            return
+        self._pending_sam2_track = None
+        self._submit_sam2_track_job(clip)
 
     @staticmethod
     def _sam2_preview_qimage(frame_rgb: np.ndarray, mask: np.ndarray) -> QImage:
@@ -235,25 +293,35 @@ class AnnotationMixin:
 
     def _on_clear_annotations(self) -> None:
         """Clear all annotations on the current clip and remove tracked masks."""
-        iv = self._dual_viewer.input_viewer
-        iv.clear_annotations()
-        self._update_annotation_info()
-
-        # Remove exported mask directory so VideoMaMa button disables
         clip = self._current_clip
+        if not self._hint_mutation_allowed():
+            self._refresh_hint_tools()
+            return
+        error = None
         if clip is not None:
-            mask_dir = os.path.join(clip.root_path, "VideoMamaMaskHint")
-            if os.path.isdir(mask_dir):
-                shutil.rmtree(mask_dir, ignore_errors=True)
-                logger.info(f"Removed mask hints: {mask_dir}")
-            manifest_path = os.path.join(clip.root_path, ".corridorkey_mask_manifest.json")
-            if os.path.isfile(manifest_path):
-                os.remove(manifest_path)
+            # Masks + manifest only: AlphaHint and holdout strokes are kept
+            try:
+                clear_hint_assets(clip, clear_alpha=False, clear_masks=True)
+            except OSError as e:
+                error = e
+                logger.warning("Could not remove mask hints for %s: %s", clip.name, e)
+            self._clear_annotations_for_reset(clip)
+        else:
+            self._dual_viewer.input_viewer.clear_annotations()
+        self._update_annotation_info()
+        if clip is not None:
             clip.mask_asset = None
-            clip.find_assets()
-            _has_mask = self._clip_has_videomama_ready_mask(clip)
-            self._param_panel.set_videomama_enabled(_has_mask)
-            self._param_panel.set_matanyone2_enabled(_has_mask)
+            try:
+                clip.find_assets()
+            except Exception:
+                logger.exception("find_assets failed after clearing annotations")
+            self._clip_model.update_clip_state(clip.name, clip.state)
+            self._refresh_hint_tools()
+        if error is not None:
+            QMessageBox.warning(
+                self, _tr("Clear Annotations"),
+                _tr("Could not delete all mask files: %s") % error,
+            )
 
     def _update_annotation_info(self) -> None:
         """Update parameter panel with current annotation count and scrubber markers."""
