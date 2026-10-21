@@ -343,6 +343,9 @@ class MainWindow(
         self._bg_cache: QImage | None = None
         # Batch pipeline: clip_name -> remaining queued steps after the current one.
         self._pipeline_steps: dict[str, list[JobType]] = {}
+        # Frozen per-clip settings for auto-chained INFERENCE steps:
+        # {clip_name: {"params": InferenceParams, "output_config": OutputConfig, "frame_range": tuple|None}}
+        self._pipeline_settings: dict[str, dict] = {}
         # Batch Pipeline dialog state
         self._init_batch_pipeline()
         # Debug console — created eagerly so log handler captures from startup
@@ -578,7 +581,7 @@ class MainWindow(
         self._gpu_worker.status_update.connect(self._on_worker_status)
         self._gpu_worker.error.connect(self._on_worker_error)
         self._gpu_worker.queue_empty.connect(self._on_queue_empty)
-        self._gpu_worker.sam2_preview_result.connect(self._on_reprocess_result)
+        self._gpu_worker.sam2_preview_result.connect(self._on_sam2_preview_result)
 
         # GPU monitor -> top bar widgets (not status bar)
         self._gpu_monitor.vram_updated.connect(self._update_vram)
@@ -634,9 +637,8 @@ class MainWindow(
             _on_stroke_finished
         )
 
-        # Parameter panel — live reprocess (debounced, Codex: coalesce stale)
+        # Parameter panel changes (no live re-key in CorridorKey 2.0)
         self._param_panel.params_changed.connect(self._on_params_changed)
-        self._param_panel._live_preview.toggled.connect(self._on_live_preview_toggled)
 
         # Sync IO tray divider with dual viewer splitter
         self._dual_viewer._viewer_splitter.splitterMoved.connect(self._sync_io_divider)

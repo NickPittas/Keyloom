@@ -46,7 +46,6 @@ class SessionMixin:
             "version": _SESSION_VERSION,
             "params": self._param_panel.get_params().to_dict(),
             "output_config": self._param_panel.get_output_config().to_dict(),
-            "live_preview": self._param_panel.live_preview_enabled,
         }
 
         # Window geometry
@@ -97,10 +96,6 @@ class SessionMixin:
                 self._param_panel.set_output_config(config)
             except Exception as e:
                 logger.warning(f"Failed to restore output config: {e}")
-
-        # Restore live preview toggle
-        if "live_preview" in data:
-            self._param_panel._live_preview.setChecked(bool(data["live_preview"]))
 
         if "clip_input_is_linear" in data:
             try:

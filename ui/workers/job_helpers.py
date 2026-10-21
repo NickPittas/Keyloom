@@ -5,9 +5,11 @@ import copy
 
 from backend import (
     ClipEntry,
+    ClipState,
     GPUJob,
     InferenceParams,
     JobType,
+    OutputConfig,
 )
 
 
@@ -53,13 +55,44 @@ def create_job_snapshot(
         job_params["_birefnet_usage"] = birefnet_usage
     elif job_type == JobType.CHROMA_KEY_ALPHA:
         job_params["_chroma_params"] = chroma_params or {}
-    elif job_type == JobType.PREVIEW_REPROCESS:
-        if params is None:
-            params = InferenceParams()
-        job_params["_inference_params"] = params
 
     return GPUJob(
         job_type=job_type,
         clip_name=clip.name,
         params=job_params,
     )
+
+
+def clip_frame_range(clip: ClipEntry) -> tuple[int, int] | None:
+    """In/out range to publish, or None for the whole clip."""
+    if clip.in_out_range is None:
+        return None
+    return (clip.in_out_range.in_point, clip.in_out_range.out_point)
+
+
+def reset_complete_state(clip: ClipEntry) -> None:
+    """Move a COMPLETE clip back to the state its assets support, for a re-run."""
+    if clip.state != ClipState.COMPLETE:
+        return
+    if clip.alpha_asset is not None:
+        clip.transition_to(ClipState.READY)
+    elif clip.mask_asset is not None:
+        clip.transition_to(ClipState.MASKED)
+    else:
+        clip.transition_to(ClipState.RAW)
+
+
+def create_inference_job(
+    clip: ClipEntry,
+    params: InferenceParams,
+    output_config: OutputConfig,
+    *,
+    frame_range: tuple[int, int] | None = None,
+    resume: bool = False,
+) -> GPUJob:
+    """Create a CorridorKey 2.0 INFERENCE job with frozen params/output/range."""
+    job = create_job_snapshot(clip, params, resume=resume)
+    job.params["_output_config"] = output_config
+    if frame_range is not None:
+        job.params["_frame_range"] = tuple(frame_range)
+    return job
