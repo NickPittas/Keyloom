@@ -1,5 +1,9 @@
 import os
 import sys
+# CorridorKey 2.0 4K windows OOM from allocator fragmentation without this;
+# must be set before torch initialises CUDA. Linux only (unsupported on Windows).
+if sys.platform.startswith("linux") and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 import argparse
 import logging
 import glob

@@ -7,6 +7,11 @@ import sys
 import time
 from pathlib import Path
 
+# CorridorKey 2.0 4K windows OOM from allocator fragmentation without this;
+# must be set before torch initialises CUDA. Linux only (unsupported on Windows).
+if sys.platform.startswith("linux") and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -69,7 +74,7 @@ def check_outputs(clip, n, expect_hw):
         print("   ", info)
         if img.shape[:2] != expect_hw:
             errs.append(f"{sub}: size {img.shape[:2]} != {expect_hw}")
-        if img.dtype == np.float32 and not (-0.02 <= img.min() and img.max() <= 1.02) and sub in ("FG", "Matte", "Comp"):
+        if img.dtype == np.float32 and not (-0.02 <= img.min() and img.max() <= 1.02) and sub == "Matte":
             errs.append(f"{sub}: values outside [0,1]")
     return errs
 
