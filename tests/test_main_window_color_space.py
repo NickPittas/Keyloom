@@ -43,6 +43,8 @@ class _DummyParamPanel:
     def set_videomama_enabled(self, enabled): pass
     def set_matanyone2_enabled(self, enabled): pass
     def set_import_alpha_enabled(self, enabled): pass
+    def set_reset_hint_enabled(self, enabled): pass
+    def set_track_enabled(self, enabled): pass
     def set_annotation_info(self, annotated, total): pass
     def reset_chroma_params(self): pass
 
@@ -136,6 +138,11 @@ class _DummyTray:
 class _DummyGpuWorker:
     def isRunning(self) -> bool:
         return False
+
+    def is_busy(self) -> bool:
+        return False
+
+    current_job_id = None
 
 
 class _DummyStatusBar:
