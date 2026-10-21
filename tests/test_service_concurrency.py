@@ -1,85 +1,53 @@
-"""Behavioral tests for GPU lock serialization (Codex: not structural).
-
-Uses threading.Barrier + time recording to prove process_frame calls
-don't overlap, without asserting Lock.acquire directly.
-"""
+"""Behavioral tests for GPU lock serialization of whole-clip CorridorKey 2.0 runs."""
 import threading
 import time
 from unittest.mock import MagicMock
-
-import numpy as np
-import pytest
 
 from backend.service import CorridorKeyService, InferenceParams, OutputConfig, _ActiveModel
 from backend.clip_state import ClipAsset, ClipEntry, ClipState
 
 
-def _make_slow_engine(delay: float = 0.1):
-    """Create a mock engine whose process_frame takes `delay` seconds."""
-    engine = MagicMock()
-    call_log = []
-
-    def slow_process(*args, **kwargs):
-        start = time.monotonic()
-        call_log.append(("start", start))
-        time.sleep(delay)
-        end = time.monotonic()
-        call_log.append(("end", end))
-        return {
-            "fg": np.ones((4, 4, 3), dtype=np.float32),
-            "alpha": np.ones((4, 4, 1), dtype=np.float32),
-            "comp": np.ones((4, 4, 3), dtype=np.float32),
-            "processed": np.ones((4, 4, 4), dtype=np.float32),
-        }
-
-    engine.process_frame.side_effect = slow_process
-    return engine, call_log
-
-
 class TestGPULockSerialization:
-    """Two threads running reprocess_single_frame should not overlap."""
+    """Two whole-clip runs share one engine and must not overlap on the GPU."""
 
-    def test_concurrent_reprocess_serialized(self, sample_clip):
+    def test_concurrent_runs_serialized_single_engine(self, sample_clip, tmp_path, monkeypatch):
+        from backend.service.v2_inputs import V2PreparedInput
+
+        monkeypatch.setenv("CORRIDORKEY_V2_SCRATCH_DIR", str(tmp_path))
         svc = CorridorKeyService()
-        engine, call_log = _make_slow_engine(0.05)
-        svc._engine_pool = [engine]
-        svc._active_model = _ActiveModel.INFERENCE
-        params = InferenceParams(screen_color="green")
+        log = []
+        engine = MagicMock()
 
-        results = [None, None]
-        errors = [None, None]
+        def slow_run(*args, **kwargs):
+            log.append(("start", time.monotonic()))
+            time.sleep(0.05)
+            log.append(("end", time.monotonic()))
+            raise RuntimeError("stop after run_clip")
 
-        def worker(idx):
+        engine.run_clip.side_effect = slow_run
+        svc._get_v2_engine = MagicMock(return_value=engine)
+        prepared = V2PreparedInput("x", ["a"], 1, 24.0, False, None)
+        monkeypatch.setattr("backend.service.inference.prepare_v2_inputs",
+                            lambda *a, **k: prepared)
+        errors = []
+
+        def worker():
             try:
-                results[idx] = svc.reprocess_single_frame(sample_clip, params, 0)
-            except Exception as e:
-                errors[idx] = e
+                svc.run_inference(sample_clip, InferenceParams(), output_config=OutputConfig())
+            except RuntimeError as e:
+                errors.append(e)
 
-        t1 = threading.Thread(target=worker, args=(0,))
-        t2 = threading.Thread(target=worker, args=(1,))
-        t1.start()
-        t2.start()
-        t1.join(timeout=5)
-        t2.join(timeout=5)
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
 
-        assert errors[0] is None, f"Thread 0 error: {errors[0]}"
-        assert errors[1] is None, f"Thread 1 error: {errors[1]}"
-        assert results[0] is not None
-        assert results[1] is not None
-
-        # Verify serialization: no overlapping process_frame calls
-        starts = [t for label, t in call_log if label == "start"]
-        ends = [t for label, t in call_log if label == "end"]
-        assert len(starts) == 2
-        assert len(ends) == 2
-
-        # Second call must start after first call ends
-        sorted_starts = sorted(starts)
-        sorted_ends = sorted(ends)
-        assert sorted_starts[1] >= sorted_ends[0], (
-            f"Overlap detected: second start {sorted_starts[1]:.4f} "
-            f"< first end {sorted_ends[0]:.4f}"
-        )
+        assert len(errors) == 2
+        starts = sorted(t for k, t in log if k == "start")
+        ends = sorted(t for k, t in log if k == "end")
+        assert len(starts) == 2 and len(ends) == 2
+        assert starts[1] >= ends[0], "run_clip calls overlapped"
 
 
 class TestGPULockModelSwitch:
@@ -87,7 +55,7 @@ class TestGPULockModelSwitch:
 
     def test_model_residency_consistent_after_concurrent_access(self):
         svc = CorridorKeyService()
-        svc._engine_pool = [MagicMock()]
+        svc._v2_engine = MagicMock()
         svc._gvm_processor = MagicMock()
         svc._active_model = _ActiveModel.INFERENCE
 

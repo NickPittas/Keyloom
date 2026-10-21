@@ -5,7 +5,6 @@ stays loaded at a time. Switching triggers offload + gc + cache clear.
 """
 from __future__ import annotations
 
-import gc
 import logging
 import os
 import sys
@@ -72,21 +71,11 @@ class ModelManagerMixin:
         Only ONE heavy model stays in VRAM at a time. Before loading a
         different model, the previous is moved to CPU and dereferenced.
 
-        Uses gated protocol: sets _switch_pending to block new inference
-        sessions, then waits for active sessions to drain before switching.
+        Callers must hold ``_gpu_lock`` so a switch never unloads a model
+        that a running job is using.
         """
         if self._active_model == needed:
             return
-
-        # Gate: block new inference sessions and wait for active ones to drain
-        if self._active_model == _ActiveModel.INFERENCE and needed != _ActiveModel.INFERENCE:
-            with self._gate_lock:
-                self._switch_pending = True
-            # Wait for all active inference sessions to finish
-            if not self._inference_idle.wait(timeout=300):  # 5 min max
-                logger.warning("Timed out waiting for inference sessions to drain")
-            with self._gate_lock:
-                self._switch_pending = False
 
         # Unload whatever is currently loaded
         if self._active_model != _ActiveModel.NONE:
@@ -101,9 +90,9 @@ class ModelManagerMixin:
             if on_status:
                 on_status(f"Offloading {self._active_model.value}...")
             if self._active_model == _ActiveModel.INFERENCE:
-                for eng in self._engine_pool:
-                    self._safe_offload(eng)
-                self._engine_pool.clear()
+                if self._v2_engine is not None:
+                    self._v2_engine.unload()
+                    self._v2_engine = None
             elif self._active_model == _ActiveModel.GVM:
                 # GVM has circular refs (pipe <-> vae <-> unet) — break them
                 # explicitly so gc can reclaim everything in one pass.
@@ -158,113 +147,25 @@ class ModelManagerMixin:
             except ImportError:
                 logger.debug("torch not available for cache clear during model switch")
 
-            # Reset Triton/dynamo/inductor compilation cache so torch.compile
-            # doesn't choke on stale CUDA state from the previous model
-            try:
-                import torch._dynamo
-                torch._dynamo.reset()
-                logger.info("torch._dynamo.reset() — cleared compilation cache")
-            except Exception as e:
-                logger.debug(f"dynamo reset skipped: {e}")
-
-            try:
-                import torch._inductor
-                torch._inductor.codecache.PyCodeCache.clear()
-                logger.info("torch._inductor code cache cleared")
-            except Exception as e:
-                logger.debug(f"inductor cache clear skipped: {e}")
-
             vram_after_mb = self._vram_allocated_mb()
             freed = vram_before_mb - vram_after_mb
             logger.info(f"VRAM after unload: {vram_after_mb:.0f}MB (freed {freed:.0f}MB)")
 
         self._active_model = needed
 
-    def _get_engine_pool(self, on_status=None, screen_color: str = "green") -> list:
-        """Lazy-load the CorridorKey inference engine pool.
-
-        Creates up to _pool_size engines. If the pool already has enough
-        engines, returns immediately. OOM during creation shrinks the pool
-        to however many engines fit in VRAM.
-
-        Uses the backend factory to auto-detect MLX on Apple Silicon.
-        MLX forces pool_size=1 (unified memory, no multi-engine benefit).
-
-        If screen_color differs from the currently loaded variant, the
-        pool is cleared and reloaded with the correct checkpoint.
-        """
+    def _get_v2_engine(self, on_status=None):
+        """Lazy-load the single CorridorKey 2.0 engine. Caller holds ``_gpu_lock``."""
         self._ensure_model(_ActiveModel.INFERENCE, on_status=on_status)
-
-        # Reload if screen color changed (green <-> blue checkpoint)
-        if self._engine_pool and self._engine_screen_color != screen_color:
-            logger.info("Screen color changed %s -> %s, reloading engine pool",
-                        self._engine_screen_color, screen_color)
-            for eng in self._engine_pool:
-                self._safe_offload(eng)
-            self._engine_pool.clear()
-            gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except ImportError:
-                pass
-
-        # Pool already has enough engines
-        if len(self._engine_pool) >= self._pool_size:
-            return self._engine_pool[:self._pool_size]
-
-        from CorridorKeyModule.backend import create_engine, resolve_backend
-
-        # Read user's backend preference (macOS: auto/mlx/torch)
-        requested_backend = None
+        if self._v2_engine is None:
+            from backend.corridorkey_v2 import CorridorKeyV2Engine
+            self._v2_engine = CorridorKeyV2Engine(device=self._device)
         try:
-            from PySide6.QtCore import QSettings
-            requested_backend = QSettings().value("inference/backend", "auto", type=str)
-            if requested_backend == "auto":
-                requested_backend = None  # let resolve_backend auto-detect
-        except Exception:
-            pass
-        backend = resolve_backend(requested_backend)
-        opt_mode = os.environ.get('CORRIDORKEY_OPT_MODE', 'auto')
-        _img_size = self._model_resolution
-
-        # MLX: unified memory, single engine only
-        pool_size = 1 if backend == "mlx" else self._pool_size
-
-        # Create engines serially (warmup each before creating next)
-        import torch
-        for i in range(len(self._engine_pool), pool_size):
-            if on_status:
-                on_status(f"Loading engine {i + 1}/{pool_size}...")
-            logger.info("Creating engine %d/%d (backend=%s)", i + 1, pool_size, backend)
-            t0 = time.monotonic()
-            try:
-                engine = create_engine(
-                    backend=backend,
-                    device=self._device,
-                    img_size=_img_size,
-                    optimization_mode=opt_mode,
-                    on_status=on_status if i == 0 else None,
-                    screen_color=screen_color,
-                )
-                self._engine_pool.append(engine)
-                self._engine_screen_color = screen_color
-                logger.info(f"Engine {i + 1} loaded in {time.monotonic() - t0:.1f}s")
-            except (RuntimeError, torch.cuda.OutOfMemoryError):
-                logger.warning(
-                    "OOM creating engine %d/%d, using %d engine(s)",
-                    i + 1, pool_size, len(self._engine_pool),
-                )
-                gc.collect()
-                if backend == "torch":
-                    torch.cuda.empty_cache()
-                break
-
-        if not self._engine_pool:
-            raise RuntimeError("Failed to create any inference engine")
-
-        return self._engine_pool
+            self._v2_engine.load(on_status)
+        except BaseException:
+            self._v2_engine = None
+            self._active_model = _ActiveModel.NONE
+            raise
+        return self._v2_engine
 
     def _get_gvm(self):
         """Lazy-load the GVM processor."""
@@ -364,9 +265,9 @@ class ModelManagerMixin:
 
     def unload_engines(self) -> None:
         """Free GPU memory by unloading all engines."""
-        for eng in self._engine_pool:
-            self._safe_offload(eng)
-        self._engine_pool.clear()
+        if self._v2_engine is not None:
+            self._v2_engine.unload()
+            self._v2_engine = None
         self._safe_offload(self._gvm_processor)
         self._safe_offload(self._sam2_tracker)
         self._safe_offload(self._videomama_pipeline)
@@ -390,4 +291,4 @@ class ModelManagerMixin:
 
     def is_engine_loaded(self) -> bool:
         """True if the inference engine is already loaded in VRAM."""
-        return self._active_model == _ActiveModel.INFERENCE and len(self._engine_pool) > 0
+        return self._active_model == _ActiveModel.INFERENCE and self._v2_engine is not None and self._v2_engine.is_loaded

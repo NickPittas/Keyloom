@@ -11,10 +11,8 @@ Model Residency Policy:
 """
 from __future__ import annotations
 
-import gc
 import logging
 import threading
-import time
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -142,8 +140,6 @@ class CorridorKeyService(
     """
 
     def __init__(self):
-        self._engine_pool: list = []
-        self._pool_size: int = 1
         self._v2_engine = None
         self._gvm_processor = None
         self._sam2_tracker = None
@@ -157,12 +153,6 @@ class CorridorKeyService(
         self._sam2_model_id: str = "facebook/sam2.1-hiera-base-plus"
         # GPU mutex — serializes ALL model operations
         self._gpu_lock = threading.Lock()
-        # Gated model switch — prevents starvation during model switch
-        self._inference_active: int = 0
-        self._switch_pending: bool = False
-        self._gate_lock = threading.Lock()
-        self._inference_idle = threading.Event()
-        self._inference_idle.set()
 
     @property
     def job_queue(self) -> GPUJobQueue:
@@ -193,48 +183,6 @@ class CorridorKeyService(
                     torch.cuda.empty_cache()
             except Exception:
                 logger.debug("CUDA cache clear skipped after SAM2 model switch", exc_info=True)
-
-    def set_pool_size(self, n: int) -> None:
-        """Set the number of parallel inference engines."""
-        n = max(1, n)
-        if n != self._pool_size:
-            logger.info("Engine pool size: %d -> %d", self._pool_size, n)
-            old_size = self._pool_size
-            self._pool_size = n
-            # Trim excess engines to free VRAM immediately
-            if n < old_size and len(self._engine_pool) > n:
-                excess = self._engine_pool[n:]
-                self._engine_pool = self._engine_pool[:n]
-                for eng in excess:
-                    del eng
-                gc.collect()
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                logger.info("Trimmed %d excess engine(s), freed VRAM", len(excess))
-
-    def _begin_inference(self) -> None:
-        """Mark an inference session as active (gated model switch)."""
-        with self._gate_lock:
-            if self._switch_pending:
-                # Model switch is waiting — block until it completes
-                pass
-            self._inference_active += 1
-            self._inference_idle.clear()
-        # If switch_pending, wait outside gate_lock to avoid deadlock
-        while self._switch_pending:
-            time.sleep(0.05)
-
-    def _end_inference(self) -> None:
-        """Mark an inference session as finished."""
-        with self._gate_lock:
-            self._inference_active -= 1
-            if self._inference_active <= 0:
-                self._inference_active = 0
-                self._inference_idle.set()
 
     # --- Device Utilities ---
 

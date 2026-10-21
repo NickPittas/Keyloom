@@ -1,68 +1,37 @@
-"""Core CorridorKey inference pipeline — dispatcher, sequential, and finalization."""
+"""CorridorKey 2.0 whole-clip inference: prepare inputs, run the engine, publish outputs."""
 from __future__ import annotations
 
 import logging
 import os
+import shutil
+import tempfile
 import time
-from collections import deque
 from typing import Callable, Optional
 
-import cv2
-import numpy as np
-
 from ..clip_state import ClipEntry, ClipState
-from ..errors import (
-    CorridorKeyError,
-    FrameReadError,
-    JobCancelledError,
-    WriteFailureError,
-)
-from ..frame_io import open_video, read_video_frame_at, read_video_mask_at
+from ..errors import CorridorKeyError, JobCancelledError
 from ..job_queue import GPUJob
-from ..validators import ensure_output_dirs, validate_frame_counts
-from .inference_parallel import ParallelInferenceMixin
+from ..validators import ensure_output_dirs
+from .v2_inputs import prepare_v2_inputs
 
 logger = logging.getLogger(__name__)
 
+_MANIFEST_NAME = ".corridorkey_manifest.json"
+# float32 channels per runtime product (uncompressed EXR upper bound; do not assume compression)
+_PRODUCT_CHANNELS = {"alpha": 1, "fg": 3, "checker": 3, "cutout": 4}
 
-class InferenceMixin(ParallelInferenceMixin):
-    """Mixin providing core inference pipeline for CorridorKeyService."""
 
-    def _resolve_screen_color(self, clip: ClipEntry) -> str:
-        """Detect green vs blue from the clip's middle frame.
+def _scratch_root() -> str:
+    root = os.environ.get("CORRIDORKEY_V2_SCRATCH_DIR")
+    if not root:
+        from ..v2_paths import get_v2_models_dir
+        root = str(get_v2_models_dir().parent)
+    os.makedirs(root, exist_ok=True)
+    return root
 
-        Reads a single frame at the midpoint and checks the dominant
-        border hue. Caches the result on the clip entry.
-        """
-        cached = getattr(clip, '_screen_color_cache', None)
-        if cached:
-            return cached
 
-        from CorridorKeyModule.core.color_utils import detect_screen_color
-        from . import read_image_frame
-
-        try:
-            if clip.input_asset is None:
-                return "green"
-            files = clip.input_asset.get_frame_files()
-            if not files:
-                return "green"
-            mid_idx = len(files) // 2
-            fpath = os.path.join(clip.input_asset.path, files[mid_idx])
-            frame = read_image_frame(fpath)
-            if frame is None:
-                return "green"
-            # detect_screen_color expects uint8; convert from float32 [0,1]
-            if frame.dtype != np.uint8:
-                frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
-            result = detect_screen_color(frame)
-            clip._screen_color_cache = result
-            logger.info("Auto-detected screen color for '%s': %s (frame %d/%d)",
-                        clip.name, result, mid_idx, len(files))
-            return result
-        except Exception as e:
-            logger.warning("Screen color detection failed for '%s': %s", clip.name, e)
-            return "green"
+class InferenceMixin:
+    """Mixin providing the CorridorKey 2.0 inference pipeline for CorridorKeyService."""
 
     def run_inference(
         self,
@@ -76,363 +45,171 @@ class InferenceMixin(ParallelInferenceMixin):
         output_config=None,
         frame_range: Optional[tuple[int, int]] = None,
     ) -> list:
-        """Run CorridorKey inference on a single clip.
+        """Key one clip with CorridorKey 2.0.
 
-        Uses gated model switch protocol. If pool_size > 1, dispatches
-        to _run_inference_parallel with N engines processing N frames
-        concurrently. Otherwise uses _run_inference_sequential.
+        The whole clip is always inferred (temporal context); ``frame_range``
+        (inclusive) and ``skip_stems`` only limit which frames are published.
         """
-        if clip.input_asset is None or clip.alpha_asset is None:
-            raise CorridorKeyError(f"Clip '{clip.name}' missing input or alpha asset")
-
-        # Resolve "auto" screen color from the clip's middle frame
-        if params.screen_color == "auto":
-            from .core import InferenceParams
-            resolved = self._resolve_screen_color(clip)
-            params = InferenceParams(**{**params.to_dict(), "screen_color": resolved})
-
-        self._begin_inference()
-        try:
-            if on_status:
-                on_status("Loading model...")
-            logger.info("run_inference: waiting for _gpu_lock")
-            with self._gpu_lock:
-                logger.info("run_inference: acquired _gpu_lock")
-                engines = self._get_engine_pool(on_status=on_status,
-                                                screen_color=params.screen_color)
-
-            if len(engines) == 1:
-                return self._run_inference_sequential(
-                    clip, params, engines[0], job=job,
-                    on_progress=on_progress, on_warning=on_warning,
-                    on_status=on_status, skip_stems=skip_stems,
-                    output_config=output_config, frame_range=frame_range,
-                )
-            return self._run_inference_parallel(
-                clip, params, engines, job=job,
-                on_progress=on_progress, on_warning=on_warning,
-                on_status=on_status, skip_stems=skip_stems,
-                output_config=output_config, frame_range=frame_range,
-            )
-        finally:
-            self._end_inference()
-
-    def _run_inference_sequential(
-        self,
-        clip: ClipEntry,
-        params,
-        engine,
-        job: Optional[GPUJob] = None,
-        on_progress: Optional[Callable[..., None]] = None,
-        on_warning: Optional[Callable[[str], None]] = None,
-        on_status: Optional[Callable[[str], None]] = None,
-        skip_stems: Optional[set[str]] = None,
-        output_config=None,
-        frame_range: Optional[tuple[int, int]] = None,
-    ) -> list:
-        """Sequential frame loop — exact extraction of original run_inference."""
         from .core import FrameResult, OutputConfig
-        t_start = time.monotonic()
-        dirs = ensure_output_dirs(clip.output_dir)
+
+        if clip.input_asset is None:
+            raise CorridorKeyError(f"Clip '{clip.name}' has no input asset")
+        if params.use_alpha_hint and clip.alpha_asset is None:
+            raise CorridorKeyError(
+                f"Clip '{clip.name}' has no AlphaHint; turn off 'Use AlphaHint' or generate one"
+            )
         cfg = output_config or OutputConfig()
+        cfg.validate_selection()
 
-        self._write_manifest(dirs['root'], cfg, params)
+        def check_cancel() -> None:
+            if job is not None and job.is_cancelled:
+                raise JobCancelledError(clip.name)
 
-        if clip.input_asset.asset_type == 'sequence' and clip.alpha_asset.asset_type == 'sequence':
-            num_frames = clip.input_asset.frame_count
-            if clip.input_asset.frame_count != clip.alpha_asset.frame_count:
-                logger.warning(
-                    "Clip '%s': sequence alpha count mismatch — input has %d, alpha has %d. "
-                    "Using stem-matched alpha reads across the selected range.",
-                    clip.name,
-                    clip.input_asset.frame_count,
-                    clip.alpha_asset.frame_count,
+        t_start = time.monotonic()
+        if on_status:
+            on_status("Loading model...")
+        root = _scratch_root()
+        self._v2_check_disk(clip, cfg, root)
+        with tempfile.TemporaryDirectory(prefix="run_", dir=root) as scratch:
+            with self._gpu_lock:
+                engine = self._get_v2_engine(on_status)
+                prepared = prepare_v2_inputs(
+                    clip, use_alpha_hint=params.use_alpha_hint,
+                    staging_dir=os.path.join(scratch, "staging"), check_cancel=check_cancel,
                 )
-        else:
-            num_frames = validate_frame_counts(
-                clip.name,
-                clip.input_asset.frame_count,
-                clip.alpha_asset.frame_count,
+                check_cancel()
+                os.makedirs(os.path.join(scratch, "tmp"), exist_ok=True)
+                result = engine.run_clip(
+                    prepared.input_path, os.path.join(scratch, "out"), params,
+                    outputs=self._v2_required_products(cfg),
+                    temp_dir=os.path.join(scratch, "tmp"),
+                    frame_dir_fps=prepared.fps,
+                    hint_video_path=prepared.hint_path,
+                    ffmpeg_bin=self._v2_ffmpeg_bin(),
+                    on_progress=(lambda ph, cur, tot: on_progress(clip.name, cur, tot, phase=ph))
+                    if on_progress else None,
+                    check_cancel=check_cancel, on_status=on_status,
+                )
+                logger.info(
+                    "Clip '%s': v2 run done (hann_chunk=%s hann_stride=%s low_vram=%s)",
+                    clip.name, result.hann_chunk, result.hann_stride, result.low_vram,
+                )
+                results, bounds = self._v2_publish(
+                    clip, params, cfg, prepared, result, frame_range, skip_stems,
+                    check_cancel, on_progress, on_warning, on_status, FrameResult,
+                )
+        return self._finalize_inference(clip, results, bounds, prepared.frame_count,
+                                        t_start, on_warning=on_warning)
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _v2_ffmpeg_bin() -> str:
+        from ..ffmpeg_tools.discovery import find_ffmpeg
+        return find_ffmpeg() or "ffmpeg"
+
+    def _v2_check_disk(self, clip: ClipEntry, cfg, root: str) -> None:
+        """Fail early if scratch EXRs (assumed uncompressed float32) cannot fit."""
+        dims = clip.input_asset.get_dimensions()
+        count = clip.input_asset.frame_count
+        if not dims or not count:
+            return
+        channels = sum(_PRODUCT_CHANNELS[p] for p in self._v2_required_products(cfg))
+        need = dims[0] * dims[1] * count * channels * 4
+        free = shutil.disk_usage(root).free
+        if free < need:
+            raise CorridorKeyError(
+                f"Not enough free disk space for CorridorKey 2.0 scratch files in {root}: "
+                f"need ~{need / 2**30:.1f} GB, have {free / 2**30:.1f} GB. "
+                "Free space or set CORRIDORKEY_V2_SCRATCH_DIR to a larger drive."
             )
 
-        input_cap = None
-        alpha_cap = None
-        input_files: list[str] = []
-        alpha_files: list[str] = []
-
-        if clip.input_asset.asset_type == 'video':
-            input_cap = open_video(clip.input_asset.path)
-        else:
-            input_files = clip.input_asset.get_frame_files()
-
-        if clip.alpha_asset.asset_type == 'video':
-            alpha_cap = open_video(clip.alpha_asset.path)
-        else:
-            alpha_files = clip.alpha_asset.get_frame_files()
-        alpha_stem_lookup = (
-            {os.path.splitext(fname)[0]: fname for fname in alpha_files}
-            if alpha_files else None
+    @staticmethod
+    def _v2_resume_compatible(manifest, cfg, params, source_stems) -> bool:
+        return bool(
+            manifest
+            and manifest.get("engine") == "corridorkey-v2"
+            and manifest.get("params") == params.to_dict()
+            and manifest.get("enabled_outputs") == cfg.enabled_outputs
+            and manifest.get("formats") == {
+                "fg": cfg.fg_format, "matte": cfg.matte_format,
+                "comp": cfg.comp_format, "processed": cfg.processed_format,
+            }
+            and manifest.get("source_stems") == list(source_stems)
         )
 
-        results: list[FrameResult] = []
-        skipped: list[int] = []
-        skip_stems = skip_stems or set()
-        frame_times: deque[float] = deque(maxlen=10)
-        processed_count = 0
+    def _v2_publish(self, clip, params, cfg, prepared, result, frame_range, skip_stems,
+                    check_cancel, on_progress, on_warning, on_status, FrameResult):
+        """Publish runtime outputs to EZ folders. Returns (results, (start, end))."""
+        dirs = ensure_output_dirs(clip.output_dir)
+        stems = prepared.source_stems
+        n = len(stems)
+        start, end = (0, n - 1) if frame_range is None else (
+            max(0, frame_range[0]), min(n - 1, frame_range[1]))
+        indices = list(range(start, end + 1))
+        skip = set(skip_stems or ())
+        if skip:
+            manifest = self._v2_read_manifest(dirs["root"])
+            if not self._v2_resume_compatible(manifest, cfg, params, stems):
+                skip = set()
+                if on_warning:
+                    on_warning("Existing outputs came from a different run/settings; "
+                               "re-publishing all selected frames.")
+        manifest_kw = dict(source_stems=stems, frame_range=[start, end])
+        self._write_manifest(dirs["root"], cfg, params, complete=False, **manifest_kw)
+        if on_status:
+            on_status("Writing outputs...")
+        total = len(indices)
+        done = [0]
 
-        if frame_range is not None:
-            range_start = max(0, frame_range[0])
-            range_end = min(num_frames - 1, frame_range[1])
-            frame_indices = range(range_start, range_end + 1)
-            range_count = range_end - range_start + 1
-        else:
-            frame_indices = range(num_frames)
-            range_count = num_frames
-
-        _warmup_done = False
-
-        try:
-            for progress_i, i in enumerate(frame_indices):
-                if job and job.is_cancelled:
-                    raise JobCancelledError(clip.name, i)
-
-                if not _warmup_done and on_status:
-                    on_status("Compiling (first frame may take a minute)...")
-
-                if on_progress:
-                    timing_kwargs: dict[str, float] = {}
-                    elapsed = time.monotonic() - t_start
-                    timing_kwargs["elapsed"] = elapsed
-                    if frame_times:
-                        avg_time = sum(frame_times) / len(frame_times)
-                        fps = 1.0 / avg_time if avg_time > 0 else 0.0
-                        remaining = range_count - progress_i
-                        timing_kwargs["fps"] = fps
-                        timing_kwargs["eta_seconds"] = remaining * avg_time
-                    on_progress(clip.name, progress_i, range_count, **timing_kwargs)
-
-                try:
-                    img, input_stem, is_linear = self._read_input_frame(
-                        clip, i, input_files, input_cap, params.input_is_linear,
-                    )
-                    if img is None:
-                        skipped.append(i)
-                        results.append(FrameResult(i, f"{i:05d}", False, "video read failed"))
-                        continue
-
-                    if input_stem in skip_stems:
-                        results.append(FrameResult(i, input_stem, True, "resumed (skipped)"))
-                        continue
-
-                    mask = self._read_alpha_frame(
-                        clip, i, alpha_files, alpha_cap,
-                        input_stem=input_stem,
-                        alpha_stem_lookup=alpha_stem_lookup,
-                    )
-                    if mask is None:
-                        skipped.append(i)
-                        results.append(FrameResult(i, input_stem, False, "alpha read failed"))
-                        continue
-
-                    if mask.shape[:2] != img.shape[:2]:
-                        mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
-
-                    t_frame = time.monotonic()
-                    with self._gpu_lock:
-                        res = engine.process_frame(
-                            img, mask,
-                            input_is_linear=is_linear,
-                            fg_is_straight=True,
-                            despill_strength=params.despill_strength,
-                            auto_despeckle=params.auto_despeckle,
-                            despeckle_size=params.despeckle_size,
-                            despeckle_dilation=params.despeckle_dilation,
-                            despeckle_blur=params.despeckle_blur,
-                            refiner_scale=params.refiner_scale,
-                            source_passthrough=params.source_passthrough,
-                            edge_erode_px=params.edge_erode_px,
-                            edge_blur_px=params.edge_blur_px,
-                            screen_color=params.screen_color,
-                            garbage_matte_px=params.garbage_matte_px,
-                        )
-                    dt = time.monotonic() - t_frame
-                    frame_times.append(dt)
-                    processed_count += 1
-
-                    if not _warmup_done:
-                        _warmup_done = True
-                        if on_status:
-                            on_status("")
-                    total_t = sum(frame_times)
-                    avg_fps = len(frame_times) / total_t if total_t > 0 else 0.0
-                    logger.debug(
-                        f"Frame {i}: {dt * 1000:.0f}ms ({avg_fps:.1f} fps avg)"
-                    )
-
-                    self._write_outputs(res, dirs, input_stem, clip.name, i, cfg)
-                    results.append(FrameResult(i, input_stem, True))
-
-                except FrameReadError as e:
-                    logger.warning(str(e))
-                    skipped.append(i)
-                    results.append(FrameResult(i, f"{i:05d}", False, str(e)))
-                    if on_warning:
-                        on_warning(str(e))
-
-                except WriteFailureError as e:
-                    logger.error(str(e))
-                    results.append(FrameResult(i, f"{i:05d}", False, str(e)))
-                    if on_warning:
-                        on_warning(str(e))
-
+        def on_frame(_i, _stem):
+            done[0] += 1
             if on_progress:
-                final_elapsed = time.monotonic() - t_start
-                final_kwargs: dict[str, float] = {"elapsed": final_elapsed, "eta_seconds": 0.0}
-                total_t = sum(frame_times)
-                if total_t > 0:
-                    final_kwargs["fps"] = len(frame_times) / total_t
-                on_progress(clip.name, range_count, range_count, **final_kwargs)
+                on_progress(clip.name, done[0], total, phase="publish")
 
-        finally:
-            if input_cap:
-                input_cap.release()
-            if alpha_cap:
-                alpha_cap.release()
+        published = set(self._publish_v2_outputs(
+            result.product_dirs, dirs, stems, cfg, clip.name,
+            publish_indices=indices, skip_stems=skip,
+            check_cancel=check_cancel, on_frame=on_frame,
+        ))
+        self._copy_v2_settings(result.settings_path, dirs["root"])
+        self._write_manifest(dirs["root"], cfg, params, complete=True, **manifest_kw)
+        results = [
+            FrameResult(i, stems[i], True) if stems[i] in published
+            else FrameResult(i, stems[i], True, "resumed (skipped)")
+            for i in indices
+        ]
+        return results, (start, end)
 
-        return self._finalize_inference(
-            clip, results, skipped, processed_count,
-            t_start, frame_range, num_frames,
-            on_warning=on_warning,
-        )
+    @staticmethod
+    def _v2_read_manifest(output_root: str) -> Optional[dict]:
+        import json
+        try:
+            with open(os.path.join(output_root, _MANIFEST_NAME)) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
 
     def _finalize_inference(
         self,
         clip: ClipEntry,
         results: list,
-        skipped: list[int],
-        processed_count: int,
-        t_start: float,
-        frame_range: Optional[tuple[int, int]],
+        bounds: tuple[int, int],
         num_frames: int,
+        t_start: float,
         on_warning: Optional[Callable[[str], None]] = None,
     ) -> list:
-        """Shared post-processing for sequential and parallel inference."""
-        range_count = len(results) if results else 0
-        processed = sum(1 for r in results if r.success)
-        if skipped:
-            msg = (
-                f"Clip '{clip.name}': {len(skipped)} frame(s) skipped: "
-                f"{skipped[:20]}{'...' if len(skipped) > 20 else ''}"
-            )
-            logger.warning(msg)
-            if on_warning:
-                on_warning(msg)
-
+        """Log timing and mark the clip COMPLETE only if the whole clip was published."""
         t_total = time.monotonic() - t_start
-        avg_fps = processed_count / t_total if t_total > 0 and processed_count > 0 else 0.0
-        range_label = f" (range {frame_range[0]}-{frame_range[1]})" if frame_range else ""
+        published = sum(1 for r in results if r.success and not r.warning)
         logger.info(
-            f"Clip '{clip.name}': inference complete{range_label}. {processed}/{range_count} frames "
-            f"in {t_total:.1f}s ({t_total / max(processed, 1):.2f}s/frame, {avg_fps:.1f} fps avg)"
+            "Clip '%s': inference complete (range %d-%d). %d published, %d skipped in %.1fs",
+            clip.name, bounds[0], bounds[1], published, len(results) - published, t_total,
         )
-
-        is_full_clip = (frame_range is None or
-                        (frame_range[0] == 0 and frame_range[1] >= num_frames - 1))
-        if processed == range_count and is_full_clip:
+        full = bounds[0] == 0 and bounds[1] >= num_frames - 1
+        if full and all(r.success for r in results):
             try:
                 clip.transition_to(ClipState.COMPLETE)
             except Exception as e:
-                logger.warning(f"Clip '{clip.name}': state transition to COMPLETE failed: {e}")
-
+                logger.warning("Clip '%s': state transition to COMPLETE failed: %s", clip.name, e)
         return results
-
-    def reprocess_single_frame(
-        self,
-        clip: ClipEntry,
-        params,
-        frame_index: int,
-        job: Optional[GPUJob] = None,
-        on_status: Optional[Callable[[str], None]] = None,
-    ) -> Optional[dict]:
-        """Reprocess a single frame with current params.
-
-        Returns the result dict (fg, alpha, comp, processed) or None.
-        Does NOT write to disk — returns in-memory results for preview.
-        """
-        from . import read_image_frame
-
-        # Resolve "auto" screen color
-        if params.screen_color == "auto":
-            from .core import InferenceParams
-            resolved = self._resolve_screen_color(clip)
-            params = InferenceParams(**{**params.to_dict(), "screen_color": resolved})
-
-        t_start = time.monotonic()
-        if clip.input_asset is None or clip.alpha_asset is None:
-            return None
-
-        if job and job.is_cancelled:
-            return None
-
-        with self._gpu_lock:
-            engines = self._get_engine_pool(on_status=on_status,
-                                            screen_color=params.screen_color)
-            engine = engines[0]
-
-        # Read the specific input frame
-        is_linear = params.input_is_linear
-        input_stem = f"{frame_index:05d}"
-        if clip.input_asset.asset_type == 'video':
-            img = read_video_frame_at(clip.input_asset.path, frame_index)
-        else:
-            input_files = clip.input_asset.get_frame_files()
-            if frame_index >= len(input_files):
-                return None
-            fpath = os.path.join(clip.input_asset.path, input_files[frame_index])
-            input_stem = os.path.splitext(input_files[frame_index])[0]
-            img = read_image_frame(fpath)
-        if img is None:
-            return None
-
-        # Read the specific alpha frame
-        if clip.alpha_asset.asset_type == 'video':
-            mask = read_video_mask_at(clip.alpha_asset.path, frame_index)
-        else:
-            alpha_files = clip.alpha_asset.get_frame_files()
-            alpha_stem_lookup = {os.path.splitext(fname)[0]: fname for fname in alpha_files}
-            mask = self._read_alpha_frame(
-                clip,
-                frame_index,
-                alpha_files,
-                None,
-                input_stem=input_stem,
-                alpha_stem_lookup=alpha_stem_lookup,
-            )
-        if mask is None:
-            return None
-
-        if mask.shape[:2] != img.shape[:2]:
-            mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
-
-        if job and job.is_cancelled:
-            return None
-
-        with self._gpu_lock:
-            res = engine.process_frame(
-                img, mask,
-                input_is_linear=is_linear,
-                fg_is_straight=True,
-                despill_strength=params.despill_strength,
-                auto_despeckle=params.auto_despeckle,
-                despeckle_size=params.despeckle_size,
-                despeckle_dilation=params.despeckle_dilation,
-                despeckle_blur=params.despeckle_blur,
-                refiner_scale=params.refiner_scale,
-                source_passthrough=params.source_passthrough,
-                edge_erode_px=params.edge_erode_px,
-                edge_blur_px=params.edge_blur_px,
-                screen_color=params.screen_color,
-                garbage_matte_px=params.garbage_matte_px,
-            )
-        logger.debug(f"Clip '{clip.name}' frame {frame_index}: reprocess {time.monotonic() - t_start:.3f}s")
-        return res

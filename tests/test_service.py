@@ -40,7 +40,7 @@ from backend.job_queue import GPUJob, JobType
 class TestServiceInit:
     def test_constructor_defaults(self):
         svc = CorridorKeyService()
-        assert svc._engine_pool == []
+        assert svc._v2_engine is None
         assert svc._gvm_processor is None
         assert svc._videomama_pipeline is None
         assert svc._active_model == _ActiveModel.NONE
@@ -120,16 +120,17 @@ class TestModelResidency:
     def test_ensure_model_noop_when_same(self):
         svc = CorridorKeyService()
         svc._active_model = _ActiveModel.INFERENCE
-        svc._engine_pool = [MagicMock()]
+        svc._v2_engine = MagicMock()
         svc._ensure_model(_ActiveModel.INFERENCE)
-        assert len(svc._engine_pool) > 0  # Not unloaded
+        svc._v2_engine.unload.assert_not_called()
 
     def test_ensure_model_switch_unloads_inference(self):
         svc = CorridorKeyService()
         svc._active_model = _ActiveModel.INFERENCE
-        svc._engine_pool = [MagicMock()]
+        engine = svc._v2_engine = MagicMock()
         svc._ensure_model(_ActiveModel.GVM)
-        assert svc._engine_pool == []
+        engine.unload.assert_called_once()
+        assert svc._v2_engine is None
         assert svc._active_model == _ActiveModel.GVM
 
     def test_ensure_model_switch_unloads_gvm(self):
@@ -184,29 +185,24 @@ class TestMatAnyone2Import:
 # ── TestGetEngine ──
 
 
-class TestGetEnginePool:
-    def test_cached_pool_returns_immediately(self):
+class TestGetV2Engine:
+    def test_creates_and_loads_once(self):
         svc = CorridorKeyService()
-        svc._active_model = _ActiveModel.INFERENCE
-        mock_engine = MagicMock()
-        svc._engine_pool = [mock_engine]
-        result = svc._get_engine_pool()
-        assert result[0] is mock_engine
+        with patch("backend.corridorkey_v2.CorridorKeyV2Engine") as cls:
+            e1 = svc._get_v2_engine()
+            e2 = svc._get_v2_engine()
+        assert e1 is e2
+        cls.assert_called_once()
+        assert svc._active_model == _ActiveModel.INFERENCE
 
-    @patch("CorridorKeyModule.backend.create_engine", side_effect=FileNotFoundError("No .pth checkpoint found"))
-    @patch("CorridorKeyModule.backend.resolve_backend", return_value="torch")
-    def test_no_checkpoint_raises(self, _rb, _ce):
+    def test_load_failure_resets_state(self):
         svc = CorridorKeyService()
-        svc._active_model = _ActiveModel.NONE
-        with pytest.raises(FileNotFoundError, match="No .pth checkpoint"):
-            svc._get_engine_pool()
-
-    @patch("CorridorKeyModule.backend.create_engine", side_effect=ValueError("Multiple checkpoints"))
-    @patch("CorridorKeyModule.backend.resolve_backend", return_value="torch")
-    def test_multiple_checkpoints_raises(self, _rb, _ce):
-        svc = CorridorKeyService()
-        with pytest.raises(ValueError, match="Multiple checkpoints"):
-            svc._get_engine_pool()
+        with patch("backend.corridorkey_v2.CorridorKeyV2Engine") as cls:
+            cls.return_value.load.side_effect = CorridorKeyError("boom")
+            with pytest.raises(CorridorKeyError):
+                svc._get_v2_engine()
+        assert svc._v2_engine is None
+        assert svc._active_model == _ActiveModel.NONE
 
 
 # ── TestScanAndFilter ──
@@ -419,7 +415,7 @@ class TestWriteManifest:
             assert os.path.exists(manifest_path)
             with open(manifest_path) as f:
                 data = json.load(f)
-            assert data["version"] == 1
+            assert data["version"] == 2
             assert "fg" in data["enabled_outputs"]
             assert "matte" in data["enabled_outputs"]
             assert "comp" not in data["enabled_outputs"]
@@ -438,13 +434,13 @@ class TestWriteManifest:
                 data = json.load(f)
             assert "fg" not in data["enabled_outputs"]
 
-    def test_manifest_write_failure_graceful(self):
-        """Manifest write failure is non-fatal (logs warning, continues)."""
+    def test_manifest_write_failure_raises(self):
+        """Manifest write failure raises (a missing manifest breaks resume validation)."""
         svc = CorridorKeyService()
         cfg = OutputConfig()
         params = InferenceParams()
-        # Write to non-existent path — should not raise
-        svc._write_manifest("/nonexistent/path/that/doesnt/exist", cfg, params)
+        with pytest.raises(OSError):
+            svc._write_manifest("/nonexistent/path/that/doesnt/exist", cfg, params)
 
 
 # ── TestWriteOutputs ──
@@ -602,485 +598,21 @@ class TestWriteOutputs:
         np.testing.assert_allclose(img, expected_bgra, atol=1e-6)
 
 
-# ── TestRunInference ──
-
-
-class TestRunInference:
-    def _setup_service_with_mock_engine(self):
-        """Create a service with a mocked inference engine.
-
-        Patches _resolve_screen_color to always return "green" so
-        auto-detection (which reads frames and may return "blue" for
-        random test data) doesn't trigger an engine pool reload.
-        """
-        svc = CorridorKeyService()
-        svc._device = "cuda"
-        svc._active_model = _ActiveModel.INFERENCE
-        svc._engine_screen_color = "green"
-        svc._resolve_screen_color = lambda clip: "green"
-        mock_engine = MagicMock()
-        mock_engine.process_frame.return_value = {
-            "fg": np.ones((4, 4, 3), dtype=np.float32) * 0.5,
-            "alpha": np.ones((4, 4, 1), dtype=np.float32) * 0.8,
-            "comp": np.ones((4, 4, 3), dtype=np.float32) * 0.3,
-            "processed": np.ones((4, 4, 4), dtype=np.float32) * 0.6,
-        }
-        svc._engine_pool = [mock_engine]
-        return svc, mock_engine
-
-    def test_happy_path(self, sample_clip, tmp_clip_dir):
-        svc, mock_engine = self._setup_service_with_mock_engine()
-        params = InferenceParams()
-        cfg = OutputConfig(
-            fg_format="png", matte_format="png",
-            comp_format="png", processed_format="png",
-        )
-        results = svc.run_inference(sample_clip, params, output_config=cfg)
-        assert len(results) == 3  # 3 frames in fixture
-        assert all(r.success for r in results)
-        assert mock_engine.process_frame.call_count == 3
-
-    def test_resume_skips_stems(self, sample_clip, tmp_clip_dir):
-        svc, mock_engine = self._setup_service_with_mock_engine()
-        params = InferenceParams()
-        input_files = sample_clip.input_asset.get_frame_files()
-        first_stem = os.path.splitext(input_files[0])[0]
-        results = svc.run_inference(
-            sample_clip, params, skip_stems={first_stem},
-            output_config=OutputConfig(fg_format="png", matte_format="png",
-                                       comp_format="png", processed_format="png"),
-        )
-        # First frame skipped (resumed), 2 processed
-        skipped = [r for r in results if r.warning and "resumed" in r.warning]
-        assert len(skipped) == 1
-        assert mock_engine.process_frame.call_count == 2
-
-    def test_cancellation_raises(self, sample_clip):
-        svc, _ = self._setup_service_with_mock_engine()
-        params = InferenceParams()
-        job = GPUJob(JobType.INFERENCE, "test_clip")
-        job.request_cancel()
-
-        with pytest.raises(JobCancelledError):
-            svc.run_inference(sample_clip, params, job=job,
-                              output_config=OutputConfig(fg_format="png", matte_format="png",
-                                                          comp_format="png", processed_format="png"))
-
-    def test_frame_read_error_continues(self, sample_clip, tmp_clip_dir):
-        """FrameReadError on a frame → skip that frame, continue others."""
-        svc, mock_engine = self._setup_service_with_mock_engine()
-        params = InferenceParams()
-
-        # Patch _read_input_frame to fail on first call, succeed on others
-        original_read = svc._read_input_frame
-        call_count = [0]
-
-        def fail_first_frame(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                raise FrameReadError("test_clip", 0, "/fake/path.png")
-            return original_read(*args, **kwargs)
-
-        svc._read_input_frame = fail_first_frame
-
-        warnings = []
-        results = svc.run_inference(
-            sample_clip, params,
-            on_warning=lambda msg: warnings.append(msg),
-            output_config=OutputConfig(fg_format="png", matte_format="png",
-                                       comp_format="png", processed_format="png"),
-        )
-        failed = [r for r in results if not r.success]
-        assert len(failed) >= 1
-        assert len(warnings) >= 1
-
-    def test_engine_process_frame_raises(self, sample_clip, tmp_clip_dir):
-        """Codex: engine.process_frame raising should propagate (fail-fast)."""
-        svc, mock_engine = self._setup_service_with_mock_engine()
-        mock_engine.process_frame.side_effect = RuntimeError("GPU OOM")
-        params = InferenceParams()
-
-        # Should propagate — not caught by the per-frame handler
-        with pytest.raises(RuntimeError, match="GPU OOM"):
-            svc.run_inference(sample_clip, params,
-                              output_config=OutputConfig(fg_format="png", matte_format="png",
-                                                          comp_format="png", processed_format="png"))
-
-    def test_progress_callback_cadence(self, sample_clip, tmp_clip_dir):
-        """Codex: progress fires every 5th frame + final, not per-frame."""
-        svc, _ = self._setup_service_with_mock_engine()
-        params = InferenceParams()
-        calls = []
-        results = svc.run_inference(
-            sample_clip, params,
-            on_progress=lambda name, cur, total, **kwargs: calls.append((cur, total)),
-            output_config=OutputConfig(fg_format="png", matte_format="png",
-                                       comp_format="png", processed_format="png"),
-        )
-        # With 3 frames: fires at frame 0 (0%5==0) and final (3)
-        assert len(calls) >= 2
-        # Final call should be (total, total)
-        assert calls[-1][0] == calls[-1][1]
-
-    def test_state_transition_to_complete(self, sample_clip, tmp_clip_dir):
-        svc, _ = self._setup_service_with_mock_engine()
-        params = InferenceParams()
-        assert sample_clip.state == ClipState.READY
-        svc.run_inference(sample_clip, params,
-                          output_config=OutputConfig(fg_format="png", matte_format="png",
-                                                      comp_format="png", processed_format="png"))
-        assert sample_clip.state == ClipState.COMPLETE
-
-    def test_zero_frame_clip_no_complete(self):
-        """Codex: zero-frame clip should not transition to COMPLETE (0==0 passes)."""
-        svc, _ = self._setup_service_with_mock_engine()
-        params = InferenceParams()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            clip_root = os.path.join(tmpdir, "empty_clip")
-            input_dir = os.path.join(clip_root, "Input")
-            alpha_dir = os.path.join(clip_root, "AlphaHint")
-            os.makedirs(input_dir)
-            os.makedirs(alpha_dir)
-
-            clip = ClipEntry(
-                name="empty", root_path=clip_root, state=ClipState.READY,
-                input_asset=ClipAsset(input_dir, "sequence"),
-                alpha_asset=ClipAsset(alpha_dir, "sequence"),
-            )
-            results = svc.run_inference(clip, params,
-                                        output_config=OutputConfig(fg_format="png", matte_format="png",
-                                                                    comp_format="png", processed_format="png"))
-            # 0 frames processed, 0 total — current code does 0==0 → COMPLETE
-            # This test documents the current behavior
-            assert len(results) == 0
-            # NOTE: Current behavior transitions to COMPLETE for 0 frames.
-            # This is a known policy issue (Codex finding).
-
-    def test_missing_assets_raises(self):
-        svc = CorridorKeyService()
-        clip = ClipEntry("test", "/tmp", state=ClipState.READY)
-        with pytest.raises(CorridorKeyError, match="missing input or alpha"):
-            svc.run_inference(clip, InferenceParams())
-
-    def test_video_captures_released(self, sample_clip, tmp_clip_dir):
-        """Video captures should be released in finally block."""
-        svc, mock_engine = self._setup_service_with_mock_engine()
-        job = GPUJob(JobType.INFERENCE, "test_clip")
-
-        call_count = [0]
-        result_dict = {
-            "fg": np.ones((4, 4, 3), dtype=np.float32) * 0.5,
-            "alpha": np.ones((4, 4, 1), dtype=np.float32) * 0.8,
-            "comp": np.ones((4, 4, 3), dtype=np.float32) * 0.3,
-            "processed": np.ones((4, 4, 4), dtype=np.float32) * 0.6,
-        }
-
-        def cancel_after_first(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] >= 2:
-                job.request_cancel()
-            return result_dict
-
-        mock_engine.process_frame.side_effect = cancel_after_first
-
-        params = InferenceParams()
-        with pytest.raises(JobCancelledError):
-            svc.run_inference(sample_clip, params, job=job,
-                              output_config=OutputConfig(fg_format="png", matte_format="png",
-                                                          comp_format="png", processed_format="png"))
-        # Test passed — if finally block didn't run, we'd leak captures
-
-    def test_frame_range_uses_stem_matched_partial_alpha_sequence(self):
-        svc, mock_engine = self._setup_service_with_mock_engine()
-        params = InferenceParams()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            frames_dir = os.path.join(tmpdir, "Frames")
-            alpha_dir = os.path.join(tmpdir, "AlphaHint")
-            os.makedirs(frames_dir)
-            os.makedirs(alpha_dir)
-
-            for i in range(5):
-                cv2.imwrite(
-                    os.path.join(frames_dir, f"frame_{i:06d}.png"),
-                    np.zeros((4, 4, 3), dtype=np.uint8),
-                )
-            for i in (3, 4):
-                cv2.imwrite(
-                    os.path.join(alpha_dir, f"frame_{i:06d}.png"),
-                    np.ones((4, 4), dtype=np.uint8) * 255,
-                )
-
-            clip = ClipEntry(
-                "test",
-                tmpdir,
-                state=ClipState.READY,
-                input_asset=ClipAsset(frames_dir, "sequence"),
-                alpha_asset=ClipAsset(alpha_dir, "sequence"),
-            )
-
-            fake_img = np.zeros((4, 4, 3), dtype=np.float32)
-            fake_mask = np.ones((4, 4), dtype=np.float32)
-            read_mask_paths: list[str] = []
-
-            def _record_mask(path, clip_name, frame_index):
-                read_mask_paths.append(os.path.basename(path))
-                return fake_mask
-
-            with patch("backend.service.read_image_frame", return_value=fake_img), patch(
-                "backend.service.read_mask_frame", side_effect=_record_mask
-            ):
-                results = svc.run_inference(
-                    clip,
-                    params,
-                    frame_range=(3, 4),
-                    output_config=OutputConfig(
-                        fg_format="png",
-                        matte_format="png",
-                        comp_format="png",
-                        processed_format="png",
-                    ),
-                )
-
-        assert len(results) == 2
-        assert all(r.success for r in results)
-        assert mock_engine.process_frame.call_count == 2
-        assert read_mask_paths == ["frame_000003.png", "frame_000004.png"]
-
-
-# ── TestReprocessSingleFrame ──
-
-
-class TestReprocessSingleFrame:
-    def test_returns_dict(self, sample_clip):
-        svc = CorridorKeyService()
-        svc._active_model = _ActiveModel.INFERENCE
-        mock_engine = MagicMock()
-        mock_engine.process_frame.return_value = {
-            "fg": np.ones((4, 4, 3), dtype=np.float32),
-            "alpha": np.ones((4, 4, 1), dtype=np.float32),
-        }
-        svc._engine_pool = [mock_engine]
-        result = svc.reprocess_single_frame(sample_clip, InferenceParams(), 0)
-        assert result is not None
-        assert "fg" in result
-
-    def test_missing_assets_returns_none(self):
-        svc = CorridorKeyService()
-        clip = ClipEntry("test", "/tmp")
-        result = svc.reprocess_single_frame(clip, InferenceParams(), 0)
-        assert result is None
-
-    def test_cancelled_returns_none(self, sample_clip):
-        svc = CorridorKeyService()
-        svc._active_model = _ActiveModel.INFERENCE
-        svc._engine_pool = [MagicMock()]
-        job = GPUJob(JobType.PREVIEW_REPROCESS, "test")
-        job.request_cancel()
-        result = svc.reprocess_single_frame(sample_clip, InferenceParams(), 0, job=job)
-        assert result is None
-
-    def test_out_of_range_returns_none(self, sample_clip):
-        svc = CorridorKeyService()
-        svc._active_model = _ActiveModel.INFERENCE
-        svc._engine_pool = [MagicMock()]
-        result = svc.reprocess_single_frame(sample_clip, InferenceParams(), 9999)
-        assert result is None
-
-    def test_reprocess_forwards_status_during_engine_warmup(self, sample_clip):
-        svc = CorridorKeyService()
-        mock_engine = MagicMock()
-        mock_engine.process_frame.return_value = {
-            "fg": np.ones((4, 4, 3), dtype=np.float32),
-            "alpha": np.ones((4, 4, 1), dtype=np.float32),
-            "comp": np.ones((4, 4, 3), dtype=np.float32),
-            "processed": np.ones((4, 4, 4), dtype=np.float32),
-        }
-        statuses: list[str] = []
-
-        def _fake_get_engine_pool(on_status=None, screen_color="green"):
-            assert on_status is not None
-            on_status("Loading engine 1/1...")
-            return [mock_engine]
-
-        fake_img = np.zeros((4, 4, 3), dtype=np.float32)
-        fake_mask = np.ones((4, 4), dtype=np.float32)
-        with patch.object(svc, "_get_engine_pool", side_effect=_fake_get_engine_pool), patch(
-            "backend.service.read_image_frame", return_value=fake_img
-        ), patch("backend.service.read_mask_frame", return_value=fake_mask):
-            result = svc.reprocess_single_frame(
-                sample_clip,
-                InferenceParams(),
-                0,
-                on_status=statuses.append,
-            )
-
-        assert result is not None
-        assert statuses == ["Loading engine 1/1..."]
-
-    def test_exr_sequence_honors_explicit_srgb_setting(self):
-        svc = CorridorKeyService()
-        svc._active_model = _ActiveModel.INFERENCE
-        mock_engine = MagicMock()
-        mock_engine.process_frame.return_value = {
-            "fg": np.ones((4, 4, 3), dtype=np.float32),
-            "alpha": np.ones((4, 4, 1), dtype=np.float32),
-            "comp": np.ones((4, 4, 3), dtype=np.float32),
-            "processed": np.ones((4, 4, 4), dtype=np.float32),
-        }
-        svc._engine_pool = [mock_engine]
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            frames_dir = os.path.join(tmpdir, "Frames")
-            alpha_dir = os.path.join(tmpdir, "AlphaHint")
-            os.makedirs(frames_dir)
-            os.makedirs(alpha_dir)
-
-            frame_path = os.path.join(frames_dir, "frame_000000.exr")
-            alpha_path = os.path.join(alpha_dir, "_alphaHint_000000.png")
-            with open(frame_path, "w", encoding="utf-8") as handle:
-                handle.write("dummy")
-            with open(alpha_path, "w", encoding="utf-8") as handle:
-                handle.write("dummy")
-
-            clip = ClipEntry(
-                "test",
-                tmpdir,
-                state=ClipState.READY,
-                input_asset=ClipAsset(frames_dir, "sequence"),
-                alpha_asset=ClipAsset(alpha_dir, "sequence"),
-            )
-
-            fake_img = np.zeros((4, 4, 3), dtype=np.float32)
-            fake_mask = np.ones((4, 4), dtype=np.float32)
-            with patch("backend.service.read_image_frame", return_value=fake_img), patch(
-                "backend.service.read_mask_frame", return_value=fake_mask
-            ):
-                svc.reprocess_single_frame(
-                    clip,
-                    InferenceParams(input_is_linear=False),
-                    0,
-                )
-
-        assert mock_engine.process_frame.call_args is not None
-        assert mock_engine.process_frame.call_args.kwargs["input_is_linear"] is False
-
-    def test_exr_sequence_honors_explicit_linear_setting(self):
-        svc = CorridorKeyService()
-        svc._active_model = _ActiveModel.INFERENCE
-        mock_engine = MagicMock()
-        mock_engine.process_frame.return_value = {
-            "fg": np.ones((4, 4, 3), dtype=np.float32),
-            "alpha": np.ones((4, 4, 1), dtype=np.float32),
-            "comp": np.ones((4, 4, 3), dtype=np.float32),
-            "processed": np.ones((4, 4, 4), dtype=np.float32),
-        }
-        svc._engine_pool = [mock_engine]
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            frames_dir = os.path.join(tmpdir, "Frames")
-            alpha_dir = os.path.join(tmpdir, "AlphaHint")
-            os.makedirs(frames_dir)
-            os.makedirs(alpha_dir)
-
-            frame_path = os.path.join(frames_dir, "frame_000000.exr")
-            alpha_path = os.path.join(alpha_dir, "_alphaHint_000000.png")
-            with open(frame_path, "w", encoding="utf-8") as handle:
-                handle.write("dummy")
-            with open(alpha_path, "w", encoding="utf-8") as handle:
-                handle.write("dummy")
-
-            clip = ClipEntry(
-                "test",
-                tmpdir,
-                state=ClipState.READY,
-                input_asset=ClipAsset(frames_dir, "sequence"),
-                alpha_asset=ClipAsset(alpha_dir, "sequence"),
-            )
-
-            fake_img = np.zeros((4, 4, 3), dtype=np.float32)
-            fake_mask = np.ones((4, 4), dtype=np.float32)
-            with patch("backend.service.read_image_frame", return_value=fake_img), patch(
-                "backend.service.read_mask_frame", return_value=fake_mask
-            ):
-                svc.reprocess_single_frame(
-                    clip,
-                    InferenceParams(input_is_linear=True),
-                    0,
-                )
-
-        assert mock_engine.process_frame.call_args is not None
-        assert mock_engine.process_frame.call_args.kwargs["input_is_linear"] is True
-
-    def test_sequence_reprocess_prefers_alpha_with_matching_input_stem(self):
-        svc = CorridorKeyService()
-        svc._active_model = _ActiveModel.INFERENCE
-        mock_engine = MagicMock()
-        mock_engine.process_frame.return_value = {
-            "fg": np.ones((4, 4, 3), dtype=np.float32),
-            "alpha": np.ones((4, 4, 1), dtype=np.float32),
-            "comp": np.ones((4, 4, 3), dtype=np.float32),
-            "processed": np.ones((4, 4, 4), dtype=np.float32),
-        }
-        svc._engine_pool = [mock_engine]
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            frames_dir = os.path.join(tmpdir, "Frames")
-            alpha_dir = os.path.join(tmpdir, "AlphaHint")
-            os.makedirs(frames_dir)
-            os.makedirs(alpha_dir)
-
-            for i in range(5):
-                with open(os.path.join(frames_dir, f"frame_{i:06d}.png"), "wb") as handle:
-                    handle.write(b"fake")
-            for i in (3, 4):
-                with open(os.path.join(alpha_dir, f"frame_{i:06d}.png"), "wb") as handle:
-                    handle.write(b"fake")
-
-            clip = ClipEntry(
-                "test",
-                tmpdir,
-                state=ClipState.READY,
-                input_asset=ClipAsset(frames_dir, "sequence"),
-                alpha_asset=ClipAsset(alpha_dir, "sequence"),
-            )
-
-            fake_img = np.zeros((4, 4, 3), dtype=np.float32)
-            fake_mask = np.ones((4, 4), dtype=np.float32)
-            read_mask_paths: list[str] = []
-
-            def _record_mask(path, clip_name, frame_index):
-                read_mask_paths.append(os.path.basename(path))
-                return fake_mask
-
-            with patch("backend.service.read_image_frame", return_value=fake_img), patch(
-                "backend.service.read_mask_frame", side_effect=_record_mask
-            ):
-                result = svc.reprocess_single_frame(
-                    clip,
-                    InferenceParams(),
-                    3,
-                )
-
-        assert result is not None
-        assert read_mask_paths == ["frame_000003.png"]
-
-
 # ── TestUnloadEngines ──
 
 
 class TestUnloadEngines:
     def test_clears_all(self):
         svc = CorridorKeyService()
-        svc._engine_pool = [MagicMock()]
+        engine = svc._v2_engine = MagicMock()
         svc._gvm_processor = MagicMock()
         svc._videomama_pipeline = MagicMock()
         svc._active_model = _ActiveModel.INFERENCE
 
         svc.unload_engines()
 
-        assert svc._engine_pool == []
+        engine.unload.assert_called_once()
+        assert svc._v2_engine is None
         assert svc._gvm_processor is None
         assert svc._videomama_pipeline is None
         assert svc._active_model == _ActiveModel.NONE
@@ -1093,7 +625,7 @@ class TestIsEngineLoaded:
     def test_true_when_active(self):
         svc = CorridorKeyService()
         svc._active_model = _ActiveModel.INFERENCE
-        svc._engine_pool = [MagicMock()]
+        svc._v2_engine = MagicMock(is_loaded=True)
         assert svc.is_engine_loaded() is True
 
     def test_false_when_not_loaded(self):
@@ -1195,7 +727,7 @@ class TestSam2PreviewInputColorSpace:
     def test_false_when_active_but_engine_empty(self):
         svc = CorridorKeyService()
         svc._active_model = _ActiveModel.INFERENCE
-        svc._engine_pool = []
+        svc._v2_engine = None
         assert svc.is_engine_loaded() is False
 
 
