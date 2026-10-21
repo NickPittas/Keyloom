@@ -25,6 +25,7 @@ from ..errors import (
 from ..frame_io import imread_unicode, imwrite_unicode
 from .helpers import BASE_DIR
 from .model_manager import _ActiveModel
+from .pipelines_auto import _holds_gpu_lock
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 class GuidedPipelinesMixin:
     """Mixin providing guided pipelines (SAM2, VideoMaMa, MatAnyone2) for CorridorKeyService."""
 
+    @_holds_gpu_lock
     def run_sam2_track(
         self,
         clip: ClipEntry,
@@ -61,15 +63,14 @@ class GuidedPipelinesMixin:
                 raise JobCancelledError(clip.name, 0)
 
         _status("Loading model...")
-        with self._gpu_lock:
-            tracker = self._get_sam2_tracker(
-                on_progress=(
-                    None
-                    if on_progress is None
-                    else lambda current, total: on_progress(clip.name, current, total)
-                ),
-                on_status=on_status,
-            )
+        tracker = self._get_sam2_tracker(
+            on_progress=(
+                None
+                if on_progress is None
+                else lambda current, total: on_progress(clip.name, current, total)
+            ),
+            on_status=on_status,
+        )
         _check_cancel()
 
         _status("Loading frames...")
@@ -181,6 +182,7 @@ class GuidedPipelinesMixin:
             len(stems),
         )
 
+    @_holds_gpu_lock
     def preview_sam2_prompt(
         self,
         clip: ClipEntry,
@@ -212,15 +214,14 @@ class GuidedPipelinesMixin:
                 raise JobCancelledError(clip.name, 0)
 
         _status("Loading model...")
-        with self._gpu_lock:
-            tracker = self._get_sam2_tracker(
-                on_progress=(
-                    None
-                    if on_progress is None
-                    else lambda current, total: on_progress(clip.name, current, total)
-                ),
-                on_status=on_status,
-            )
+        tracker = self._get_sam2_tracker(
+            on_progress=(
+                None
+                if on_progress is None
+                else lambda current, total: on_progress(clip.name, current, total)
+            ),
+            on_status=on_status,
+        )
         _check_cancel()
 
         start_index = clip.in_out_range.in_point if clip.in_out_range is not None else 0
@@ -304,6 +305,7 @@ class GuidedPipelinesMixin:
             "fill": float((mask > 0).mean()),
         }
 
+    @_holds_gpu_lock
     def run_videomama(
         self,
         clip: ClipEntry,
@@ -346,8 +348,7 @@ class GuidedPipelinesMixin:
 
         # Phase 1: Load model
         _status("Loading model...")
-        with self._gpu_lock:
-            pipeline = self._get_videomama_pipeline()
+        pipeline = self._get_videomama_pipeline()
         _check_cancel("model load")
 
         alpha_dir = os.path.join(clip.root_path, "AlphaHint")
@@ -477,6 +478,7 @@ class GuidedPipelinesMixin:
 
         logger.info(f"VideoMaMa complete for '{clip.name}': {frames_written} alpha frames in {time.monotonic() - t_start:.1f}s")
 
+    @_holds_gpu_lock
     def run_matanyone2(
         self,
         clip: ClipEntry,
@@ -511,8 +513,7 @@ class GuidedPipelinesMixin:
 
         # Phase 1: Load model
         _status("Loading MatAnyone2 model...")
-        with self._gpu_lock:
-            processor = self._get_matanyone2()
+        processor = self._get_matanyone2()
         if _check_cancel():
             raise JobCancelledError(clip.name, 0)
 

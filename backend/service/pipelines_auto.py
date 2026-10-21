@@ -1,6 +1,7 @@
 """Auto-alpha pipelines — GVM, BiRefNet, Apple Vision (no annotations required)."""
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import time
@@ -17,9 +18,25 @@ from .model_manager import _ActiveModel
 logger = logging.getLogger(__name__)
 
 
+def _holds_gpu_lock(fn):
+    """Hold ``self._gpu_lock`` for the whole call (model fetch + GPU compute).
+
+    ``_gpu_lock`` is a non-reentrant Lock: decorated methods (and anything
+    they call) must never acquire it again. ``_get_*`` model getters rely on
+    the caller holding it. The ``with`` releases on any exception, including
+    JobCancelledError.
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._gpu_lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class AutoPipelinesMixin:
     """Mixin providing auto-alpha pipelines (GVM, BiRefNet) for CorridorKeyService."""
 
+    @_holds_gpu_lock
     def run_gvm(
         self,
         clip: ClipEntry,
@@ -39,10 +56,7 @@ class AutoPipelinesMixin:
 
         t_start = time.monotonic()
 
-        logger.info("run_gvm: waiting for _gpu_lock")
-        with self._gpu_lock:
-            logger.info("run_gvm: acquired _gpu_lock")
-            gvm = self._get_gvm()
+        gvm = self._get_gvm()
 
         alpha_dir = os.path.join(clip.root_path, "AlphaHint")
         os.makedirs(alpha_dir, exist_ok=True)
@@ -96,6 +110,7 @@ class AutoPipelinesMixin:
 
         logger.info(f"GVM complete for '{clip.name}': {clip.alpha_asset.frame_count} alpha frames in {time.monotonic() - t_start:.1f}s")
 
+    @_holds_gpu_lock
     def run_birefnet(
         self,
         clip: ClipEntry,
@@ -128,8 +143,7 @@ class AutoPipelinesMixin:
 
         # Phase 1: Load model
         _status(f"Loading BiRefNet ({usage})...")
-        with self._gpu_lock:
-            processor = self._get_birefnet(usage=usage, on_status=on_status)
+        processor = self._get_birefnet(usage=usage, on_status=on_status)
         if _check_cancel():
             raise JobCancelledError(clip.name, 0)
 
