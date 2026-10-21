@@ -131,6 +131,7 @@ class FrameOpsMixin:
         source_stems: Optional[Iterable[str]] = None,
         frame_range: Optional[Iterable[int]] = None,
         complete: bool = False,
+        hint_keyframes: Optional[Iterable[int]] = None,
     ) -> None:
         """Write the v2 run manifest atomically (tmp + os.replace).
 
@@ -155,6 +156,8 @@ class FrameOpsMixin:
                 "processed_png": "straight-srgb",
             },
         }
+        if hint_keyframes is not None:  # Keyframes mode only: effective absolute indices
+            manifest["hint_keyframes"] = [int(i) for i in hint_keyframes]
         manifest_path = os.path.join(output_root, ".corridorkey_manifest.json")
         tmp_path = manifest_path + ".tmp"
         try:

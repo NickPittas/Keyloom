@@ -38,9 +38,13 @@ class FakeEngine:
         self.loaded = False
 
     def run_clip(self, input_path, output_dir, params, *, outputs, temp_dir, frame_dir_fps,
-                 hint_video_path, ffmpeg_bin, on_progress, check_cancel, on_status):
+                 hint_video_path, ffmpeg_bin, on_progress, check_cancel, on_status,
+                 initial_hint_path=None, initial_hint_index=0, hint_frame_indices=None):
         self.calls.append(dict(input_path=input_path, hint=hint_video_path, outputs=outputs,
-                               temp_dir=temp_dir, output_dir=output_dir))
+                               temp_dir=temp_dir, output_dir=output_dir, params=params,
+                               initial_hint_path=initial_hint_path,
+                               initial_hint_index=initial_hint_index,
+                               hint_frame_indices=hint_frame_indices))
         os.makedirs(temp_dir, exist_ok=True)
         with open(os.path.join(temp_dir, "memmap.bin"), "wb") as f:
             f.write(b"x")

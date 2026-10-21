@@ -43,12 +43,12 @@ def create_job_snapshot(
     if job_type == JobType.INFERENCE:
         if params is None:
             params = InferenceParams()
-        job_params["_inference_params"] = params
+        job_params["_inference_params"] = copy.deepcopy(params)
         if resume:
             job_params["_skip_stems"] = clip.completed_stems()
     elif job_type in (JobType.SAM2_PREVIEW, JobType.SAM2_TRACK):
         if params is not None:
-            job_params["_inference_params"] = params
+            job_params["_inference_params"] = copy.deepcopy(params)
     elif job_type == JobType.VIDEOMAMA_ALPHA:
         job_params["_chunk_size"] = chunk_size
     elif job_type == JobType.BIREFNET_ALPHA:
@@ -92,7 +92,7 @@ def create_inference_job(
 ) -> GPUJob:
     """Create a CorridorKey 2.0 INFERENCE job with frozen params/output/range."""
     job = create_job_snapshot(clip, params, resume=resume)
-    job.params["_output_config"] = output_config
+    job.params["_output_config"] = copy.deepcopy(output_config)
     if frame_range is not None:
         job.params["_frame_range"] = tuple(frame_range)
     return job

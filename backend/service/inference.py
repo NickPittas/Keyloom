@@ -54,10 +54,18 @@ class InferenceMixin:
 
         if clip.input_asset is None:
             raise CorridorKeyError(f"Clip '{clip.name}' has no input asset")
-        if params.use_alpha_hint and clip.alpha_asset is None:
+        mode = self._v2_hint_mode(params)
+        if mode != "none" and clip.alpha_asset is None:
             raise CorridorKeyError(
                 f"Clip '{clip.name}' has no AlphaHint; turn off 'Use AlphaHint' or generate one"
             )
+        if mode == "keyframes":
+            if clip.hint_keyframes_error:
+                raise CorridorKeyError(
+                    f"Clip '{clip.name}': keyframe marks unusable: {clip.hint_keyframes_error}")
+            if not clip.hint_keyframes:
+                raise CorridorKeyError(
+                    f"Clip '{clip.name}' has no keyframe marks; mark at least one frame")
         cfg = output_config or OutputConfig()
         cfg.validate_selection()
 
@@ -74,7 +82,7 @@ class InferenceMixin:
             with self._gpu_lock:
                 engine = self._get_v2_engine(on_status)
                 prepared = prepare_v2_inputs(
-                    clip, use_alpha_hint=params.use_alpha_hint,
+                    clip, use_alpha_hint=mode != "none", hint_mode=mode,
                     staging_dir=os.path.join(scratch, "staging"), check_cancel=check_cancel,
                 )
                 check_cancel()
@@ -85,6 +93,9 @@ class InferenceMixin:
                     temp_dir=os.path.join(scratch, "tmp"),
                     frame_dir_fps=prepared.fps,
                     hint_video_path=prepared.hint_path,
+                    initial_hint_path=prepared.initial_hint_path,
+                    initial_hint_index=prepared.initial_hint_index,
+                    hint_frame_indices=prepared.hint_frame_indices,
                     ffmpeg_bin=self._v2_ffmpeg_bin(),
                     on_progress=(lambda ph, cur, tot: on_progress(clip.name, cur, tot, phase=ph))
                     if on_progress else None,
@@ -129,11 +140,39 @@ class InferenceMixin:
             )
 
     @staticmethod
-    def _v2_resume_compatible(manifest, cfg, params, source_stems) -> bool:
+    def _v2_hint_mode(params) -> str:
+        mode = getattr(params, "hint_mode", None)
+        return mode or ("full" if params.use_alpha_hint else "none")
+
+    @staticmethod
+    def _v2_effective_keyframes(params, prepared) -> Optional[list]:
+        """Absolute source indices actually sent to the engine (Keyframes mode only)."""
+        if InferenceMixin._v2_hint_mode(params) != "keyframes":
+            return None
+        if prepared.hint_frame_indices is not None:
+            return [int(i) for i in prepared.hint_frame_indices]
+        if prepared.initial_hint_path:
+            return [int(prepared.initial_hint_index)]
+        return []
+
+    @staticmethod
+    def _v2_resume_compatible(manifest, cfg, params, source_stems, hint_keyframes=None) -> bool:
+        if not manifest:
+            return False
+        recorded = manifest.get("params")
+        if isinstance(recorded, dict):
+            # Pre-hint-mode manifests: only the pre-feature meaning is provable
+            # (legacy boolean -> none/full, automatic temporal window).
+            recorded = dict(recorded)
+            recorded.setdefault(
+                "hint_mode", "full" if recorded.get("use_alpha_hint") else "none")
+            recorded.setdefault("temporal_window", "auto")
+        if hint_keyframes is not None:
+            hint_keyframes = [int(i) for i in hint_keyframes]
         return bool(
-            manifest
-            and manifest.get("engine") == "corridorkey-v2"
-            and manifest.get("params") == params.to_dict()
+            manifest.get("engine") == "corridorkey-v2"
+            and recorded == params.to_dict()
+            and manifest.get("hint_keyframes") == hint_keyframes
             and manifest.get("enabled_outputs") == cfg.enabled_outputs
             and manifest.get("formats") == {
                 "fg": cfg.fg_format, "matte": cfg.matte_format,
@@ -147,6 +186,7 @@ class InferenceMixin:
         """Publish runtime outputs to EZ folders. Returns (results, (start, end))."""
         dirs = ensure_output_dirs(clip.output_dir)
         stems = prepared.source_stems
+        kf = self._v2_effective_keyframes(params, prepared)
         n = len(stems)
         start, end = (0, n - 1) if frame_range is None else (
             max(0, frame_range[0]), min(n - 1, frame_range[1]))
@@ -154,14 +194,15 @@ class InferenceMixin:
         skip = set(skip_stems or ())
         if skip:
             manifest = self._v2_read_manifest(dirs["root"])
-            if not self._v2_resume_compatible(manifest, cfg, params, stems):
+            if not self._v2_resume_compatible(manifest, cfg, params, stems, kf):
                 skip = set()
                 if on_warning:
                     on_warning("Existing outputs came from a different run/settings; "
                                "re-publishing all selected frames.")
         # None = full clip; clip_state only treats full-range manifests as COMPLETE.
         full = start == 0 and end == n - 1
-        manifest_kw = dict(source_stems=stems, frame_range=None if full else [start, end])
+        manifest_kw = dict(source_stems=stems, frame_range=None if full else [start, end],
+                           hint_keyframes=kf)
         self._write_manifest(dirs["root"], cfg, params, complete=False, **manifest_kw)
         if on_status:
             on_status("Writing outputs...")
