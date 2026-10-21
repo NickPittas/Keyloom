@@ -241,7 +241,7 @@ if !UV_AVAILABLE!==1 (
 if not defined INSTALL_PYTHON call :resolve_system_python
 if not defined INSTALL_PYTHON (
     echo   [ERROR] Could not find a supported Python runtime.
-    echo   CorridorKey needs Python 3.10-3.13, and the one-click installer targets managed Python !PYTHON_SPEC!.
+    echo   CorridorKey 2.0 needs Python 3.11-3.13, and the one-click installer targets managed Python !PYTHON_SPEC!.
     echo   Please install uv or Python 3.11 manually, then rerun this installer.
     goto :fail
 )
@@ -259,8 +259,8 @@ if %errorlevel% neq 0 (
     echo   [WARN] uv venv creation failed, trying pip fallback...
     goto :use_pip
 )
-echo   Installing packages (uv + auto CUDA detection)...
-uv pip install --python .venv\Scripts\python.exe --torch-backend=auto -e . 2>&1
+echo   Installing packages (uv + CUDA 12.8 PyTorch)...
+uv pip install --python .venv\Scripts\python.exe --torch-backend=cu128 -e . 2>&1
 if %errorlevel% neq 0 (
     echo   [WARN] uv install failed, trying pip fallback...
     goto :use_pip
@@ -278,36 +278,14 @@ if %errorlevel% neq 0 (
 )
 call .venv\Scripts\activate.bat
 
-REM Detect CUDA version for correct PyTorch wheel
-set "INDEX_URL="
-set "DRIVER="
-set "CUDA_LINE="
-set "CUDA_VERSION="
-set "CUDA_WHEEL_LABEL="
-set "CUDA_NOTE="
-for /f "usebackq tokens=1,* delims==" %%A in (`.venv\Scripts\python.exe scripts\detect_windows_torch_index.py --format env`) do set "%%A=%%B"
-if not defined INDEX_URL set "INDEX_URL=https://download.pytorch.org/whl/cpu"
-if not defined CUDA_NOTE set "CUDA_NOTE=Could not run CUDA detection helper; installing CPU-only PyTorch."
-
-if defined DRIVER echo(  NVIDIA driver detected: !DRIVER!
-if defined CUDA_LINE echo(  !CUDA_LINE!
-if /i "!CUDA_DETECT_MODE!"=="nvidia" (
-    echo(  Using !CUDA_WHEEL_LABEL!
-) else (
-    echo(  !CUDA_NOTE!
-    if /i "!CUDA_DETECT_REASON!"=="nvidia_smi_not_found" (
-        echo(  If you have an NVIDIA GPU, ensure drivers are installed and nvidia-smi works.
-    )
-)
-if /i "!CUDA_DETECT_REASON!"=="nvidia_smi_failed" (
-    if "%CORRIDORKEY_EXPECT_GPU%"=="0" (
-        echo(  CORRIDORKEY_EXPECT_GPU=0 is set, continuing with CPU-only PyTorch.
-    ) else (
-        echo   [ERROR] nvidia-smi was found but failed to run. Your NVIDIA driver is broken or outdated.
-        echo   Reinstall the driver from https://www.nvidia.com/Download/index.aspx then re-run this installer.
-        echo   To install CPU-only PyTorch anyway, set CORRIDORKEY_EXPECT_GPU=0 and re-run this installer.
-        goto :fail
-    )
+REM CorridorKey 2.0 is CUDA/NVIDIA only: always use the cu128 PyTorch wheels.
+set "INDEX_URL=https://download.pytorch.org/whl/cu128"
+nvidia-smi >nul 2>&1
+if !errorlevel! neq 0 (
+    echo   [ERROR] No working NVIDIA GPU detected ^(nvidia-smi missing or failing^).
+    echo   CorridorKey 2.0 requires an NVIDIA GPU with CUDA.
+    echo   Install or reinstall the driver from https://www.nvidia.com/Download/index.aspx then re-run this installer.
+    goto :fail
 )
 
 :pip_install
@@ -363,7 +341,7 @@ if /i "!INSTALL_SAM2!"=="y" (
     set SAM2_OK=0
     echo   Installing SAM2 tracker package...
     if !UV_AVAILABLE!==1 (
-        uv pip install --python .venv\Scripts\python.exe --torch-backend=auto -e ".[tracker]" 2>&1
+        uv pip install --python .venv\Scripts\python.exe --torch-backend=cu128 -e ".[tracker]" 2>&1
         if !errorlevel! equ 0 set SAM2_OK=1
     ) else (
         if defined INDEX_URL (
@@ -573,7 +551,7 @@ for /f "tokens=1,2 delims=." %%a in ("!SYSTEM_PYVER!") do (
     set SYSTEM_PYMINOR=%%b
 )
 if !SYSTEM_PYMAJOR! LSS 3 goto :eof
-if !SYSTEM_PYMAJOR!==3 if !SYSTEM_PYMINOR! LSS 10 goto :eof
+if !SYSTEM_PYMAJOR!==3 if !SYSTEM_PYMINOR! LSS 11 goto :eof
 if !SYSTEM_PYMAJOR!==3 if !SYSTEM_PYMINOR! GEQ 14 goto :eof
 set "INSTALL_PYTHON=python"
 goto :eof

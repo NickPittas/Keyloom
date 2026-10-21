@@ -22,7 +22,7 @@ resolve_system_python() {
         ver="$("$candidate" --version 2>&1 | awk '{print $2}')"
         major="$(echo "$ver" | cut -d. -f1)"
         minor="$(echo "$ver" | cut -d. -f2)"
-        if [ "$major" -eq 3 ] && [ "$minor" -ge 10 ] && [ "$minor" -lt 14 ]; then
+        if [ "$major" -eq 3 ] && [ "$minor" -ge 11 ] && [ "$minor" -lt 14 ]; then
             INSTALL_PYTHON="$candidate"
             return 0
         fi
@@ -32,6 +32,18 @@ resolve_system_python() {
 
 echo "[0/6] Installer runtime target..."
 echo "  CorridorKey will provision and use Python ${PYTHON_SPEC} for this install."
+
+# CorridorKey 2.0 is CUDA/NVIDIA only (no CPU/MPS/MLX keying path).
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "  [ERROR] CorridorKey 2.0 requires an NVIDIA GPU with CUDA. macOS is not supported."
+    exit 1
+fi
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+    echo "  [ERROR] No working NVIDIA GPU detected (nvidia-smi missing or failing)."
+    echo "  CorridorKey 2.0 requires an NVIDIA GPU with CUDA. Install the NVIDIA driver and re-run."
+    exit 1
+fi
+INDEX_URL="https://download.pytorch.org/whl/cu128"
 
 # ── Step 2: Check for old venv ──
 if [ -d "venv" ] && [ ! -d ".venv" ]; then
@@ -84,7 +96,7 @@ fi
 if [ -z "$INSTALL_PYTHON" ]; then
     if ! resolve_system_python; then
         echo "  [ERROR] Could not find a supported Python runtime."
-        echo "  CorridorKey needs Python 3.10-3.13, and the one-click installer targets Python ${PYTHON_SPEC}."
+        echo "  CorridorKey 2.0 needs Python 3.11-3.13, and the one-click installer targets Python ${PYTHON_SPEC}."
         case "$OS_TYPE" in
             macos) echo "  Install via: brew install python@3.11" ;;
             *)     echo "  Install via: your package manager, then rerun this installer." ;;
@@ -100,8 +112,8 @@ echo "[4/6] Installing dependencies..."
 if [ "$UV_AVAILABLE" -eq 1 ]; then
     echo "  Creating virtual environment..."
     uv venv --clear --managed-python --python "$INSTALL_PYTHON" .venv >/dev/null 2>&1
-    echo "  Installing packages (uv + auto CUDA detection)..."
-    if uv pip install --python .venv/bin/python --torch-backend=auto -e . 2>&1; then
+    echo "  Installing packages (uv + CUDA 12.8 PyTorch)..."
+    if uv pip install --python .venv/bin/python --torch-backend=cu128 -e . 2>&1; then
         echo "  [OK] Dependencies installed via uv"
     else
         echo "  [WARN] uv install failed, trying pip fallback..."
@@ -115,41 +127,9 @@ if [ "$UV_AVAILABLE" -eq 0 ]; then
     "$INSTALL_PYTHON" -m venv .venv
     source .venv/bin/activate
 
-    if [ "$OS_TYPE" = "macos" ]; then
-        # macOS: default PyTorch wheels include MPS support, no special index needed
-        echo "  macOS detected — PyTorch will use MPS (Apple Silicon) or CPU"
-    elif command -v nvidia-smi &>/dev/null; then
-        CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' || echo "")
-        if [ -n "$CUDA_VER" ]; then
-            CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
-            CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
-            echo "  CUDA $CUDA_VER detected"
-            # cu128 wheels cover Pascal through Blackwell and run on
-            # any CUDA 12.6-13.x driver. cu130 was removed here in
-            # 1.9.2 because it drops Pascal (sm_60/61) kernels and
-            # crashes GTX 10-series users with "no kernel image".
-            if [ "$CUDA_MAJOR" -ge 13 ]; then
-                INDEX_URL="https://download.pytorch.org/whl/cu128"
-            elif [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -ge 6 ]; then
-                INDEX_URL="https://download.pytorch.org/whl/cu128"
-            elif [ "$CUDA_MAJOR" -eq 12 ]; then
-                INDEX_URL="https://download.pytorch.org/whl/cu126"
-            fi
-        fi
-    fi
-
-    if [ -z "$INDEX_URL" ] && [ "$OS_TYPE" != "macos" ]; then
-        echo "  No NVIDIA GPU detected, installing CPU-only PyTorch"
-        INDEX_URL="https://download.pytorch.org/whl/cpu"
-    fi
-
     echo "  Installing packages via pip (this may take a few minutes)..."
     .venv/bin/python -m pip install --upgrade pip >/dev/null 2>&1
-    if [ -n "$INDEX_URL" ]; then
-        .venv/bin/python -m pip install --extra-index-url "$INDEX_URL" -e . 2>&1
-    else
-        .venv/bin/python -m pip install -e . 2>&1
-    fi
+    .venv/bin/python -m pip install --extra-index-url "$INDEX_URL" -e . 2>&1
     echo "  [OK] Dependencies installed via pip"
 fi
 
@@ -170,37 +150,8 @@ else
     exit 1
 fi
 
-# ── Step 4c: MLX acceleration for Apple Silicon ──
-if [ "$OS_TYPE" = "macos" ] && [ "$(uname -m)" = "arm64" ]; then
-    echo "[4c/6] Installing MLX acceleration for Apple Silicon..."
-    MLX_OK=0
-    if [ "$UV_AVAILABLE" -eq 1 ]; then
-        if uv pip install --python .venv/bin/python -e ".[mlx]" 2>&1; then
-            MLX_OK=1
-        fi
-    else
-        if .venv/bin/python -m pip install -e ".[mlx]" 2>&1; then
-            MLX_OK=1
-        fi
-    fi
-    if [ "$MLX_OK" -eq 1 ]; then
-        echo "  [OK] MLX acceleration installed (1.5-2x faster inference on Apple Silicon)"
-        echo "  Downloading MLX checkpoint..."
-        .venv/bin/python scripts/setup_models.py --corridorkey-mlx 2>&1 || \
-            echo "  [WARN] MLX checkpoint download failed. You can retry: .venv/bin/python scripts/setup_models.py --corridorkey-mlx"
-    else
-        echo "  [WARN] MLX install failed. CorridorKey will use PyTorch MPS instead."
-        echo "  You can retry later with: .venv/bin/python -m pip install -e '.[mlx]'"
-    fi
-else
-    echo "[4c/6] MLX acceleration — skipped (Apple Silicon only)"
-fi
-
 echo "[4d/6] Optional SAM2 tracker..."
 INSTALL_SAM2="y"
-if [ "$OS_TYPE" = "macos" ]; then
-    echo "  [NOTE] SAM2 tracking on macOS is experimental in CorridorKey."
-fi
 INSTALL_SAM2_INPUT="${CORRIDORKEY_INSTALL_SAM2:-}"
 if [ -z "$INSTALL_SAM2_INPUT" ]; then
     read -rp "  Install SAM2 tracking support? [Y/n]: " INSTALL_SAM2_INPUT
@@ -213,18 +164,12 @@ if [ "$INSTALL_SAM2" = "y" ]; then
     SAM2_OK=0
     echo "  Installing SAM2 tracker package..."
     if [ "$UV_AVAILABLE" -eq 1 ]; then
-        if uv pip install --python .venv/bin/python --torch-backend=auto -e ".[tracker]" 2>&1; then
+        if uv pip install --python .venv/bin/python --torch-backend=cu128 -e ".[tracker]" 2>&1; then
             SAM2_OK=1
         fi
     else
-        if [ -n "${INDEX_URL:-}" ]; then
-            if .venv/bin/python -m pip install --extra-index-url "$INDEX_URL" -e ".[tracker]" 2>&1; then
-                SAM2_OK=1
-            fi
-        else
-            if .venv/bin/python -m pip install -e ".[tracker]" 2>&1; then
-                SAM2_OK=1
-            fi
+        if .venv/bin/python -m pip install --extra-index-url "$INDEX_URL" -e ".[tracker]" 2>&1; then
+            SAM2_OK=1
         fi
     fi
 
@@ -297,7 +242,7 @@ else
 fi
 
 # ── Step 7: Download model weights ──
-echo "[6/6] Checking model weights..."
+echo "[6/6] Checking model weights (CorridorKey 2.0 bundle, ~5 GB)..."
 .venv/bin/python scripts/setup_models.py --check
 .venv/bin/python scripts/setup_models.py --corridorkey
 if [ $? -ne 0 ]; then
@@ -317,11 +262,6 @@ if [[ "$(echo "$INSTALL_GVM" | tr '[:upper:]' '[:lower:]')" == "y" ]]; then
     .venv/bin/python scripts/setup_models.py --gvm
 fi
 
-if [ "$OS_TYPE" = "macos" ]; then
-    echo ""
-echo "  [NOTE] VideoMaMa runs on CPU on macOS (no MPS support yet)."
-echo "  It works but will be slow. 37GB download — skip if unsure."
-fi
 INSTALL_VM="${CORRIDORKEY_INSTALL_VIDEOMAMA:-}"
 if [ -z "$INSTALL_VM" ]; then
     read -rp "  Download VideoMaMa alpha generator? (~37GB) [y/N]: " INSTALL_VM
