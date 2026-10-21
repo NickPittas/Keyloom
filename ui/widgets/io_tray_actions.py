@@ -278,6 +278,8 @@ class IOTrayActionsMixin:
         )
         if confirm != QMessageBox.Yes:
             return
+        if not self._hint_mutation_ok():  # a job may have started during the dialog
+            return
 
         failures: list[str] = []
         for clip in clips:
@@ -342,6 +344,8 @@ class IOTrayActionsMixin:
         )
         if confirm != QMessageBox.Yes:
             return
+        if not self._hint_mutation_ok():  # a job may have started during the dialog
+            return
 
         failures: list[str] = []
         for clip in clips:
@@ -378,6 +382,8 @@ class IOTrayActionsMixin:
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if confirm != QMessageBox.Yes:
+            return
+        if not self._hint_mutation_ok():  # a job may have started during the dialog
             return
 
         failures: list[str] = []

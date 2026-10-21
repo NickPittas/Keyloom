@@ -170,3 +170,18 @@ def test_oserror_reported_once_and_state_refreshed(tmp_path, monkeypatch):
     assert box.warnings == 1
     assert "one" in box.last[2] and "two" in box.last[2] and "denied" in box.last[2]
     assert t._model.updated == ["one", "two"]
+
+
+def test_guard_rechecked_after_confirmation(tmp_path, monkeypatch):
+    """A GPU job that starts while the confirm dialog is open blocks the clear."""
+    clip, root = _clip(tmp_path)
+    box = _Box()
+    _patch(monkeypatch, box)
+    t = _Tray()
+    for fn in (t._clear_alpha_batch, t._clear_mask_batch, t._clear_all_batch):
+        answers = iter([True, False])  # idle before the dialog, busy after
+        t.set_hint_mutation_guard(lambda: next(answers))
+        fn([clip])
+    assert box.questions == 3 and box.infos == 3
+    assert os.path.isdir(os.path.join(root, "AlphaHint"))
+    assert os.path.isdir(os.path.join(root, "VideoMamaMaskHint"))
