@@ -57,28 +57,30 @@ _DIAGNOSTICS: list[Diagnostic] = [
         ],
         tags=["gpu", "cuda", "cpu", "float16"],
     ),
-    # ── Missing checkpoint ────────────────────────────────────────
+    # ── Missing CorridorKey 2.0 assets ────────────────────────────
     Diagnostic(
         id="missing-checkpoint",
-        title="Model Checkpoint Not Found",
+        title="CorridorKey 2.0 Model Assets Not Found",
         pattern=re.compile(
+            r"CorridorKey 2\.0.*(missing|incomplete)|"
+            r"CorridorKeyV2 package missing|"
             r"No \.pth checkpoint found|"
-            r"checkpoints.*not found|"
-            r"CorridorKey\.pth.*missing",
+            r"checkpoints.*not found",
             re.IGNORECASE,
         ),
         explanation=(
-            "The CorridorKey model weights (.pth file) are missing from the "
-            "checkpoints folder.  The model must be downloaded separately."
+            "The CorridorKey 2.0 model assets (corridorkey_v2 weights, "
+            "foundation stats, RVM, MoGe and C-RADIO) are missing or "
+            "incomplete.  They must be downloaded separately."
         ),
         steps=[
-            "Download CorridorKey.pth from the project release page\n"
-            "or the link in the README.",
-            "Place the file in:\n"
-            "    CorridorKeyModule/checkpoints/CorridorKey.pth",
+            "Download the CorridorKey 2.0 bundle:\n"
+            "    python scripts/setup_models.py --corridorkey",
+            "Check the status with:\n"
+            "    python scripts/setup_models.py --check",
             "Restart EZ-CorridorKey.",
         ],
-        tags=["checkpoint", "model", "pth"],
+        tags=["checkpoint", "model", "corridorkey-v2"],
     ),
     # ── FFmpeg ────────────────────────────────────────────────────
     Diagnostic(
@@ -353,9 +355,7 @@ _DIAGNOSTICS: list[Diagnostic] = [
         steps=[
             "Close other GPU-heavy applications (games, other AI tools,\n"
             "browser hardware acceleration).",
-            "Try processing at a lower resolution first.",
-            "Set the environment variable for low-VRAM mode:\n"
-            "    set CORRIDORKEY_OPT_MODE=lowvram",
+            "Switch VRAM profile to 'Low VRAM' in inference settings.",
             "If the problem persists, your GPU may not have enough\n"
             "VRAM for this clip resolution.",
         ],
@@ -675,7 +675,7 @@ def _resolve_missing_checkpoint(ctx: dict, base: list[str]) -> list[str]:
         return [
             "Model weights are downloaded by the first-run Setup\n"
             "Wizard. If you dismissed it, reopen the app and follow\n"
-            "the setup prompts to fetch CorridorKey.pth (~383 MB).",
+            "the setup prompts to fetch the CorridorKey 2.0 bundle.",
             "If the wizard does not appear, go to:\n"
             "    Edit > Preferences > Re-run Setup Wizard",
             "If the download fails, please click Report Issue on\n"

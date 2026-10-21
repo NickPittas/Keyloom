@@ -145,7 +145,7 @@ class TestMissingCheckpointResolution:
         text = _text(steps)
         assert "setup wizard" in text
         # Must not leak the dev-only file-path instruction.
-        assert "corridorkeymodule/checkpoints" not in text
+        assert "setup_models.py --corridorkey" not in text
 
     def test_dev_keeps_original_instructions(self):
         ctx = {"is_frozen": False, "has_nvidia": True, "platform": "win32"}
@@ -154,7 +154,7 @@ class TestMissingCheckpointResolution:
         ):
             steps = resolve_steps(_by_id(self.DIAG_ID))
         text = _text(steps)
-        assert "corridorkeymodule/checkpoints" in text or "checkpoints" in text
+        assert "setup_models.py --corridorkey" in text
 
 
 class TestUnregisteredDiagnosticPassthrough:

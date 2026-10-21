@@ -230,34 +230,6 @@ def _checkpoint_info(path: str | os.PathLike[str]) -> dict[str, object]:
     }
 
 
-def _verify_torch_checkpoint_load(path: str | os.PathLike[str]) -> dict[str, object]:
-    import gc
-    import torch
-
-    p = Path(path)
-    checkpoint = torch.load(str(p), map_location="cpu", weights_only=True)
-    state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    key_count = len(state_dict) if hasattr(state_dict, "keys") else None
-    info = _checkpoint_info(p)
-    info["state_dict_keys"] = key_count
-    del state_dict
-    del checkpoint
-    gc.collect()
-    return info
-
-
-def _verify_safetensors_checkpoint_load(path: str | os.PathLike[str]) -> dict[str, object]:
-    from safetensors import safe_open
-
-    p = Path(path)
-    with safe_open(str(p), framework="np") as handle:
-        keys = list(handle.keys())
-    info = _checkpoint_info(p)
-    info["tensor_keys"] = len(keys)
-    info["first_keys"] = keys[:5]
-    return info
-
-
 def _verify_birefnet_model_load(model_dir: str | os.PathLike[str]) -> dict[str, object]:
     import gc
     import torch
@@ -332,7 +304,11 @@ def run_model_path_check(
         resolved_data_dir = os.path.abspath(get_data_dir())
         set_app_dir(resolved_data_dir)
 
-        import CorridorKeyModule.backend as ck_backend
+        from backend.v2_paths import (
+            get_v2_asset_paths,
+            get_v2_models_dir,
+            validate_v2_assets,
+        )
 
         result: dict[str, object] = {
             "frozen": bool(getattr(sys, "frozen", False)),
@@ -341,10 +317,8 @@ def run_model_path_check(
             "data_dir": resolved_data_dir,
             "verify_model_loads": verify_model_loads,
             "verify_optional_model_downloads": verify_optional_model_downloads,
-            "checkpoint_search_dirs": [
-                os.path.abspath(path)
-                for path in ck_backend._checkpoint_search_dirs()
-            ],
+            "corridorkey_v2_code_root": str(get_v2_asset_paths().package_root),
+            "corridorkey_v2_models_dir": str(get_v2_models_dir()),
         }
         errors: list[str] = []
         model_loads: dict[str, object] = {}
@@ -355,46 +329,24 @@ def run_model_path_check(
                 f"{os.path.abspath(data_dir)}, got {resolved_data_dir}"
             )
 
-        try:
-            torch_green = ck_backend._discover_checkpoint(
-                ck_backend.TORCH_EXT, "green"
+        v2_problems = validate_v2_assets()
+        result["corridorkey_v2"] = "OK" if not v2_problems else "MISSING"
+        if v2_problems:
+            errors.append(
+                "CorridorKey 2.0 missing/incomplete: "
+                + "; ".join(v2_problems)
+                + ". Run: python scripts/setup_models.py --corridorkey"
             )
-            result["torch_green"] = str(torch_green)
-            if verify_model_loads:
-                model_loads["torch_green"] = _verify_torch_checkpoint_load(torch_green)
-        except Exception as exc:
-            errors.append(f"Torch green checkpoint missing: {exc}")
-
-        try:
-            torch_blue = ck_backend._discover_checkpoint(
-                ck_backend.TORCH_EXT, "blue"
-            )
-            result["torch_blue"] = str(torch_blue)
-            if verify_model_loads:
-                model_loads["torch_blue"] = _verify_torch_checkpoint_load(torch_blue)
-        except Exception as exc:
-            errors.append(f"Torch blue checkpoint missing: {exc}")
-
-        if sys.platform == "darwin" and platform.machine() == "arm64":
+        elif verify_model_loads:
             try:
-                mlx_green = ck_backend._discover_checkpoint(
-                    ck_backend.MLX_EXT, "green"
-                )
-                result["mlx_green"] = str(mlx_green)
-                if verify_model_loads:
-                    model_loads["mlx_green"] = _verify_safetensors_checkpoint_load(mlx_green)
-            except Exception as exc:
-                errors.append(f"MLX green checkpoint missing: {exc}")
+                from backend.corridorkey_v2 import CorridorKeyV2Engine
 
-            try:
-                mlx_blue = ck_backend._discover_checkpoint(
-                    ck_backend.MLX_EXT, "blue"
-                )
-                result["mlx_blue"] = str(mlx_blue)
-                if verify_model_loads:
-                    model_loads["mlx_blue"] = _verify_safetensors_checkpoint_load(mlx_blue)
+                engine = CorridorKeyV2Engine()
+                engine.load()
+                engine.unload()
+                model_loads["corridorkey_v2"] = {"status": "loaded"}
             except Exception as exc:
-                errors.append(f"MLX blue checkpoint missing: {exc}")
+                errors.append(f"CorridorKey 2.0 model load failed: {exc}")
 
         from modules.BiRefNetModule import wrapper as birefnet_wrapper
         from modules.MatAnyone2Module import wrapper as matanyone2_wrapper
@@ -446,9 +398,6 @@ def run_model_path_check(
                         f"{setup_models.PROJECT_ROOT}"
                     )
                 setup_targets = {
-                    "corridorkey": setup_models.MODELS["corridorkey"]["local_dir"],
-                    "corridorkey_blue": setup_models.MODELS["corridorkey-blue"]["local_dir"],
-                    "mlx": setup_models.MLX_CHECKPOINTS[0]["local_dir"],
                     "matanyone2": setup_models.MATANYONE2_CHECKPOINT["local_dir"],
                     "birefnet": setup_models.BIREFNET_DEFAULT_CHECKPOINT["local_dir"],
                     "gvm": setup_models.MODELS["gvm"]["local_dir"],
@@ -553,13 +502,6 @@ def main() -> int:
         help="Logging level (default: INFO)",
     )
     parser.add_argument(
-        "--opt-mode",
-        default=None,
-        choices=["auto", "speed", "lowvram"],
-        help="GPU optimization mode: auto (detect VRAM), speed (torch.compile), "
-             "lowvram (tiled refiner for 8GB cards). Overrides CORRIDORKEY_OPT_MODE env var.",
-    )
-    parser.add_argument(
         "--verify-model-paths",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -583,10 +525,6 @@ def main() -> int:
     # parse_known_args so CLI-mode flags (--action, --win_path, etc.)
     # pass through to clip_manager.py without error.
     args, _unknown = parser.parse_known_args()
-
-    # CLI flag takes priority over env var for optimization mode
-    if args.opt_mode:
-        os.environ['CORRIDORKEY_OPT_MODE'] = args.opt_mode
 
     if args.verify_model_paths:
         return run_model_path_check(
