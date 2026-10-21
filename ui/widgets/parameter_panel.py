@@ -667,7 +667,7 @@ class ParameterPanel(QWidget):
         self._proc_check.setChecked(True)
         self._proc_check.setToolTip(
             self.tr(
-                "Processed EXR is premultiplied linear; PNG straight sRGB.\n"
+                "Processed EXR is straight-alpha linear; PNG straight sRGB.\n"
                 "Designed for import into Resolve, Premiere, and compositing tools."
             )
         )

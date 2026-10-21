@@ -113,12 +113,14 @@ def test_png_negative_and_hdr_clamped(tmp_path):
     assert read(os.path.join(dirs["comp"], "shot_1001.png")).min() == 255
 
 
-def test_processed_exr_premultiplied_once(tmp_path):
+def test_exr_outputs_are_moved_not_reencoded(tmp_path):
     runtime = make_runtime(tmp_path, cutout=(0.8, 0.4, 0.2, 0.5))  # BGRA
-    _, dirs, _ = publish(tmp_path, cfg(), runtime)
-    img = read(os.path.join(dirs["processed"], "shot_1001.exr"))
-    assert img.shape == (H, W, 4)
-    np.testing.assert_allclose(img[0, 0], [0.4, 0.2, 0.1, 0.5], atol=1e-3)
+    src = {p: open(Svc._v2_runtime_file(p, d, 0), "rb").read() for p, d in runtime.items()}
+    _, dirs, _ = publish(tmp_path, cfg(comp_format="exr"), runtime)
+    for product, ez in Svc.V2_PRODUCT_TO_EZ.items():
+        with open(os.path.join(dirs[ez], "shot_1001.exr"), "rb") as f:
+            assert f.read() == src[product]
+        assert not any(n.endswith("_000000.exr") for n in os.listdir(runtime[product]))
 
 
 def test_processed_png_straight_srgb_alpha_0_and_1(tmp_path):
@@ -148,6 +150,7 @@ def test_matte_values(tmp_path):
     assert m.ndim == 2
     np.testing.assert_allclose(m, 0.25, atol=1e-3)
     d2 = make_dirs(tmp_path / "b")
+    runtime = make_runtime(tmp_path / "rt2", alpha=0.25)
     Svc()._publish_v2_outputs(runtime, d2, STEMS, cfg(matte_format="png"), "clip")
     m = read(os.path.join(d2["matte"], "shot_1001.png"))
     assert m.ndim == 2 and abs(int(m[0, 0]) - 63) <= 1
@@ -202,7 +205,8 @@ def test_wrong_channels_raises(tmp_path):
     runtime = make_runtime(tmp_path)
     _exr(f"{runtime['cutout']}/cutout_000000.exr", np.zeros((H, W, 3)))
     with pytest.raises(CorridorKeyError, match="cutout_000000"):
-        Svc()._publish_v2_outputs(runtime, make_dirs(tmp_path), STEMS, cfg(), "clip")
+        Svc()._publish_v2_outputs(runtime, make_dirs(tmp_path), STEMS,
+                                  cfg(processed_format="png"), "clip")
 
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf])
@@ -213,7 +217,7 @@ def test_nonfinite_raises(tmp_path, bad):
     _exr(f"{runtime['fg']}/fg_000000.exr", arr)
     dirs = make_dirs(tmp_path)
     with pytest.raises(CorridorKeyError, match="fg_000000"):
-        Svc()._publish_v2_outputs(runtime, dirs, STEMS, cfg(), "clip")
+        Svc()._publish_v2_outputs(runtime, dirs, STEMS, cfg(fg_format="png"), "clip")
     assert os.listdir(dirs["fg"]) == []
 
 
@@ -238,7 +242,7 @@ def test_manifest_fields(tmp_path):
     m = _manifest(tmp_path)
     assert m["version"] == 2 and m["engine"] == "corridorkey-v2"
     assert m["source_stems"] is None and m["frame_range"] is None and m["complete"] is False
-    assert m["alpha_convention"] == {"processed_exr": "premultiplied-linear",
+    assert m["alpha_convention"] == {"processed_exr": "straight-linear",
                                      "processed_png": "straight-srgb"}
     Svc()._write_manifest(str(tmp_path), OutputConfig(), params, source_stems=STEMS,
                           frame_range=(0, 2), complete=True)
@@ -264,12 +268,3 @@ def test_copy_v2_settings(tmp_path):
     out2.mkdir()
     Svc()._copy_v2_settings(str(tmp_path / "nope.txt"), str(out2))
     assert os.listdir(out2) == []
-
-
-def test_half_overflow_clamped_with_single_warning(tmp_path):
-    runtime = make_runtime(tmp_path, fg=70000.0)
-    warns = []
-    _, dirs, _ = publish(tmp_path, cfg(), runtime=runtime, on_warning=warns.append)
-    img = read(os.path.join(dirs["fg"], f"{STEMS[0]}.exr"))
-    assert np.isfinite(img).all() and img.max() <= 65504.0
-    assert len(warns) == 1 and "half-float" in warns[0]

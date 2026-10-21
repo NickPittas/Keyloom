@@ -21,14 +21,12 @@ from ..frame_io import (
     _srgb_to_linear,
     decode_video_mask_frame,
     imread_unicode,
-    read_video_frame_at,
     read_video_frames,
 )
 from ..validators import validate_frame_read, validate_write
 
 logger = logging.getLogger(__name__)
 
-_HALF_MAX = 65504.0  # largest finite float16
 
 
 class FrameOpsMixin:
@@ -153,7 +151,7 @@ class FrameOpsMixin:
             "frame_range": list(frame_range) if frame_range is not None else None,
             "complete": bool(complete),
             "alpha_convention": {
-                "processed_exr": "premultiplied-linear",
+                "processed_exr": "straight-linear",
                 "processed_png": "straight-srgb",
             },
         }
@@ -235,6 +233,15 @@ class FrameOpsMixin:
             )
         return img
 
+    @staticmethod
+    def _v2_move(src: str, final_path: str) -> None:
+        if not os.path.isfile(src):
+            raise CorridorKeyError(f"Missing CorridorKey 2.0 runtime output: {src}")
+        d, name = os.path.split(final_path)
+        tmp = os.path.join(d, f".{name}.tmp")
+        shutil.move(src, tmp)  # rename on the same filesystem, else a plain copy
+        os.replace(tmp, final_path)
+
     def _v2_atomic_write(self, img, final_path, fmt, clip_name, frame_index, compression):
         d, name = os.path.split(final_path)
         tmp = os.path.join(d, f".{os.path.splitext(name)[0]}.tmp.{fmt}")
@@ -271,7 +278,6 @@ class FrameOpsMixin:
         indices = range(len(source_stems)) if publish_indices is None else publish_indices
         skip = skip_stems or set()
         published: list[str] = []
-        clamp_warned = False
         for i in indices:
             if check_cancel is not None:
                 check_cancel()
@@ -282,33 +288,21 @@ class FrameOpsMixin:
                 if product not in product_dirs:
                     raise CorridorKeyError(f"No runtime directory for product '{product}'")
                 path = self._v2_runtime_file(product, product_dirs[product], i)
-                img = self._v2_read(product, path)
                 fmt = fmts[product]
+                ez = self.V2_PRODUCT_TO_EZ[product]
+                if fmt == "exr":
+                    # Runtime already wrote the final EXR: move/rename, never re-encode.
+                    self._v2_move(path, os.path.join(dirs[ez], f"{stem}.exr"))
+                    continue
+                img = self._v2_read(product, path)
                 if product == "alpha":
                     out = img
                 elif product == "cutout":
-                    if fmt == "exr":
-                        out = np.concatenate(
-                            [img[:, :, :3] * img[:, :, 3:4], img[:, :, 3:4]], axis=-1)
-                    else:
-                        out = np.concatenate(
-                            [_linear_to_srgb(np.clip(img[:, :, :3], 0.0, None)),
-                             img[:, :, 3:4]], axis=-1)
-                elif fmt == "exr":
-                    out = img
+                    out = np.concatenate(
+                        [_linear_to_srgb(np.clip(img[:, :, :3], 0.0, None)),
+                         img[:, :, 3:4]], axis=-1)
                 else:
                     out = _linear_to_srgb(np.clip(img, 0.0, None))
-                ez = self.V2_PRODUCT_TO_EZ[product]
-                if fmt == "exr" and (np.abs(out) > _HALF_MAX).any():
-                    # EXR output is half-float; larger finite values would become inf.
-                    out = np.clip(out, -_HALF_MAX, _HALF_MAX)
-                    if not clamp_warned:
-                        clamp_warned = True
-                        msg = ("Some output values exceeded half-float EXR range and were "
-                               "clamped to +/-65504.")
-                        logger.warning("Clip '%s': %s", clip_name, msg)
-                        if on_warning:
-                            on_warning(msg)
                 self._v2_atomic_write(
                     np.ascontiguousarray(out, dtype=np.float32),
                     os.path.join(dirs[ez], f"{stem}.{fmt}"),
