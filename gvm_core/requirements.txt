@@ -3,7 +3,7 @@ diffusers
 easydict
 imageio
 numpy
-opencv-python-headless
+opencv-python-headless>=4.11,<5
 peft
 Pillow
 PIMS

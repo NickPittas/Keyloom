@@ -3,7 +3,7 @@ torchvision
 diffusers
 transformers
 accelerate
-opencv-python
+opencv-python-headless>=4.11,<5
 pillow
 numpy
 einops
