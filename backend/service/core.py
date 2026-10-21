@@ -27,30 +27,32 @@ from .pipelines import PipelinesMixin
 
 logger = logging.getLogger(__name__)
 
-# Pull defaults from CorridorKeyModule
-from CorridorKeyModule.inference_engine import INFERENCE_DEFAULTS as _D
+VALID_VRAM_PROFILES = ("auto", "low")
+VALID_EXR_COMPRESSIONS = ("dwab", "piz", "zip", "none")
+VALID_OUTPUT_FORMATS = ("exr", "png")
 
 
 @dataclass
 class InferenceParams:
-    """Frozen parameters for a single inference job.
+    """CorridorKey 2.0 inference parameters (mapped to the engine config)."""
+    input_is_linear: bool = False  # frame-dir input is scene-linear (cfg.frame_dir_linear)
+    use_alpha_hint: bool = False  # external AlphaHint off by default
+    hint_quality: float = 0.95  # trust in external hint; only used if use_alpha_hint
+    carry_hint: bool = True
+    carry_hint_quality: float = 0.95
+    vram_profile: str = "auto"  # "auto" | "low"
+    despill_strength: float = 0.5
+    cutout_linear: bool = False  # carried to cfg; no effect on EXR output
 
-    Defaults are pulled from INFERENCE_DEFAULTS (single source of truth
-    in CorridorKeyModule.inference_engine).  Change a default there and
-    it propagates to every engine path and the service layer.
-    """
-    input_is_linear: bool = False
-    despill_strength: float = _D["despill_strength"]
-    auto_despeckle: bool = _D["auto_despeckle"]
-    despeckle_size: int = _D["despeckle_size"]
-    despeckle_dilation: int = _D["despeckle_dilation"]
-    despeckle_blur: int = _D["despeckle_blur"]
-    refiner_scale: float = _D["refiner_scale"]
-    source_passthrough: bool = _D["source_passthrough"]
-    edge_erode_px: int = _D["edge_erode_px"]
-    edge_blur_px: int = _D["edge_blur_px"]
-    screen_color: str = _D["screen_color"]
-    garbage_matte_px: int = _D["garbage_matte_px"]
+    def __post_init__(self) -> None:
+        if self.vram_profile not in VALID_VRAM_PROFILES:
+            raise ValueError(
+                f"vram_profile must be one of {VALID_VRAM_PROFILES}, got {self.vram_profile!r}"
+            )
+        for name in ("hint_quality", "carry_hint_quality", "despill_strength"):
+            v = getattr(self, name)
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {v!r}")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -73,6 +75,21 @@ class OutputConfig:
     processed_enabled: bool = True
     processed_format: str = "exr"
     exr_compression: str = "dwab"  # "dwab", "piz", "zip", or "none"
+
+    def __post_init__(self) -> None:
+        for name in ("fg_format", "matte_format", "comp_format", "processed_format"):
+            v = getattr(self, name)
+            if v not in VALID_OUTPUT_FORMATS:
+                raise ValueError(f"{name} must be one of {VALID_OUTPUT_FORMATS}, got {v!r}")
+        if self.exr_compression not in VALID_EXR_COMPRESSIONS:
+            raise ValueError(
+                f"exr_compression must be one of {VALID_EXR_COMPRESSIONS}, got {self.exr_compression!r}"
+            )
+
+    def validate_selection(self) -> None:
+        """Raise ValueError if no output is enabled."""
+        if not self.enabled_outputs:
+            raise ValueError("No outputs selected; enable at least one output")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -124,16 +141,10 @@ class CorridorKeyService(
             service.run_inference(clip, params, on_progress=my_callback)
     """
 
-    # Model resolution options — user-facing setting.
-    # 2048 = full quality (matches OG CK), 1024 = faster / less memory.
-    VALID_MODEL_RESOLUTIONS = (1024, 2048)
-
     def __init__(self):
         self._engine_pool: list = []
         self._pool_size: int = 1
-        self._engine_screen_color: str = "green"  # which checkpoint variant is loaded
-        self._model_resolution: int = 2048  # default: full quality
-        self._inference_backend: str = "auto"  # auto | mlx | torch (macOS only)
+        self._v2_engine = None
         self._gvm_processor = None
         self._sam2_tracker = None
         self._videomama_pipeline = None
@@ -141,6 +152,7 @@ class CorridorKeyService(
         self._birefnet_processor = None
         self._active_model = _ActiveModel.NONE
         self._device: str = 'cpu'
+        self._device_detected: bool = False
         self._job_queue: Optional[GPUJobQueue] = None
         self._sam2_model_id: str = "facebook/sam2.1-hiera-base-plus"
         # GPU mutex — serializes ALL model operations
@@ -181,57 +193,6 @@ class CorridorKeyService(
                     torch.cuda.empty_cache()
             except Exception:
                 logger.debug("CUDA cache clear skipped after SAM2 model switch", exc_info=True)
-
-    @property
-    def model_resolution(self) -> int:
-        """Current model inference resolution (1024 or 2048)."""
-        return self._model_resolution
-
-    def set_model_resolution(self, res: int) -> None:
-        """Set model inference resolution. Requires engine reload to take effect."""
-        if res not in self.VALID_MODEL_RESOLUTIONS:
-            logger.warning("Invalid model resolution %d, ignoring", res)
-            return
-        if res != self._model_resolution:
-            logger.info("Model resolution: %d -> %d (engine reload required)", self._model_resolution, res)
-            self._model_resolution = res
-            # Clear engine pool — next inference will rebuild at new resolution
-            for eng in self._engine_pool:
-                self._safe_offload(eng)
-            self._engine_pool.clear()
-            if self._active_model == _ActiveModel.INFERENCE:
-                self._active_model = _ActiveModel.NONE
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-    def set_inference_backend(self, backend: str) -> None:
-        """Change the inference backend (macOS: auto/mlx/torch). Drops the engine pool
-        so the next inference rebuilds on the new backend without a restart.
-        """
-        backend = (backend or "auto").lower()
-        if backend not in ("auto", "mlx", "torch"):
-            logger.warning("Invalid inference backend %r, ignoring", backend)
-            return
-        if backend == self._inference_backend:
-            return
-        logger.info("Inference backend: %s -> %s (engine reload required)", self._inference_backend, backend)
-        self._inference_backend = backend
-        for eng in self._engine_pool:
-            self._safe_offload(eng)
-        self._engine_pool.clear()
-        if self._active_model == _ActiveModel.INFERENCE:
-            self._active_model = _ActiveModel.NONE
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
 
     def set_pool_size(self, n: int) -> None:
         """Set the number of parallel inference engines."""
@@ -278,22 +239,26 @@ class CorridorKeyService(
     # --- Device Utilities ---
 
     def detect_device(self) -> str:
-        """Detect best available compute device (CUDA > MPS > CPU)."""
+        """Detect compute device. CorridorKey 2.0 keying requires CUDA."""
+        self._device_detected = True
         try:
             import torch
-            if torch.cuda.is_available():
-                self._device = 'cuda'
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                self._device = 'mps'
-                logger.info("Apple MPS acceleration available")
-            else:
-                self._device = 'cpu'
-                logger.warning("No GPU acceleration available — using CPU (will be very slow)")
+            cuda = torch.cuda.is_available()
         except ImportError:
+            cuda = False
+        if cuda:
+            self._device = 'cuda'
+        else:
             self._device = 'cpu'
-            logger.warning("PyTorch not installed — using CPU")
+            logger.error("CorridorKey 2.0 requires an NVIDIA CUDA GPU; keying unavailable")
         logger.info(f"Compute device: {self._device}")
         return self._device
+
+    def cuda_keying_available(self) -> bool:
+        """True if a CUDA GPU is available for CorridorKey 2.0 keying."""
+        if not self._device_detected:
+            self.detect_device()
+        return self._device == 'cuda'
 
     def get_vram_info(self) -> dict[str, float]:
         """Get GPU VRAM info in GB. Returns empty dict if not CUDA."""

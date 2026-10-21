@@ -78,10 +78,7 @@ class TestDeviceDetection:
         svc = CorridorKeyService()
         result = svc.detect_device()
         assert isinstance(result, str)
-        if sys.platform == "darwin":
-            assert result in ("mps", "cpu")
-        else:
-            assert result in ("cuda", "cpu")
+        assert result in ("cuda", "cpu")
 
 
 # ── TestVRAMInfo ──
@@ -431,7 +428,7 @@ class TestWriteManifest:
     def test_manifest_overwrites_existing(self):
         svc = CorridorKeyService()
         cfg = OutputConfig()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
         with tempfile.TemporaryDirectory() as tmpdir:
             # Write twice — second should overwrite
             svc._write_manifest(tmpdir, cfg, params)
@@ -445,7 +442,7 @@ class TestWriteManifest:
         """Manifest write failure is non-fatal (logs warning, continues)."""
         svc = CorridorKeyService()
         cfg = OutputConfig()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
         # Write to non-existent path — should not raise
         svc._write_manifest("/nonexistent/path/that/doesnt/exist", cfg, params)
 
@@ -633,7 +630,7 @@ class TestRunInference:
 
     def test_happy_path(self, sample_clip, tmp_clip_dir):
         svc, mock_engine = self._setup_service_with_mock_engine()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
         cfg = OutputConfig(
             fg_format="png", matte_format="png",
             comp_format="png", processed_format="png",
@@ -645,7 +642,7 @@ class TestRunInference:
 
     def test_resume_skips_stems(self, sample_clip, tmp_clip_dir):
         svc, mock_engine = self._setup_service_with_mock_engine()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
         input_files = sample_clip.input_asset.get_frame_files()
         first_stem = os.path.splitext(input_files[0])[0]
         results = svc.run_inference(
@@ -660,7 +657,7 @@ class TestRunInference:
 
     def test_cancellation_raises(self, sample_clip):
         svc, _ = self._setup_service_with_mock_engine()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
         job = GPUJob(JobType.INFERENCE, "test_clip")
         job.request_cancel()
 
@@ -672,7 +669,7 @@ class TestRunInference:
     def test_frame_read_error_continues(self, sample_clip, tmp_clip_dir):
         """FrameReadError on a frame → skip that frame, continue others."""
         svc, mock_engine = self._setup_service_with_mock_engine()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
 
         # Patch _read_input_frame to fail on first call, succeed on others
         original_read = svc._read_input_frame
@@ -701,7 +698,7 @@ class TestRunInference:
         """Codex: engine.process_frame raising should propagate (fail-fast)."""
         svc, mock_engine = self._setup_service_with_mock_engine()
         mock_engine.process_frame.side_effect = RuntimeError("GPU OOM")
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
 
         # Should propagate — not caught by the per-frame handler
         with pytest.raises(RuntimeError, match="GPU OOM"):
@@ -712,7 +709,7 @@ class TestRunInference:
     def test_progress_callback_cadence(self, sample_clip, tmp_clip_dir):
         """Codex: progress fires every 5th frame + final, not per-frame."""
         svc, _ = self._setup_service_with_mock_engine()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
         calls = []
         results = svc.run_inference(
             sample_clip, params,
@@ -727,7 +724,7 @@ class TestRunInference:
 
     def test_state_transition_to_complete(self, sample_clip, tmp_clip_dir):
         svc, _ = self._setup_service_with_mock_engine()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
         assert sample_clip.state == ClipState.READY
         svc.run_inference(sample_clip, params,
                           output_config=OutputConfig(fg_format="png", matte_format="png",
@@ -737,7 +734,7 @@ class TestRunInference:
     def test_zero_frame_clip_no_complete(self):
         """Codex: zero-frame clip should not transition to COMPLETE (0==0 passes)."""
         svc, _ = self._setup_service_with_mock_engine()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             clip_root = os.path.join(tmpdir, "empty_clip")
@@ -764,7 +761,7 @@ class TestRunInference:
         svc = CorridorKeyService()
         clip = ClipEntry("test", "/tmp", state=ClipState.READY)
         with pytest.raises(CorridorKeyError, match="missing input or alpha"):
-            svc.run_inference(clip, InferenceParams(screen_color="green"))
+            svc.run_inference(clip, InferenceParams())
 
     def test_video_captures_released(self, sample_clip, tmp_clip_dir):
         """Video captures should be released in finally block."""
@@ -787,7 +784,7 @@ class TestRunInference:
 
         mock_engine.process_frame.side_effect = cancel_after_first
 
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
         with pytest.raises(JobCancelledError):
             svc.run_inference(sample_clip, params, job=job,
                               output_config=OutputConfig(fg_format="png", matte_format="png",
@@ -796,7 +793,7 @@ class TestRunInference:
 
     def test_frame_range_uses_stem_matched_partial_alpha_sequence(self):
         svc, mock_engine = self._setup_service_with_mock_engine()
-        params = InferenceParams(screen_color="green")
+        params = InferenceParams()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             frames_dir = os.path.join(tmpdir, "Frames")
@@ -865,14 +862,14 @@ class TestReprocessSingleFrame:
             "alpha": np.ones((4, 4, 1), dtype=np.float32),
         }
         svc._engine_pool = [mock_engine]
-        result = svc.reprocess_single_frame(sample_clip, InferenceParams(screen_color="green"), 0)
+        result = svc.reprocess_single_frame(sample_clip, InferenceParams(), 0)
         assert result is not None
         assert "fg" in result
 
     def test_missing_assets_returns_none(self):
         svc = CorridorKeyService()
         clip = ClipEntry("test", "/tmp")
-        result = svc.reprocess_single_frame(clip, InferenceParams(screen_color="green"), 0)
+        result = svc.reprocess_single_frame(clip, InferenceParams(), 0)
         assert result is None
 
     def test_cancelled_returns_none(self, sample_clip):
@@ -881,14 +878,14 @@ class TestReprocessSingleFrame:
         svc._engine_pool = [MagicMock()]
         job = GPUJob(JobType.PREVIEW_REPROCESS, "test")
         job.request_cancel()
-        result = svc.reprocess_single_frame(sample_clip, InferenceParams(screen_color="green"), 0, job=job)
+        result = svc.reprocess_single_frame(sample_clip, InferenceParams(), 0, job=job)
         assert result is None
 
     def test_out_of_range_returns_none(self, sample_clip):
         svc = CorridorKeyService()
         svc._active_model = _ActiveModel.INFERENCE
         svc._engine_pool = [MagicMock()]
-        result = svc.reprocess_single_frame(sample_clip, InferenceParams(screen_color="green"), 9999)
+        result = svc.reprocess_single_frame(sample_clip, InferenceParams(), 9999)
         assert result is None
 
     def test_reprocess_forwards_status_during_engine_warmup(self, sample_clip):
@@ -914,7 +911,7 @@ class TestReprocessSingleFrame:
         ), patch("backend.service.read_mask_frame", return_value=fake_mask):
             result = svc.reprocess_single_frame(
                 sample_clip,
-                InferenceParams(screen_color="green"),
+                InferenceParams(),
                 0,
                 on_status=statuses.append,
             )
@@ -1062,7 +1059,7 @@ class TestReprocessSingleFrame:
             ):
                 result = svc.reprocess_single_frame(
                     clip,
-                    InferenceParams(screen_color="green"),
+                    InferenceParams(),
                     3,
                 )
 
