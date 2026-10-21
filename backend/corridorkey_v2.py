@@ -89,6 +89,50 @@ def _free_gpu_memory() -> None:
         return
 
 
+def _is_index(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _resolve_hint_args(params, hint_video_path, initial_hint_path, initial_hint_index,
+                       hint_frame_indices):
+    """Return engine (initial_path, initial_index, video_path, sparse_indices)."""
+    mode = getattr(params, "hint_mode", None)
+    if mode is None:
+        mode = "full" if params.use_alpha_hint else "none"
+    if mode == "none":
+        return None, 0, None, None
+    if mode == "full":
+        if not hint_video_path:
+            raise V2EngineError("AlphaHint enabled but no hint provided")
+        return None, 0, hint_video_path, None
+    if mode != "keyframes":
+        raise V2EngineError(f"Unknown hint mode: {mode!r}")
+    if hint_frame_indices is None:
+        if not initial_hint_path:
+            raise V2EngineError("Keyframes hint mode needs a reference hint path")
+        if hint_video_path:
+            raise V2EngineError("Single keyframe cannot be combined with a hint video")
+        if not _is_index(initial_hint_index):
+            raise V2EngineError(f"Invalid keyframe index: {initial_hint_index!r}")
+        return str(initial_hint_path), initial_hint_index, None, None
+    try:
+        idx = tuple(hint_frame_indices)
+    except TypeError:
+        raise V2EngineError("hint_frame_indices must be a sequence of frame indices")
+    if len(idx) < 2:
+        raise V2EngineError(
+            "Sparse keyframes need at least 2 indices; use the single-keyframe path for one")
+    if not all(_is_index(i) for i in idx):
+        raise V2EngineError(f"Invalid keyframe indices: {idx!r}")
+    if list(idx) != sorted(set(idx)):
+        raise V2EngineError(f"Keyframe indices must be sorted and unique: {idx!r}")
+    if initial_hint_path:
+        raise V2EngineError("Sparse keyframes cannot be combined with an initial hint path")
+    if not hint_video_path:
+        raise V2EngineError("Sparse keyframes need a hint video path")
+    return None, 0, hint_video_path, idx
+
+
 class CorridorKeyV2Engine:
     def __init__(self, asset_paths: V2AssetPaths | None = None, device: str = "cuda"):
         self._paths = asset_paths or get_v2_asset_paths()
@@ -142,6 +186,8 @@ class CorridorKeyV2Engine:
             raise ValueError(f"outputs must be a non-empty subset of {_PRODUCTS}: {outs}")
         self.last_warnings = []
         cfg = InferenceConfig()
+        cfg.initial_hint_index = 0
+        cfg.hint_frame_indices = None
         cfg.hint_quality = params.hint_quality
         cfg.carry_hint = params.carry_hint
         cfg.carry_hint_quality = params.carry_hint_quality
@@ -198,9 +244,12 @@ class CorridorKeyV2Engine:
 
     def run_clip(self, input_path, output_dir, params, *, outputs, temp_dir,
                  frame_dir_fps=24.0, hint_video_path=None, ffmpeg_bin="ffmpeg",
-                 on_progress=None, check_cancel=None, on_status=None) -> V2RunResult:
-        if params.use_alpha_hint and not hint_video_path:
-            raise V2EngineError("AlphaHint enabled but no hint provided")
+                 on_progress=None, check_cancel=None, on_status=None,
+                 initial_hint_path=None, initial_hint_index=0,
+                 hint_frame_indices=None) -> V2RunResult:
+        eng_initial, eng_index, eng_video, eng_sparse = _resolve_hint_args(
+            params, hint_video_path, initial_hint_path, initial_hint_index,
+            hint_frame_indices)
         self.load(on_status)
         from CorridorKeyV2.corridorkey import runtime as rt
         from CorridorKeyV2.corridorkey.video_io import WriterConfig, raw_clip_name
@@ -212,7 +261,8 @@ class CorridorKeyV2Engine:
         cfg = self.build_inference_config(
             params, outputs=outputs, temp_dir=temp_dir,
             frame_dir_fps=frame_dir_fps, **extra)
-        hint = hint_video_path if params.use_alpha_hint else None
+        cfg.initial_hint_index = eng_index
+        cfg.hint_frame_indices = eng_sparse
         rt.configure_low_vram_inference(self._model, rt.InferenceConfig(
             low_vram_mlp_chunk_tokens=0, low_vram_enc_frame_chunk=0,
             low_vram_swin_window_batch=0, low_vram_full_attn_query_chunk_tokens=0))
@@ -220,7 +270,7 @@ class CorridorKeyV2Engine:
             rt.run_inference(
                 self._model, str(input_path), str(output_dir), cfg,
                 WriterConfig(ffmpeg_bin=ffmpeg_bin),
-                initial_hint_path=None, hint_video_path=hint,
+                initial_hint_path=eng_initial, hint_video_path=eng_video,
                 on_progress=on_progress, check_cancel=check_cancel)
         clip = raw_clip_name(str(input_path))
         settings = os.path.join(str(output_dir), f"{clip}_settings.txt")
