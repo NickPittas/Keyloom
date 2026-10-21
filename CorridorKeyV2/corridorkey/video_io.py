@@ -540,6 +540,9 @@ class SequentialHintVideoWindowReader:
             del self.cache[old_t]
         return hint
 
+    def window_with_presence(self, t0: int, t1: int):
+        return self.window(t0, t1), [True] * (t1 - t0)
+
 
 class SequentialHintFrameDirWindowReader:
     def __init__(self, hint_dir_path: str, meta: dict):
@@ -569,11 +572,116 @@ class SequentialHintFrameDirWindowReader:
             del self.cache[old_t]
         return hint
 
+    def window_with_presence(self, t0: int, t1: int):
+        return self.window(t0, t1), [True] * (t1 - t0)
 
-def make_hint_reader(path: str | None, meta: dict):
+
+def _sparse_hint_to_model_tensor(path: str, meta: dict) -> torch.Tensor:
+    """read_hint_image semantics + load_initial_hint_frame resize/padding."""
+    hint = read_hint_image(path)
+    native_hw = tuple(meta["native_hw"])
+    model_hw = tuple(meta["model_native_hw"])
+    if hint.shape[:2] == native_hw and model_hw != native_hw:
+        hint = cv2.resize(hint, (model_hw[1], model_hw[0]),
+                          interpolation=cv2.INTER_LANCZOS4)
+    elif hint.shape[:2] != model_hw:
+        raise ValueError(
+            f"{path}: hint shape {hint.shape[:2]} does not match "
+            f"native {native_hw} or model {model_hw}")
+    hint, pad_check = center_pad_to_shape(
+        np.clip(hint, 0.0, 1.0), meta["shape_hw"][0], meta["shape_hw"][1])
+    if tuple(pad_check) != tuple(meta["pad"]):
+        raise ValueError(f"{path}: hint pad {pad_check} != input pad {meta['pad']}")
+    return torch.from_numpy(np.ascontiguousarray(hint)[None]).to(dtype=torch.bfloat16)
+
+
+class SequentialSparseHintFrameDirWindowReader:
+    """Index-preserving sparse hints: ``<absolute_index>.png`` per selected frame.
+
+    Missing slots are a zero tensor with presence False; selected slots are the
+    decoded matte (even all-black) with presence True.
+    """
+
+    def __init__(self, hint_dir_path: str, meta: dict, frame_indices):
+        self.hint_dir_path = hint_dir_path
+        self.meta = meta
+        n_frames = int(meta["num_frames"])
+        try:
+            indices = list(frame_indices)
+        except TypeError:
+            raise ValueError("frame_indices must be an iterable of ints") from None
+        if not indices:
+            raise ValueError("frame_indices must not be empty")
+        for i in indices:
+            if isinstance(i, bool) or not isinstance(i, (int, np.integer)):
+                raise ValueError(f"frame index {i!r} is not an int")
+            if not 0 <= int(i) < n_frames:
+                raise ValueError(
+                    f"frame index {int(i)} out of range [0, {n_frames})")
+        indices = [int(i) for i in indices]
+        if len(set(indices)) != len(indices):
+            raise ValueError("frame_indices must be unique")
+        if not os.path.isdir(hint_dir_path):
+            raise RuntimeError(f"Sparse hint directory not found: {hint_dir_path}")
+        selected = set(indices)
+        found: dict[int, str] = {}
+        for name in sorted(os.listdir(hint_dir_path)):
+            full = os.path.join(hint_dir_path, name)
+            stem, ext = os.path.splitext(name)
+            if (not os.path.isfile(full) or ext.lower() != ".png"
+                    or not (stem.isascii() and stem.isdigit())):
+                raise ValueError(f"{full}: not a numeric <index>.png sparse hint")
+            idx = int(stem)
+            if idx in found:
+                raise ValueError(
+                    f"duplicate sparse hint spelling for index {idx}: "
+                    f"{os.path.basename(found[idx])}, {name}")
+            if idx >= n_frames:
+                raise ValueError(f"{full}: index {idx} out of range [0, {n_frames})")
+            if idx not in selected:
+                raise ValueError(f"{full}: index {idx} is not a selected frame")
+            found[idx] = full
+        missing = sorted(selected - set(found))
+        if missing:
+            raise ValueError(f"{hint_dir_path}: missing sparse hint frames {missing}")
+        self.indices = sorted(selected)
+        self.paths = found
+        self.cache: dict[int, torch.Tensor] = {}
+
+    def close(self):
+        self.cache.clear()
+
+    def window_with_presence(self, t0: int, t1: int):
+        for old_t in [k for k in self.cache if k < t0]:
+            del self.cache[old_t]
+        h_out, w_out = self.meta["shape_hw"]
+        slots, present = [], []
+        for t in range(t0, t1):
+            if t in self.paths:
+                if t not in self.cache:
+                    self.cache[t] = _sparse_hint_to_model_tensor(
+                        self.paths[t], self.meta)
+                slots.append(self.cache[t])
+                present.append(True)
+            else:
+                slots.append(torch.zeros(1, h_out, w_out, dtype=torch.bfloat16))
+                present.append(False)
+        if not slots:
+            return torch.zeros(0, 1, h_out, w_out, dtype=torch.bfloat16), []
+        return torch.stack(slots), present
+
+    def window(self, t0: int, t1: int):
+        return self.window_with_presence(t0, t1)[0]
+
+
+def make_hint_reader(path: str | None, meta: dict, frame_indices=None):
     path = none_path(path)
     if path is None:
         return None
+    if frame_indices is not None:
+        if not os.path.isdir(path):
+            raise ValueError(f"Sparse hints require a PNG directory: {path}")
+        return SequentialSparseHintFrameDirWindowReader(path, meta, frame_indices)
     if os.path.isdir(path):
         return SequentialHintFrameDirWindowReader(path, meta)
     return SequentialHintVideoWindowReader(path, meta)

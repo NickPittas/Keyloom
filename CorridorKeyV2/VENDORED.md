@@ -29,3 +29,7 @@
    - `run_inference` validates `k` (int, not bool, `0 <= k < T_all`) right after the source frame count is known, before writers/memmaps are created; raises `ValueError`. Settings log gains `Initial Hint Index (0-based): k`; the hint load log is now index-neutral ("loaded reference hint").
    - Why: EZ lets the user pick any frame as the reference matte. Default `k=0` is identical to upstream behaviour.
    - Tests: `tests/test_v2_reference_hint.py`.
+4. `corridorkey/video_io.py` — index-preserving sparse hint reader (EZ-CorridorKey2).
+   - New `SequentialSparseHintFrameDirWindowReader(dir, meta, frame_indices)` and `make_hint_reader(path, meta, frame_indices=None)` (sparse only when indices are given; sparse video rejected). Dir must hold exactly `<absolute_index>.png` for the selected unique in-range indices (no extras, duplicates of one numeric spelling, non-PNG or missing files). Files load via `read_hint_image` (uint8/uint16 normalised, RGBA → alpha), same model resize/padding as `load_initial_hint_frame`.
+   - New `.window_with_presence(t0, t1)` → (tensor, per-frame bool list) on all hint readers: dense readers all True; sparse zero tensor/False for unselected slots, loaded matte/True for selected ones (even all-black). Dense `.window()` unchanged; sparse cache holds only selected decoded frames and drops those before the window start.
+   - Why: sparse keyframe hints with real absolute timing. Tests: `tests/test_v2_sparse_hint_reader.py`.
