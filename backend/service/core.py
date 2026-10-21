@@ -151,6 +151,7 @@ class CorridorKeyService(
         self._device_detected: bool = False
         self._job_queue: Optional[GPUJobQueue] = None
         self._sam2_model_id: str = "facebook/sam2.1-hiera-base-plus"
+        self._sam2_tracker_model_id: Optional[str] = None  # id the live tracker was built with
         # GPU mutex — serializes ALL model operations
         self._gpu_lock = threading.Lock()
 
@@ -171,18 +172,32 @@ class CorridorKeyService(
         if not model_id or model_id == self._sam2_model_id:
             return
         logger.info("SAM2 model preference changed: %s -> %s", self._sam2_model_id, model_id)
+        if self._sam2_tracker is not None and self._sam2_tracker_model_id is None:
+            self._sam2_tracker_model_id = self._sam2_model_id  # externally injected tracker
         self._sam2_model_id = model_id
-        if self._sam2_tracker is not None:
-            self._safe_offload(self._sam2_tracker)
-            self._sam2_tracker = None
-            if self._active_model == _ActiveModel.SAM2:
-                self._active_model = _ActiveModel.NONE
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                logger.debug("CUDA cache clear skipped after SAM2 model switch", exc_info=True)
+        # Never block the GUI thread on a running GPU job: if the lock is busy the
+        # stale tracker is replaced by the next _get_sam2_tracker() call (under lock).
+        if not self._gpu_lock.acquire(blocking=False):
+            return
+        try:
+            self._drop_stale_sam2_tracker()
+        finally:
+            self._gpu_lock.release()
+
+    def _drop_stale_sam2_tracker(self) -> None:
+        """Offload the SAM2 tracker if it was loaded for another model id. Caller holds the lock."""
+        if self._sam2_tracker is None or self._sam2_tracker_model_id in (None, self._sam2_model_id):
+            return
+        self._safe_offload(self._sam2_tracker)
+        self._sam2_tracker = None
+        if self._active_model == _ActiveModel.SAM2:
+            self._active_model = _ActiveModel.NONE
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            logger.debug("CUDA cache clear skipped after SAM2 model switch", exc_info=True)
 
     # --- Device Utilities ---
 

@@ -188,6 +188,7 @@ class ModelManagerMixin:
         on_status: Callable[[str], None] | None = None,
     ):
         """Lazy-load the optional SAM2 tracker."""
+        self._drop_stale_sam2_tracker()
         self._ensure_model(_ActiveModel.SAM2)
 
         if self._sam2_tracker is not None:
@@ -204,6 +205,7 @@ class ModelManagerMixin:
             offload_video_to_cpu=self._device.startswith("cuda"),
             offload_state_to_cpu=False,
         )
+        self._sam2_tracker_model_id = self._sam2_model_id
         if self._sam2_tracker is not None:
             self._sam2_tracker.prepare(on_progress=on_progress, on_status=on_status)
         logger.info(f"SAM2 tracker ready in {time.monotonic() - t0:.1f}s")

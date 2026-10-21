@@ -167,6 +167,16 @@ def test_tiny_budget(env):
     assert (env.runs[0].cfg.hann_chunk, env.runs[0].cfg.hann_stride) == (1, 1)
 
 
+def test_tiny_budget_warns(env):
+    env.budget = int(0.1 * GIB)
+    res = run(env, InferenceParams(vram_profile="low"))
+    assert len(res.warnings) == 1 and "1-frame" in res.warnings[0]
+
+
+def test_fitting_budget_no_warning(env):
+    assert run(env, InferenceParams(vram_profile="low")).warnings == ()
+
+
 def test_low_requires_probe_info(env):
     with pytest.raises(ValueError):
         env.engine.build_inference_config(InferenceParams(vram_profile="low"),

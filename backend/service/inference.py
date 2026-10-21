@@ -9,7 +9,7 @@ import time
 from typing import Callable, Optional
 
 from ..clip_state import ClipEntry, ClipState
-from ..errors import CorridorKeyError, JobCancelledError
+from ..errors import CorridorKeyError, InvalidStateTransitionError, JobCancelledError
 from ..job_queue import GPUJob
 from ..validators import ensure_output_dirs
 from .v2_inputs import prepare_v2_inputs
@@ -90,6 +90,10 @@ class InferenceMixin:
                     if on_progress else None,
                     check_cancel=check_cancel, on_status=on_status,
                 )
+                for w in getattr(result, "warnings", ()) or ():
+                    logger.warning("Clip '%s': %s", clip.name, w)
+                    if on_warning:
+                        on_warning(w)
                 logger.info(
                     "Clip '%s': v2 run done (hann_chunk=%s hann_stride=%s low_vram=%s)",
                     clip.name, result.hann_chunk, result.hann_stride, result.low_vram,
@@ -172,7 +176,7 @@ class InferenceMixin:
         published = set(self._publish_v2_outputs(
             result.product_dirs, dirs, stems, cfg, clip.name,
             publish_indices=indices, skip_stems=skip,
-            check_cancel=check_cancel, on_frame=on_frame,
+            check_cancel=check_cancel, on_frame=on_frame, on_warning=on_warning,
         ))
         self._copy_v2_settings(result.settings_path, dirs["root"])
         self._write_manifest(dirs["root"], cfg, params, complete=True, **manifest_kw)
@@ -209,9 +213,9 @@ class InferenceMixin:
             clip.name, bounds[0], bounds[1], published, len(results) - published, t_total,
         )
         full = bounds[0] == 0 and bounds[1] >= num_frames - 1
-        if full and all(r.success for r in results):
+        if full and all(r.success for r in results) and clip.state != ClipState.COMPLETE:
             try:
                 clip.transition_to(ClipState.COMPLETE)
-            except Exception as e:
+            except InvalidStateTransitionError as e:
                 logger.warning("Clip '%s': state transition to COMPLETE failed: %s", clip.name, e)
         return results

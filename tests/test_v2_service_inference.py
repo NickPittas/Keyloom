@@ -268,3 +268,13 @@ def test_gpu_lock_held_during_run_clip(svc, clip):
         release.set()
         FakeEngine.run_clip = original
     assert not svc._gpu_lock.locked()
+
+
+def test_rerun_on_complete_clip_does_not_warn(svc, clip, caplog):
+    cfgo = OutputConfig(**EXR_CFG)
+    svc.run_inference(clip, InferenceParams(use_alpha_hint=True), output_config=cfgo)
+    assert clip.state == ClipState.COMPLETE
+    with caplog.at_level("WARNING"):
+        svc.run_inference(clip, InferenceParams(use_alpha_hint=True), output_config=cfgo)
+    assert clip.state == ClipState.COMPLETE
+    assert "state transition to COMPLETE failed" not in caplog.text

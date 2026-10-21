@@ -264,3 +264,12 @@ def test_copy_v2_settings(tmp_path):
     out2.mkdir()
     Svc()._copy_v2_settings(str(tmp_path / "nope.txt"), str(out2))
     assert os.listdir(out2) == []
+
+
+def test_half_overflow_clamped_with_single_warning(tmp_path):
+    runtime = make_runtime(tmp_path, fg=70000.0)
+    warns = []
+    _, dirs, _ = publish(tmp_path, cfg(), runtime=runtime, on_warning=warns.append)
+    img = read(os.path.join(dirs["fg"], f"{STEMS[0]}.exr"))
+    assert np.isfinite(img).all() and img.max() <= 65504.0
+    assert len(warns) == 1 and "half-float" in warns[0]

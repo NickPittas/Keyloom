@@ -28,6 +28,7 @@ class V2RunResult:
     hann_chunk: int
     hann_stride: int
     low_vram: bool
+    warnings: tuple[str, ...] = ()
 
 
 @contextmanager
@@ -56,6 +57,7 @@ def runtime_product_dir(output_dir, clip_name: str, product: str,
 
 
 def _select_low_vram_window(shape_hw, num_frames, budget_gb) -> tuple[int, int]:
+    """Pick (chunk, stride); falls back to (1, 1) when nothing fits (see _low_vram_fits)."""
     from CorridorKeyV2.corridorkey import runtime as rt
 
     mp = shape_hw[0] * shape_hw[1] / 1e6
@@ -64,6 +66,16 @@ def _select_low_vram_window(shape_hw, num_frames, budget_gb) -> tuple[int, int]:
         if peak * rt._VRAM_MARGIN_SCALE + rt._VRAM_MARGIN_GB <= budget_gb:
             return chunk, max(1, chunk // 2)
     return 1, 1
+
+
+def _low_vram_window_fits(shape_hw, num_frames, budget_gb) -> bool:
+    from CorridorKeyV2.corridorkey import runtime as rt
+
+    mp = shape_hw[0] * shape_hw[1] / 1e6
+    return any(
+        rt.estimate_peak_vram_gb(mp, min(chunk, num_frames), True) * rt._VRAM_MARGIN_SCALE
+        + rt._VRAM_MARGIN_GB <= budget_gb
+        for chunk in rt._VRAM_PEAK_GB[True][0])
 
 
 def _free_gpu_memory() -> None:
@@ -83,6 +95,7 @@ class CorridorKeyV2Engine:
         self._device = device
         self._model = None
         self.load_count = 0
+        self.last_warnings: list[str] = []
 
     @property
     def is_loaded(self) -> bool:
@@ -127,6 +140,7 @@ class CorridorKeyV2Engine:
         outs = set(outputs)
         if not outs or not outs <= set(_PRODUCTS):
             raise ValueError(f"outputs must be a non-empty subset of {_PRODUCTS}: {outs}")
+        self.last_warnings = []
         cfg = InferenceConfig()
         cfg.hint_quality = params.hint_quality
         cfg.carry_hint = params.carry_hint
@@ -152,6 +166,11 @@ class CorridorKeyV2Engine:
             cfg.low_vram = True
             cfg.hann_chunk, cfg.hann_stride = _select_low_vram_window(
                 shape_hw, num_frames, budget_gb)
+            if not _low_vram_window_fits(shape_hw, num_frames, budget_gb):
+                self.last_warnings.append(
+                    f"Low VRAM profile: even a 1-frame window may not fit in the "
+                    f"~{budget_gb:.1f} GB of free GPU memory; using the smallest window "
+                    "(1 frame). Inference may run out of memory.")
         return cfg
 
     def _probe_low_vram(self, input_path, params, frame_dir_fps):
@@ -214,4 +233,5 @@ class CorridorKeyV2Engine:
             hann_chunk=cfg.hann_chunk,
             hann_stride=cfg.hann_stride,
             low_vram=cfg.low_vram,
+            warnings=tuple(self.last_warnings),
         )

@@ -276,3 +276,28 @@ class TestGeneratorsHoldGPULock:
         with pytest.raises(JobCancelledError):
             svc.run_sam2_track(clip, job=job)
         assert not svc._gpu_lock.locked()
+
+
+class TestSam2ModelSwitch:
+    def test_set_model_does_not_block_or_offload_while_gpu_busy(self):
+        svc = CorridorKeyService()
+        tracker = MagicMock()
+        svc._sam2_tracker = tracker
+        svc._sam2_tracker_model_id = "old"
+        svc._sam2_model_id = "old"
+        svc._safe_offload = MagicMock()
+        svc._gpu_lock.acquire()
+        try:
+            t = threading.Thread(target=svc.set_sam2_model, args=("new",))
+            t.start()
+            t.join(timeout=2)
+            assert not t.is_alive()
+            svc._safe_offload.assert_not_called()
+            assert svc._sam2_tracker is tracker
+        finally:
+            svc._gpu_lock.release()
+        assert svc.sam2_model_id == "new"
+        # Next tracker fetch (under the lock) drops the stale tracker.
+        svc._drop_stale_sam2_tracker()
+        svc._safe_offload.assert_called_once_with(tracker)
+        assert svc._sam2_tracker is None

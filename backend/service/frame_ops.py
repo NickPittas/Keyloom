@@ -28,6 +28,8 @@ from ..validators import validate_frame_read, validate_write
 
 logger = logging.getLogger(__name__)
 
+_HALF_MAX = 65504.0  # largest finite float16
+
 
 class FrameOpsMixin:
     """Mixin providing frame I/O operations for CorridorKeyService."""
@@ -259,6 +261,7 @@ class FrameOpsMixin:
         skip_stems: Optional[set[str]] = None,
         check_cancel: Optional[Callable[[], None]] = None,
         on_frame: Optional[Callable[..., None]] = None,
+        on_warning: Optional[Callable[[str], None]] = None,
     ) -> list[str]:
         """Convert runtime float EXRs into EZ output folders. Returns published stems."""
         cfg = output_config
@@ -268,6 +271,7 @@ class FrameOpsMixin:
         indices = range(len(source_stems)) if publish_indices is None else publish_indices
         skip = skip_stems or set()
         published: list[str] = []
+        clamp_warned = False
         for i in indices:
             if check_cancel is not None:
                 check_cancel()
@@ -295,6 +299,16 @@ class FrameOpsMixin:
                 else:
                     out = _linear_to_srgb(np.clip(img, 0.0, None))
                 ez = self.V2_PRODUCT_TO_EZ[product]
+                if fmt == "exr" and (np.abs(out) > _HALF_MAX).any():
+                    # EXR output is half-float; larger finite values would become inf.
+                    out = np.clip(out, -_HALF_MAX, _HALF_MAX)
+                    if not clamp_warned:
+                        clamp_warned = True
+                        msg = ("Some output values exceeded half-float EXR range and were "
+                               "clamped to +/-65504.")
+                        logger.warning("Clip '%s': %s", clip_name, msg)
+                        if on_warning:
+                            on_warning(msg)
                 self._v2_atomic_write(
                     np.ascontiguousarray(out, dtype=np.float32),
                     os.path.join(dirs[ez], f"{stem}.{fmt}"),

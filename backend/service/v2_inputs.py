@@ -156,7 +156,9 @@ def validate_dense_hint_alignment(clip, source_stems: list[str]) -> list[str]:
     files = asset.get_frame_files()
     _check_duplicate_stems(files, "AlphaHint")
     ordered = _match_hints(files, source_stems)
-    _check_hint_dims(clip, os.path.join(asset.path, ordered[0]))
+    want = clip.input_asset.get_dimensions()
+    for f in ordered:
+        _check_hint_dims(want, os.path.join(asset.path, f))
     return ordered
 
 
@@ -203,15 +205,25 @@ def _match_by_ordinal(files: list[str], total: int) -> list[str | None]:
     return [parsed.get(i) for i in range(total)]
 
 
-def _check_hint_dims(clip, first_hint: str) -> None:
-    want = clip.input_asset.get_dimensions()
-    img = imread_unicode(first_hint, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise V2InputError(f"Could not read AlphaHint frame '{first_hint}'.")
-    got = (int(img.shape[1]), int(img.shape[0]))
+def _image_size(path: str) -> tuple[int, int] | None:
+    """(width, height) from the file header when possible (PIL), else a full read."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return int(im.size[0]), int(im.size[1])
+    except Exception:  # EXR / unsupported by PIL -> decode with cv2
+        img = imread_unicode(path, cv2.IMREAD_UNCHANGED)
+        return None if img is None else (int(img.shape[1]), int(img.shape[0]))
+
+
+def _check_hint_dims(want, hint_path: str) -> None:
+    got = _image_size(hint_path)
+    if got is None:
+        raise V2InputError(f"Could not read AlphaHint frame '{hint_path}'.")
     if want is not None and tuple(want) != got:
         raise V2InputError(
-            f"AlphaHint is {got[0]}x{got[1]} but the input is {want[0]}x{want[1]} — "
+            f"AlphaHint frame '{os.path.basename(hint_path)}' is {got[0]}x{got[1]} but the "
+            f"input is {want[0]}x{want[1]} — "
             "regenerate the AlphaHint at the clip resolution or turn off 'Use AlphaHint'.")
 
 

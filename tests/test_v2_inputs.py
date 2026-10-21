@@ -239,6 +239,14 @@ def test_hint_dimension_mismatch(tmp_path):
         _prep(_clip(tmp_path, d, a), tmp_path, hint=True)
 
 
+def test_hint_later_frame_dimension_mismatch(tmp_path):
+    d = _seq(tmp_path, NAMES)
+    a = _seq(tmp_path, NAMES, sub="alpha", gray=True)
+    _write(tmp_path / "alpha" / NAMES[1], _rgb(9, (4, 4))[..., 0])
+    with pytest.raises(V2InputError, match=NAMES[1]):
+        _prep(_clip(tmp_path, d, a), tmp_path, hint=True)
+
+
 def test_no_alpha_asset(tmp_path):
     d = _seq(tmp_path, NAMES)
     with pytest.raises(V2InputError, match="no AlphaHint"):
