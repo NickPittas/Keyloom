@@ -92,6 +92,7 @@ class ParameterPanel(QWidget):
     chroma_key_requested = Signal(dict)  # GENERATE chroma key, emits params dict
     chroma_key_preview = Signal()         # any chroma key param changed (live preview)
     eyedropper_requested = Signal(bool)   # toggle eyedropper mode on viewer
+    input_colour_switch_requested = Signal(bool)  # True = switch input to Linear
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -101,7 +102,10 @@ class ParameterPanel(QWidget):
         # Signal suppression flag (Codex: block signals during session restore)
         self._suppress_signals = False
         # Hint-keyframe state (context pushed by the app; no disk/model access)
-        self._temporal_window = "auto"  # until a temporal-window combo exists (task14)
+        # Scalar temporal/colour context pushed by the app (no CUDA/IO here)
+        self._tctx = dict(width=None, height=None, frame_count=0, budget_gib=None)
+        self._colour_peak = None
+        self._colour_switch_target = None
         self._kf_count = 0
         self._kf_ctx = dict(has_clip=False, frame_available=False,
                             is_marked=False, error=None)
@@ -604,6 +608,35 @@ class ParameterPanel(QWidget):
         self._vram_profile.currentIndexChanged.connect(self._emit_changed)
         inf_grid.addWidget(self._vram_profile, 5, 1)
 
+        # Rows 7-10: temporal window + feedback
+        self._temporal_label = QLabel(self.tr("Temporal"))
+        _tw_tip = self.tr(
+            "Frames per processing window / overlap stride. Auto picks the "
+            "largest window that fits GPU memory. Estimates are approximate."
+        )
+        self._temporal_label.setToolTip(_tw_tip)
+        inf_grid.addWidget(self._temporal_label, 7, 0)
+        self._temporal_window = QComboBox()
+        self._temporal_window.setToolTip(_tw_tip)
+        for _pid in ("auto", "80/40", "48/24", "24/12", "8/4", "1/1"):
+            self._temporal_window.addItem(self._temporal_text(_pid, None), _pid)
+        self._temporal_window.currentIndexChanged.connect(self._on_temporal_changed)
+        inf_grid.addWidget(self._temporal_window, 7, 1)
+        self._temporal_warning = QLabel("")
+        self._temporal_warning.setWordWrap(True)
+        self._temporal_warning.setVisible(False)
+        inf_grid.addWidget(self._temporal_warning, 8, 0, 1, 2)
+        self._colour_notice = QLabel("")
+        self._colour_notice.setWordWrap(True)
+        self._colour_notice.setVisible(False)
+        inf_grid.addWidget(self._colour_notice, 9, 0, 1, 2)
+        self._colour_action = QPushButton("")
+        self._colour_action.setVisible(False)
+        self._colour_action.clicked.connect(self._on_colour_action)
+        inf_grid.addWidget(self._colour_action, 10, 0, 1, 2)
+        self._vram_profile.currentIndexChanged.connect(self._recompute_temporal)
+        self._color_space.currentIndexChanged.connect(lambda _i: self._refresh_colour_notice())
+
         # Row 6: Cutout linear (permanently disabled)
         self._cutout_linear = QCheckBox(self.tr("Cutout linear"))
         self._cutout_linear.setChecked(False)
@@ -739,6 +772,7 @@ class ParameterPanel(QWidget):
             self._hint_quality: (self._hint_quality.setValue, 0.95),
             self._carry_hint_quality: (self._carry_hint_quality.setValue, 0.95),
             self._vram_profile: (self._vram_profile.setCurrentIndex, 0),    # Auto
+            self._temporal_window: (self._temporal_window.setCurrentIndex, 0),  # Auto
             self._ck_strength: (self._ck_strength.setValue, 10),            # 1.0
             self._ck_clip_black: (self._ck_clip_black.setValue, 0),         # 0.0
             self._ck_clip_white: (self._ck_clip_white.setValue, 100),       # 1.0
@@ -771,6 +805,109 @@ class ParameterPanel(QWidget):
         """Emit params_changed unless signals are suppressed."""
         if not self._suppress_signals:
             self.params_changed.emit()
+
+    # ── Temporal window feedback ──
+
+    def _temporal_id(self) -> str:
+        return self._temporal_window.currentData() or "auto"
+
+    def _temporal_text(self, pid: str, est) -> str:
+        if pid == "auto":
+            if est is not None and est.chunk:
+                return self.tr("Auto (%d/%d)") % (est.chunk, est.stride)
+            return self.tr("Auto")
+        if est is not None and est.peak_gib is not None:
+            return self.tr("%s (~%.1f GiB)") % (pid, est.peak_gib)
+        return pid
+
+    def _on_temporal_changed(self, _index: int = 0) -> None:
+        self._refresh_temporal_warning()
+        self._emit_changed()
+
+    def set_temporal_context(self, *, width: int | None, height: int | None,
+                             frame_count: int, budget_gib: float | None) -> None:
+        """Store scalar clip/GPU context and refresh estimates (pure, no IO)."""
+        self._tctx = dict(width=width, height=height, frame_count=frame_count,
+                          budget_gib=budget_gib)
+        self._recompute_temporal()
+
+    def _context_valid(self) -> bool:
+        c = self._tctx
+        return bool(c["width"] and c["height"] and c["frame_count"]
+                    and c["width"] > 0 and c["height"] > 0 and c["frame_count"] > 0)
+
+    def _estimate(self, pid: str):
+        if not self._context_valid():
+            return None
+        try:
+            from backend.v2_temporal import estimate_temporal_window
+
+            c = self._tctx
+            return estimate_temporal_window(
+                c["width"], c["height"], c["frame_count"], pid,
+                "low" if self._vram_profile.currentIndex() == 1 else "auto",
+                c["budget_gib"])
+        except Exception:
+            return None
+
+    def _recompute_temporal(self, _index: int = 0) -> None:
+        self._temporal_estimates = {}
+        for i in range(self._temporal_window.count()):
+            pid = self._temporal_window.itemData(i)
+            est = self._estimate(pid)
+            self._temporal_estimates[pid] = est
+            self._temporal_window.setItemText(i, self._temporal_text(pid, est))
+        self._refresh_temporal_warning()
+
+    def _refresh_temporal_warning(self) -> None:
+        est = getattr(self, "_temporal_estimates", {}).get(self._temporal_id())
+        msg, tip, over = "", "", False
+        if est is not None:
+            if est.over_budget:
+                over = True
+                msg = self.tr("May exceed free GPU memory: needs ~%.1f GiB, %.1f GiB available.") % (
+                    est.required_gib, est.budget_gib)
+                tip = msg
+            if est.caveat:
+                tip = (tip + "\n" if tip else "") + self.tr(est.caveat)
+                if not msg:
+                    msg = self.tr("Estimate is conservative for short windows.")
+        self._temporal_warning.setText(msg)
+        self._temporal_warning.setToolTip(tip)
+        self._temporal_warning.setStyleSheet("color: #e5484d;" if over else "")
+        self._temporal_warning.setVisible(bool(msg))
+
+    # ── Input colour notice ──
+
+    def set_input_colour_notice(self, sample, input_is_linear: bool) -> None:
+        """Show a non-modal, heuristic hint when footage may be mis-tagged."""
+        peak = getattr(sample, "peak", None) if sample is not None else None
+        err = getattr(sample, "error", None) if sample is not None else None
+        self._colour_peak = None if (err or peak is None) else float(peak)
+        self._refresh_colour_notice(input_is_linear)
+
+    def _refresh_colour_notice(self, input_is_linear: bool | None = None) -> None:
+        if input_is_linear is None:
+            input_is_linear = self._color_space.currentIndex() == 1
+        peak = self._colour_peak
+        text = action = ""
+        self._colour_switch_target = None
+        if peak is not None and input_is_linear and peak <= 1.0:
+            text = self.tr("Values stay within 0-1: footage may be display-coded.")
+            action = self.tr("Switch to sRGB")
+            self._colour_switch_target = False
+        elif peak is not None and not input_is_linear and peak > 1.0:
+            text = self.tr("Values exceed 1.0: footage may be scene-linear.")
+            action = self.tr("Switch to Linear")
+            self._colour_switch_target = True
+        self._colour_notice.setText(text)
+        self._colour_action.setText(action)
+        self._colour_notice.setVisible(bool(text))
+        self._colour_action.setVisible(bool(text))
+
+    def _on_colour_action(self) -> None:
+        if self._colour_switch_target is not None:
+            self.input_colour_switch_requested.emit(self._colour_switch_target)
 
     def _hint_mode_id(self) -> str:
         return self._hint_mode.currentData() or "none"
@@ -861,7 +998,7 @@ class ParameterPanel(QWidget):
         return InferenceParams(
             input_is_linear=self._color_space.currentIndex() == 1,
             hint_mode=self._hint_mode_id(),
-            temporal_window=self._temporal_window,
+            temporal_window=self._temporal_id(),
             hint_quality=round(self._hint_quality.value(), 2),
             carry_hint=self._carry_hint.isChecked(),
             carry_hint_quality=round(self._carry_hint_quality.value(), 2),
@@ -903,6 +1040,7 @@ class ParameterPanel(QWidget):
             self._color_space.setCurrentIndex(1 if input_is_linear else 0)
         finally:
             self._suppress_signals = False
+        self._refresh_colour_notice(input_is_linear)
 
     def set_params(self, params: InferenceParams) -> None:
         """Load parameter values (e.g. from a saved session).
@@ -914,7 +1052,8 @@ class ParameterPanel(QWidget):
             self._color_space.setCurrentIndex(1 if params.input_is_linear else 0)
             idx = self._hint_mode.findData(params.hint_mode)
             self._hint_mode.setCurrentIndex(idx if idx >= 0 else 0)
-            self._temporal_window = params.temporal_window
+            tidx = self._temporal_window.findData(params.temporal_window)
+            self._temporal_window.setCurrentIndex(tidx if tidx >= 0 else 0)
             self._hint_quality.setValue(params.hint_quality)
             self._refresh_hint_mode_state()
             self._carry_hint.setChecked(params.carry_hint)
@@ -924,6 +1063,8 @@ class ParameterPanel(QWidget):
             self._despill_slider.setValue(round(params.despill_strength * 10))
         finally:
             self._suppress_signals = False
+        self._recompute_temporal()
+        self._refresh_colour_notice()
 
     def set_output_config(self, config: OutputConfig) -> None:
         """Load output config values (e.g. from a saved session)."""
