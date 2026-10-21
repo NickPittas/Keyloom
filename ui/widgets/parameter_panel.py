@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSlider,
-    QComboBox, QCheckBox, QSpinBox, QPushButton, QGroupBox,
+    QComboBox, QCheckBox, QSpinBox, QDoubleSpinBox, QPushButton, QGroupBox,
     QScrollArea,
 )
 from PySide6.QtCore import Qt, Signal, QEvent
@@ -64,7 +64,7 @@ _COLOR_SPACE_TOOLTIP = (
     "what CorridorKey thinks your footage is.\n\n"
     "sRGB: standard gamma-corrected footage (most cameras, phone video, PNG/JPG).\n"
     "Linear: linear-light footage (true linear EXRs, CG renders).\n\n"
-    "Changing this before Run Inference affects live preview and any future "
+    "Changing this before Run Inference affects any future "
     "exports you generate.\n"
     "Changing it after files are already exported does not rewrite those files on "
     "disk; rerun inference to save new outputs.\n"
@@ -72,22 +72,12 @@ _COLOR_SPACE_TOOLTIP = (
     "the INPUT viewer looks wrong."
 )
 
-_LIVE_PREVIEW_TOOLTIP = (
-    "Instantly reprocess the current frame when you adjust Color Space, Despill, "
-    "Refiner, or Despeckle.\n"
-    "Requires a READY or COMPLETE clip with alpha hints.\n"
-    "On a fresh launch, the first preview change may take a moment while the "
-    "inference engine loads.\n"
-    "Preview updates do not rewrite exported files on disk; rerun inference to "
-    "save them."
-)
 
 
 class ParameterPanel(QWidget):
     """Right panel with all inference parameter controls."""
 
     params_changed = Signal()  # emitted when any parameter changes
-    parallel_frames_changed = Signal(int)  # parallel engine count changed
     screen_color_changed = Signal(str)  # "green" or "blue" — UI accent swap
     gvm_requested = Signal()      # GVM AUTO button clicked
     birefnet_requested = Signal(str)  # BiRefNet button clicked, emits model variant name
@@ -517,59 +507,77 @@ class ParameterPanel(QWidget):
         self._color_space.currentIndexChanged.connect(self._emit_changed)
         inf_grid.addWidget(self._color_space, 1, 1)
 
-        # Row 2: Despeckle
-        self._despeckle_check = QCheckBox(self.tr("Despeckle"))
-        self._despeckle_check.setChecked(True)
-        self._despeckle_check.setToolTip(
+        # Row 2: Use AlphaHint + hint quality
+        self._use_alpha_hint = QCheckBox(self.tr("Use AlphaHint"))
+        self._use_alpha_hint.setChecked(False)
+        self._use_alpha_hint.setToolTip(
             self.tr(
-                "Removes small floating noise and speckles from the\n"
-                "alpha by discarding isolated regions smaller than the\n"
-                "size threshold."
+                "Feed the clip's external AlphaHint (GVM, BiRefNet, VideoMaMa,\n"
+                "MatAnyone2, chroma key, imported) to CorridorKey 2.0.\n"
+                "Off = CorridorKey 2.0 keys the clip on its own."
             )
         )
-        self._despeckle_check.stateChanged.connect(self._on_despeckle_toggled)
-        inf_grid.addWidget(self._despeckle_check, 2, 0)
-        self._despeckle_size = _no_scroll_wheel(QSpinBox())
-        self._despeckle_size.setRange(0, 999999)
-        self._despeckle_size.setValue(400)
-        self._despeckle_size.setSuffix("px")
-        self._despeckle_size.setToolTip(
-            self.tr(
-                "Minimum area (in pixels) for a region to survive.\n"
-                "Isolated alpha blobs smaller than this are removed.\n"
-                "Lower = keep more detail, higher = cleaner matte."
-            )
+        self._use_alpha_hint.stateChanged.connect(self._on_use_alpha_hint_toggled)
+        inf_grid.addWidget(self._use_alpha_hint, 2, 0)
+        self._hint_quality = _no_scroll_wheel(QDoubleSpinBox())
+        self._hint_quality.setRange(0.0, 1.0)
+        self._hint_quality.setSingleStep(0.05)
+        self._hint_quality.setDecimals(2)
+        self._hint_quality.setValue(0.95)
+        self._hint_quality.setEnabled(False)
+        self._hint_quality.setToolTip(
+            self.tr("How much CorridorKey 2.0 trusts the external AlphaHint (0.00-1.00).")
         )
-        self._despeckle_size.valueChanged.connect(self._emit_changed)
-        inf_grid.addWidget(self._despeckle_size, 2, 1)
+        self._hint_quality.valueChanged.connect(self._emit_changed)
+        inf_grid.addWidget(self._hint_quality, 2, 1)
 
-        # Row 3: Garbage Matte
-        self._garbage_matte_check = QCheckBox(self.tr("Garbage Matte"))
-        self._garbage_matte_check.setChecked(False)
-        self._garbage_matte_check.setToolTip(
+        # Row 3: Carry hint + carry quality
+        self._carry_hint = QCheckBox(self.tr("Carry hint"))
+        self._carry_hint.setChecked(True)
+        self._carry_hint.setToolTip(
             self.tr(
-                "Expands the alpha hint by N pixels, then zeros out\n"
-                "anything in the predicted matte that falls outside\n"
-                "that expanded region. Removes edge-of-frame artifacts\n"
-                "and background gunk that inference leaves behind."
+                "Carry the previous frame's result forward as the hint\n"
+                "for the next frame (temporal consistency)."
             )
         )
-        self._garbage_matte_check.stateChanged.connect(self._on_garbage_matte_toggled)
-        inf_grid.addWidget(self._garbage_matte_check, 3, 0)
-        self._garbage_matte_px = _no_scroll_wheel(QSpinBox())
-        self._garbage_matte_px.setRange(1, 500)
-        self._garbage_matte_px.setValue(20)
-        self._garbage_matte_px.setSuffix("px")
-        self._garbage_matte_px.setToolTip(
+        self._carry_hint.stateChanged.connect(self._on_carry_hint_toggled)
+        inf_grid.addWidget(self._carry_hint, 3, 0)
+        self._carry_hint_quality = _no_scroll_wheel(QDoubleSpinBox())
+        self._carry_hint_quality.setRange(0.0, 1.0)
+        self._carry_hint_quality.setSingleStep(0.05)
+        self._carry_hint_quality.setDecimals(2)
+        self._carry_hint_quality.setValue(0.95)
+        self._carry_hint_quality.setToolTip(
+            self.tr("How much CorridorKey 2.0 trusts the carried hint (0.00-1.00).")
+        )
+        self._carry_hint_quality.valueChanged.connect(self._emit_changed)
+        inf_grid.addWidget(self._carry_hint_quality, 3, 1)
+
+        # Row 4: VRAM profile
+        self._vram_label = QLabel(self.tr("VRAM"))
+        _vram_tip = self.tr(
+            "Auto picks the largest processing window that fits free GPU memory. "
+            "Low VRAM trades speed for memory."
+        )
+        self._vram_label.setToolTip(_vram_tip)
+        inf_grid.addWidget(self._vram_label, 4, 0)
+        self._vram_profile = QComboBox()
+        self._vram_profile.addItems([self.tr("Auto"), self.tr("Low VRAM")])
+        self._vram_profile.setToolTip(_vram_tip)
+        self._vram_profile.currentIndexChanged.connect(self._emit_changed)
+        inf_grid.addWidget(self._vram_profile, 4, 1)
+
+        # Row 5: Cutout linear (permanently disabled)
+        self._cutout_linear = QCheckBox(self.tr("Cutout linear"))
+        self._cutout_linear.setChecked(False)
+        self._cutout_linear.setEnabled(False)
+        self._cutout_linear.setToolTip(
             self.tr(
-                "Pixel expansion around the alpha hint.\n"
-                "Higher = more breathing room around subject edges.\n"
-                "Lower = tighter crop to the hint boundary."
+                "Not applicable: CorridorKey 2.0 writes linear EXR internally; "
+                "Processed EXR stays linear, PNG stays sRGB."
             )
         )
-        self._garbage_matte_px.setEnabled(False)
-        self._garbage_matte_px.valueChanged.connect(self._emit_changed)
-        inf_grid.addWidget(self._garbage_matte_px, 3, 1)
+        inf_grid.addWidget(self._cutout_linear, 5, 0, 1, 2)
 
         inf_layout.addLayout(inf_grid)
 
@@ -589,28 +597,6 @@ class ParameterPanel(QWidget):
         self._despill_slider.valueChanged.connect(self._on_despill_changed)
         inf_layout.addWidget(self._despill_slider)
 
-        # Refiner Scale (slider 0-30 -> 0.0-3.0)
-        self._refiner_label = QLabel(self.tr("Refiner: 1.0"))
-        inf_layout.addWidget(self._refiner_label)
-        self._refiner_slider = _no_scroll_wheel(QSlider(Qt.Horizontal))
-        self._refiner_slider.setRange(0, 30)
-        self._refiner_slider.setValue(10)
-        self._refiner_slider.setToolTip(
-            self.tr(
-                "Edge refinement strength (0.0-3.0).\n"
-                "Scales the CNN refiner's edge corrections.\n"
-                "1.0 = default, 0.0 = backbone only (no refinement),\n"
-                "higher = sharper edges but may introduce artifacts."
-            )
-        )
-        self._refiner_slider.valueChanged.connect(self._on_refiner_changed)
-        inf_layout.addWidget(self._refiner_slider)
-
-        # Live Preview toggle
-        self._live_preview = QCheckBox(self.tr("Live Preview"))
-        self._live_preview.setChecked(True)
-        self._live_preview.setToolTip(self.tr(_LIVE_PREVIEW_TOOLTIP))
-        inf_layout.addWidget(self._live_preview)
 
         layout.addWidget(inf_group)
 
@@ -625,8 +611,7 @@ class ParameterPanel(QWidget):
         self._fg_check.setChecked(True)
         self._fg_check.setToolTip(
             self.tr(
-                "Foreground \u2014 despilled subject on black background.\n"
-                "Screen spill removed from hair and edges.\n"
+                "FG raw (not despilled) foreground.\n"
                 "Straight alpha (not premultiplied)."
             )
         )
@@ -682,9 +667,8 @@ class ParameterPanel(QWidget):
         self._proc_check.setChecked(True)
         self._proc_check.setToolTip(
             self.tr(
-                "Processed \u2014 production-ready RGBA (straight, linear).\n"
-                "Designed for import into Resolve, Premiere, and compositing tools.\n"
-                "Includes despill + garbage matte cleanup applied."
+                "Processed EXR is premultiplied linear; PNG straight sRGB.\n"
+                "Designed for import into Resolve, Premiere, and compositing tools."
             )
         )
         proc_row.addWidget(self._proc_check, 1)
@@ -696,39 +680,6 @@ class ParameterPanel(QWidget):
         out_layout.addLayout(proc_row)
 
         layout.addWidget(out_group)
-
-        # ── PERFORMANCE section ──
-        perf_group = QGroupBox(self.tr("PERFORMANCE"))
-        perf_layout = QVBoxLayout(perf_group)
-        perf_layout.setSpacing(6)
-
-        parallel_row = QHBoxLayout()
-        parallel_label = QLabel(self.tr("Parallel frames"))
-        parallel_row.addWidget(parallel_label, 1)
-        self._parallel_spin = QSpinBox()
-        self._parallel_spin.setRange(1, 64)
-        self._parallel_spin.setToolTip(
-            self.tr(
-                "Process multiple frames simultaneously using parallel engines.\n\n"
-                "Each extra engine loads a full copy of the model.\n"
-                "CUDA: ~6-8 GB VRAM per engine.\n"
-                "\n"
-                "Default: 1 (safest). Try 2 first, then increase if stable.\n\n"
-                "EXPERIMENTAL: Values above 8 are for high-memory CUDA systems\n"
-                "(e.g. RTX 6000).\n"
-                "If you run out of memory, the app will automatically scale\n"
-                "back to however many engines fit.\n\n"
-                "CUDA only right now. Not currently supported on Apple Silicon."
-            )
-        )
-        self._parallel_spin.setFixedWidth(60)
-        from ui.widgets.preferences_dialog import get_setting_int, KEY_PARALLEL_CLIPS, DEFAULT_PARALLEL_CLIPS
-        self._parallel_spin.setValue(get_setting_int(KEY_PARALLEL_CLIPS, DEFAULT_PARALLEL_CLIPS))
-        self._parallel_spin.valueChanged.connect(self._on_parallel_changed)
-        parallel_row.addWidget(self._parallel_spin)
-        perf_layout.addLayout(parallel_row)
-
-        layout.addWidget(perf_group)
 
         layout.addStretch(1)
 
@@ -748,10 +699,9 @@ class ParameterPanel(QWidget):
             self._bg_color: (self._bg_color.setCurrentIndex, 0),            # Auto
             self._color_space: (self._color_space.setCurrentIndex, 0),      # sRGB
             self._despill_slider: (self._despill_slider.setValue, 5),       # 0.5
-            self._refiner_slider: (self._refiner_slider.setValue, 10),      # 1.0
-            self._despeckle_size: (self._despeckle_size.setValue, 400),      # 400px
-            self._garbage_matte_px: (self._garbage_matte_px.setValue, 20),  # 20px
-            self._parallel_spin: (self._parallel_spin.setValue, 1),         # 1
+            self._hint_quality: (self._hint_quality.setValue, 0.95),
+            self._carry_hint_quality: (self._carry_hint_quality.setValue, 0.95),
+            self._vram_profile: (self._vram_profile.setCurrentIndex, 0),    # Auto
             self._ck_strength: (self._ck_strength.setValue, 10),            # 1.0
             self._ck_clip_black: (self._ck_clip_black.setValue, 0),         # 0.0
             self._ck_clip_white: (self._ck_clip_white.setValue, 100),       # 1.0
@@ -785,21 +735,17 @@ class ParameterPanel(QWidget):
         if not self._suppress_signals:
             self.params_changed.emit()
 
-    def _on_despeckle_toggled(self, state: int) -> None:
+    def _on_use_alpha_hint_toggled(self, state: int) -> None:
+        self._hint_quality.setEnabled(self._use_alpha_hint.isChecked())
         self._emit_changed()
 
-    def _on_garbage_matte_toggled(self, state: int) -> None:
-        self._garbage_matte_px.setEnabled(state == Qt.Checked.value)
+    def _on_carry_hint_toggled(self, state: int) -> None:
+        self._carry_hint_quality.setEnabled(self._carry_hint.isChecked())
         self._emit_changed()
 
     def _on_despill_changed(self, value: int) -> None:
         display = value / 10.0
         self._despill_label.setText(self.tr("Despill: %s") % f"{display:.1f}")
-        self._emit_changed()
-
-    def _on_refiner_changed(self, value: int) -> None:
-        display = value / 10.0
-        self._refiner_label.setText(self.tr("Refiner: %s") % f"{display:.1f}")
         self._emit_changed()
 
     def _on_bg_color_changed(self, index: int) -> None:
@@ -817,30 +763,17 @@ class ParameterPanel(QWidget):
         from PySide6.QtCore import QSettings
         QSettings().setValue("alpha/birefnet_model", text)
 
-    def _on_parallel_changed(self, value: int) -> None:
-        from PySide6.QtCore import QSettings
-        from ui.widgets.preferences_dialog import KEY_PARALLEL_CLIPS
-        QSettings().setValue(KEY_PARALLEL_CLIPS, value)
-        self.parallel_frames_changed.emit(value)
-
-    @property
-    def live_preview_enabled(self) -> bool:
-        return self._live_preview.isChecked()
-
     def get_params(self) -> InferenceParams:
-        """Snapshot current parameter values into a frozen InferenceParams."""
-        bg_idx = self._bg_color.currentIndex()
-        screen_color = ["auto", "green", "blue"][bg_idx]
+        """Snapshot current parameter values into an InferenceParams."""
         return InferenceParams(
             input_is_linear=self._color_space.currentIndex() == 1,
+            use_alpha_hint=self._use_alpha_hint.isChecked(),
+            hint_quality=round(self._hint_quality.value(), 2),
+            carry_hint=self._carry_hint.isChecked(),
+            carry_hint_quality=round(self._carry_hint_quality.value(), 2),
+            vram_profile=["auto", "low"][self._vram_profile.currentIndex()],
             despill_strength=self._despill_slider.value() / 10.0,
-            auto_despeckle=self._despeckle_check.isChecked(),
-            despeckle_size=self._despeckle_size.value(),
-            despeckle_dilation=25,  # fixed default
-            despeckle_blur=5,       # fixed default
-            refiner_scale=self._refiner_slider.value() / 10.0,
-            screen_color=screen_color,
-            garbage_matte_px=self._garbage_matte_px.value() if self._garbage_matte_check.isChecked() else 0,
+            cutout_linear=False,
         )
 
     def get_output_config(self) -> OutputConfig:
@@ -885,11 +818,14 @@ class ParameterPanel(QWidget):
         self._suppress_signals = True
         try:
             self._color_space.setCurrentIndex(1 if params.input_is_linear else 0)
-            self._despill_slider.setValue(int(params.despill_strength * 10))
-            self._despeckle_check.setChecked(params.auto_despeckle)
-            self._despeckle_size.setValue(params.despeckle_size)
-            # despeckle_dilation / despeckle_blur: no longer exposed in UI (fixed defaults)
-            self._refiner_slider.setValue(int(params.refiner_scale * 10))
+            self._use_alpha_hint.setChecked(params.use_alpha_hint)
+            self._hint_quality.setValue(params.hint_quality)
+            self._hint_quality.setEnabled(params.use_alpha_hint)
+            self._carry_hint.setChecked(params.carry_hint)
+            self._carry_hint_quality.setValue(params.carry_hint_quality)
+            self._carry_hint_quality.setEnabled(params.carry_hint)
+            self._vram_profile.setCurrentIndex(1 if params.vram_profile == "low" else 0)
+            self._despill_slider.setValue(round(params.despill_strength * 10))
         finally:
             self._suppress_signals = False
 
