@@ -1,6 +1,6 @@
-"""First-launch setup wizard — download model checkpoints with progress.
+"""First-launch setup wizard — download model weights with progress.
 
-Shown automatically when the required CorridorKey checkpoint is missing.
+Shown automatically when the CorridorKey 2.0 asset bundle is incomplete.
 Provides the same model selection as 1-install.sh / 1-install.bat but in
 a PySide6 GUI with checkboxes and progress bars.
 """
@@ -9,7 +9,6 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
-import platform
 import sys
 import traceback
 from pathlib import Path
@@ -64,8 +63,11 @@ def _data_root() -> Path:
         return _default_install_dir()
 
 
-def _checkpoint_dir() -> Path:
-    return _data_root() / "CorridorKeyModule" / "checkpoints"
+def _v2_assets_ready() -> bool:
+    """True when the full CorridorKey 2.0 bundle is present and valid."""
+    from backend.v2_paths import v2_assets_ready
+    return v2_assets_ready()
+
 
 
 def _hf_hub_cache_dir() -> Path:
@@ -118,7 +120,7 @@ def _current_version() -> str:
 def detect_installed_models(install_path: Path | None = None) -> dict[str, bool]:
     """Return {model_key: present} for every model in the wizard catalogue.
 
-    Models that live under the install path (CorridorKey, MLX, GVM, VideoMaMa,
+    Models that live under the install path (GVM, VideoMaMa,
     MatAnyone2) are resolved against ``install_path``. Models that live in the
     Hugging Face hub cache (SAM2) are resolved against the HF cache regardless
     of the install path — that's how hf_hub_download stores them without a
@@ -133,39 +135,13 @@ def detect_installed_models(install_path: Path | None = None) -> dict[str, bool]
 
     results: dict[str, bool] = {}
 
-    # CorridorKey core/blue/MLX weights are bundled into the app by the
-    # installers, but they live in the read-only bundle dir (_MEIPASS in a
-    # frozen build), not the writable install path. Check both, mirroring the
-    # loader's search order in CorridorKeyModule.backend, so the wizard does
-    # not offer to download core models that already ship in the bundle.
-    ck_dir = root / "CorridorKeyModule" / "checkpoints"
-    ck_bundled = _project_root() / "CorridorKeyModule" / "checkpoints"
-
-    def _ck_has(*names: str) -> bool:
-        for d in (ck_dir, ck_bundled):
-            if any((d / n).is_file() for n in names):
-                return True
-        return False
-
-    # CorridorKey core .pth — any .pth in either checkpoints dir counts
-    def _ck_any_pth() -> bool:
-        for d in (ck_dir, ck_bundled):
-            try:
-                if d.is_dir() and any(d.glob("*.pth")):
-                    return True
-            except OSError:
-                continue
-        return False
-
-    results["corridorkey"] = _ck_any_pth()
-
-    # CorridorKey Blue — specific filename check
-    results["corridorkey-blue"] = _ck_has("CorridorKeyBlue_1.0.pth")
-
-    # CorridorKey MLX — built-in engine needs both green and blue weights
-    results["corridorkey-mlx"] = _ck_has("CorridorKey.mlx.safetensors") and _ck_has(
-        "CorridorKeyBlue_1.0.mlx.safetensors"
-    )
+    # CorridorKey 2.0 bundle lives in the v2 models dir (CORRIDORKEY_V2_MODELS_DIR
+    # override honoured); backend.v2_paths validates every required file.
+    try:
+        results["corridorkey"] = _v2_assets_ready()
+    except Exception:
+        logger.exception("v2 asset validation failed")
+        results["corridorkey"] = False
 
     # SAM2 Base+ needs BOTH the Python package (installed by the installer,
     # not the wizard) and the checkpoint in the HF hub cache (shared across
@@ -243,36 +219,16 @@ def _hf_cache_has(repo_id: str, cache_dir: Path) -> bool:
 # Model catalogue
 # ---------------------------------------------------------------------------
 
-_IS_APPLE_SILICON = sys.platform == "darwin" and platform.machine() == "arm64"
-
 MODELS: list[dict] = [
     {
         "key": "corridorkey",
-        "label": "CorridorKey Green",
-        "size": "383 MB",
+        "label": "CorridorKey 2.0",
+        "size": "~5 GB",
         "required": True,
-        "description": "Core green screen keying model (required)",
-        "default_checked": True,
-    },
-    {
-        "key": "corridorkey-blue",
-        "label": "CorridorKey Blue",
-        "size": "401 MB",
-        "required": False,
-        "description": "Blue screen keying model",
+        "description": "CorridorKey 2.0 model bundle (required)",
         "default_checked": True,
     },
 ]
-
-if _IS_APPLE_SILICON:
-    MODELS.append({
-        "key": "corridorkey-mlx",
-        "label": "CorridorKey MLX (Apple Silicon)",
-        "size": "2x 380 MB",
-        "required": False,
-        "description": "1.5-2x faster inference on Apple Silicon, green and blue checkpoints",
-        "default_checked": True,
-    })
 
 MODELS += [
     {
@@ -346,9 +302,10 @@ def needs_setup() -> bool:
         logger.exception("detect_installed_models failed during needs_setup()")
         # Safe fallback: mirror the old behaviour so a broken detect doesn't
         # leave users stuck with no CorridorKey weights and no wizard.
-        import glob
-        ckpt_dir = _checkpoint_dir()
-        if len(glob.glob(str(ckpt_dir / "*.pth"))) == 0:
+        try:
+            if not _v2_assets_ready():
+                return True
+        except Exception:
             return True
 
     try:
@@ -440,7 +397,7 @@ class _DownloadWorker(QThread):
             self.all_finished.emit(False)
             return
 
-        self._patch_mlx_progress(setup_models)
+        self._patch_hf_progress()
 
         all_ok = True
         for key in self._selected:
@@ -468,11 +425,7 @@ class _DownloadWorker(QThread):
 
     def _download_one(self, setup_models, key: str) -> bool:
         if key == "corridorkey":
-            return setup_models.download_model("corridorkey")
-        elif key == "corridorkey-blue":
-            return setup_models.download_model("corridorkey-blue")
-        elif key == "corridorkey-mlx":
-            return setup_models.download_corridorkey_mlx()
+            return bool(setup_models.download_corridorkey())
         elif key == "sam2":
             return setup_models.download_sam2_model("base-plus")
         elif key == "gvm":
@@ -485,29 +438,8 @@ class _DownloadWorker(QThread):
             return setup_models.download_model("videomama")
         return False
 
-    def _patch_mlx_progress(self, setup_models):
+    def _patch_hf_progress(self):
         worker = self
-        original = setup_models.download_corridorkey_mlx
-
-        def patched():
-            # Reuse the canonical per-file downloader (SHA256 verify, tmp
-            # rename, disk-space check) and only supply wizard progress.
-            def hook(bn, bs, total):
-                if total > 0 and not worker._cancelled:
-                    worker.model_progress.emit(
-                        worker._current_key,
-                        (bn * bs) // (1024 * 1024),
-                        total // (1024 * 1024),
-                    )
-
-            ok = True
-            for cfg in setup_models.MLX_CHECKPOINTS:
-                if worker._cancelled:
-                    return False
-                ok = setup_models._download_mlx_one(cfg, reporthook=hook) and ok
-            return ok
-
-        setup_models.download_corridorkey_mlx = patched
 
         try:
             import huggingface_hub
