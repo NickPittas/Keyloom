@@ -1,3 +1,35 @@
+# EZ-CorridorKey2 — CorridorKey 2.0 fork (private, personal use)
+
+> **EZ-CorridorKey2 is a personal-use fork of EZ-CorridorKey whose keyer is CorridorKey 2.0 (NVIDIA CUDA only).**
+> The CorridorKey v1 engine is replaced; this is not a general release. Upstream: [edenaion/EZ-CorridorKey](https://github.com/edenaion/EZ-CorridorKey) v2.1.5.
+
+## Requirements and setup
+
+- NVIDIA GPU with CUDA and Python 3.11. CPU, MPS and macOS are not supported.
+- Install with `1-install.sh` / `1-install.bat`, then fetch the weights with `python scripts/setup_models.py --corridorkey` (also offered by the in-app setup wizard).
+- The engine is vendored in `CorridorKeyV2/`. Weights (about 5 GB) live in the per-OS app data dir, by default `~/.local/share/EZ-CorridorKey2/CorridorKeyV2` (see `backend/v2_paths.py`); override with `CORRIDORKEY_V2_MODELS_DIR`.
+- Scratch/temp files go to the system temp dir; override with `CORRIDORKEY_V2_SCRATCH_DIR` (`backend/service/inference.py`).
+
+## CorridorKey 2.0 behaviour
+
+- Whole-clip inference (`backend/service/core.py`): every run infers the entire clip. Inference settings (`InferenceParams`, `ui/widgets/parameter_panel.py`): optional AlphaHint source (GVM / BiRefNet / VideoMaMa / MatAnyone2) with quality, carry hint, VRAM profile (auto / low), despill strength, and cutout linear (shown disabled).
+- Outputs: `FG/`, `Matte/`, `Comp/`, `Processed/` folders as EXR or PNG, plus the manifest `.corridorkey_manifest.json`. The In/Out range only limits which frames are written; resume re-publishes only frames missing from a compatible earlier run.
+- Progress is shown per phase. Cancel is cooperative (stops after the current GPU step); quitting during a job asks first.
+- CLI: `python clip_manager.py --action run_inference [--non-interactive]`.
+- Not available: live single-frame re-key, parallel clips, model resolution/backend settings, MLX, and automatic updates (disabled; `3-update.sh` / `3-update.bat` refuse to run, the Update button is hidden). Update by `git pull` from your own remote.
+
+## Licensing and provenance
+
+- Engine provenance: [`CorridorKeyV2/VENDORED.md`](CorridorKeyV2/VENDORED.md); engine license: [`CorridorKeyV2/LICENSE`](CorridorKeyV2/LICENSE); third-party notices: [`CorridorKeyV2/THIRD_PARTY_NOTICES.md`](CorridorKeyV2/THIRD_PARTY_NOTICES.md).
+- The upstream EZ-CorridorKey repo has no standalone license file at its root; its README states CC BY-NC-SA 4.0 (see "Licensing & Attribution" below).
+- Personal use only; do not redistribute.
+
+---
+
+# Original EZ-CorridorKey README (v1 — historical)
+
+> Everything below is the upstream v1 README. Instructions that no longer apply are marked "(Removed in CorridorKey 2.0 fork.)".
+
 # EZ-CorridorKey **v2.1.5**
 
 [![Release](https://img.shields.io/badge/Release-v2.1.5-FFF203?style=flat-square&labelColor=141300)](https://github.com/edenaion/EZ-CorridorKey/releases/latest)
@@ -48,7 +80,7 @@ Official site, install guide, and downloads: **[ezcorridorkey.com](https://ezcor
 | Session persistence | None                        | Recent projects, auto-save                           |
 | Paint / masking     | Manual external tool        | Built-in brush for masks + chroma key holdout        |
 | Alpha generators    | None                        | GVM, BiRefNet, VideoMaMa, MatAnyone2, Chroma Key, Apple Vision (macOS) |
-| Apple Silicon       | MPS only                    | MLX acceleration (auto-detected)                     |
+| Apple Silicon       | MPS only                    | (Removed in CorridorKey 2.0 fork.) |
 
 ---
 
@@ -81,7 +113,7 @@ The installer includes everything — Python runtime, AI models, GPU libraries �
 - For the one-click installer: no preinstalled Python required
 - For manual installs: [Python 3.10–3.13](https://python.org) (3.14 is not yet supported)
 - **Windows/Linux:** NVIDIA GPU with CUDA support (8 GB+ VRAM recommended). Keep your driver current — the installer verifies the torch runtime and will stop with diagnostics instead of silently leaving you on the wrong backend.
-- **macOS:** Apple Silicon (M1+). CorridorKey inference runs natively via MLX (1.5–2x faster than MPS). GPU-intensive alpha generators (SAM2, GVM, VideoMaMa, MatAnyone2) run on MPS but are significantly slower — importing pre-made alpha mattes is recommended on Mac.
+- **macOS:** (Removed in CorridorKey 2.0 fork.)
 
 **What the installer does:**
 
@@ -90,7 +122,7 @@ The installer includes everything — Python runtime, AI models, GPU libraries �
 - Creates a `.venv` virtual environment in the project folder
 - Installs the correct PyTorch backend for your platform/GPU and verifies the resulting torch runtime before reporting success
 - Downloads and installs [FFmpeg](https://ffmpeg.org/) locally if not found on PATH (used for video import)
-- Downloads the CorridorKey model checkpoint (383 MB, required)
+- Downloads CorridorKey v1 model checkpoint (blue/green) (Removed in CorridorKey 2.0 fork.)
 - Optionally installs SAM2 tracking support and pre-downloads the default Base+ checkpoint (324 MB)
 - Optionally downloads BiRefNet (~940 MB), MatAnyone2 (~135 MB), GVM (~6 GB), and VideoMaMa (~37 GB) alpha hint generators
 - Creates a desktop shortcut (optional)
@@ -488,20 +520,12 @@ Logs are written to `logs/backend/YYMMDD_HHMMSS_corridorkey.log`.
 | **Speed** (≥12 GB)    | ~8.7 GB    | ~1.5s/frame | Full-frame refiner, full torch.compile   |
 | **Low-VRAM** (<12 GB) | ~2.5 GB    | ~1.6s/frame | 512×512 tiled refiner, selective compile |
 
-Mode is auto-detected from available VRAM. Override with `CORRIDORKEY_OPT_MODE=speed|lowvram|auto`.
+VRAM mode selection / `CORRIDORKEY_OPT_MODE` / `--opt-mode`: (Removed in CorridorKey 2.0 fork.)
 
 ### macOS (Apple Silicon)
 
-> Applies to v2.0.0 and source installs. 2.1.5 is a Windows-only patch, so there is no macOS update this release; source installs can still update with `3-update.sh`.
+(Removed in CorridorKey 2.0 fork.)
 
-|             | Minimum       | Recommended                                      |
-| ----------- | ------------- | ------------------------------------------------ |
-| **Chip**    | M1 (8 GB)     | M1 Pro+ (16 GB+)                                 |
-| **Backend** | MPS (PyTorch) | MLX (built-in, auto-detected)                    |
-
-CorridorKey inference auto-selects the fastest available backend: the built-in MLX engine (roughly 2x faster than MPS, runs in float16) when its `.mlx.safetensors` checkpoints are present, otherwise PyTorch MPS. Both green and blue MLX checkpoints download through the setup wizard. Override with `CORRIDORKEY_BACKEND=torch|mlx|auto`.
-
-Alpha generators (SAM2, GVM, VideoMaMa, MatAnyone2) always run on PyTorch MPS — no MLX ports exist for these models. For best Mac experience, import pre-made alpha mattes from After Effects, DaVinci Resolve, or Nuke.
 
 ---
 

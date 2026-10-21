@@ -6,6 +6,25 @@ All notable changes to EZ-CorridorKey are documented here.
 
 ---
 
+## EZ-CorridorKey2 (CorridorKey 2.0 fork) — 2026-10-21
+
+Private personal-use fork of EZ-CorridorKey v2.1.5.
+
+### Changed
+- Keyer engine replaced: CorridorKey v1 → CorridorKey 2.0 (vendored in `CorridorKeyV2/`). NVIDIA CUDA only; MLX, MPS, CPU keying and `--opt-mode` removed.
+- New inference settings: AlphaHint source (GVM / BiRefNet / VideoMaMa / MatAnyone2), quality, carry hint, VRAM profile (auto/low), despill strength, cutout linear (disabled). Hints are optional (hint-free runs supported).
+- Whole-clip inference with In/Out range limiting frames written; resume re-publishes only missing frames.
+- Output manifest v2 (`.corridorkey_manifest.json`); FG / Matte / Comp / Processed products published as EXR or PNG.
+- Serial GPU worker with per-phase progress and cooperative cancel; quitting during a job asks first.
+- `clip_manager.py` CLI runs inference through the service layer.
+- Setup wizard, diagnostics and installers updated for the CorridorKey 2.0 weights bundle (`scripts/setup_models.py --corridorkey`); settings and data now live under EZ-CorridorKey2.
+
+### Removed
+- Live single-frame re-key, blue-screen checkpoint offer, v1/MLX model downloads.
+- Upstream updates: update check, Update button, in-app updater, and `3-update.sh`/`3-update.bat` are disabled so upstream v1 releases can never overwrite the fork.
+
+---
+
 ## [2.1.5] - 2026-07-31 - Clean matte edges on high-resolution footage
 
 ### Fixed
