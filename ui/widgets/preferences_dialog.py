@@ -48,9 +48,6 @@ KEY_LOOP_PLAYBACK = "playback/loop"
 KEY_COPY_SEQUENCES = "project/copy_image_sequences"
 KEY_EXR_COMPRESSION = "output/exr_compression"
 KEY_TRACKER_MODEL = "tracking/sam2_model"
-KEY_PARALLEL_CLIPS = "gpu/parallel_clips"
-KEY_MODEL_RESOLUTION = "inference/model_resolution"
-KEY_INFERENCE_BACKEND = "inference/backend"
 KEY_OUTPUT_DIRECTORY = "output/default_directory"
 KEY_UI_LANGUAGE = "ui/language"
 KEY_SHOW_UPDATE_BUTTON = "ui/show_update_button"
@@ -66,13 +63,7 @@ DEFAULT_LOOP_PLAYBACK = True
 DEFAULT_CRASH_REPORTS = False
 DEFAULT_EXR_COMPRESSION = "dwab"
 DEFAULT_TRACKER_MODEL = "facebook/sam2.1-hiera-base-plus"
-DEFAULT_PARALLEL_CLIPS = 1
-import platform as _platform
 import sys as _sys
-# MPS/MLX (Apple Silicon) defaults to 1024 — 2048 needs 20GB+ and is very slow.
-# CUDA defaults to 2048 (dedicated VRAM handles it fine).
-_is_apple_silicon = _sys.platform == "darwin" and _platform.machine() == "arm64"
-DEFAULT_MODEL_RESOLUTION = 1024 if _is_apple_silicon else 2048
 
 EXR_COMPRESSION_OPTIONS = [
     ("DWAB — Lossy, Smallest Files", "dwab"),
@@ -328,59 +319,6 @@ class PreferencesDialog(QDialog):
 
         # (added to layout below in display order)
 
-        # Inference section
-        inference_group = QGroupBox(self.tr("Inference"))
-        inference_layout = QVBoxLayout(inference_group)
-
-        res_label = QLabel(self.tr("Model resolution"))
-        inference_layout.addWidget(res_label)
-
-        self._model_resolution_combo = _no_scroll_wheel(QComboBox())
-        self._model_resolution_combo.addItem(self.tr("2048 \u2014 Full Quality"), 2048)
-        self._model_resolution_combo.addItem(self.tr("1024 \u2014 Faster, Less Detail"), 1024)
-        saved_res = get_setting_int(KEY_MODEL_RESOLUTION, DEFAULT_MODEL_RESOLUTION)
-        idx = self._model_resolution_combo.findData(saved_res)
-        self._model_resolution_combo.setCurrentIndex(max(0, idx))
-        self._model_resolution_combo.setToolTip(
-            self.tr(
-                "Resolution the model processes internally before upscaling to your frame size.\n"
-                "Applies to all backends (CUDA, MPS, MLX, CPU).\n\n"
-                "2048: Full quality \u2014 captures fine hair strands and edge detail.\n"
-                "Matches the original CorridorKey quality. Recommended for CUDA with 8GB+ VRAM.\n"
-                "WARNING: Very slow on Apple Silicon (needs 20GB+ memory).\n\n"
-                "1024: Faster inference with lower memory usage.\n"
-                "Fine hair detail may be lost. Recommended for Apple Silicon / low-VRAM GPUs.\n\n"
-                "Changing this requires an engine reload (happens automatically)."
-            )
-        )
-        inference_layout.addWidget(self._model_resolution_combo)
-
-        # Backend selector (macOS only — choose MLX or PyTorch MPS)
-        self._backend_combo = None
-        if _is_apple_silicon:
-            backend_label = QLabel(self.tr("Processing backend"))
-            inference_layout.addWidget(backend_label)
-
-            self._backend_combo = _no_scroll_wheel(QComboBox())
-            self._backend_combo.addItem(self.tr("Auto \u2014 MLX if available, otherwise MPS"), "auto")
-            self._backend_combo.addItem(self.tr("MLX \u2014 Apple Metal acceleration (recommended)"), "mlx")
-            self._backend_combo.addItem(self.tr("MPS \u2014 PyTorch Metal Performance Shaders"), "torch")
-            saved_backend = get_setting_str(KEY_INFERENCE_BACKEND, "auto")
-            idx = self._backend_combo.findData(saved_backend)
-            self._backend_combo.setCurrentIndex(max(0, idx))
-            self._backend_combo.setToolTip(
-                self.tr(
-                    "Choose the inference backend for Apple Silicon.\n\n"
-                    "MLX: Native Apple Metal \u2014 fastest on M1/M2/M3/M4.\n"
-                    "MPS: PyTorch Metal Performance Shaders \u2014 compatible fallback.\n"
-                    "Auto: Uses MLX if installed, otherwise falls back to MPS.\n\n"
-                    "Changing this requires an engine reload (happens automatically)."
-                )
-            )
-            inference_layout.addWidget(self._backend_combo)
-
-        # (added to layout below in display order)
-
         # Playback section
         play_group = QGroupBox(self.tr("Playback"))
         play_layout = QVBoxLayout(play_group)
@@ -553,7 +491,6 @@ class PreferencesDialog(QDialog):
         layout.addWidget(proj_group)
         layout.addWidget(play_group)
         layout.addWidget(tracking_group)
-        layout.addWidget(inference_group)
         layout.addWidget(output_group)
         layout.addWidget(privacy_group)
         layout.addWidget(ffmpeg_group)
@@ -636,9 +573,6 @@ class PreferencesDialog(QDialog):
         s.setValue(KEY_LOOP_PLAYBACK, self._loop_cb.isChecked())
         s.setValue(KEY_EXR_COMPRESSION, self._exr_compression_combo.currentData())
         s.setValue(KEY_TRACKER_MODEL, self._tracker_model_combo.currentData())
-        s.setValue(KEY_MODEL_RESOLUTION, self._model_resolution_combo.currentData())
-        if self._backend_combo is not None:
-            s.setValue(KEY_INFERENCE_BACKEND, self._backend_combo.currentData())
         s.setValue(KEY_OUTPUT_DIRECTORY, self._output_dir_edit.text().strip())
         s.setValue(KEY_CRASH_REPORTS, self._crash_reports_cb.isChecked())
         # Apply sound mute immediately

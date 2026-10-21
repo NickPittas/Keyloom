@@ -288,7 +288,7 @@ def run_model_path_check(
     from PySide6.QtCore import QCoreApplication
 
     QCoreApplication.setOrganizationName("EZSCAPE")
-    QCoreApplication.setApplicationName("EZ-CorridorKey")
+    QCoreApplication.setApplicationName("EZ-CorridorKey2")
 
     settings_patch = None
     if data_dir:

@@ -13,8 +13,7 @@ from . import _tr
 from ui.widgets.preferences_dialog import (
     PreferencesDialog, KEY_SHOW_TOOLTIPS, DEFAULT_SHOW_TOOLTIPS,
     KEY_TRACKER_MODEL, DEFAULT_TRACKER_MODEL,
-    KEY_MODEL_RESOLUTION, DEFAULT_MODEL_RESOLUTION,
-    KEY_INFERENCE_BACKEND, KEY_UI_LANGUAGE,
+    KEY_UI_LANGUAGE,
     KEY_SHOW_UPDATE_BUTTON, DEFAULT_SHOW_UPDATE_BUTTON,
     get_setting_bool, get_setting_str, get_setting_int,
 )
@@ -67,9 +66,6 @@ class SettingsMixin:
             self._apply_update_button_setting()
             self._apply_sound_setting()
             self._apply_tracker_model_setting()
-            self._apply_parallel_clips_setting()
-            self._apply_model_resolution_setting()
-            self._apply_inference_backend_setting()
             self._apply_language_setting(old_lang)
 
     def _apply_language_setting(self, old_lang: str) -> None:
@@ -185,28 +181,6 @@ class SettingsMixin:
         """Apply saved SAM2 tracker model preference to the backend service."""
         model_id = get_setting_str(KEY_TRACKER_MODEL, DEFAULT_TRACKER_MODEL)
         self._service.set_sam2_model(model_id)
-
-    def _apply_model_resolution_setting(self) -> None:
-        """Apply saved model resolution preference to the backend service."""
-        res = get_setting_int(KEY_MODEL_RESOLUTION, DEFAULT_MODEL_RESOLUTION)
-        self._service.set_model_resolution(res)
-
-    def _apply_inference_backend_setting(self) -> None:
-        """Apply saved inference backend (macOS MLX/MPS) to the backend service.
-
-        Drops the engine pool if the backend changed so the next inference
-        rebuilds on the newly selected backend without an app restart.
-        """
-        backend = get_setting_str(KEY_INFERENCE_BACKEND, "auto")
-        self._service.set_inference_backend(backend)
-
-    def _apply_parallel_clips_setting(self) -> None:
-        """Apply saved parallel clips preference to the GPU worker."""
-        from ui.widgets.preferences_dialog import (
-            get_setting_int as _get_int, KEY_PARALLEL_CLIPS, DEFAULT_PARALLEL_CLIPS,
-        )
-        n = _get_int(KEY_PARALLEL_CLIPS, DEFAULT_PARALLEL_CLIPS)
-        self._gpu_worker.set_max_workers(n)
 
     def _show_report_issue(self) -> None:
         import logging as _logging

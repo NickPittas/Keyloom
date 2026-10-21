@@ -57,7 +57,6 @@ from ui.widgets.preferences_dialog import (
     KEY_COPY_SOURCE, DEFAULT_COPY_SOURCE,
     KEY_COPY_SEQUENCES, DEFAULT_COPY_SEQUENCES,
     KEY_TRACKER_MODEL, DEFAULT_TRACKER_MODEL,
-    KEY_MODEL_RESOLUTION, DEFAULT_MODEL_RESOLUTION,
     get_setting_bool, get_setting_str, get_setting_int,
 )
 from ui.workers.gpu_job_worker import GPUJobWorker, create_job_snapshot
@@ -309,7 +308,7 @@ class MainWindow(
     def __init__(self, service: CorridorKeyService | None = None,
                  store: RecentSessionsStore | None = None):
         super().__init__()
-        self.setWindowTitle(self.tr("EZ-CorridorKey"))
+        self.setWindowTitle(self.tr("EZ-CorridorKey2"))
         self.setMinimumSize(1100, 650)
 
         container_env = str(os.getenv("CORRIDORKEY_CONTAINER_MODE", "0")).strip().lower()
@@ -382,12 +381,9 @@ class MainWindow(
         self._setup_shortcuts()
 
         # Workers
-        from ui.widgets.preferences_dialog import (
-            get_setting_int, KEY_PARALLEL_CLIPS, DEFAULT_PARALLEL_CLIPS,
-        )
         self._gpu_worker = GPUJobWorker(
             self._service,
-            max_workers=get_setting_int(KEY_PARALLEL_CLIPS, DEFAULT_PARALLEL_CLIPS),
+            max_workers=1,
             parent=self,
         )
         self._gpu_monitor = GPUMonitor(interval_ms=2000, parent=self)
@@ -422,8 +418,6 @@ class MainWindow(
         self._apply_tooltip_setting()
         self._apply_sound_setting()
         self._apply_tracker_model_setting()
-        self._apply_model_resolution_setting()
-        self._apply_inference_backend_setting()
 
         # Check for updates (non-blocking background thread)
         if os.environ.get("CORRIDORKEY_SKIP_UPDATE_CHECK") != "1":
@@ -649,9 +643,6 @@ class MainWindow(
 
         # Parameter panel — live reprocess (debounced, Codex: coalesce stale)
         self._param_panel.params_changed.connect(self._on_params_changed)
-        self._param_panel.parallel_frames_changed.connect(
-            lambda n: self._gpu_worker.set_max_workers(n)
-        )
         self._param_panel._live_preview.toggled.connect(self._on_live_preview_toggled)
 
         # Sync IO tray divider with dual viewer splitter

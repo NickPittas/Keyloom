@@ -111,27 +111,6 @@ def _configure_runtime_backends() -> None:
         logger.debug(f"OpenCV thread tuning skipped: {exc}")
 
 
-def _migrate_legacy_settings() -> None:
-    """One-time migration from old QSettings path to new one.
-
-    Old: HKCU\\Software\\Corridor Digital\\CorridorKey
-    New: HKCU\\Software\\EZSCAPE\\EZ-CorridorKey
-    """
-    from PySide6.QtCore import QSettings
-    new = QSettings()  # Uses current org/app (EZSCAPE / EZ-CorridorKey)
-    if new.value("_migrated_from_legacy", False, type=bool):
-        return
-    old = QSettings("Corridor Digital", "CorridorKey")
-    old_keys = old.allKeys()
-    if not old_keys:
-        return
-    for key in old_keys:
-        if not new.contains(key):
-            new.setValue(key, old.value(key))
-    new.setValue("_migrated_from_legacy", True)
-    logger.info("Migrated %d settings from Corridor Digital/CorridorKey", len(old_keys))
-
-
 def apply_language(app: QApplication, lang: str | None = None) -> bool:
     """Install the .qm translator for `lang`, replacing any active one.
 
@@ -205,26 +184,6 @@ def apply_language(app: QApplication, lang: str | None = None) -> bool:
     return False
 
 
-def _prewarm_mlx() -> None:
-    """Import mlx.core on the main thread so Metal initializes safely.
-
-    The PyInstaller runtime hook (pyi_rth_mlx.py) does this too, but its
-    failure is silent.  This second attempt runs after paths are fully set
-    up and logs any failure so we can diagnose crash reports where Metal
-    abort()s because mlx.core first loaded on a worker thread.
-    """
-    if sys.platform != "darwin":
-        return
-    if "mlx.core" in sys.modules:
-        return  # Already initialized (runtime hook succeeded)
-    try:
-        import mlx.core as mx
-        mx.eval(mx.zeros(1))
-        logger.info("MLX Metal prewarm succeeded on main thread")
-    except Exception as exc:
-        logger.warning("MLX prewarm failed (will fall back to MPS): %s", exc)
-
-
 def create_app(argv: list[str] | None = None) -> QApplication:
     """Create and configure the QApplication with brand theming.
 
@@ -234,19 +193,17 @@ def create_app(argv: list[str] | None = None) -> QApplication:
         argv = sys.argv
 
     _configure_runtime_backends()
-    _prewarm_mlx()
 
     app = QApplication(argv)
-    app.setApplicationName("EZ-CorridorKey")
-    app.setApplicationDisplayName("EZ-CorridorKey")
+    app.setApplicationName("EZ-CorridorKey2")
+    app.setApplicationDisplayName("EZ-CorridorKey2")
     app.setOrganizationName("EZSCAPE")
 
     # ── i18n: load translation for user's language ──
     apply_language(app)
 
-    # One-time migration from old registry path
-    # (Corridor Digital\CorridorKey → EZSCAPE\EZ-CorridorKey)
-    _migrate_legacy_settings()
+    # Settings identity EZSCAPE/EZ-CorridorKey2 is isolated from the v1 app;
+    # no settings are migrated from EZ-CorridorKey or Corridor Digital/CorridorKey.
 
     # Optional crash reporting — does nothing unless the user enabled it
     # in Preferences (off by default) and this is an installed build.
