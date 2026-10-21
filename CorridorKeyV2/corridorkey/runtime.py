@@ -103,6 +103,8 @@ class InferenceConfig:
     hann_stride: int = 40
     carry_hint: bool = True
     hint_quality: float = 0.95
+    # 0-based source frame the initial (reference) hint belongs to.
+    initial_hint_index: int = 0
     carry_hint_quality: float = 0.95
     shape_quantum: int = 128
     model_scale: float = 1.0
@@ -465,7 +467,8 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                        carry_hint_quality: float,
                        on_baton_frames,
                        on_progress: Callable[[str, int, int], None] | None = None,
-                       check_cancel: Callable[[], None] | None = None):
+                       check_cancel: Callable[[], None] | None = None,
+                       initial_hint_index: int = 0):
     device = next(model.stage1.parameters()).device
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
@@ -534,10 +537,11 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                     hint_cpu[0, j] = carry_cache[t_abs]
                     hint_quality_cpu[0, j] = float(carry_hint_quality)
                     hint_present[0, j] = True
-            if initial_hint is not None and t0 == 0:
-                hint_cpu[0, 0] = initial_hint.to(dtype=hint_cpu.dtype)
-                hint_quality_cpu[0, 0] = float(initial_hint_quality)
-                hint_present[0, 0] = True
+            if initial_hint is not None and t0 <= initial_hint_index < t1:
+                j0 = initial_hint_index - t0
+                hint_cpu[0, j0] = initial_hint.to(dtype=hint_cpu.dtype)
+                hint_quality_cpu[0, j0] = float(initial_hint_quality)
+                hint_present[0, j0] = True
             if not bool(hint_present.any().item()):
                 hint_quality_cpu.fill_(-1.0)
 
@@ -807,6 +811,12 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             linear_contrast=cfg.linear_contrast,
             linear_contrast_pivot=cfg.linear_contrast_pivot)
     T_all = int(meta["num_frames"])
+    if none_path(initial_hint_path) is not None:
+        k = cfg.initial_hint_index
+        if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k < T_all:
+            raise ValueError(
+                f"initial_hint_index must be an int in [0, {T_all - 1}] "
+                f"(source has {T_all} frames), got {k!r}")
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
         apply_auto_vram(cfg, (H, W), T_all)
@@ -861,6 +871,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 if cfg.output_format == "exr":
                     sf.write(f"EXR Pixel Type: {cfg.exr_dtype}\n")
                 sf.write(f"Hint First Frame: {initial_hint_path}\n")
+                sf.write(f"Initial Hint Index (0-based): {cfg.initial_hint_index}\n")
                 sf.write(f"Hint Video: {hint_video_path}\n")
                 sf.write(f"Hint Quality (Trust): {cfg.hint_quality}\n")
                 sf.write(f"Carry Hint: {cfg.carry_hint}\n")
@@ -957,6 +968,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             reader_kind=reader_kind, chunk=cfg.hann_chunk, stride=cfg.hann_stride,
             baton_path=baton_path, initial_hint=initial_hint,
             initial_hint_quality=cfg.hint_quality,
+            initial_hint_index=cfg.initial_hint_index,
             full_hint_video_path=hint_video_path,
             full_hint_quality=cfg.hint_quality,
             rvm_path=rvm_feat_path, foundation_paths=foundation_paths,

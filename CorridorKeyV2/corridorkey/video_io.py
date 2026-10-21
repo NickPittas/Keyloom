@@ -495,7 +495,7 @@ def load_initial_hint_frame(path_or_dir: str, meta: dict) -> torch.Tensor:
         hint, meta["shape_hw"][0], meta["shape_hw"][1])
     if pad_check != meta["pad"]:
         raise ValueError(f"{paths[0]}: hint pad {pad_check} != input pad {meta['pad']}")
-    print(f"  loaded initial frame-1 hint from {paths[0]}")
+    print(f"  loaded reference hint from {paths[0]}")
     return torch.from_numpy(hint[None]).to(dtype=torch.bfloat16)
 
 

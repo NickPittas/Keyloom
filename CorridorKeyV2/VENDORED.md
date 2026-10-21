@@ -24,3 +24,8 @@
    - `check_cancel()` runs at the top of every prepass chunk, Hann window and stage-2 batch; the caller's exception propagates untouched.
    - New `_run_cleanups(steps, body_ok)`: each writer release, reader close and memmap removal runs independently; cleanup errors never mask an in-flight exception, and are re-raised only when the body succeeded.
    - No algorithm/math/colour changes. Tests: `tests/test_v2_runtime_hooks.py`.
+3. `corridorkey/runtime.py` (+ log line in `video_io.load_initial_hint_frame`) — indexed reference hint (EZ-CorridorKey2).
+   - New `InferenceConfig.initial_hint_index: int = 0` and keyword-only `initial_hint_index` on `hann_stage1_stream`. The initial hint is injected into slot `k - t0` of every Hann window with `t0 <= k < t1` (same value/quality/presence as upstream's frame-0 injection). Order kept: dense fill → carry → initial override → `-1` empty-window sentinel.
+   - `run_inference` validates `k` (int, not bool, `0 <= k < T_all`) right after the source frame count is known, before writers/memmaps are created; raises `ValueError`. Settings log gains `Initial Hint Index (0-based): k`; the hint load log is now index-neutral ("loaded reference hint").
+   - Why: EZ lets the user pick any frame as the reference matte. Default `k=0` is identical to upstream behaviour.
+   - Tests: `tests/test_v2_reference_hint.py`.
