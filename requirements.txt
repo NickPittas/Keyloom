@@ -4,7 +4,7 @@ numpy>=1.26,<2
 # Pinned <5: opencv 5.0 wheels dropped OpenEXR support, breaking all EXR frame reads (#180)
 opencv-python-headless>=4.11,<5
 OpenEXR>=3.4
-timm==1.0.24
+timm==1.0.24  # required by BiRefNet remote code (HF trust_remote_code imports timm.layers)
 av
 diffusers
 easydict
