@@ -326,8 +326,7 @@ _DIAGNOSTICS: list[Diagnostic] = [
             "once to upgrade them."
         ),
         steps=[
-            "Download the latest installer from:\n"
-            "    https://github.com/edenaion/EZ-CorridorKey/releases/latest",
+            "See README.md in the EZ-CorridorKey2 folder for setup.",
             "Run the installer over your existing install —\n"
             "your projects, settings, and model weights are preserved.",
             "After reinstalling, future updates will work normally\n"
@@ -612,8 +611,7 @@ def _steps_frozen_reinstall(reason: str) -> list[str]:
     official build is the correct remedy, not pip."""
     return [
         f"{reason}",
-        "Download the latest installer from:\n"
-        "    https://github.com/edenaion/EZ-CorridorKey/releases/latest",
+        "See README.md in the EZ-CorridorKey2 folder for setup.",
         "Run the installer over your existing install —\n"
         "your projects and settings will be preserved.",
         "If the problem persists after reinstalling, please\n"

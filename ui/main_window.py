@@ -203,72 +203,6 @@ class _MuteOverlay(QLabel):
         self.raise_()
 
 
-class _UpdateChecker(QThread):
-    """Background thread that checks GitHub for a newer version."""
-    update_available = Signal(str)  # emits the remote version string
-
-    def __init__(self, local_version: str):
-        super().__init__()
-        self._local = local_version
-
-    def run(self):
-        try:
-            import json
-            import sys as _sys
-            import urllib.request
-            # Read the published GitHub release, the SAME source the updater
-            # downloads from (_run_frozen_update). Reading main's pyproject.toml
-            # instead would nag for a version that has no downloadable release
-            # yet whenever main is bumped ahead of a cut release.
-            from backend.update_verify import UPDATE_ORIGIN
-            url = (
-                f"https://api.github.com/repos/{UPDATE_ORIGIN}"
-                "/releases/latest"
-            )
-            req = urllib.request.Request(url, headers={"User-Agent": "CorridorKey"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                release = json.loads(resp.read().decode("utf-8"))
-            tag = release.get("tag_name", "")
-            remote = tag.lstrip("v") if tag else ""
-            if not remote or not self._is_newer(remote, self._local):
-                return
-            # Frozen builds self-update by downloading a platform asset. Do not
-            # nag if that asset is missing from the release (the click would
-            # fail in _run_frozen_update). Source installs update via git pull,
-            # so they only need the version to be newer.
-            if getattr(_sys, "frozen", False) and not self._has_platform_asset(release, remote):
-                return
-            self.update_available.emit(remote)
-        except Exception:
-            pass  # silently fail — no internet / 404 (no releases) / no button
-
-    @staticmethod
-    def _has_platform_asset(release: dict, version: str) -> bool:
-        """Whether the release carries the frozen-update asset for this platform.
-
-        Mirrors the asset name built in _run_frozen_update.
-        """
-        import sys as _sys
-        if _sys.platform == "darwin":
-            asset_platform = "macOS-arm64"
-        elif _sys.platform == "win32":
-            asset_platform = "Windows-x64"
-        else:
-            return False
-        asset_name = f"EZ-CorridorKey-{version}-{asset_platform}.zip"
-        return any(a.get("name") == asset_name for a in release.get("assets", []))
-
-    @staticmethod
-    def _is_newer(remote: str, local: str) -> bool:
-        """Simple semver comparison: 1.4.0 > 1.3.1."""
-        try:
-            r = tuple(int(x) for x in remote.split("."))
-            l = tuple(int(x) for x in local.split("."))
-            return r > l
-        except (ValueError, AttributeError):
-            return False
-
-
 class MainWindow(
     QMainWindow,
     MenuMixin, ShortcutsMixin, ClipMixin, ImportMixin,
@@ -415,9 +349,7 @@ class MainWindow(
         self._apply_sound_setting()
         self._apply_tracker_model_setting()
 
-        # Check for updates (non-blocking background thread)
-        if os.environ.get("CORRIDORKEY_SKIP_UPDATE_CHECK") != "1":
-            self._check_for_updates()
+        # Upstream update checks are disabled in the CorridorKey 2.0 fork.
 
         # Re-apply configured window mode after first layout pass.
         QTimer.singleShot(0, self._ensure_window_mode)

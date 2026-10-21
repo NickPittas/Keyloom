@@ -212,18 +212,6 @@ class PreferencesDialog(QDialog):
         )
         ui_layout.addWidget(self._sounds_cb)
 
-        self._update_btn_cb = QCheckBox(self.tr("Show update notifications"))
-        self._update_btn_cb.setToolTip(
-            self.tr(
-                "When enabled, an Update Available button appears when a newer\n"
-                "release exists. Turn off to never check for or show updates."
-            )
-        )
-        self._update_btn_cb.setChecked(
-            get_setting_bool(KEY_SHOW_UPDATE_BUTTON, DEFAULT_SHOW_UPDATE_BUTTON)
-        )
-        ui_layout.addWidget(self._update_btn_cb)
-
         # (added to layout below in display order)
 
         # Project section
@@ -566,7 +554,6 @@ class PreferencesDialog(QDialog):
         s = QSettings()
         s.setValue(KEY_SHOW_TOOLTIPS, self._tooltips_cb.isChecked())
         s.setValue(KEY_UI_SOUNDS, self._sounds_cb.isChecked())
-        s.setValue(KEY_SHOW_UPDATE_BUTTON, self._update_btn_cb.isChecked())
         s.setValue(KEY_UI_LANGUAGE, self._language_combo.currentData())
         s.setValue(KEY_COPY_SOURCE, self._copy_source_cb.isChecked())
         s.setValue(KEY_COPY_SEQUENCES, self._copy_sequences_cb.isChecked())
