@@ -21,6 +21,7 @@ from PySide6.QtGui import (
     QCursor,
 )
 
+from ui.preview.display_transform import image_source_size
 from ui.widgets.annotation_overlay import (
     AnnotationModel, paint_annotations, paint_brush_cursor,
     paint_resize_indicator, paint_annotation_hud,
@@ -49,6 +50,7 @@ class SplitViewWidget(QWidget):
     """Image display with optional split view, zoom, and pan."""
 
     zoom_changed = Signal(float)  # current zoom level
+    canvas_resized = Signal(int, int)  # physical (DPR-scaled) canvas width, height
     view_transform_changed = Signal(float, QPointF)  # user pan/zoom, for tandem viewer sync
     stroke_finished = Signal()    # emitted when an annotation stroke completes
     color_sampled = Signal(int, int, int)  # eyedropper: final averaged RGB on release
@@ -137,6 +139,17 @@ class SplitViewWidget(QWidget):
     def is_annotating(self) -> bool:
         """True when annotation mode is active (brush tool enabled)."""
         return self._annotation_mode is not None
+
+    def canvas_physical_size(self) -> tuple[int, int]:
+        """Canvas size in physical pixels (DPR-aware)."""
+        dpr = self.devicePixelRatioF()
+        return (max(1, int(round(self.width() * dpr))),
+                max(1, int(round(self.height() * dpr))))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        w, h = self.canvas_physical_size()
+        self.canvas_resized.emit(w, h)
 
     def set_image(self, image: QImage | None) -> None:
         """Set the single (non-split) image."""
@@ -242,13 +255,13 @@ class SplitViewWidget(QWidget):
         if displayed is None:
             return
         dest = self._image_rect(displayed)
+        # Fractions of the displayed rect map onto the *raster* of the sample
+        # source, so reduced cache rasters and full frames sample identically.
         iw, ih = source.width(), source.height()
-        dw, dh = displayed.width(), displayed.height()
-
-        img_x = (display_pos.x() - dest.x()) * dw / dest.width()
-        img_y = (display_pos.y() - dest.y()) * dh / dest.height()
-        sx = int(min(max(img_x * iw / dw, 0), iw - 1))
-        sy = int(min(max(img_y * ih / dh, 0), ih - 1))
+        fx = (display_pos.x() - dest.x()) / dest.width()
+        fy = (display_pos.y() - dest.y()) / dest.height()
+        sx = int(min(max(fx * iw, 0), iw - 1))
+        sy = int(min(max(fy * ih, 0), ih - 1))
 
         # Interpolate between last and current position so fast drags don't skip
         points = [(sx, sy)]
@@ -550,7 +563,7 @@ class SplitViewWidget(QWidget):
         paintable_rect = self._annotation_paint_rect(img)
         if paintable_rect is None:
             return
-        iw, ih = img.width(), img.height()
+        iw, ih = image_source_size(img)
 
         # Draw existing strokes + in-progress stroke
         strokes = active_model.get_strokes(self._active_stem_idx)
@@ -595,7 +608,7 @@ class SplitViewWidget(QWidget):
         paintable_rect = self._annotation_paint_rect(img)
         if paintable_rect is None or not paintable_rect.contains(display_pos):
             return None
-        iw, ih = img.width(), img.height()
+        iw, ih = image_source_size(img)
         img_x = (display_pos.x() - dest.x()) * iw / dest.width()
         img_y = (display_pos.y() - dest.y()) * ih / dest.height()
         img_x = min(max(float(img_x), 0.0), float(iw - 1))
@@ -633,7 +646,9 @@ class SplitViewWidget(QWidget):
             so each panel gets its own fit calculation). Defaults to the full
             widget area.
         """
-        iw, ih = img.width(), img.height()
+        # Source dimensions drive geometry so a reduced cache raster of the
+        # same frame occupies exactly the same rect as the full-resolution one.
+        iw, ih = image_source_size(img)
         if viewport is not None:
             vx, vy = viewport.x(), viewport.y()
             vw, vh = viewport.width(), viewport.height()

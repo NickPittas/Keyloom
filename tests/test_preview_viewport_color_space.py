@@ -42,6 +42,14 @@ class _DummySplitView:
         self.placeholder = text
 
 
+class _DummyDecoder:
+    def __init__(self):
+        self.invalidated = 0
+
+    def invalidate(self) -> None:
+        self.invalidated += 1
+
+
 class _DummyFrameIndex:
     frame_count = 0
 
@@ -73,6 +81,11 @@ def test_set_clip_preserves_existing_input_color_space_override():
     viewport._split_view = _DummySplitView()
     viewport._current_stem_idx = -1
     viewport._current_mode = ViewMode.INPUT
+    viewport._decoder = _DummyDecoder()
+    viewport._expect = {}
+    viewport._source_dims = None
+    viewport._shown_raster = None
+    viewport._shown_stem = -1
     viewport._update_clip_info = lambda _clip: None
     viewport._build_frame_index = lambda _clip: _DummyFrameIndex()
     viewport._navigate_to = lambda _idx: None
@@ -82,3 +95,5 @@ def test_set_clip_preserves_existing_input_color_space_override():
 
     assert viewport._clip is clip
     assert viewport._input_exr_is_linear is True
+    # Clip switch starts a new cache generation.
+    assert viewport._decoder.invalidated == 1
