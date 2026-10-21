@@ -11,13 +11,16 @@ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 pyside6 = pytest.importorskip("PySide6", reason="PySide6 not installed")
 from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QApplication
 
 from ui.preview.display_transform import (
     decode_frame, clear_cache, _cache_key, _transform_matte,
     _transform_linear_rgb, _transform_processed_rgba, _numpy_to_qimage,
-    processed_rgba_to_qimage, decode_video_frame,
+    processed_rgba_to_qimage, decode_video_frame, image_source_size,
 )
 from ui.preview.frame_index import ViewMode
+
+_APP = QApplication.instance() or QApplication([])
 
 
 class TestNumpyToQImage:
@@ -214,3 +217,131 @@ class TestDecodeVideoFrame:
         assert 45 <= srgb_color.red() <= 46
         assert 117 <= linear_color.red() <= 118
         assert linear_color.red() > srgb_color.red()
+
+
+class TestTargetSize:
+    def _write(self, tmp_path, name, arr):
+        path = os.path.join(str(tmp_path), name)
+        assert cv2.imwrite(path, arr)
+        return path
+
+    def test_exr_fit_and_source_size(self, tmp_path):
+        clear_cache()
+        arr = np.full((180, 320, 3), 0.2, dtype=np.float32)
+        path = self._write(tmp_path, "a.exr", arr)
+        img = decode_frame(path, ViewMode.FG, target_size=(160, 90))
+        assert (img.width(), img.height()) == (160, 90)
+        assert img.text("source_width") == "320"
+        assert img.text("source_height") == "180"
+        assert image_source_size(img) == (320, 180)
+
+    def test_large_source_text(self):
+        from ui.preview import display_transform as d
+        arr = np.full((1800, 3200, 3), 0.5, dtype=np.float32)
+        img = d._transform_linear_rgb(arr, ViewMode.FG, target_size=(1280, 720))
+        assert (img.width(), img.height()) == (1280, 720)
+        assert image_source_size(img) == (3200, 1800)
+
+    def test_linear_to_srgb_on_reduced_array(self, monkeypatch):
+        from ui.preview import display_transform as d
+        seen = []
+        orig = d._linear_to_srgb
+        monkeypatch.setattr(d, "_linear_to_srgb", lambda a: (seen.append(a.shape), orig(a))[1])
+        d._transform_linear_rgb(
+            np.full((400, 800, 3), 0.5, dtype=np.float32), ViewMode.FG, target_size=(200, 100)
+        )
+        assert seen == [(100, 200, 3)]
+
+    def test_no_upscale(self, tmp_path):
+        clear_cache()
+        path = self._write(tmp_path, "s.png", np.zeros((10, 20, 3), np.uint8))
+        img = decode_frame(path, ViewMode.COMP, target_size=(1280, 720))
+        assert (img.width(), img.height()) == (20, 10)
+        assert image_source_size(img) == (20, 10)
+
+    def test_png_reduced(self, tmp_path):
+        clear_cache()
+        path = self._write(tmp_path, "p.png", np.zeros((90, 160, 3), np.uint8))
+        img = decode_frame(path, ViewMode.COMP, target_size=(80, 80))
+        assert (img.width(), img.height()) == (80, 45)
+        assert image_source_size(img) == (160, 90)
+
+    def test_none_identical_to_default(self, tmp_path):
+        clear_cache()
+        rng = np.random.default_rng(0)
+        arr = rng.random((12, 16, 3), dtype=np.float32)
+        path = self._write(tmp_path, "n.exr", arr)
+        a = decode_frame(path, ViewMode.FG)
+        clear_cache()
+        b = decode_frame(path, ViewMode.FG, target_size=None)
+        assert a == b
+        bgr = arr.copy()
+        expected = np.clip(bgr, 0, 1)
+        lin = np.where(expected <= 0.0031308, expected * 12.92,
+                       1.055 * np.power(expected, 1 / 2.4) - 0.055)
+        rgb = cv2.cvtColor((lin * 255.0).astype(np.uint8), cv2.COLOR_BGR2RGB)
+        ref = _numpy_to_qimage(rgb)
+        assert a == ref
+
+    def test_processed_alpha_edge_premultiplied(self):
+        # left: transparent pixel with bright colour; right: opaque black
+        bgra = np.zeros((2, 2, 4), dtype=np.float32)
+        bgra[:, 0] = [1.0, 1.0, 1.0, 0.0]
+        bgra[:, 1] = [0.0, 0.0, 0.0, 1.0]
+        img = _transform_processed_rgba(bgra, target_size=(1, 1))
+        assert img.width() == 1
+        assert img.pixelColor(0, 0).red() == 0
+        # half alpha white next to opaque black -> 0.25 linear average
+        bgra[:, 0] = [1.0, 1.0, 1.0, 0.5]
+        img = _transform_processed_rgba(bgra, target_size=(1, 1))
+        assert 0.2 < img.pixelColor(0, 0).red() / 255.0 < 0.6
+
+    def test_image_source_size_fallback(self):
+        img = QImage(7, 5, QImage.Format_RGB888)
+        assert image_source_size(img) == (7, 5)
+        img.setText("source_width", "bad")
+        img.setText("source_height", "3")
+        assert image_source_size(img) == (7, 5)
+
+    def test_video_release_on_failure(self):
+        clear_cache()
+        released = []
+
+        class _Cap:
+            def isOpened(self):
+                return True
+
+            def set(self, *_a):
+                raise RuntimeError("boom")
+
+            def read(self):
+                return False, None
+
+            def release(self):
+                released.append(1)
+
+        with patch("ui.preview.display_transform.cv2.VideoCapture", return_value=_Cap()):
+            assert decode_video_frame("clip.mp4", 0, target_size=(10, 10)) is None
+        assert released
+
+    def test_video_target_size(self):
+        clear_cache()
+        frame = np.zeros((40, 80, 3), np.uint8)
+
+        class _Cap:
+            def isOpened(self):
+                return True
+
+            def set(self, *_a):
+                return True
+
+            def read(self):
+                return True, frame.copy()
+
+            def release(self):
+                pass
+
+        with patch("ui.preview.display_transform.cv2.VideoCapture", return_value=_Cap()):
+            img = decode_video_frame("clip.mp4", 0, target_size=(40, 40))
+        assert (img.width(), img.height()) == (40, 20)
+        assert image_source_size(img) == (80, 40)
