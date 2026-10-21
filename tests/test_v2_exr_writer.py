@@ -92,3 +92,65 @@ def test_failure_never_blocks(tmp_path, monkeypatch, fail_after):
     with pytest.raises(RuntimeError, match="imwrite failed"):
         _run(w.release)
     _run(w.release)  # second call: no-op, no re-raise
+
+
+def _write_all(path, workers):
+    w = ExrSequenceWriter(str(path), 24, (5, 4), channels=3, dtype="float",
+                          workers=workers)
+    for b in range(3):
+        data = np.stack([np.full((4, 5, 3), b * 5 + k, np.float32)
+                         for k in range(5)])
+        w.write_many(data)
+    w.release()
+    return w
+
+
+def _read(path, i):
+    return cv2.imread(str(path / f"frame_{i:06d}.exr"), cv2.IMREAD_UNCHANGED)
+
+
+def test_pool_writes_all_frames_in_order(tmp_path):
+    w = _write_all(tmp_path, 4)
+    assert len(w.threads) == 4 and not any(t.is_alive() for t in w.threads)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        f"frame_{i:06d}.exr" for i in range(15)]
+    for i in range(15):
+        assert (_read(tmp_path, i) == i).all()
+
+
+def test_pool_matches_single_worker(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    _write_all(a, 1)
+    _write_all(b, 4)
+    for i in range(15):
+        np.testing.assert_array_equal(_read(a, i), _read(b, i))
+
+
+def test_worker_error_propagates_without_hang(tmp_path):
+    w = ExrSequenceWriter(str(tmp_path), 24, (5, 4), channels=3, workers=3)
+    real = w._write_item
+
+    def bad(idx0, arr):
+        if idx0 == 3:
+            raise RuntimeError("boom")
+        real(idx0, arr)
+
+    w._write_item = bad
+
+    def produce():
+        with pytest.raises(RuntimeError, match="boom"):
+            for _ in range(50):
+                w.write_many(_batch(2))
+
+    _run(produce)
+    with pytest.raises(RuntimeError, match="boom"):
+        _run(w.release)
+    assert not any(t.is_alive() for t in w.threads)
+
+
+def test_workers_validation_and_default(tmp_path):
+    with pytest.raises(ValueError):
+        ExrSequenceWriter(str(tmp_path), 24, (5, 4), workers=0)
+    w = ExrSequenceWriter(str(tmp_path), 24, (5, 4))
+    w.release()
+    assert 1 <= w.workers <= 8

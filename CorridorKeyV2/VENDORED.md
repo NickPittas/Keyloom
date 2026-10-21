@@ -14,6 +14,7 @@
 1. `corridorkey/video_io.py` — `ExrSequenceWriter` failure-safe queue/shutdown (EZ-CorridorKey2).
    - Worker keeps draining the queue after the first error (stored in `self.err`) until the sentinel, so producers never block on a full queue.
    - New `_put()` enqueues with 0.1 s timeout loops and raises `self.err` (or RuntimeError if the thread died) instead of hanging.
+   - Writes frames with pool worker threads (`workers`, default min(8, cpu_count//4)), one queued item per frame, queue bounded to `workers` frames; same file names/content. Reason: single-threaded float ZIP EXR writing (~2 s/frame at 4K) stalled stage 2.
    - `release()` is idempotent; first call joins and re-raises the stored error, later calls are no-ops.
    - Unchanged: naming `{frame_name}_{idx:06d}.exr`, half clamp ±65504, ZIP compression, dtype/channel validation.
    - Tests: `tests/test_v2_exr_writer.py`.

@@ -707,13 +707,22 @@ class ExrSequenceWriter:
     matching the layout convention of ThreadedVideoWriter/cv2. Values are
     written as-is: no clamping and no quantization. `dtype` selects the EXR
     pixel type: "half" (float16, VFX standard) or "float" (full float32).
+    Frames are written by a pool of `workers` threads (cv2 releases the GIL),
+    one queued item per frame.
     """
 
     def __init__(self, dir_path: str, fps: float, size: tuple[int, int], *,
-                 channels: int = 3, dtype: str = "half", maxsize: int = 2,
-                 frame_name: str = "frame"):
+                 channels: int = 3, dtype: str = "half", maxsize: int | None = None,
+                 frame_name: str = "frame", workers: int | None = None):
         if dtype not in ("half", "float"):
             raise ValueError(f"exr dtype must be 'half' or 'float', got {dtype!r}")
+        if workers is None:
+            workers = max(1, min(8, (os.cpu_count() or 4) // 4))
+        if workers < 1:
+            raise ValueError(f"workers must be >= 1, got {workers}")
+        if maxsize is None:
+            maxsize = workers
+        self.workers = workers
         self.dir_path = str(dir_path)
         self.path = self.dir_path  # for logging parity with ThreadedVideoWriter
         self.size = size
@@ -730,8 +739,10 @@ class ExrSequenceWriter:
         self.frame_idx = 0
         self.q = queue.Queue(maxsize=maxsize)
         self.err = None
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
+        self.threads = [threading.Thread(target=self._worker, daemon=True)
+                        for _ in range(workers)]
+        for t in self.threads:
+            t.start()
 
     def _write_item(self, idx0: int, arr: np.ndarray):
         if self.clamp_half:
@@ -772,9 +783,9 @@ class ExrSequenceWriter:
                 self.q.put(item, timeout=0.1)
                 return
             except queue.Full:
-                if not self.thread.is_alive():
+                if not any(t.is_alive() for t in self.threads):
                     raise self.err or RuntimeError(
-                        f"EXR writer thread died: {self.dir_path}")
+                        f"EXR writer threads died: {self.dir_path}")
 
     def write_many(self, frames: np.ndarray):
         if self.err is not None:
@@ -786,7 +797,8 @@ class ExrSequenceWriter:
                 f"{self.channels} channels, got {arr.shape}")
         if arr.dtype != np.float32:
             raise ValueError(f"expected float32 frames, got {arr.dtype}")
-        self._put((self.frame_idx, arr))
+        for j in range(arr.shape[0]):
+            self._put((self.frame_idx + j, arr[j:j + 1]))
         self.frame_idx += arr.shape[0]
 
     def write(self, frame: np.ndarray):
@@ -796,13 +808,15 @@ class ExrSequenceWriter:
         if getattr(self, "_released", False):
             return
         self._released = True
-        while self.thread.is_alive():
-            try:
-                self.q.put(None, timeout=0.1)
-                break
-            except queue.Full:
-                continue
-        self.thread.join()
+        for _ in self.threads:
+            while any(t.is_alive() for t in self.threads):
+                try:
+                    self.q.put(None, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+        for t in self.threads:
+            t.join()
         if self.err is not None:
             raise self.err
 
