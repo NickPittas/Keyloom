@@ -23,7 +23,8 @@ _DSN = "".join([
     "@", "ingest.", "ezscape.space", "/9",
 ])
 
-_ORIGIN = "/".join(["edenaion", "EZ-CorridorKey"])
+# Private CorridorKey 2.0 fork: never report crashes to the upstream v1 project.
+_ORIGIN = None
 
 
 def _origin_ok() -> bool:
@@ -38,7 +39,7 @@ def _origin_ok() -> bool:
 VALID_STAGES = frozenset({"installer", "updater", "runtime", "inference"})
 
 SETTINGS_ORG = "EZSCAPE"
-SETTINGS_APP = "EZ-CorridorKey"
+SETTINGS_APP = "EZ-CorridorKey2"
 KEY_CRASH_REPORTS = "privacy/crash_reports_enabled"
 
 _install_id_cache: str | None = None
@@ -72,13 +73,13 @@ def _config_dir() -> str:
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(
             "~\\AppData\\Local")
-        return os.path.join(base, "EZ-CorridorKey")
+        return os.path.join(base, "EZ-CorridorKey2")
     if sys.platform == "darwin":
         return os.path.expanduser(
-            "~/Library/Application Support/EZ-CorridorKey")
+            "~/Library/Application Support/EZ-CorridorKey2")
     return os.path.join(
         os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-        "EZ-CorridorKey",
+        "EZ-CorridorKey2",
     )
 
 
