@@ -24,7 +24,7 @@ scipy>=1.16
 utils3d @ git+https://github.com/EasternJournalist/utils3d.git@83bfa5bda008803f6521ce9547f94023b8afeddd
 matplotlib
 nvidia-ml-py
-PySide6>=6.7.0
+PySide6>=6.7.0,<6.12  # 6.12.0 leaks a None reference per repaint/resize -> fatal abort
 triton-windows>=3.5,<3.6; sys_platform == 'win32'
 cryptography>=43.0
 sentry-sdk>=2,<3
