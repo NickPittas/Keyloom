@@ -105,6 +105,8 @@ class InferenceConfig:
     hint_quality: float = 0.95
     # 0-based source frame the initial (reference) hint belongs to.
     initial_hint_index: int = 0
+    # Sparse keyframe hints: absolute 0-based indices (None = dense).
+    hint_frame_indices: tuple[int, ...] | None = None
     carry_hint_quality: float = 0.95
     shape_quantum: int = 128
     model_scale: float = 1.0
@@ -468,7 +470,8 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                        on_baton_frames,
                        on_progress: Callable[[str, int, int], None] | None = None,
                        check_cancel: Callable[[], None] | None = None,
-                       initial_hint_index: int = 0):
+                       initial_hint_index: int = 0,
+                       hint_frame_indices=None):
     device = next(model.stage1.parameters()).device
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
@@ -499,7 +502,13 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                                    mode="r", shape=tuple(foundation_paths["cradio_shape"]))
 
     reader = reader_cls(str(source), meta)
-    hint_reader = make_hint_reader(full_hint_video_path, meta)
+    sparse = hint_frame_indices is not None
+    if sparse:
+        _validate_sparse_hint_request(full_hint_video_path, hint_frame_indices)
+        hint_reader = make_hint_reader(
+            full_hint_video_path, meta, frame_indices=hint_frame_indices)
+    else:
+        hint_reader = make_hint_reader(full_hint_video_path, meta)
     carry_cache = {}
     stage2_frame_cache = {}
 
@@ -529,11 +538,20 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             hint_quality_cpu = torch.zeros(1, Tc, dtype=torch.bfloat16)
             hint_present = torch.zeros(1, Tc, dtype=torch.bool)
             if hint_reader is not None:
-                hint_cpu[0] = hint_reader.window(t0, t1)
-                hint_quality_cpu.fill_(float(full_hint_quality))
-                hint_present.fill_(True)
+                if sparse:
+                    win, presence = hint_reader.window_with_presence(t0, t1)
+                    for j, has in enumerate(presence):
+                        if has:
+                            hint_cpu[0, j] = win[j]
+                            hint_quality_cpu[0, j] = float(full_hint_quality)
+                            hint_present[0, j] = True
+                else:
+                    hint_cpu[0] = hint_reader.window(t0, t1)
+                    hint_quality_cpu.fill_(float(full_hint_quality))
+                    hint_present.fill_(True)
             for j, t_abs in enumerate(range(t0, t1)):
-                if t_abs in carry_cache:
+                if t_abs in carry_cache and not (
+                        sparse and bool(hint_present[0, j])):
                     hint_cpu[0, j] = carry_cache[t_abs]
                     hint_quality_cpu[0, j] = float(carry_hint_quality)
                     hint_present[0, j] = True
@@ -624,6 +642,16 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
         baton_fp16.flush()
     del baton_fp16, live_acc, live_w, rvm_map, cradio_map, moge_map
     torch.cuda.empty_cache()
+
+
+def _validate_sparse_hint_request(hint_path, indices) -> None:
+    if none_path(hint_path) is None:
+        raise ValueError("hint_frame_indices requires a hint directory")
+    if not os.path.isdir(str(hint_path)):
+        raise ValueError(
+            f"Sparse hints require a PNG directory: {hint_path}")
+    if len(tuple(indices)) == 0:
+        raise ValueError("hint_frame_indices must not be empty")
 
 
 def _crop_native_torch(x: torch.Tensor, meta: dict) -> torch.Tensor:
@@ -817,6 +845,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             raise ValueError(
                 f"initial_hint_index must be an int in [0, {T_all - 1}] "
                 f"(source has {T_all} frames), got {k!r}")
+    if cfg.hint_frame_indices is not None:
+        _validate_sparse_hint_request(hint_video_path, cfg.hint_frame_indices)
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
         apply_auto_vram(cfg, (H, W), T_all)
@@ -873,6 +903,9 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 sf.write(f"Hint First Frame: {initial_hint_path}\n")
                 sf.write(f"Initial Hint Index (0-based): {cfg.initial_hint_index}\n")
                 sf.write(f"Hint Video: {hint_video_path}\n")
+                if cfg.hint_frame_indices is not None:
+                    sf.write("Hint Frame Indices (0-based): "
+                             f"{list(cfg.hint_frame_indices)}\n")
                 sf.write(f"Hint Quality (Trust): {cfg.hint_quality}\n")
                 sf.write(f"Carry Hint: {cfg.carry_hint}\n")
                 sf.write(f"Carry Hint Quality: {cfg.carry_hint_quality}\n")
@@ -969,6 +1002,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             baton_path=baton_path, initial_hint=initial_hint,
             initial_hint_quality=cfg.hint_quality,
             initial_hint_index=cfg.initial_hint_index,
+            hint_frame_indices=cfg.hint_frame_indices,
             full_hint_video_path=hint_video_path,
             full_hint_quality=cfg.hint_quality,
             rvm_path=rvm_feat_path, foundation_paths=foundation_paths,
