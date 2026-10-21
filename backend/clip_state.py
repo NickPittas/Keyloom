@@ -88,12 +88,40 @@ def mask_sequence_is_videomama_ready(root_path: str) -> bool:
     return data.get("source") in {"sam2", "imported"}
 
 
-def can_run_inference(clip: "ClipEntry", use_alpha_hint: bool) -> bool:
+_HINT_MODES = ("none", "full", "keyframes")
+
+
+def _check_hint_mode(hint_mode: Optional[str]) -> None:
+    if hint_mode is not None and hint_mode not in _HINT_MODES:
+        raise ValueError(f"Unknown hint mode: {hint_mode!r}")
+
+
+def _keyframes_ready(clip: "ClipEntry") -> bool:
+    """Sparse-keyframe readiness: input + AlphaHint (may be partial) + valid marks."""
+    return (clip.input_asset is not None
+            and clip.alpha_asset is not None
+            and bool(clip.hint_keyframes)
+            and clip.hint_keyframes_error is None
+            and clip.state not in (ClipState.EXTRACTING, ClipState.ERROR))
+
+
+def can_run_inference(clip: "ClipEntry", use_alpha_hint: bool = False, *,
+                      hint_mode: Optional[str] = None) -> bool:
     """Return True if CorridorKey inference can run on the clip.
+
+    ``hint_mode`` (none/full/keyframes), when given, overrides the legacy
+    boolean; None keeps the legacy meaning exactly.
 
     Hint off: any clip with an input and not EXTRACTING/ERROR.
     Hint on: needs an AlphaHint and READY/COMPLETE state.
+    Keyframes: input + AlphaHint + valid non-empty marks, not EXTRACTING/ERROR
+    (a partial AlphaHint is fine).
     """
+    _check_hint_mode(hint_mode)
+    if hint_mode == "keyframes":
+        return _keyframes_ready(clip)
+    if hint_mode is not None:
+        use_alpha_hint = hint_mode == "full"
     if not use_alpha_hint:
         return (clip.input_asset is not None
                 and clip.state not in (ClipState.EXTRACTING, ClipState.ERROR))
@@ -101,7 +129,8 @@ def can_run_inference(clip: "ClipEntry", use_alpha_hint: bool) -> bool:
             and clip.state in (ClipState.READY, ClipState.COMPLETE))
 
 
-def classify_pipeline_route(clip: "ClipEntry", use_alpha_hint: bool = True) -> PipelineRoute:
+def classify_pipeline_route(clip: "ClipEntry", use_alpha_hint: bool = True, *,
+                            hint_mode: Optional[str] = None) -> PipelineRoute:
     """Determine the full-pipeline route for a clip.
 
     When ``use_alpha_hint`` is False, annotations, masks and existing hints
@@ -109,7 +138,16 @@ def classify_pipeline_route(clip: "ClipEntry", use_alpha_hint: bool = True) -> P
 
     For RAW clips, checks for annotations.json on disk to decide
     between GVM (automatic) and VideoMaMa (annotation-based) paths.
+
+    ``hint_mode`` (none/full/keyframes), when given, overrides the boolean.
+    Keyframes: INFERENCE_ONLY when eligible, otherwise SKIP (never a generator).
     """
+    _check_hint_mode(hint_mode)
+    if hint_mode == "keyframes":
+        return (PipelineRoute.INFERENCE_ONLY if _keyframes_ready(clip)
+                else PipelineRoute.SKIP)
+    if hint_mode is not None:
+        use_alpha_hint = hint_mode == "full"
     if not use_alpha_hint:
         if clip.state in (ClipState.EXTRACTING, ClipState.ERROR):
             return PipelineRoute.SKIP
@@ -265,6 +303,8 @@ class ClipEntry:
     extraction_progress: float = 0.0  # 0.0 to 1.0 during EXTRACTING
     extraction_total: int = 0         # total frames expected during extraction
     custom_output_dir: str = ""       # Per-clip output dir override (from clip.json)
+    hint_keyframes: tuple[int, ...] = ()          # sparse hint marks (source indices)
+    hint_keyframes_error: Optional[str] = None    # diagnostic if the sidecar is unusable
     _processing: bool = field(default=False, repr=False)  # lock: watcher must not reclassify
 
     @property
@@ -522,6 +562,8 @@ class ClipEntry:
         self.alpha_asset = None
         self.mask_asset = None
         self.source_type = "unknown"
+        self.hint_keyframes = ()
+        self.hint_keyframes_error = None
 
         # Load per-clip output dir override from clip.json
         from .project import load_custom_output_dir
@@ -563,6 +605,7 @@ class ClipEntry:
             elif self.state == ClipState.ERROR:
                 # _resolve_external_sequence() set ERROR (missing source folder)
                 # Clip remains visible with error state — don't raise
+                self._load_hint_keyframes()
                 return
             else:
                 candidates = glob_module.glob(os.path.join(self.root_path, "[Ii]nput.*"))
@@ -612,8 +655,37 @@ class ClipEntry:
         from .project import load_in_out_range
         self.in_out_range = load_in_out_range(self.root_path)
 
+        self._load_hint_keyframes()
+
         # Determine initial state
         self._resolve_state()
+
+    def _source_stems(self) -> Optional[list[str]]:
+        """Ordered source stems (same convention as v2_inputs), None without input."""
+        asset = self.input_asset
+        if asset is None:
+            return None
+        if asset.asset_type == "video":
+            return [f"{i:05d}" for i in range(asset.frame_count)]
+        return [os.path.splitext(f)[0] for f in asset.get_frame_files()]
+
+    def _load_hint_keyframes(self) -> None:
+        """Load the sparse-hint sidecar into memory. Never writes to disk."""
+        from .hint_keyframes import (
+            HintKeyframesError, KEYFRAMES_FILENAME, load_hint_keyframes)
+        self.hint_keyframes = ()
+        self.hint_keyframes_error = None
+        stems = self._source_stems()
+        if stems is None:
+            if os.path.lexists(os.path.join(self.root_path, KEYFRAMES_FILENAME)):
+                self.hint_keyframes_error = (
+                    "Hint keyframe sidecar present but the clip has no source to validate it against")
+            return
+        try:
+            self.hint_keyframes = tuple(load_hint_keyframes(self.root_path, stems))
+        except (HintKeyframesError, OSError) as exc:
+            self.hint_keyframes = ()
+            self.hint_keyframes_error = str(exc)
 
     def _resolve_state(self) -> None:
         """Set state based on what assets are present on disk.
