@@ -181,17 +181,8 @@ class ClipMixin:
             needs_extraction=needs_extraction,
         )
 
-        # Enable Apple Vision/GVM/BiRefNet/ChromaKey/VideoMaMa/MatAnyone2/Import Alpha buttons based on state
-        self._param_panel.set_applevision_enabled(clip.state in (ClipState.RAW, ClipState.MASKED))
-        self._param_panel.set_gvm_enabled(clip.state in (ClipState.RAW, ClipState.MASKED))
-        self._param_panel.set_birefnet_enabled(clip.state in (ClipState.RAW, ClipState.MASKED))
-        self._param_panel.set_chroma_key_enabled(clip.state in (ClipState.RAW, ClipState.MASKED))
-        has_mask = self._clip_has_videomama_ready_mask(clip)
-        self._param_panel.set_videomama_enabled(has_mask)
-        self._param_panel.set_matanyone2_enabled(has_mask)
-        self._param_panel.set_import_alpha_enabled(
-            clip.state in (ClipState.RAW, ClipState.MASKED, ClipState.READY)
-        )
+        # Hint tools (generators/guided/import/reset/track) share one refresh
+        self._refresh_hint_tools()
 
     @Slot(str)
     def _on_clips_dir_changed(

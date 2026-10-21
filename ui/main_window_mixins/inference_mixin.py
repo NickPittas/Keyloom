@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QMessageBox
 from PySide6.QtCore import Slot, QThread
 
 from . import _tr
+from .hint_reset_mixin import refresh_hint_tools_if_available
 
 from backend import (
     ClipState, JobType,
@@ -228,6 +229,7 @@ class InferenceMixin:
             self._status_bar.update_button_state(
                 can_run=False, has_partial=False, has_in_out=False,
             )
+            refresh_hint_tools_if_available(self)
             return
         can_run = can_run_inference(clip, self._param_panel.get_params().use_alpha_hint)
         self._status_bar.update_button_state(
@@ -236,6 +238,7 @@ class InferenceMixin:
             has_in_out=clip.in_out_range is not None,
             batch_count=batch_count if batch_count > 1 else 0,
         )
+        refresh_hint_tools_if_available(self)
 
     @Slot()
     def _on_run_all_ready(self) -> None:
@@ -381,5 +384,6 @@ class InferenceMixin:
         self._status_bar.reset_progress()
         self._status_bar.start_job_timer(label=job_label)
         self._queue_panel.refresh()
+        refresh_hint_tools_if_available(self)  # job submitted: disable hint tools
         if self._queue_panel._collapsed:
             self._queue_panel.toggle_collapsed()  # auto-expand when job starts

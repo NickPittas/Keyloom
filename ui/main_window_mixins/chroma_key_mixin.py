@@ -2,17 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 
 import cv2
 import numpy as np
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QMessageBox
 
-from . import _tr
-
-from backend import ClipState, JobType
+from backend import JobType
 from backend.frame_io import imread_unicode
 from ui.workers.job_helpers import create_job_snapshot
 
@@ -42,8 +38,8 @@ class ChromaKeyMixin:
     def _on_run_chroma_key(self, chroma_params: dict) -> None:
         """Generate alpha hints via chroma key for the selected clip."""
         clip = self._current_clip
-        if clip is None or clip.state not in (ClipState.RAW, ClipState.MASKED):
-            logger.warning("Chroma key generate: no clip or wrong state")
+        if clip is None or not self._prepare_alpha_generator_run():
+            logger.warning("Chroma key generate: no clip, busy, wrong state or cancelled")
             return
 
         # Resolve "auto" screen type from clip's detected color
@@ -51,19 +47,6 @@ class ChromaKeyMixin:
             chroma_params["screen_type"] = getattr(clip, '_screen_color_cache', None) or "green"
 
         logger.info(f"Chroma key generate for '{clip.name}': {chroma_params}")
-
-        # Check for existing alpha hints (reuse the same pattern as GVM/BiRefNet)
-        alpha_dir = os.path.join(clip.root_path, "AlphaHint")
-        if os.path.isdir(alpha_dir) and os.listdir(alpha_dir):
-            result = QMessageBox.question(
-                self, _tr("Replace Alpha Hints?"),
-                _tr("Clip '%s' already has alpha hint images.\n\n"
-                    "Do you want to replace them with chroma key hints?") % clip.name,
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if result != QMessageBox.Yes:
-                return
-            shutil.rmtree(alpha_dir, ignore_errors=True)
 
         job = create_job_snapshot(
             clip,

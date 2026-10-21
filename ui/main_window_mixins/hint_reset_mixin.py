@@ -8,8 +8,20 @@ from PySide6.QtWidgets import QCheckBox, QMessageBox
 from backend import ClipState
 from backend.hint_assets import clear_hint_assets, has_hint_assets
 from ui.main_window_mixins import _tr
+from ui.workers.job_helpers import reset_complete_state
+
+# States from which an alpha generator (chroma/GVM/BiRefNet/Apple Vision) may run
+_GENERATOR_STATES = (ClipState.RAW, ClipState.MASKED, ClipState.READY, ClipState.COMPLETE)
+_PRE_INFERENCE_STATES = (ClipState.RAW, ClipState.MASKED, ClipState.READY)
 
 logger = logging.getLogger(__name__)
+
+
+def refresh_hint_tools_if_available(win) -> None:
+    """Refresh hint tools on ``win`` if it provides them (lightweight fakes may not)."""
+    refresh = getattr(win, "_refresh_hint_tools", None)
+    if callable(refresh):
+        refresh()
 
 
 class HintResetMixin:
@@ -32,6 +44,27 @@ class HintResetMixin:
             if clip.is_processing:
                 return False
         return True
+
+    def _refresh_hint_tools(self, *_args) -> None:
+        """Single source of truth for hint-tool enablement (generators, guided, import, reset, track)."""
+        clip = getattr(self, "_current_clip", None)
+        panel = self._param_panel
+        allowed = clip is not None and self._hint_mutation_allowed()
+        generators = (
+            allowed and clip.input_asset is not None and clip.state in _GENERATOR_STATES
+        )
+        panel.set_applevision_enabled(generators)
+        panel.set_gvm_enabled(generators)
+        panel.set_birefnet_enabled(generators)
+        panel.set_chroma_key_enabled(generators)
+        guided = (
+            allowed and clip.state in _PRE_INFERENCE_STATES
+            and bool(self._clip_has_videomama_ready_mask(clip))
+        )
+        panel.set_videomama_enabled(guided)
+        panel.set_matanyone2_enabled(guided)
+        panel.set_import_alpha_enabled(allowed and clip.state in _PRE_INFERENCE_STATES)
+        self._refresh_hint_button_state()
 
     def _refresh_hint_button_state(self, *_args) -> None:
         clip = getattr(self, "_current_clip", None)
@@ -145,17 +178,65 @@ class HintResetMixin:
             if callable(fn):
                 fn(clip)
         self._update_annotation_info()
-        panel = self._param_panel
-        pre = clip.state in (ClipState.RAW, ClipState.MASKED)
-        panel.set_applevision_enabled(pre)
-        panel.set_gvm_enabled(pre)
-        panel.set_birefnet_enabled(pre)
-        panel.set_chroma_key_enabled(pre)
-        has_mask = self._clip_has_videomama_ready_mask(clip)
-        panel.set_videomama_enabled(has_mask)
-        panel.set_matanyone2_enabled(has_mask)
-        panel.set_import_alpha_enabled(
-            clip.state in (ClipState.RAW, ClipState.MASKED, ClipState.READY)
-        )
         self._refresh_button_state()
-        self._refresh_hint_button_state()
+        self._refresh_hint_tools()
+
+    # ── Shared guard for alpha generators ──
+
+    def _prepare_alpha_generator_run(self) -> bool:
+        """Guard + confirm before Apple Vision/GVM/BiRefNet/Chroma submission.
+
+        Returns True when the caller may submit its job. A complete AlphaHint
+        is replaced only after confirmation (alpha only; masks, annotations and
+        outputs are kept). Partial alpha keeps the Resume/Regenerate/Cancel flow.
+        """
+        clip = getattr(self, "_current_clip", None)
+        if clip is None or not self._hint_mutation_allowed():
+            return False
+        if clip.state not in _GENERATOR_STATES:
+            return False
+
+        alpha, src = clip.alpha_asset, clip.input_asset
+        has_complete_alpha = alpha is not None and (
+            clip.state in (ClipState.READY, ClipState.COMPLETE)
+            or (src is not None and alpha.frame_count >= src.frame_count)
+        )
+        if not has_complete_alpha:
+            if self._confirm_partial_alpha() is False:
+                return False
+            return (
+                self._current_clip is clip and self._hint_mutation_allowed()
+            )
+
+        answer = QMessageBox.question(
+            self, _tr("Replace AlphaHint?"),
+            _tr("'%s' already has an AlphaHint.\n\nReplace it? "
+                "SAM masks, annotations and keyed outputs are kept.") % clip.name,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return False
+        if self._current_clip is not clip or not self._hint_mutation_allowed():
+            self._refresh_hint_tools()
+            return False
+        try:
+            clear_hint_assets(clip, clear_alpha=True, clear_masks=False)
+        except OSError as e:
+            logger.warning("Replace AlphaHint failed for %s: %s", clip.name, e)
+            QMessageBox.warning(
+                self, _tr("Replace AlphaHint?"),
+                _tr("Could not delete the existing AlphaHint: %s") % e,
+            )
+            self._refresh_hint_tools()
+            return False
+        self._rescan_after_alpha_clear(clip)
+        return True
+
+    def _rescan_after_alpha_clear(self, clip) -> None:
+        clip.alpha_asset = None
+        try:
+            clip.find_assets()
+        except Exception:
+            logger.exception("find_assets failed after AlphaHint replace")
+        reset_complete_state(clip)
+        self._clip_model.update_clip_state(clip.name, clip.state)

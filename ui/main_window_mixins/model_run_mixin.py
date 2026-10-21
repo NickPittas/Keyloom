@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 
 from PySide6.QtWidgets import QMessageBox
 from PySide6.QtCore import Slot
 
 from . import _tr
 
-from backend import ClipState, JobType
+from backend import JobType
+from backend.hint_assets import clear_hint_assets
 from ui.workers.gpu_job_worker import create_job_snapshot
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,16 @@ class ModelRunMixin:
         msg.exec()
         clicked = msg.clickedButton()
         if clicked == regen_btn:
-            shutil.rmtree(alpha_dir, ignore_errors=True)
+            clip = self._current_clip
+            try:
+                clear_hint_assets(clip, clear_alpha=True, clear_masks=False)
+            except OSError as e:
+                QMessageBox.warning(
+                    self, _tr("Partial Alpha Found"),
+                    _tr("Could not delete the existing AlphaHint: %s") % e,
+                )
+                return False
+            self._rescan_after_alpha_clear(clip)
             return True
         if clicked == resume_btn:
             return True
@@ -57,11 +66,7 @@ class ModelRunMixin:
 
     def _on_run_applevision(self) -> None:
         """Run Apple Vision foreground alpha generation on the selected clip."""
-        if self._current_clip is None or self._current_clip.state not in (ClipState.RAW, ClipState.MASKED):
-            return
-
-        result = self._confirm_partial_alpha()
-        if result is False:
+        if not self._prepare_alpha_generator_run():
             return
 
         job = create_job_snapshot(self._current_clip, job_type=JobType.APPLEVISION_ALPHA)
@@ -73,15 +78,14 @@ class ModelRunMixin:
 
     def _on_run_gvm(self) -> None:
         """Run GVM alpha generation on the selected clip."""
-        if self._current_clip is None or self._current_clip.state not in (ClipState.RAW, ClipState.MASKED):
+        if self._current_clip is None or not self._hint_mutation_allowed():
             return
 
         if not self._warn_mps_slow("GVM Auto Alpha"):
             return
 
-        result = self._confirm_partial_alpha()
-        if result is False:
-            return  # cancelled
+        if not self._prepare_alpha_generator_run():
+            return
 
         job = create_job_snapshot(self._current_clip, job_type=JobType.GVM_ALPHA)
         if not self._service.job_queue.submit(job):
@@ -93,12 +97,8 @@ class ModelRunMixin:
     @Slot(str)
     def _on_run_birefnet(self, usage: str) -> None:
         """Run BiRefNet alpha generation on the selected clip."""
-        if self._current_clip is None or self._current_clip.state not in (ClipState.RAW, ClipState.MASKED):
+        if not self._prepare_alpha_generator_run():
             return
-
-        result = self._confirm_partial_alpha()
-        if result is False:
-            return  # cancelled
 
         job = create_job_snapshot(
             self._current_clip,

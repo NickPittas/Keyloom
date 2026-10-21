@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QMessageBox
 from PySide6.QtCore import Slot
 
 from . import _tr
+from .hint_reset_mixin import refresh_hint_tools_if_available
 
 from backend import ClipState, JobType
 from ui.workers.gpu_job_worker import create_job_snapshot
@@ -247,12 +248,7 @@ class WorkerMixin:
         if self._current_clip and self._current_clip.name == clip_name:
             self._sync_selected_clip_view(self._current_clip)
             self._refresh_button_state()
-            _has_mask = self._clip_has_videomama_ready_mask(self._current_clip)
-            self._param_panel.set_videomama_enabled(_has_mask)
-            self._param_panel.set_matanyone2_enabled(_has_mask)
-            self._param_panel.set_import_alpha_enabled(
-                self._current_clip.state in (ClipState.RAW, ClipState.MASKED, ClipState.READY)
-            )
+            refresh_hint_tools_if_available(self)
 
         logger.info(f"Clip finished ({job_type}): {clip_name} -> {target_state.value}")
 
@@ -280,6 +276,7 @@ class WorkerMixin:
                         self._sync_selected_clip_view(clip)
                         self._refresh_button_state()
                     break
+            refresh_hint_tools_if_available(self)
             self._status_bar.stop_job_timer()
             self._status_bar.set_running(False)
             self._status_bar.set_message(_tr("Cancelled: %s") % clip_name)
@@ -314,6 +311,7 @@ class WorkerMixin:
                     clip.find_assets()
                     self._sync_selected_clip_view(clip)
                 break
+        refresh_hint_tools_if_available(self)
         self._queue_panel.refresh()
         logger.error(f"Worker error for {clip_name}: {error_msg}")
         from ui.sounds.audio_manager import UIAudio
@@ -353,6 +351,8 @@ class WorkerMixin:
         self._pipeline_steps.clear()
         self._pipeline_settings.clear()
         self._queue_panel.refresh()
+        # current_job_id is cleared before queue_empty fires: re-enable hint tools now
+        refresh_hint_tools_if_available(self)
         # NOTE: Do NOT call unload_engines() here — engines stay loaded so the
         # next whole-clip job reuses them.  Model switching is already handled
         # by _ensure_model() when a different model type is needed.
