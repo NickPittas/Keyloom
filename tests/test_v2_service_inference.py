@@ -99,7 +99,11 @@ def test_happy_path_with_hint(svc, clip, tmp_path):
         assert _out(clip, sub) == [f"frame_{i:05d}.exr" for i in range(N)]
     assert clip.state == ClipState.COMPLETE
     m = _manifest(clip)
-    assert m["complete"] is True and m["frame_range"] == [0, N - 1]
+    assert m["complete"] is True and m["frame_range"] is None
+    # A fresh scan from disk (app restart) must also resolve COMPLETE.
+    clip.state = ClipState.RAW
+    clip.find_assets()
+    assert clip.state == ClipState.COMPLETE
     call = FakeEngine.instances[0].calls[0]
     assert call["hint"] is not None
     assert sorted(call["outputs"]) == ["alpha", "checker", "cutout", "fg"]

@@ -155,7 +155,9 @@ class InferenceMixin:
                 if on_warning:
                     on_warning("Existing outputs came from a different run/settings; "
                                "re-publishing all selected frames.")
-        manifest_kw = dict(source_stems=stems, frame_range=[start, end])
+        # None = full clip; clip_state only treats full-range manifests as COMPLETE.
+        full = start == 0 and end == n - 1
+        manifest_kw = dict(source_stems=stems, frame_range=None if full else [start, end])
         self._write_manifest(dirs["root"], cfg, params, complete=False, **manifest_kw)
         if on_status:
             on_status("Writing outputs...")
