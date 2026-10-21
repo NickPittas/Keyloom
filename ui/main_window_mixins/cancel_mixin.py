@@ -71,6 +71,7 @@ class CancelMixin:
         self._cancel_requested_job_id = current_job.id if current_job is not None else None
         queue.cancel_all()
         self._pipeline_steps.clear()
+        self._pipeline_settings.clear()
         self._status_bar.stop_job_timer()
         if current_job is not None:
             self._force_stop_armed = True

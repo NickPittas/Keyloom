@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
-import os
 
 from PySide6.QtWidgets import QMessageBox
 from PySide6.QtCore import Slot
@@ -10,6 +10,7 @@ from . import _tr
 
 from backend import ClipState, JobType
 from ui.workers.gpu_job_worker import create_job_snapshot
+from ui.workers.job_helpers import clip_frame_range, create_inference_job, reset_complete_state
 
 logger = logging.getLogger(__name__)
 
@@ -100,34 +101,39 @@ class WorkerMixin:
     def _on_worker_clip_finished(self, job_id: str, clip_name: str, job_type: str) -> None:
         self._force_stop_armed = False
         self._status_bar.set_stop_button_mode(force=False)
-        # Map job type to correct next state.
+        # Map job type to the state the finished step should leave the clip in.
+        # INFERENCE is resolved from disk below (only a full-range manifest is COMPLETE).
+        is_inference = job_type == JobType.INFERENCE.value
         if job_type == JobType.SAM2_TRACK.value:
             target_state = ClipState.MASKED
         elif job_type in (JobType.GVM_ALPHA.value, JobType.VIDEOMAMA_ALPHA.value,
-                          JobType.MATANYONE2_ALPHA.value, JobType.BIREFNET_ALPHA.value):
+                          JobType.MATANYONE2_ALPHA.value, JobType.BIREFNET_ALPHA.value,
+                          JobType.CHROMA_KEY_ALPHA.value, JobType.APPLEVISION_ALPHA.value):
             target_state = ClipState.READY
+        elif is_inference:
+            target_state = None
         else:
             target_state = ClipState.COMPLETE
 
-        self._clip_model.update_clip_state(clip_name, target_state)
-
-        # Clear processing lock and rescan assets for pipeline steps
+        # Clear processing lock and rescan assets (re-resolves state from disk)
         for clip in self._clip_model.clips:
             if clip.name == clip_name:
                 clip.set_processing(False)
-                if target_state in (ClipState.MASKED, ClipState.READY):
-                    try:
-                        clip.find_assets()
-                    except Exception:
-                        pass
+                try:
+                    clip.find_assets()
+                except Exception:
+                    pass
+                if is_inference:
+                    # find_assets() resolved COMPLETE only for a full-range manifest;
+                    # a partial-range run leaves RAW/MASKED/READY.
+                    target_state = clip.state
+                else:
                     clip.state = target_state
-                    self._clip_model.update_clip_state(clip_name, target_state)
-                elif target_state == ClipState.COMPLETE:
-                    try:
-                        clip.find_assets()
-                    except Exception:
-                        pass
+                self._clip_model.update_clip_state(clip_name, clip.state)
                 break
+        if target_state is None:
+            self._clip_model.update_clip_state(clip_name, ClipState.RAW)
+            target_state = ClipState.RAW
 
         finished_clip = next((c for c in self._clip_model.clips if c.name == clip_name), None)
         if finished_clip is not None:
@@ -141,21 +147,28 @@ class WorkerMixin:
             self._dual_viewer.refresh_generated_assets()
 
         # Pipeline auto-chain: queue the next stage, if any.
-        if clip_name in self._pipeline_steps and self._pipeline_steps[clip_name]:
-            next_step = self._pipeline_steps[clip_name].pop(0)
+        steps = self._pipeline_steps.get(clip_name)
+        if steps:
+            next_step = steps.pop(0)
             queued_next = False
             for clip in self._clip_model.clips:
                 if clip.name != clip_name:
                     continue
                 if next_step == JobType.INFERENCE:
-                    params = self._param_panel.get_params()
-                    job = create_job_snapshot(clip, params)
-                    job.params["_output_config"] = self._param_panel.get_output_config()
-                    if clip.in_out_range:
-                        job.params["_frame_range"] = (
-                            clip.in_out_range.in_point,
-                            clip.in_out_range.out_point,
+                    s = self._pipeline_settings.get(clip_name)
+                    if s is not None:
+                        job = create_inference_job(
+                            clip, s["params"], s["output_config"], frame_range=s["frame_range"],
                         )
+                    else:
+                        # Legacy chain: always follows a hint generator, so the hint is used.
+                        job = create_inference_job(
+                            clip,
+                            dataclasses.replace(self._param_panel.get_params(), use_alpha_hint=True),
+                            self._param_panel.get_output_config(),
+                            frame_range=clip_frame_range(clip),
+                        )
+                    reset_complete_state(clip)
                 else:
                     job = create_job_snapshot(clip, job_type=next_step)
                 clip.set_processing(True)
@@ -169,10 +182,13 @@ class WorkerMixin:
                 else:
                     clip.set_processing(False)
                 break
-            if not self._pipeline_steps[clip_name]:
-                self._pipeline_steps.pop(clip_name, None)
-            elif not queued_next:
+            if not queued_next:
                 logger.warning("Pipeline auto-chain failed to queue next step for %s", clip_name)
+                self._pipeline_steps.pop(clip_name, None)
+                self._pipeline_settings.pop(clip_name, None)
+        if not self._pipeline_steps.get(clip_name):
+            self._pipeline_steps.pop(clip_name, None)
+            self._pipeline_settings.pop(clip_name, None)
 
         # Stop timer; only exit running state if no more jobs are pending
         has_more = self._service.job_queue.has_pending or self._pipeline_steps
@@ -211,9 +227,11 @@ class WorkerMixin:
             self._status_bar.set_message(
                 _tr("%s complete for %s%s -- Ready to Run Inference") % (type_label, clip_name, alpha_info)
             )
-        elif target_state == ClipState.COMPLETE:
+        elif target_state == ClipState.COMPLETE and is_inference:
             UIAudio.inference_done()
             self._status_bar.set_message(_tr("Inference complete: %s") % clip_name)
+        elif is_inference:
+            self._status_bar.set_message(_tr("Partial-range inference finished: %s") % clip_name)
 
         # Refresh views
         self._pending_live_asset_refresh_clip = None
@@ -248,6 +266,7 @@ class WorkerMixin:
             # Job was cancelled — clear processing lock on the clip
             clip_name = message.removeprefix("Cancelled:").strip()
             self._pipeline_steps.pop(clip_name, None)
+            self._pipeline_settings.pop(clip_name, None)
             for clip in self._clip_model.clips:
                 if clip.name == clip_name:
                     clip.set_processing(False)
@@ -280,6 +299,7 @@ class WorkerMixin:
         self._pending_live_asset_refresh_clip = None
         self._live_asset_refresh_timer.stop()
         self._pipeline_steps.pop(clip_name, None)
+        self._pipeline_settings.pop(clip_name, None)
         self._clip_model.update_clip_state(clip_name, ClipState.ERROR)
         # Clear processing lock
         for clip in self._clip_model.clips:
@@ -327,6 +347,7 @@ class WorkerMixin:
         self._pending_live_asset_refresh_clip = None
         self._live_asset_refresh_timer.stop()
         self._pipeline_steps.clear()
+        self._pipeline_settings.clear()
         self._queue_panel.refresh()
         # NOTE: Do NOT call unload_engines() here — it kills the inference
         # engine that live preview depends on.  Model switching is already
