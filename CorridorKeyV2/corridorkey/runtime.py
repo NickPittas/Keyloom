@@ -1,9 +1,11 @@
+# Local patch (EZ-CorridorKey2): optional on_progress/check_cancel hooks + independent finally cleanup.
 from __future__ import annotations
 
 import json
 import os
 import sys
 import tempfile
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -292,6 +294,21 @@ def _build_foundation_inputs(rgb_bt: torch.Tensor):
     )
 
 
+def _run_cleanups(steps, body_ok: bool) -> None:
+    """Run every cleanup step. Errors are logged; if the body succeeded the
+    first cleanup error is re-raised (never masks an in-flight exception)."""
+    first = None
+    for step in steps:
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARNING] cleanup step failed: {e!r}")
+            if first is None:
+                first = e
+    if first is not None and body_ok:
+        raise first
+
+
 def _next_or_none(iterator):
     try:
         return next(iterator)
@@ -301,7 +318,9 @@ def _next_or_none(iterator):
 
 @torch.no_grad()
 def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
-                             *, chunk: int, reader_kind: str):
+                             *, chunk: int, reader_kind: str,
+                             on_progress: Callable[[str, int, int], None] | None = None,
+                             check_cancel: Callable[[], None] | None = None):
     assert model.foundations.rvm is not None
     device = next(model.foundations.rvm.parameters()).device
     T_all = int(meta["num_frames"])
@@ -320,9 +339,13 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
     else:
         chunks = iter_frame_dir_chunks(str(source), meta, chunk_size=chunk, need_model=False)
     state = None
+    if on_progress is not None:
+        on_progress("rvm", 0, T_all)
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_next_or_none, chunks)
         while True:
+            if check_cancel is not None:
+                check_cancel()
             item = future.result()
             if item is None:
                 break
@@ -339,6 +362,8 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
             feats_cpu = (feats.float().cpu() - mean) / std
             out[t0:t0 + Tc] = feats_cpu[0].numpy().astype(np.float16)
             del rgb, rgb_rvm, feats, feats_cpu, display
+            if on_progress is not None:
+                on_progress("rvm", min(t0 + Tc, T_all), T_all)
     out.flush()
     del out
     torch.cuda.empty_cache()
@@ -346,7 +371,9 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
 
 @torch.no_grad()
 def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
-                                     *, chunk: int, reader_kind: str):
+                                     *, chunk: int, reader_kind: str,
+                                     on_progress: Callable[[str, int, int], None] | None = None,
+                                     check_cancel: Callable[[], None] | None = None):
     device = next(model.foundations.parameters()).device
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
@@ -372,9 +399,13 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
         chunks = iter_video_frame_chunks(str(source), meta, chunk_size=chunk, need_model=False)
     else:
         chunks = iter_frame_dir_chunks(str(source), meta, chunk_size=chunk, need_model=False)
+    if on_progress is not None:
+        on_progress("vfm", 0, T_all)
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_next_or_none, chunks)
         while True:
+            if check_cancel is not None:
+                check_cancel()
             item = future.result()
             if item is None:
                 break
@@ -392,6 +423,8 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
             if cradio_out is not None:
                 cradio_out[t0:t0 + Tc] = ff["cradio"].float().cpu().numpy()
             del rgb, rgb_radio, rgb_moge, ff, display
+            if on_progress is not None:
+                on_progress("vfm", min(t0 + Tc, T_all), T_all)
     moge_out.flush()
     del moge_out
     if cradio_out is not None:
@@ -430,7 +463,9 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
                        foundation_paths,
                        carry_hint_from_aux: bool,
                        carry_hint_quality: float,
-                       on_baton_frames):
+                       on_baton_frames,
+                       on_progress: Callable[[str, int, int], None] | None = None,
+                       check_cancel: Callable[[], None] | None = None):
     device = next(model.stage1.parameters()).device
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
@@ -477,8 +512,13 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
         if ready:
             on_baton_frames(ready)
 
+    if on_progress is not None:
+        on_progress("stage1", 0, len(starts))
+    body_ok = False
     try:
         for i, t0 in enumerate(starts):
+            if check_cancel is not None:
+                check_cancel()
             t1 = min(t0 + chunk, T_all)
             Tc = t1 - t0
             model_chunk, display_chunk, review_chunk = reader.window(t0, t1)
@@ -565,12 +605,16 @@ def hann_stage1_stream(model, source, meta, *, reader_cls, reader_kind: str,
             del model_chunk, display_chunk, review_chunk
             flush_before(next_start)
             print(f"      window {i + 1}/{len(starts)} [{t0}:{t1}]", flush=True)
+            if on_progress is not None:
+                on_progress("stage1", i + 1, len(starts))
         torch.cuda.synchronize()
         flush_before(T_all + 1)
+        body_ok = True
     finally:
-        reader.close()
-        if hint_reader is not None:
-            hint_reader.close()
+        _run_cleanups(
+            [reader.close]
+            + ([hint_reader.close] if hint_reader is not None else []),
+            body_ok)
 
     if baton_fp16 is not None:
         baton_fp16.flush()
@@ -732,7 +776,9 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
 
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                   writer_cfg: WriterConfig, *, initial_hint_path: str | None,
-                  hint_video_path: str | None):
+                  hint_video_path: str | None,
+                  on_progress: Callable[[str, int, int], None] | None = None,
+                  check_cancel: Callable[[], None] | None = None):
     input_path = str(input_path)
     output_dir = str(output_dir)
     cfg.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -778,6 +824,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         "checker": f"checker_comp_despill{int(cfg.despill_strength * 100):03d}",
         "cutout": "cutout",
     }
+    body_ok = False
     try:
         use_exr = cfg.output_format == "exr"
         if cfg.output_format not in ("video", "exr"):
@@ -853,7 +900,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             precompute_rvm_to_memmap(
                 model, input_path, meta, rvm_path,
                 chunk=max(1, min(int(cfg.hann_chunk), 8)),
-                reader_kind=reader_kind)
+                reader_kind=reader_kind,
+                on_progress=on_progress, check_cancel=check_cancel)
             rvm_feat_path = rvm_path
         else:
             rvm_feat_path = None
@@ -862,7 +910,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             foundation_paths = precompute_foundations_to_memmap(
                 model, input_path, meta, foundation_prefix,
                 chunk=max(1, int(cfg.low_vram_foundation_chunk)),
-                reader_kind=reader_kind)
+                reader_kind=reader_kind,
+                on_progress=on_progress, check_cancel=check_cancel)
             model.foundations.cpu()
             model.stage2.cpu()
             model.stage1.cuda()
@@ -873,10 +922,14 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             torch.cuda.empty_cache()
 
         stage2_batch = max(1, int(cfg.stage2_batch))
+        stage2_done = 0
 
         def write_prediction_batches(items):
+            nonlocal stage2_done
             device = next(model.stage2.parameters()).device
             for offset in range(0, len(items), stage2_batch):
+                if check_cancel is not None:
+                    check_cancel()
                 sub = items[offset:offset + stage2_batch]
                 rgb_t = torch.stack([item[2] for item in sub], dim=0)
                 rgb_t = rgb_t.unsqueeze(0).to(device, non_blocking=True)
@@ -893,7 +946,12 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 for name, frames in rendered.items():
                     writers[name].write_many(frames)
                 del logits, baton_t, rgb_t, baton_np, rendered
+                stage2_done += len(sub)
+                if on_progress is not None:
+                    on_progress("stage2", stage2_done, T_all)
 
+        if on_progress is not None and not cfg.low_vram:
+            on_progress("stage2", 0, T_all)
         hann_stage1_stream(
             model, input_path, meta, reader_cls=reader_cls,
             reader_kind=reader_kind, chunk=cfg.hann_chunk, stride=cfg.hann_stride,
@@ -904,7 +962,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             rvm_path=rvm_feat_path, foundation_paths=foundation_paths,
             carry_hint_from_aux=cfg.carry_hint,
             carry_hint_quality=cfg.carry_hint_quality,
-            on_baton_frames=None if cfg.low_vram else write_prediction_batches)
+            on_baton_frames=None if cfg.low_vram else write_prediction_batches,
+            on_progress=on_progress, check_cancel=check_cancel)
 
         if cfg.low_vram:
             _phase2_setup(model)
@@ -912,6 +971,9 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 baton_path, dtype=np.float16, mode="r",
                 shape=(T_all, model.stage1.d_16, H // 16, W // 16))
             reader = reader_cls(input_path, meta)
+            if on_progress is not None:
+                on_progress("stage2", 0, T_all)
+            lv_ok = False
             try:
                 for t0 in range(0, T_all, stage2_batch):
                     t1 = min(T_all, t0 + stage2_batch)
@@ -922,16 +984,19 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                     ]
                     write_prediction_batches(items)
                     del model_chunk, _display_chunk, _review_chunk, items
+                lv_ok = True
             finally:
-                reader.close()
+                _run_cleanups([reader.close], lv_ok)
                 del baton
+        body_ok = True
     finally:
-        for writer in writers.values():
-            writer.release()
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_rvm_feat.f16")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_baton.f16")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
-        safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
-        torch.cuda.empty_cache()
+        raw_name = raw_clip_name(input_path)
+        _run_cleanups(
+            [w.release for w in writers.values()]
+            + [lambda p=cfg.temp_dir / f"{raw_name}_{tail}": safe_remove(p)
+               for tail in ("rvm_feat.f16", "baton.f16",
+                            "foundation_cradio.f32", "foundation_moge.f32")]
+            + [torch.cuda.empty_cache],
+            body_ok)
     print(f"  wrote {len(writers)} output video(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")
