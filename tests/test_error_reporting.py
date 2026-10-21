@@ -210,41 +210,20 @@ class TestSendReport:
         monkeypatch.setitem(sys.modules, "sentry_sdk.utils", utils)
         return scopes
 
-    def test_send_uses_isolated_client_and_hygiene_kwargs(self, monkeypatch):
-        scopes = self._install_fake_sdk(monkeypatch)
+    def test_send_never_transmits_in_private_fork(self, monkeypatch):
+        self._install_fake_sdk(monkeypatch)
         ok = er.send_report("line one\nERROR bad thing happened", "runtime")
-        assert ok
-        client = _FakeClient.instances[0]
-        kw = client.kwargs
-        assert kw["default_integrations"] is False
-        assert kw["traces_sample_rate"] is None
-        assert kw["auto_session_tracking"] is False
-        assert kw["send_default_pii"] is False
-        assert kw["send_client_reports"] is False
-        assert kw["include_local_variables"] is False
-        assert kw["max_breadcrumbs"] == 0
-        assert client.flushed == 5.0
-        assert client.closed
-        # Event must go through THIS client, carrying the prepared scope
-        assert len(client.captured) == 1
-        event, hint, scope = client.captured[0]
-        assert "bad thing" in event["message"]
-        assert event["level"] == "error"
-        uuid.UUID(scope.user["id"])
-        assert scope.tags["product"] == er.PRODUCT
-        assert scopes[0] is scope
+        assert ok is False
+        assert _FakeClient.instances == []
 
-    def test_send_with_exception(self, monkeypatch):
+    def test_send_with_exception_never_transmits(self, monkeypatch):
         self._install_fake_sdk(monkeypatch)
         try:
             raise ValueError("boom")
         except ValueError as e:
             ok = er.send_report("bundle", "updater", exc_info=e)
-        assert ok
-        event, hint, scope = _FakeClient.instances[0].captured[0]
-        assert "boom" in str(event["exception"])
-        assert hint is not None
-        assert scope.tags["stage"] == "updater"
+        assert ok is False
+        assert _FakeClient.instances == []
 
     def test_missing_sdk_returns_false(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "sentry_sdk", None)
@@ -275,8 +254,9 @@ class TestOriginGate:
         monkeypatch.setattr(er.sys, "frozen", True, raising=False)
         assert er.init_crash_reporting() is False
 
-    def test_origin_matches_this_repo(self):
-        assert er._origin_ok() is True
+    def test_origin_never_ok_in_private_fork(self):
+        assert er._ORIGIN is None
+        assert er._origin_ok() is False
 
 
 class TestCrashReportingGates:

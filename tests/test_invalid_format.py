@@ -152,59 +152,48 @@ class TestWriteImageFormats:
 # TestOutputConfigNonStandardFormats
 # ---------------------------------------------------------------------------
 
-class TestOutputConfigNonStandardFormats:
-    """Verify OutputConfig accepts arbitrary format strings without error."""
+class TestOutputConfigFormatValidation:
+    """OutputConfig only accepts exr/png formats and dwab/piz/zip/none compression."""
 
-    def test_non_standard_format_does_not_break_enabled_outputs(self):
-        """enabled_outputs reflects enabled flags regardless of format string."""
+    def test_enabled_outputs_reflects_enabled_flags(self):
         cfg = OutputConfig(
-            fg_enabled=True,
-            fg_format="tiff",
-            matte_enabled=True,
-            matte_format="bmp",
-            comp_enabled=False,
-            comp_format="webp",
-            processed_enabled=True,
-            processed_format="jp2",
+            fg_enabled=True, fg_format="png",
+            matte_enabled=True, matte_format="exr",
+            comp_enabled=False, comp_format="png",
+            processed_enabled=True, processed_format="exr",
         )
         assert cfg.enabled_outputs == ["fg", "matte", "processed"]
 
-    def test_to_dict_from_dict_roundtrip_with_garbage_format(self):
-        """Arbitrary format strings survive a to_dict/from_dict round-trip."""
-        original = OutputConfig(
-            fg_enabled=True,
-            fg_format="tiff",
-            matte_enabled=False,
-            matte_format="???",
-            comp_enabled=True,
-            comp_format="",
-            processed_enabled=True,
-            processed_format="jp2000",
-        )
-        d = original.to_dict()
-        restored = OutputConfig.from_dict(d)
+    @pytest.mark.parametrize("field", [
+        "fg_format", "matte_format", "comp_format", "processed_format",
+    ])
+    @pytest.mark.parametrize("bad", ["tiff", "bmp", "", "jp2000"])
+    def test_invalid_format_raises(self, field, bad):
+        with pytest.raises(ValueError):
+            OutputConfig(**{field: bad})
 
-        assert restored.fg_format == "tiff"
-        assert restored.matte_format == "???"
-        assert restored.comp_format == ""
-        assert restored.processed_format == "jp2000"
-        assert restored.fg_enabled is True
-        assert restored.matte_enabled is False
-        assert restored.comp_enabled is True
-        assert restored.processed_enabled is True
+    def test_invalid_exr_compression_raises(self):
+        with pytest.raises(ValueError):
+            OutputConfig(exr_compression="lzw")
 
-    def test_from_dict_roundtrip_preserves_enabled_outputs(self):
-        """enabled_outputs computed from restored config matches original."""
+    @pytest.mark.parametrize("comp", ["dwab", "piz", "zip", "none"])
+    def test_valid_exr_compression_accepted(self, comp):
+        assert OutputConfig(exr_compression=comp).exr_compression == comp
+
+    def test_to_dict_from_dict_roundtrip(self):
         original = OutputConfig(
-            fg_enabled=True,
-            fg_format="tiff",
-            matte_enabled=True,
-            matte_format="bmp",
-            comp_enabled=False,
-            comp_format="webp",
-            processed_enabled=False,
-            processed_format="jp2",
+            fg_enabled=True, fg_format="png",
+            matte_enabled=False, matte_format="exr",
+            comp_enabled=True, comp_format="png",
+            processed_enabled=True, processed_format="exr",
+            exr_compression="zip",
         )
         restored = OutputConfig.from_dict(original.to_dict())
+        assert restored == original
         assert restored.enabled_outputs == original.enabled_outputs
-        assert restored.enabled_outputs == ["fg", "matte"]
+
+    def test_from_dict_with_invalid_format_raises(self):
+        d = OutputConfig().to_dict()
+        d["fg_format"] = "tiff"
+        with pytest.raises(ValueError):
+            OutputConfig.from_dict(d)

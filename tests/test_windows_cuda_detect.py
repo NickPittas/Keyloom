@@ -12,16 +12,24 @@ from scripts.detect_windows_torch_index import (
 )
 
 
-def test_windows_installers_use_shared_cuda_helper():
+def test_windows_installers_use_fixed_cu128_and_require_nvidia_smi():
     text = open("1-install.bat", encoding="utf-8", errors="replace").read()
-    assert ".venv\\Scripts\\python.exe scripts\\detect_windows_torch_index.py --format env" in text
-    assert "findstr" not in text.lower()
+    assert "detect_windows_torch_index.py" not in text
+    assert "whl/cpu" not in text
+    assert 'set "INDEX_URL=https://download.pytorch.org/whl/cu128"' in text
+    assert "--torch-backend=cu128" in text
+    assert "nvidia-smi" in text
+    assert "goto :fail" in text
+    assert "detect_windows_torch_index.py" not in open(
+        "Install_CorridorKey_Windows.bat", encoding="utf-8", errors="replace").read()
 
 
-def test_windows_installers_do_not_echo_cuda_line_unsafely():
-    text = open("1-install.bat", encoding="utf-8", errors="replace").read()
-    assert "echo   !CUDA_LINE!" not in text
-    assert "echo(  !CUDA_LINE!" in text
+def test_unix_installer_uses_fixed_cu128_and_requires_nvidia_smi():
+    text = open("1-install.sh", encoding="utf-8", errors="replace").read()
+    assert "whl/cu128" in text
+    assert "--torch-backend=cu128" in text
+    assert "nvidia-smi" in text
+    assert "whl/cpu" not in text
 
 
 def test_windows_installer_uses_managed_python_and_runtime_verification():

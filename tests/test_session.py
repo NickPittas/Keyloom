@@ -9,11 +9,25 @@ from backend.service import InferenceParams, OutputConfig
 class TestSessionData:
     def test_params_roundtrip(self):
         """Params serialize and deserialize correctly."""
-        params = InferenceParams(despill_strength=0.5, refiner_scale=2.0)
+        params = InferenceParams(
+            input_is_linear=True, use_alpha_hint=True, hint_quality=0.7,
+            carry_hint=False, carry_hint_quality=0.6, vram_profile="low",
+            despill_strength=0.25, cutout_linear=True,
+        )
         d = params.to_dict()
         restored = InferenceParams.from_dict(d)
-        assert restored.despill_strength == 0.5
-        assert restored.refiner_scale == 2.0
+        assert restored == params
+        assert restored.despill_strength == 0.25
+        assert restored.vram_profile == "low"
+        assert restored.cutout_linear is True
+
+    def test_legacy_v1_params_keys_ignored(self):
+        """Legacy session dicts with v1 fields load; unknown keys are dropped."""
+        d = InferenceParams().to_dict()
+        d.update({"refiner_scale": 2.0, "despeckle_size": 400})
+        restored = InferenceParams.from_dict(d)
+        assert restored == InferenceParams()
+        assert not hasattr(restored, "refiner_scale")
 
     def test_output_config_roundtrip(self):
         cfg = OutputConfig(fg_enabled=False, comp_format="exr")
