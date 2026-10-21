@@ -6,14 +6,16 @@ from __future__ import annotations
 
 import json
 import logging
+import glob
 import os
-from typing import Any, Callable, Optional
+import shutil
+from typing import Any, Callable, Iterable, Optional
 
 import cv2
 import numpy as np
 
 from ..clip_state import ClipAsset, ClipEntry
-from ..errors import FrameReadError, JobCancelledError
+from ..errors import CorridorKeyError, FrameReadError, JobCancelledError
 from ..frame_io import (
     _linear_to_srgb,
     _srgb_to_linear,
@@ -125,13 +127,18 @@ class FrameOpsMixin:
         output_root: str,
         output_config,
         params,
+        *,
+        source_stems: Optional[Iterable[str]] = None,
+        frame_range: Optional[Iterable[int]] = None,
+        complete: bool = False,
     ) -> None:
-        """Write run manifest recording expected outputs/extensions per run.
+        """Write the v2 run manifest atomically (tmp + os.replace).
 
-        Uses atomic write (tmp + rename) to prevent corruption.
+        Raises on failure: a missing manifest would break resume validation.
         """
         manifest = {
-            "version": 1,
+            "version": 2,
+            "engine": "corridorkey-v2",
             "enabled_outputs": output_config.enabled_outputs,
             "formats": {
                 "fg": output_config.fg_format,
@@ -140,16 +147,163 @@ class FrameOpsMixin:
                 "processed": output_config.processed_format,
             },
             "params": params.to_dict(),
+            "source_stems": list(source_stems) if source_stems is not None else None,
+            "frame_range": list(frame_range) if frame_range is not None else None,
+            "complete": bool(complete),
+            "alpha_convention": {
+                "processed_exr": "premultiplied-linear",
+                "processed_png": "straight-srgb",
+            },
         }
         manifest_path = os.path.join(output_root, ".corridorkey_manifest.json")
         tmp_path = manifest_path + ".tmp"
         try:
             with open(tmp_path, 'w') as f:
                 json.dump(manifest, f, indent=2)
-            # Atomic replace (os.replace is atomic on both POSIX and Windows)
             os.replace(tmp_path, manifest_path)
         except Exception as e:
-            logger.warning(f"Failed to write manifest: {e}")
+            logger.error(f"Failed to write manifest {manifest_path}: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _copy_v2_settings(settings_path: Optional[str], output_root: str) -> None:
+        """Copy the runtime settings txt into the output root (no-op if absent)."""
+        if settings_path and os.path.isfile(settings_path):
+            shutil.copyfile(
+                settings_path, os.path.join(output_root, "corridorkey_v2_settings.txt")
+            )
+
+    # ------------------------------------------------------------------
+    # CorridorKey 2.0 output publication
+    # ------------------------------------------------------------------
+
+    V2_PRODUCT_TO_EZ = {"fg": "fg", "alpha": "matte", "checker": "comp", "cutout": "processed"}
+
+    @staticmethod
+    def _v2_required_products(output_config) -> list[str]:
+        """Runtime products needed for the enabled EZ outputs."""
+        enabled = set(output_config.enabled_outputs)
+        products = [p for p, ez in FrameOpsMixin.V2_PRODUCT_TO_EZ.items() if ez in enabled]
+        if not products:
+            raise ValueError("No outputs selected; enable at least one output")
+        return products
+
+    @staticmethod
+    def _v2_runtime_file(product: str, directory: str, index: int) -> str:
+        if product == "checker":
+            pattern = os.path.join(
+                glob.escape(directory), f"checker_comp_despill*_{index:06d}.exr"
+            )
+            matches = sorted(glob.glob(pattern))
+            if len(matches) != 1:
+                raise CorridorKeyError(
+                    f"Expected exactly one runtime checker file for index {index} in "
+                    f"{directory}, found {len(matches)}"
+                )
+            return matches[0]
+        return os.path.join(directory, f"{product}_{index:06d}.exr")
+
+    @staticmethod
+    def _v2_read(product: str, path: str) -> np.ndarray:
+        if not os.path.isfile(path):
+            raise CorridorKeyError(f"Missing CorridorKey 2.0 runtime output: {path}")
+        img = imread_unicode(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise CorridorKeyError(f"Unreadable CorridorKey 2.0 runtime output: {path}")
+        if product == "alpha":
+            if img.ndim == 3 and img.shape[2] == 1:
+                img = img[:, :, 0]
+            ok = img.ndim == 2
+        elif product in ("fg", "checker"):
+            ok = img.ndim == 3 and img.shape[2] == 3
+        else:  # cutout
+            ok = img.ndim == 3 and img.shape[2] == 4
+        if not ok:
+            raise CorridorKeyError(
+                f"Unexpected shape {img.shape} for {product} runtime output: {path}"
+            )
+        img = img.astype(np.float32, copy=False)
+        if not np.isfinite(img).all():
+            raise CorridorKeyError(
+                f"Non-finite values (NaN/inf) in runtime output: {path}"
+            )
+        return img
+
+    def _v2_atomic_write(self, img, final_path, fmt, clip_name, frame_index, compression):
+        d, name = os.path.split(final_path)
+        tmp = os.path.join(d, f".{os.path.splitext(name)[0]}.tmp.{fmt}")
+        try:
+            self._write_image(img, tmp, fmt, clip_name, frame_index,
+                              exr_compression=compression)
+            os.replace(tmp, final_path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    def _publish_v2_outputs(
+        self,
+        product_dirs: dict[str, str],
+        dirs: dict[str, str],
+        source_stems: list[str],
+        output_config,
+        clip_name: str,
+        *,
+        publish_indices: Optional[Iterable[int]] = None,
+        skip_stems: Optional[set[str]] = None,
+        check_cancel: Optional[Callable[[], None]] = None,
+        on_frame: Optional[Callable[..., None]] = None,
+    ) -> list[str]:
+        """Convert runtime float EXRs into EZ output folders. Returns published stems."""
+        cfg = output_config
+        products = self._v2_required_products(cfg)
+        fmts = {"fg": cfg.fg_format, "alpha": cfg.matte_format,
+                "checker": cfg.comp_format, "cutout": cfg.processed_format}
+        indices = range(len(source_stems)) if publish_indices is None else publish_indices
+        skip = skip_stems or set()
+        published: list[str] = []
+        for i in indices:
+            if check_cancel is not None:
+                check_cancel()
+            stem = source_stems[i]
+            if stem in skip:
+                continue
+            for product in products:
+                if product not in product_dirs:
+                    raise CorridorKeyError(f"No runtime directory for product '{product}'")
+                path = self._v2_runtime_file(product, product_dirs[product], i)
+                img = self._v2_read(product, path)
+                fmt = fmts[product]
+                if product == "alpha":
+                    out = img
+                elif product == "cutout":
+                    if fmt == "exr":
+                        out = np.concatenate(
+                            [img[:, :, :3] * img[:, :, 3:4], img[:, :, 3:4]], axis=-1)
+                    else:
+                        out = np.concatenate(
+                            [_linear_to_srgb(np.clip(img[:, :, :3], 0.0, None)),
+                             img[:, :, 3:4]], axis=-1)
+                elif fmt == "exr":
+                    out = img
+                else:
+                    out = _linear_to_srgb(np.clip(img, 0.0, None))
+                ez = self.V2_PRODUCT_TO_EZ[product]
+                self._v2_atomic_write(
+                    np.ascontiguousarray(out, dtype=np.float32),
+                    os.path.join(dirs[ez], f"{stem}.{fmt}"),
+                    fmt, clip_name, i, cfg.exr_compression,
+                )
+            published.append(stem)
+            if on_frame is not None:
+                on_frame(i, stem)
+        return published
 
     def _write_outputs(
         self,
