@@ -56,3 +56,33 @@ def test_refresh_generated_assets_preserves_current_frame_and_updates_coverage(t
     assert viewer._output_viewer._frame_index is not None
     assert viewer._output_viewer._frame_index.has_frame(ViewMode.COMP, 2)
     assert viewer._scrubber._coverage_bar._inference == [False, False, True]
+
+
+def test_refresh_generated_assets_keeps_playback_and_in_out(tmp_path):
+    _app()
+    clip_root = os.path.join(tmp_path, "clip")
+    input_dir = os.path.join(clip_root, "Input")
+    os.makedirs(input_dir, exist_ok=True)
+    for i in range(6):
+        frame = np.full((8, 8, 3), 80 + i, dtype=np.uint8)
+        assert cv2.imwrite(os.path.join(input_dir, f"frame_{i:05d}.png"), frame)
+    clip = ClipEntry(
+        name="clip", root_path=clip_root, state=ClipState.RAW,
+        input_asset=ClipAsset(input_dir, "sequence"),
+    )
+    viewer = DualViewerPanel()
+    try:
+        viewer.set_clip(clip)
+        assert viewer._scrubber._legacy_playback_emit is False
+        viewer.set_in_out(1, 4)
+        viewer.toggle_playback()
+        assert viewer._scrubber.is_playing()
+        viewer.refresh_generated_assets()
+        assert viewer._scrubber.is_playing()
+        assert viewer.get_in_out() == (1, 4)
+    finally:
+        viewer._scrubber.stop_playback()
+        viewer._input_viewer.shutdown()
+        viewer._output_viewer.shutdown()
+        from ui.preview import async_decoder
+        async_decoder.preview_pool().waitForDone(5000)

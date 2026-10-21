@@ -22,9 +22,10 @@ from PySide6.QtGui import QImage
 
 from backend import ClipEntry
 from ui.preview.frame_index import FrameIndex, ViewMode, build_frame_index
-from ui.preview.display_transform import decode_frame, clear_cache, image_source_size
+from ui.preview.display_transform import clear_cache, image_source_size
 from ui.preview.async_decoder import AsyncDecoder, DecodeRequest
 from ui.preview.frame_cache import FrameCache, PREVIEW_CACHE_BYTES
+from ui.preview.playback import choose_ready_frame
 from ui.widgets.split_view import SplitViewWidget
 from ui.widgets.frame_scrubber import FrameScrubber
 from ui.widgets.view_mode_bar import ViewModeBar
@@ -48,6 +49,123 @@ class _Expect:
     target_size: tuple[int, int] | None
 
 
+class PlaybackPresenter:
+    """Presents the newest frame ready in *every* viewer, never waiting.
+
+    The scrubber clock only says which frame *should* be showing (the target).
+    The presenter prepares the target in each viewer and shows the newest
+    frame at/before the target (and not behind the last one shown) that every
+    viewer already has cached, so slow decodes drop frames instead of
+    stalling or building a slow-motion backlog.  Pure GUI-thread logic.
+    """
+
+    SCAN_LIMIT = 96  # max frames below the target probed per attempt
+
+    def __init__(self, viewers, scrubber, on_presented) -> None:
+        self._viewers = list(viewers)
+        self._scrubber = scrubber
+        self._on_presented = on_presented
+        self._active = False
+        self._target: int | None = None
+        self._cycle: int | None = None
+        self._last: int | None = None
+        self._busy = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def last_presented(self) -> int | None:
+        return self._last
+
+    def start(self) -> None:
+        self._active = True
+        self._target = None
+        self._cycle = None
+        self._last = self._scrubber.current_frame()
+
+    def stop(self) -> bool:
+        """End the playback context. Returns whether one was active."""
+        was = self._active
+        self._active = False
+        self._target = None
+        self._cycle = None
+        self._last = None
+        for v in self._viewers:
+            v.clear_playback_hints()
+        return was
+
+    def seek(self, index: int) -> None:
+        """User navigation during playback: forget the old clock target."""
+        self._last = index
+        self._target = None
+
+    def on_target(self, index: int, cycle: int) -> None:
+        if not self._active:
+            return
+        if self._cycle is not None and cycle != self._cycle:
+            self._last = None  # loop wrap: frames behind are fair game again
+        self._cycle = cycle
+        self._target = index
+        lo, hi = self._scrubber._play_range()
+        loop = (lo, hi) if self._scrubber._loop_enabled() else None
+        for v in self._viewers:
+            v.set_playback_hints(loop)
+            v.prepare_frame(index)
+        self._present()
+
+    def on_ready(self, index: int) -> None:
+        """A viewer finished a frame; show it now if it is the best candidate."""
+        if not self._active or self._target is None or index > self._target:
+            return
+        if self._last is not None and index <= self._last:
+            return
+        self._present()
+
+    def _show_on_scrubber(self, index: int) -> None:
+        """Move the slider to the shown frame without re-anchoring the clock.
+
+        ``FrameScrubber.set_frame`` re-anchors playback at the new value, which
+        would shift the clock back to the (older) presented frame and cause
+        slow motion; the clock must keep following wall time.
+        """
+        sc = self._scrubber
+        sc._suppress_signal = True
+        try:
+            sc._slider.setValue(index)
+        finally:
+            sc._suppress_signal = False
+        sc._update_label()
+
+    def _present(self) -> None:
+        if self._busy or self._target is None:
+            return
+        self._busy = True
+        try:
+            target = self._target
+            lo, hi = self._scrubber._play_range()
+            floor = lo if self._last is None else max(lo, self._last)
+            stop_at = max(floor, target - self.SCAN_LIMIT)
+            best = None
+            for i in range(min(target, hi), stop_at - 1, -1):
+                if all(v.has_cached_frame(i) for v in self._viewers):
+                    best = i
+                    break
+            choose = choose_ready_frame(
+                target, lo, hi, self._last, [] if best is None else [best])
+            if choose is None or choose == self._last:
+                return  # keep the last shown pair; never wait
+            shown = [v.present_cached_frame(choose) for v in self._viewers]
+            if not all(shown):
+                return
+            self._last = choose
+            self._show_on_scrubber(choose)
+            self._on_presented(choose)
+        finally:
+            self._busy = False
+
+
 class PreviewViewport(QWidget):
     """Center panel frame preview with split view, scrubber, and mode switching.
 
@@ -59,6 +177,11 @@ class PreviewViewport(QWidget):
     view_mode_changed = Signal(str)
     frame_ready_for_index = Signal(int)  # a primary-lane frame for this index is cached
     frame_presented = Signal(int)        # this index was painted on the primary lane
+
+    # Class-level defaults keep stub-built instances (tests) working.
+    _presenter: "PlaybackPresenter | None" = None
+    _playback_hint: bool = False
+    _loop_range: "tuple[int, int] | None" = None
 
     def __init__(self, show_scrubber: bool = True, parent=None):
         super().__init__(parent)
@@ -78,6 +201,9 @@ class PreviewViewport(QWidget):
         self._shown_raster: tuple[int, int] | None = None  # primary raster actually painted
         self._shown_stem: int = -1
         self._direction: int = 1
+        self._playback_hint = False
+        self._loop_range = None
+        self._presenter = None
 
         # One bounded cache per viewport; async decoder fills it off-thread.
         # ``frame_decoded`` stays as a *re-emitted* primary-lane signal (the
@@ -142,6 +268,12 @@ class PreviewViewport(QWidget):
 
             self._scrubber = FrameScrubber()
             self._scrubber.frame_changed.connect(self._on_scrubber_frame)
+            self._scrubber._legacy_playback_emit = False
+            self._presenter = PlaybackPresenter(
+                [self], self._scrubber, self.frame_changed.emit)
+            self._scrubber.playback_requested.connect(self._presenter.on_target)
+            self._scrubber.playback_state_changed.connect(self._on_playback_state)
+            self.frame_ready_for_index.connect(self._presenter.on_ready)
             bottom.addWidget(self._scrubber, 1)
 
             self._zoom_label = QLabel("100%")
@@ -193,6 +325,16 @@ class PreviewViewport(QWidget):
         """
         self._decoder.invalidate()
         self._expect.clear()
+
+    def set_playback_hints(self, loop_range: tuple[int, int] | None) -> None:
+        """Playing: cache eviction follows the playhead; ``loop_range`` wraps."""
+        self._playback_hint = True
+        self._loop_range = loop_range
+
+    def clear_playback_hints(self) -> None:
+        self._playback_hint = False
+        self._loop_range = None
+        self._frame_cache.set_playhead(None)
 
     def shutdown(self) -> None:
         """Stop background work for this viewport (idempotent)."""
@@ -387,23 +529,33 @@ class PreviewViewport(QWidget):
         # Only update the displayed image if in COMP mode at the latest frame
         if self._current_mode != ViewMode.COMP:
             return
+        if self._playback_hint:
+            return  # never hijack playback
 
         if self._frame_index and self._current_stem_idx >= 0:
             at_latest = self._current_stem_idx >= self._frame_index.frame_count - 2
             if not at_latest:
                 return
 
-        if not os.path.isfile(file_path):
+        if not os.path.isfile(file_path) or not self._frame_index:
             return
 
-        qimg = decode_frame(file_path, ViewMode.COMP)
-        if qimg:
-            self._split_view.set_image(qimg)
-            if self._frame_index:
-                if self._scrubber:
-                    self._scrubber.set_range(self._frame_index.frame_count)
-                    self._scrubber.set_frame(self._frame_index.frame_count - 1)
-                self._current_stem_idx = self._frame_index.frame_count - 1
+        # Decode off the GUI thread; latest-wins, same-clip guarded by _expect.
+        # The cache key carries the file revision, so a reused temp path with
+        # new content is never served stale.
+        stem = self._frame_index.frame_count - 1
+        if stem < 0:
+            return
+        if self._scrubber:
+            self._scrubber.set_range(self._frame_index.frame_count)
+            self._scrubber.set_frame(stem)
+        self._current_stem_idx = stem
+        target = self._target_size()
+        req = DecodeRequest(
+            LANE_PRIMARY, stem, ViewMode.COMP, file_path, None, 0, False, target)
+        self._requested_mode = ViewMode.COMP
+        self._expect[LANE_PRIMARY] = _Expect(stem, ViewMode.COMP.value, target)
+        self._decoder.request_foreground(req)
 
     def _build_frame_index(self, clip: ClipEntry) -> FrameIndex:
         """Build a fresh FrameIndex snapshot for the current clip assets."""
@@ -436,6 +588,12 @@ class PreviewViewport(QWidget):
 
     def _reset_frame_state(self) -> None:
         """Clip switch / placeholder: new cache generation, nothing pending."""
+        if self._presenter is not None:
+            self._presenter.stop()
+            if self._scrubber is not None:
+                self._scrubber.stop_playback()
+        self._playback_hint = False
+        self._loop_range = None
         self._decoder.invalidate()
         self._expect.clear()
         self._source_dims = None
@@ -632,7 +790,8 @@ class PreviewViewport(QWidget):
     def _target_size(self):
         return None if self._wants_full() else self._canvas_size()
 
-    def _request_frame(self, stem_index: int, mode: ViewMode) -> None:
+    def _request_frame(self, stem_index: int, mode: ViewMode,
+                       prefetch: bool = True) -> None:
         """Request async decode of a frame (cache hit presents synchronously).
 
         If the requested mode has no frame at this stem, silently falls
@@ -654,9 +813,13 @@ class PreviewViewport(QWidget):
             return
         self._expect[LANE_PRIMARY] = _Expect(
             stem_index, req.mode.value, req.target_size)
-        self._frame_cache.set_playhead(stem_index, self._direction)
+        if self._playback_hint:
+            self._frame_cache.set_playhead(stem_index, 1, self._loop_range)
+        else:
+            self._frame_cache.set_playhead(None)
         self._decoder.request_foreground(req)
-        self._schedule_prefetch(stem_index)
+        if prefetch:
+            self._schedule_prefetch(stem_index)
 
     def _load_split_images(self) -> None:
         """Request the input frame for the split-left lane (never decoded here)."""
@@ -723,11 +886,14 @@ class PreviewViewport(QWidget):
         """Paint ``index`` synchronously if every needed lane is cached."""
         if not self.has_cached_frame(index):
             return False
-        if self._current_stem_idx >= 0 and index != self._current_stem_idx:
+        if (not self._playback_hint and self._current_stem_idx >= 0
+                and index != self._current_stem_idx):
             self._direction = 1 if index > self._current_stem_idx else -1
         self._current_stem_idx = index
         self._push_stem_availability(index)
-        self._request_frame(index, self._current_mode)
+        # While playing, the presenter's prepare_frame owns the prefetch window.
+        self._request_frame(index, self._current_mode,
+                            prefetch=not self._playback_hint)
         if self._split_view.split_enabled:
             self._load_split_images()
         return True
@@ -764,8 +930,20 @@ class PreviewViewport(QWidget):
 
     @Slot(int)
     def _on_scrubber_frame(self, stem_index: int) -> None:
-        """Handle scrubber navigation (debounced)."""
+        """Handle scrubber navigation (strict latest-wins)."""
+        if self._presenter is not None:
+            self._presenter.seek(stem_index)
         self._navigate_to(stem_index)
+
+    @Slot(bool)
+    def _on_playback_state(self, playing: bool) -> None:
+        if self._presenter is None:
+            return
+        if playing:
+            self._presenter.start()
+        elif self._presenter.stop() and self._scrubber is not None:
+            # Paused: exact frame via a normal latest-wins request.
+            self._navigate_to(self._scrubber.current_frame())
 
     @Slot(str, int, str, object, int)
     def _on_frame_ready(self, lane: str, stem_index: int, mode_value: str,
@@ -775,7 +953,7 @@ class PreviewViewport(QWidget):
             return
         if not isinstance(qimage, QImage):
             return
-        if lane == LANE_PRIMARY:
+        if lane == LANE_PRIMARY or self._split_view.split_enabled:
             self.frame_ready_for_index.emit(stem_index)
         exp = self._expect.get(lane)
         if exp is None or exp.stem != stem_index or exp.mode_value != mode_value:

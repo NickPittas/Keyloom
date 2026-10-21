@@ -12,15 +12,46 @@ import logging
 import os
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, Qt, Signal, Slot
 from PySide6.QtGui import QImage
 
 from backend import ClipEntry
+from ui.preview.async_decoder import preview_pool
 from ui.preview.frame_index import FrameIndex, ViewMode
-from ui.widgets.preview_viewport import PreviewViewport
+from ui.preview.playback import resolve_clip_fps
+from ui.widgets.preview_viewport import PlaybackPresenter, PreviewViewport
 from ui.widgets.frame_scrubber import FrameScrubber
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_FPS = 24.0
+
+
+class _FpsSignals(QObject):
+    done = Signal(int, float)  # token, fps
+
+
+class _FpsTask(QRunnable):
+    """Resolve a clip's FPS off the GUI thread (metadata / video probe)."""
+
+    def __init__(self, token: int, clip_root: str, video_path: str | None):
+        super().__init__()
+        self.signals = _FpsSignals()
+        self._token = token
+        self._root = clip_root
+        self._video = video_path
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            fps = float(resolve_clip_fps(self._root, video_path=self._video))
+        except Exception as e:  # unreadable metadata must not break playback
+            logger.warning("FPS resolve failed: %s", e)
+            fps = DEFAULT_FPS
+        try:
+            self.signals.done.emit(self._token, fps)
+        except RuntimeError:
+            pass
 
 
 class DualViewerPanel(QWidget):
@@ -83,6 +114,17 @@ class DualViewerPanel(QWidget):
 
         self._scrubber = FrameScrubber()
         self._scrubber.frame_changed.connect(self._on_scrubber_frame)
+        # Playback is presented by us (ready pair), not via frame_changed.
+        self._scrubber._legacy_playback_emit = False
+        self._presenter = PlaybackPresenter(
+            [self._input_viewer, self._output_viewer], self._scrubber,
+            self.frame_changed.emit)
+        self._scrubber.playback_requested.connect(self._presenter.on_target)
+        self._scrubber.playback_state_changed.connect(self._on_playback_state)
+        self._input_viewer.frame_ready_for_index.connect(self._presenter.on_ready)
+        self._output_viewer.frame_ready_for_index.connect(self._presenter.on_ready)
+        self._fps_token = 0
+        self._fps_jobs: dict[int, _FpsSignals] = {}
         bottom.addWidget(self._scrubber, 1)
 
         self._zoom_label = QLabel("100%")
@@ -105,9 +147,9 @@ class DualViewerPanel(QWidget):
         self._output_viewer._split_view.view_transform_changed.connect(
             self._input_viewer._split_view.set_view_transform)
 
-        # Refresh wipe overlay when output viewer decodes a new frame or switches mode
-        self._output_viewer._decoder.frame_decoded.connect(self._on_wipe_frame_ready)
-        self._input_viewer._decoder.frame_decoded.connect(self._on_wipe_frame_ready)
+        # Wipe follows frames the panes actually accepted and painted.
+        self._output_viewer.frame_presented.connect(self._on_wipe_frame_presented)
+        self._input_viewer.frame_presented.connect(self._on_wipe_frame_presented)
 
     @property
     def current_stem_index(self) -> int:
@@ -181,7 +223,9 @@ class DualViewerPanel(QWidget):
 
     def set_clip(self, clip: ClipEntry) -> None:
         """Load a clip into both viewers and configure the scrubber."""
+        self._end_playback_context()
         self._clip = clip
+        self._start_fps_resolve(clip)
 
         # Load into both viewers
         self._input_viewer.set_clip(clip)
@@ -227,6 +271,7 @@ class DualViewerPanel(QWidget):
         if self._clip is None:
             return
 
+        playing = self._scrubber.is_playing()
         current_frame = self._scrubber.current_frame()
         self._output_viewer.refresh_available_assets()
 
@@ -234,7 +279,13 @@ class DualViewerPanel(QWidget):
         if fi is None:
             return
 
-        self._scrubber.set_range(fi.frame_count)
+        if not playing or fi.frame_count != self._scrubber._total:
+            self._scrubber.set_range(fi.frame_count)  # re-anchors the clock
+        if playing and self._scrubber.is_playing():
+            # Live progress must not interrupt playback: the presenter owns
+            # the displayed frame; only coverage / availability refresh.
+            self._update_coverage(self._clip, fi)
+            return
         clamped_frame = min(current_frame, max(0, fi.frame_count - 1))
         if fi.frame_count > 0:
             self._scrubber.set_frame(clamped_frame)
@@ -245,6 +296,7 @@ class DualViewerPanel(QWidget):
 
     def show_placeholder(self, text: str = "No clip selected") -> None:
         """Show placeholder on both viewers."""
+        self._end_playback_context()
         self._input_viewer.show_placeholder(text)
         self._output_viewer.show_placeholder(text)
         self._scrubber.set_range(0)
@@ -303,10 +355,41 @@ class DualViewerPanel(QWidget):
 
     @Slot(int)
     def _on_scrubber_frame(self, stem_index: int) -> None:
-        """Shared scrubber drives both viewers to the same frame."""
+        """User navigation: strict latest-wins on both viewers."""
+        self._presenter.seek(stem_index)
         self._input_viewer.navigate_to_frame(stem_index)
         self._output_viewer.navigate_to_frame(stem_index)
         self.frame_changed.emit(stem_index)
+
+    @Slot(bool)
+    def _on_playback_state(self, playing: bool) -> None:
+        if playing:
+            self._presenter.start()
+        elif self._presenter.stop():
+            # Paused: land on the exact scrubber frame (full latest-wins).
+            self._on_scrubber_frame(self._scrubber.current_frame())
+
+    def _end_playback_context(self) -> None:
+        """Clip switch / placeholder: drop presentation state, stop the clock."""
+        self._fps_token += 1  # late FPS results belong to the old clip
+        self._presenter.stop()
+        self._scrubber.stop_playback()
+        self._scrubber.set_fps(DEFAULT_FPS)
+
+    def _start_fps_resolve(self, clip: ClipEntry) -> None:
+        asset = clip.input_asset
+        video = asset.path if (asset and asset.asset_type == "video") else None
+        task = _FpsTask(self._fps_token, clip.root_path, video)
+        self._fps_jobs[self._fps_token] = task.signals
+        task.signals.done.connect(self._on_fps_resolved)
+        preview_pool().start(task)
+
+    @Slot(int, float)
+    def _on_fps_resolved(self, token: int, fps: float) -> None:
+        self._fps_jobs.pop(token, None)
+        if token != self._fps_token or self._clip is None:
+            return
+        self._scrubber.set_fps(fps)
 
     def toggle_playback(self) -> None:
         """Forward play/pause to the scrubber."""
@@ -353,9 +436,9 @@ class DualViewerPanel(QWidget):
         if self._wipe_active:
             self._position_wipe_overlay()
 
-    @Slot(int, str, object)
-    def _on_wipe_frame_ready(self, stem_index: int, mode_value: str, qimage: object) -> None:
-        """A viewer decoded a frame — refresh wipe if active."""
+    @Slot(int)
+    def _on_wipe_frame_presented(self, _stem_index: int) -> None:
+        """A viewer painted an accepted frame — refresh wipe if active."""
         if self._wipe_active:
             self._load_wipe_images()
 
