@@ -2,3 +2,9 @@
 __pycache__/
 *.py[co]
 .venv/
+
+# Runtime data created by the app (projects, logs, downloaded weights)
+Projects/
+logs/
+gvm_core/weights/
+modules/MatAnyone2Module/checkpoints/
