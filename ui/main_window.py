@@ -70,7 +70,7 @@ from ui.main_window_mixins import (
     MenuMixin, ShortcutsMixin, ClipMixin, ImportMixin,
     InferenceMixin, AlphaImportMixin, ModelRunMixin, CancelMixin,
     WorkerMixin, AnnotationMixin,
-    ExportMixin, SessionMixin, SettingsMixin,
+    ExportMixin, SessionMixin, SettingsMixin, HintResetMixin,
 )
 from ui.main_window_mixins.batch_pipeline_mixin import BatchPipelineMixin
 from ui.main_window_mixins.chroma_key_mixin import ChromaKeyMixin
@@ -208,7 +208,7 @@ class MainWindow(
     MenuMixin, ShortcutsMixin, ClipMixin, ImportMixin,
     InferenceMixin, AlphaImportMixin, ModelRunMixin, CancelMixin,
     WorkerMixin, AnnotationMixin, ChromaKeyMixin, BatchPipelineMixin,
-    ExportMixin, SessionMixin, SettingsMixin,
+    ExportMixin, SessionMixin, SettingsMixin, HintResetMixin,
 ):
     """CorridorKey main application window."""
 
@@ -525,6 +525,8 @@ class MainWindow(
         # Parameter panel — wire Apple Vision / GVM / BiRefNet / Track Mask / VideoMaMa
         self._param_panel.applevision_requested.connect(self._on_run_applevision)
         self._param_panel.gvm_requested.connect(self._on_run_gvm)
+        self._param_panel.reset_hint_requested.connect(self._on_reset_hint)
+        self._io_tray.selection_changed.connect(self._refresh_hint_button_state)
         self._param_panel.birefnet_requested.connect(self._on_run_birefnet)
         self._param_panel.videomama_requested.connect(self._on_run_videomama)
         self._param_panel.matanyone2_requested.connect(self._on_run_matanyone2)

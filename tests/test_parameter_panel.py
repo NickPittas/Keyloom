@@ -116,3 +116,28 @@ def test_chroma_params_and_bg_color_still_work():
     assert cp["strength"] == 2.0 and cp["shrink_grow"] == 3 and cp["edge_blur"] == 4
     panel._bg_color.setCurrentIndex(2)
     assert panel.get_chroma_params()["screen_type"] == "blue"
+
+
+def test_reset_hint_button_signal_and_default_disabled():
+    _app()
+    panel = ParameterPanel()
+    got = []
+    panel.reset_hint_requested.connect(lambda: got.append(1))
+    assert panel._reset_hint_btn.text() == "RESET HINT"
+    assert not panel._reset_hint_btn.isEnabled()
+    panel.set_reset_hint_enabled(True)
+    panel._reset_hint_btn.click()
+    assert got == [1]
+    assert panel._reset_hint_btn.parent() is panel._gvm_btn.parent()
+
+
+def test_busy_track_gate_survives_annotation_info():
+    _app()
+    panel = ParameterPanel()
+    panel.set_track_enabled(False)
+    panel.set_annotation_info(3, 10)
+    assert not panel._track_masks_btn.isEnabled()
+    panel.set_track_enabled(True)
+    assert panel._track_masks_btn.isEnabled()
+    panel.set_annotation_info(0, 10)
+    assert not panel._track_masks_btn.isEnabled()

@@ -80,6 +80,7 @@ class ParameterPanel(QWidget):
     params_changed = Signal()  # emitted when any parameter changes
     screen_color_changed = Signal(str)  # "green" or "blue" — UI accent swap
     gvm_requested = Signal()      # GVM AUTO button clicked
+    reset_hint_requested = Signal()  # RESET HINT button clicked
     birefnet_requested = Signal(str)  # BiRefNet button clicked, emits model variant name
     videomama_requested = Signal() # VIDEOMAMA button clicked
     matanyone2_requested = Signal()  # MatAnyone2 button clicked
@@ -377,6 +378,21 @@ class ParameterPanel(QWidget):
         self._annotation_info = QLabel("")
         self._annotation_info.setStyleSheet("color: #808070; font-size: 10px;")
         alpha_layout.addWidget(self._annotation_info)
+
+        # Track is additionally gated by the main window (busy GPU/queue);
+        # annotation-info refreshes must not override that gate.
+        self._track_allowed = True
+        self._track_has_annotations = False
+        self._reset_hint_btn = QPushButton(self.tr("RESET HINT"))
+        self._reset_hint_btn.setEnabled(False)
+        self._reset_hint_btn.setToolTip(
+            self.tr(
+                "Delete generated AlphaHint and SAM masks so you can try another method.\n"
+                "Keyed outputs and annotations are kept."
+            )
+        )
+        self._reset_hint_btn.clicked.connect(self.reset_hint_requested.emit)
+        alpha_layout.addWidget(self._reset_hint_btn)
 
         self._matanyone2_btn = QPushButton(self.tr("MATANYONE2"))
         self._matanyone2_btn.setEnabled(False)
@@ -871,12 +887,21 @@ class ParameterPanel(QWidget):
 
     def set_annotation_info(self, annotated: int, total: int) -> None:
         """Update annotation frame counter."""
-        if annotated > 0 and total > 0:
+        self._track_has_annotations = annotated > 0 and total > 0
+        if self._track_has_annotations:
             self._annotation_info.setText(self.tr("Painted: %d / %d frames") % (annotated, total))
-            self._track_masks_btn.setEnabled(True)
         else:
             self._annotation_info.setText("")
-            self._track_masks_btn.setEnabled(False)
+        self._track_masks_btn.setEnabled(self._track_has_annotations and self._track_allowed)
+
+    def set_track_enabled(self, allowed: bool) -> None:
+        """Gate TRACK MASK (e.g. busy GPU); it still needs annotations to enable."""
+        self._track_allowed = bool(allowed)
+        self._track_masks_btn.setEnabled(self._track_has_annotations and self._track_allowed)
+
+    def set_reset_hint_enabled(self, enabled: bool) -> None:
+        """Enable/disable the RESET HINT button."""
+        self._reset_hint_btn.setEnabled(bool(enabled))
 
     # ── Chroma Key ──
 

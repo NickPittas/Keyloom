@@ -24,10 +24,11 @@ from .annotation_mixin import AnnotationMixin
 from .export_mixin import ExportMixin
 from .session_mixin import SessionMixin
 from .settings_mixin import SettingsMixin
+from .hint_reset_mixin import HintResetMixin
 
 __all__ = [
     "MenuMixin", "ShortcutsMixin", "ClipMixin", "ImportMixin",
     "InferenceMixin", "AlphaImportMixin", "ModelRunMixin", "CancelMixin",
     "WorkerMixin", "AnnotationMixin",
-    "ExportMixin", "SessionMixin", "SettingsMixin",
+    "ExportMixin", "SessionMixin", "SettingsMixin", "HintResetMixin",
 ]
