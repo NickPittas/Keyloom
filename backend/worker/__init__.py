@@ -107,6 +107,7 @@ def probe_hello(gpu_arg: int | None) -> dict:
             "platform": sys.platform, "gpu": gpu, "models": models,
             "capabilities": {"key": not problems and gpu is not None,
                              "generate_hint": any(tasks[k] for k in hint_kinds),
+                             "key_modes": ["new", "resume", "replace"],
                              "tasks": tasks, "birefnet_variants": caps["birefnet_variants"],
                              "sam_models": caps["sam_models"], "task_unavailable": caps["reasons"],
                              "publish_modes": ["final"]}}

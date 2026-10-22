@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL = 1
 MANIFEST_NAME = ".corridorkey_manifest.json"
 LOCK_NAME = ".corridorkey_job.lock"
+REPLACE_JOURNAL = ".corridorkey_replace.json"  # crash journal of a mode='replace' swap
 EXR_PIXEL_TYPE = "float32"  # EXR channels are FLOAT; only the lossless codecs keep every value
 LOSSY_EXR = ("dwab",)  # DWAB quantises even FLOAT channels (values > 65504 are clipped)
 LOCK_SCHEMA = 1
@@ -218,8 +219,8 @@ class KeyJob:
                         or base.startswith(".") or _P.normcase(p) in seen):
                     _rej("paths", f"outputs.{name}: bad, duplicate or out-of-folder path {p!r}")
                 seen.add(_P.normcase(p))
-        if d["mode"] not in ("new", "resume"):
-            _rej("invalid", "mode must be 'new' or 'resume'")
+        if d["mode"] not in ("new", "resume", "replace"):
+            _rej("invalid", "mode must be 'new', 'resume' or 'replace'")
         if d["publish"] != "final":
             _rej("invalid", "only publish='final' is supported by this worker")
         if d["path_map"] != []:
@@ -315,7 +316,7 @@ def _check_paths(job: KeyJob, clip: ClipEntry, range_files: list[str]) -> str:
             if nc(r) in seen:
                 _rej("paths", f"two outputs resolve to the same file: {p}")
             seen.add(nc(r))
-            if _nt() and len(_tmp_path(p, job)) > 259 and not p.startswith("\\\\?\\"):
+            if _nt() and max(len(_tmp_path(p, job)), len(_bak_path(p, job))) > 259 and not p.startswith("\\\\?\\"):
                 _rej("paths", f"path too long for Windows (260 chars incl. temp name): {p}. "
                               "Use a shorter output folder or enable long paths.")
     return rmd
@@ -387,6 +388,22 @@ def resume_problem(manifest, job: KeyJob, stems=None) -> str | None:
     return next((msg for ok, msg in checks if not ok), None)
 
 
+def replace_problem(manifest, job: KeyJob, stems=None) -> str | None:
+    """Why ``job`` cannot replace ``manifest``'s result (None = it can). Settings may differ; the
+    set of files, the range and the source frames may not (only files the manifest lists are swapped)."""
+    if not isinstance(manifest, dict) or manifest.get("version") != 3:
+        return "the existing result is not a v3 manifest"
+    if manifest.get("engine") != "corridorkey-v2" or manifest.get("clip_id") != job.clip_id:
+        return "the existing result belongs to another clip"
+    checks = [
+        (manifest.get("range") == _thaw(job.range), "In/Out changed; write a new version"),
+        (manifest.get("files") == _rel_files(job), "the output files differ (enabled outputs, formats "
+                                                  "or names changed); write a new version"),
+        (stems is None or manifest.get("source_stems") == list(stems), "source frames changed"),
+    ]
+    return next((msg for ok, msg in checks if not ok), None)
+
+
 def resume_compatible(manifest, job: KeyJob, stems=None) -> bool:
     return resume_problem(manifest, job, stems) is None
 
@@ -404,6 +421,13 @@ def _check_targets(job: KeyJob, mdir: str, stems: list) -> dict | None:
         problem = resume_problem(manifest, job, stems) if manifest is not None else "no existing result"
         if problem:
             _rej("exists", f"Cannot resume: {problem}. Write as a new version.")
+        bad = [p for p in existing if os.path.islink(p) or not os.path.isfile(p)]
+        if bad:
+            _rej("exists", f"not a regular file, refusing to touch it: {bad[0]}")
+    elif job.mode == "replace":
+        problem = replace_problem(manifest, job, stems) if manifest is not None else "no existing result"
+        if problem:
+            _rej("exists", f"Cannot replace: {problem}.")
         bad = [p for p in existing if os.path.islink(p) or not os.path.isfile(p)]
         if bad:
             _rej("exists", f"not a regular file, refusing to touch it: {bad[0]}")
@@ -576,6 +600,13 @@ def _tmp_path(final: str, job: KeyJob) -> str:
     d, name = _P.split(final)
     tag = hashlib.sha1(final.encode("utf-8", "surrogateescape")).hexdigest()[:12]
     return _P.join(d, f".ck-{job.job_id}-{tag}{_P.splitext(name)[1]}")
+
+
+def _bak_path(final: str, job: KeyJob) -> str:
+    """Where the old file of a replace waits until the commit; same folder, hence same volume."""
+    d, name = _P.split(final)
+    tag = hashlib.sha1(final.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    return _P.join(d, f".ck-old-{job.job_id}-{tag}{_P.splitext(name)[1]}")
 
 
 def _write_tmp(path: str, data: bytes, owned: list | None = None) -> None:
@@ -754,6 +785,188 @@ def _error_kind(exc: BaseException) -> str:
     return "internal"
 
 
+def _manifest(job, cfg, params, a, b, prepared, profile, worker, jid) -> dict:
+    manifest = {
+        "version": 3, "engine": "corridorkey-v2", "clip_id": job.clip_id, "job_id": jid,
+        "enabled_outputs": cfg.enabled_outputs, "formats": _formats(cfg),
+        "exr_compression": cfg.exr_compression, "exr_pixel_type": EXR_PIXEL_TYPE,
+        "exr_lossy": cfg.exr_compression in LOSSY_EXR,
+        "params": params.to_dict(),
+        "range": _thaw(job.range), "frame_range": [a, b],
+        "source_stems": list(prepared.source_stems), "files": _rel_files(job),
+        "effective_profile": profile,
+        "worker": {k: worker.get(k) for k in ("host", "worker_rev", "gpu")},
+        "complete": False,
+        "alpha_convention": {"processed_exr": "straight-linear",
+                             "processed_png": "straight-srgb"},
+    }
+    if job.hint_keyframes_abs is not None:
+        manifest["hint_keyframes"] = list(job.hint_keyframes_abs)
+    return manifest
+
+
+# ---------------------------------------------------------------- replace (swap journal)
+
+def _journal_entries(mdir: str, journal) -> list:
+    """Validated entries of a journal found on disk (its content is not trusted blindly).
+
+    Every ``final`` must be the manifest, the settings file, or a file the manifest itself lists
+    (read from whichever of the manifest / its backup / its staged copy survived the crash); every
+    ``new``/``bak`` must sit beside its ``final`` and carry this journal's job id."""
+    ents = journal.get("items") if isinstance(journal, dict) else None
+    jid = journal.get("job_id") if isinstance(journal, dict) else None
+    if (not isinstance(ents, list) or journal.get("schema") != 1 or not isinstance(jid, str)
+            or not _JOB_ID_RE.match(jid) or journal.get("phase") not in ("prepare", "committed")):
+        _rej("exists", "the replace journal is malformed; it was left untouched")
+    nc = _P.normcase
+    for e in ents:
+        ok = (isinstance(e, dict) and set(e) == {"final", "new", "bak", "had_old"}
+              and isinstance(e["had_old"], bool)
+              and all(isinstance(e[k], str) and _P.isabs(e[k]) and _inside(e[k], mdir) for k in ("final", "new", "bak"))
+              and _P.dirname(e["new"]) == _P.dirname(e["bak"]) == _P.dirname(e["final"])
+              and _P.basename(e["new"]).startswith(f".ck-{jid}-")
+              and _P.basename(e["bak"]).startswith(f".ck-old-{jid}-")
+              and nc(e["final"]) not in (nc(e["new"]), nc(e["bak"])))
+        if not ok:
+            _rej("exists", "the replace journal lists a path it should not; it was left untouched")
+    top = [e for e in ents if nc(e["final"]) == nc(_P.join(mdir, MANIFEST_NAME))]
+    listed = None
+    for cand in ([top[0]["final"], top[0]["bak"], top[0]["new"]] if len(top) == 1 else []):
+        try:
+            with open(cand, encoding="utf-8") as f:
+                files = json.load(f).get("files")
+            if isinstance(files, dict):
+                listed = {nc(_P.normpath(_P.join(mdir, *r.split("/")))) for v in files.values() for r in v}
+                break
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+    allowed = (listed or set()) | {nc(_P.join(mdir, MANIFEST_NAME)), nc(_P.join(mdir, "corridorkey_v2_settings.txt"))}
+    if listed is None or any(nc(e["final"]) not in allowed for e in ents):
+        _rej("exists", "the replace journal does not match the result's manifest; it was left untouched")
+    return ents
+
+
+def _undo_swap(ents: list) -> None:
+    """Back to the old result: every ``final`` the journal replaced gets its ``bak`` back."""
+    for e in reversed(ents):
+        if os.path.lexists(e["bak"]):
+            os.replace(e["bak"], e["final"])  # final is the journal's own new file (or already gone)
+        elif not e["had_old"] and not os.path.lexists(e["new"]) and os.path.lexists(e["final"]):
+            _rm(e["final"])  # there was no earlier file: the one in place is ours from this swap
+        _rm(e["new"])
+
+
+def _finish_swap(ents: list) -> None:
+    for e in ents:
+        _rm(e["bak"])
+        _rm(e["new"])
+
+
+def recover_replace(mdir: str) -> str | None:
+    """Finish or undo an interrupted replace (caller holds the lease). 'prepare' means the commit
+    flag was never written: restore the old result; 'committed': keep the new one, drop the old."""
+    path = os.path.join(mdir, REPLACE_JOURNAL)
+    if not os.path.lexists(path):
+        return None
+    if os.path.islink(path) or not os.path.isfile(path):
+        _rej("exists", f"{path} is not a regular file")
+    try:
+        with open(path, encoding="utf-8") as f:
+            journal = json.load(f)
+    except (OSError, ValueError):
+        _rej("exists", f"{path} is unreadable; an interrupted replace needs manual attention")
+    ents = _journal_entries(mdir, journal)
+    try:
+        (_finish_swap if journal["phase"] == "committed" else _undo_swap)(ents)
+    except OSError as exc:
+        _rej("exists", f"Cannot finish the interrupted replace: {exc}. The journal was kept.")
+    _rm(path)
+    return journal["phase"]
+
+
+def _valid_image(path: str) -> bool:
+    try:
+        if os.path.getsize(path) == 0:
+            return False
+        if path.lower().endswith(".png"):
+            return cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_UNCHANGED) is not None
+        import OpenEXR
+        OpenEXR.InputFile(path).header()
+        return True
+    except Exception:  # noqa: BLE001 - anything unreadable is invalid
+        return False
+
+
+def _commit_swap(job: KeyJob, items: list, manifest_path: str, mnew: str) -> None:
+    jpath = os.path.join(job.manifest_dir, REPLACE_JOURNAL)
+    ents = [{"final": f, "new": n, "bak": _bak_path(f, job), "had_old": os.path.lexists(f)} for f, n in items]
+    ents.append({"final": manifest_path, "new": mnew, "bak": _bak_path(manifest_path, job), "had_old": True})
+    journal = {"schema": 1, "job_id": job.job_id, "clip_id": job.clip_id, "phase": "prepare", "items": ents}
+    jtmp = f"{jpath}.tmp.{job.job_id}"
+    _write_tmp(jtmp, json.dumps(journal, indent=1).encode("utf-8"))
+    try:
+        _link_noclobber(jtmp, jpath)  # a leftover journal was recovered earlier; never replace one
+    finally:
+        _rm(jtmp)
+    try:
+        for e in ents:  # the manifest swaps last
+            if e["had_old"]:
+                os.rename(e["final"], e["bak"])
+            os.rename(e["new"], e["final"])
+        journal["phase"] = "committed"  # the commit point
+        _write_tmp(jtmp, json.dumps(journal, indent=1).encode("utf-8"))
+        _replace_retry(jtmp, jpath)
+    except BaseException:
+        _rm(jtmp)
+        _undo_swap(ents)  # on failure here the journal stays and the next job recovers
+        _rm(jpath)
+        raise
+    _finish_swap(ents)
+    _rm(jpath)
+
+
+def _replace_publish(service, job: KeyJob, cfg: OutputConfig, result, manifest: dict, lease,
+                     check_cancel, ev, done: dict, stems: list) -> None:
+    """Render the whole new result next to the old files, validate it, then swap. The old result
+    is untouched by anything that can fail (model, inference, cancel, a bad frame)."""
+    n, mine, items = job.frames, [], []
+    ez_of, fmts = FrameOpsMixin.V2_PRODUCT_TO_EZ, _formats(cfg)
+    manifest_path = os.path.join(job.manifest_dir, MANIFEST_NAME)
+    try:
+        ev("status", message="Writing outputs...")
+        for i in range(n):
+            check_cancel()
+            lease.verify()
+            for product in service._v2_required_products(cfg):
+                final = job.outputs[ez_of[product]][i]
+                new = _tmp_path(final, job)
+                os.makedirs(os.path.dirname(final), exist_ok=True)
+                _render(service, product, fmts[ez_of[product]], service._v2_runtime_file(
+                    product, result.product_dirs[product], i), new, cfg, mine)
+                items.append((final, new))
+            ev("progress", phase="publish", done=i + 1, total=n)
+        bad = [new for _, new in items if not _valid_image(new)]
+        if bad:
+            raise PublishError(f"{len(bad)} new file(s) failed validation (e.g. {bad[0]}); "
+                               "the previous result was kept.")
+        settings = os.path.join(job.manifest_dir, "corridorkey_v2_settings.txt")
+        if result.settings_path and os.path.isfile(result.settings_path) and os.path.isfile(settings) \
+                and not os.path.islink(settings):  # an owned settings file from the old result is swapped too
+            snew = _P.join(job.manifest_dir, f".ck-{job.job_id}-settings.txt")
+            with open(result.settings_path, "rb") as f:
+                _write_tmp(snew, f.read(), mine)
+            items.append((settings, snew))
+        mnew = _P.join(job.manifest_dir, f".ck-{job.job_id}-manifest.json")
+        _write_tmp(mnew, json.dumps(manifest, indent=2).encode("utf-8"), mine)
+        check_cancel()  # the last point where cancelling keeps everything as it was
+        lease.verify()
+        _commit_swap(job, items, manifest_path, mnew)
+    finally:
+        _rm_owned(mine)
+    done.update(published=n, skipped=0, manifest=manifest_path, manifest_complete=True)
+    ev("published", stems=list(stems))
+
+
 # ------------------------------------------------------------------------- the job
 
 def run_key_job(service, job: KeyJob, *, emit: Callable[[dict], None],
@@ -777,11 +990,13 @@ def run_key_job(service, job: KeyJob, *, emit: Callable[[dict], None],
     done = dict(event="done", job_id=jid, outcome="failed", message=None, error_kind=None,
                 manifest=None, published=0, skipped=0, expected=n, manifest_complete=False)
     stems = [os.path.splitext(f)[0] for f in range_files]
-    _check_targets(job, mdir, stems)
+    if not os.path.lexists(os.path.join(job.manifest_dir, REPLACE_JOURNAL)):
+        _check_targets(job, mdir, stems)  # early, lock-free; with a journal the folder is mid-swap
     lease, created = _Lease(job, worker), []
     try:
         _make_dirs_or_reject([job.manifest_dir], created)
         lease.acquire()
+        recover_replace(job.manifest_dir)  # an interrupted replace is settled before anything else
         owned = _check_targets(job, mdir, stems)  # the disk may have changed while we waited
         dirs = sorted({os.path.dirname(p) for ps in job.outputs.values() for p in ps})
         _make_dirs_or_reject(dirs, created)
@@ -848,22 +1063,13 @@ def run_key_job(service, job: KeyJob, *, emit: Callable[[dict], None],
                     f"This machine chose window {profile['hann_chunk']}/{profile['hann_stride']}; "
                     f"existing frames used {old.get('hann_chunk')}/{old.get('hann_stride')}. "
                     "Write as v002, or pin the temporal window.")
-            manifest = {
-                "version": 3, "engine": "corridorkey-v2", "clip_id": job.clip_id, "job_id": jid,
-                "enabled_outputs": cfg.enabled_outputs, "formats": _formats(cfg),
-                "exr_compression": cfg.exr_compression, "exr_pixel_type": EXR_PIXEL_TYPE,
-                "exr_lossy": cfg.exr_compression in LOSSY_EXR,
-                "params": params.to_dict(),
-                "range": _thaw(job.range), "frame_range": [a, b],
-                "source_stems": list(prepared.source_stems), "files": _rel_files(job),
-                "effective_profile": profile,
-                "worker": {k: worker.get(k) for k in ("host", "worker_rev", "gpu")},
-                "complete": False,
-                "alpha_convention": {"processed_exr": "straight-linear",
-                                     "processed_png": "straight-srgb"},
-            }
-            if job.hint_keyframes_abs is not None:
-                manifest["hint_keyframes"] = list(job.hint_keyframes_abs)
+            manifest = _manifest(job, cfg, params, a, b, prepared, profile, worker, jid)
+            if job.mode == "replace":
+                manifest.update(replaces=owned.get("job_id"), complete=True)
+                _replace_publish(service, job, cfg, result, manifest, lease, check_cancel, ev, done,
+                                 prepared.source_stems)
+                done["outcome"] = "complete"
+                return done
             lease.verify()
             # before any output; only a verified resume may replace the earlier manifest
             _put_manifest(manifest_path, manifest, job, replace_ok=job.mode == "resume",
@@ -925,7 +1131,8 @@ def run_key_job(service, job: KeyJob, *, emit: Callable[[dict], None],
         done["outcome"] = "complete"
     except JobCancelledError:
         flush(True)
-        done.update(outcome="cancelled", message="Cancelled; published frames were kept.")
+        done.update(outcome="cancelled", message="Cancelled; the previous result was kept." if job.mode == "replace"
+                    else "Cancelled; published frames were kept.")
     except Exception as exc:  # noqa: BLE001 - every accepted job must end in `done`
         logger.exception("Key job %s failed", jid)
         flush(True)

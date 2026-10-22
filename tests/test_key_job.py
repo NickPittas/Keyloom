@@ -153,7 +153,7 @@ BAD = [
     ("duplicate", lambda d: d["outputs"]["fg"].__setitem__(1, d["outputs"]["fg"][0]), "paths"),
     ("staging publish", lambda d: d.update(publish="staging"), "invalid"),
     ("path_map", lambda d: d.update(path_map=[["/a", "/b"]]), "invalid"),
-    ("mode", lambda d: d.update(mode="replace"), "invalid"),
+    ("mode", lambda d: d.update(mode="overwrite"), "invalid"),
     ("protocol 2", lambda d: d["require"].update(protocol=2), "invalid"),
 ]
 
