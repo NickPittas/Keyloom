@@ -138,9 +138,11 @@ def _resolve_hint_args(params, hint_video_path, initial_hint_path, initial_hint_
 
 class CorridorKeyV2Engine:
     def __init__(self, asset_paths: V2AssetPaths | None = None, device: str = "cuda"):
+        self._managed_paths = asset_paths is None
         self._paths = asset_paths or get_v2_asset_paths()
         self._device = device
         self._model = None
+        self._model_asset_lease = None
         self.load_count = 0
         self.last_warnings: list[str] = []
 
@@ -151,33 +153,47 @@ class CorridorKeyV2Engine:
     def load(self, on_status: Callable[[str], None] | None = None) -> None:
         if self._model is not None:
             return
-        problems = validate_v2_assets(self._paths)
-        if problems:
-            raise V2EngineError(
-                "CorridorKey 2.0 assets are missing or invalid:\n  "
-                + "\n  ".join(problems)
-                + "\nRun: python scripts/setup_models.py --corridorkey"
-            )
-        import torch
-
-        if not torch.cuda.is_available():
-            raise V2EngineError("CorridorKey 2.0 requires an NVIDIA CUDA GPU")
-        from CorridorKeyV2.corridorkey import runtime as rt
-
-        if on_status:
-            on_status("Loading CorridorKey 2.0 model...")
-        paths = rt.RuntimePaths(**self._paths.as_runtime_kwargs())
+        lease = None
+        if self._managed_paths:
+            from backend.model_runtime import acquire_model_artifact
+            lease = acquire_model_artifact("corridorkey-weights")
         try:
+            problems = validate_v2_assets(self._paths)
+            if problems:
+                raise V2EngineError(
+                    "CorridorKey 2.0 assets are missing or invalid:\n  "
+                    + "\n  ".join(problems)
+                    + "\nRun: python scripts/setup_models.py --corridorkey"
+                )
+            import torch
+
+            if not torch.cuda.is_available():
+                raise V2EngineError("CorridorKey 2.0 requires an NVIDIA CUDA GPU")
+            from CorridorKeyV2.corridorkey import runtime as rt
+
+            if on_status:
+                on_status("Loading CorridorKey 2.0 model...")
+            paths = rt.RuntimePaths(**self._paths.as_runtime_kwargs())
             with _offline_env():
                 self._model = rt.load_model(paths, self._device)
+        except V2EngineError:
+            if lease is not None:
+                lease.close()
+            raise
         except Exception as exc:
             self._model = None
             _free_gpu_memory()
+            if lease is not None:
+                lease.close()
             raise V2EngineError(f"Failed to load CorridorKey 2.0 model: {exc}") from exc
+        self._model_asset_lease = lease
         self.load_count += 1
 
     def unload(self) -> None:
         self._model = None
+        if self._model_asset_lease is not None:
+            self._model_asset_lease.close()
+            self._model_asset_lease = None
         _free_gpu_memory()
 
     def build_inference_config(self, params, *, outputs, temp_dir, frame_dir_fps=24.0,

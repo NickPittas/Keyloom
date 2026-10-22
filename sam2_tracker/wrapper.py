@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 import shutil
@@ -84,14 +83,19 @@ class SAM2Tracker:
         self.offload_video_to_cpu = offload_video_to_cpu
         self.offload_state_to_cpu = offload_state_to_cpu
         self._predictor = None
+        self._model_asset_lease = None
 
     def unload(self) -> None:
-        """Move the predictor back to CPU if possible."""
+        """Drop the predictor and release its catalog assets after CPU offload."""
         if self._predictor is not None and hasattr(self._predictor, "to"):
             try:
                 self._predictor.to("cpu")
             except Exception:
                 logger.debug("SAM2 predictor CPU offload skipped", exc_info=True)
+        self._predictor = None
+        if self._model_asset_lease is not None:
+            self._model_asset_lease.close()
+            self._model_asset_lease = None
 
     def prepare(
         self,
@@ -119,16 +123,10 @@ class SAM2Tracker:
             ) from e
 
         if size < min_size:
-            cache_dir = os.path.dirname(os.path.dirname(ckpt_path))
             raise RuntimeError(
                 f"SAM2 checkpoint appears corrupt or incomplete ({size:,} bytes): "
-                f"{ckpt_path}\n\n"
-                f"This can happen if a download was interrupted or the cached file "
-                f"is a stub rather than the real weights.\n\n"
-                f"Fix: delete the cached model folder and restart the app so it "
-                f"re-downloads the checkpoint:\n"
-                f"  1. Delete this folder: {cache_dir}\n"
-                f"  2. Restart the app"
+                f"{ckpt_path}. Repair the installed SAM2 model in the app's model "
+                "installer before tracking."
             )
 
         # Verify ZIP magic bytes (torch .pt files are ZIP archives)
@@ -136,15 +134,10 @@ class SAM2Tracker:
             with open(ckpt_path, 'rb') as f:
                 magic = f.read(2)
             if magic != b'PK':
-                cache_dir = os.path.dirname(os.path.dirname(ckpt_path))
                 raise RuntimeError(
                     f"SAM2 checkpoint is not a valid torch file (bad header): "
-                    f"{ckpt_path}\n\n"
-                    f"The cached file may be corrupted or incomplete.\n\n"
-                    f"Fix: delete the cached model folder and restart the app so it "
-                    f"re-downloads the checkpoint:\n"
-                    f"  1. Delete this folder: {cache_dir}\n"
-                    f"  2. Restart the app"
+                    f"{ckpt_path}. Repair the installed SAM2 model in the app's model "
+                    "installer before tracking."
                 )
         except RuntimeError:
             raise
@@ -152,42 +145,6 @@ class SAM2Tracker:
             raise RuntimeError(
                 f"Cannot read SAM2 checkpoint: {ckpt_path}\n{e}"
             ) from e
-
-    def _make_download_progress_class(
-        self,
-        *,
-        on_progress: Callable[[int, int], None] | None = None,
-        on_status: Callable[[str], None] | None = None,
-    ):
-        class _DownloadProgress:
-            def __init__(self, *args, total=None, initial=0, desc="", disable=False, **kwargs):
-                self.total = int(total or 0)
-                self.n = int(initial or 0)
-                self.desc = desc or "SAM2 model"
-                if on_status:
-                    on_status(f"Downloading {self.desc}")
-                if on_progress and self.total > 0:
-                    on_progress(self.n, self.total)
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                self.close()
-                return False
-
-            def update(self, n=1):
-                self.n += int(n or 0)
-                if on_progress and self.total > 0:
-                    on_progress(min(self.n, self.total), self.total)
-
-            def close(self):
-                if on_progress and self.total > 0:
-                    on_progress(self.total, self.total)
-                if on_status:
-                    on_status(f"Downloaded {self.desc}")
-
-        return _DownloadProgress
 
     def _get_predictor(
         self,
@@ -199,7 +156,6 @@ class SAM2Tracker:
             return self._predictor
 
         try:
-            from huggingface_hub import hf_hub_download
             from sam2.build_sam import HF_MODEL_ID_TO_FILENAMES, build_sam2_video_predictor
         except ImportError as exc:
             raise SAM2NotInstalledError(
@@ -236,37 +192,40 @@ class SAM2Tracker:
             self.model_id,
             self.vos_optimized,
         )
-        config_name, checkpoint_name = HF_MODEL_ID_TO_FILENAMES[self.model_id]
-        if on_status:
-            on_status("Checking model cache")
-        from backend.net_proxy import friendly_proxy_error, sanitized_proxy_env
         try:
-            with sanitized_proxy_env():
-                dl_kwargs = {}
-                # tqdm_class needs huggingface_hub>=1.0; CorridorKey 2.0 pins
-                # transformers<5, which keeps huggingface_hub on 0.x.
-                if "tqdm_class" in inspect.signature(hf_hub_download).parameters:
-                    dl_kwargs["tqdm_class"] = self._make_download_progress_class(
-                        on_progress=on_progress,
-                        on_status=on_status,
-                    )
-                ckpt_path = hf_hub_download(
-                    repo_id=self.model_id,
-                    filename=checkpoint_name,
-                    **dl_kwargs,
-                )
-        except Exception as exc:
-            friendly = friendly_proxy_error(exc)
-            if friendly is None:
-                raise
-            raise RuntimeError(friendly) from exc
-        self._validate_checkpoint(ckpt_path)
-        self._predictor = build_sam2_video_predictor(
-            config_file=config_name,
-            ckpt_path=ckpt_path,
-            device=self.device,
-            vos_optimized=self.vos_optimized,
-        )
+            config_name, checkpoint_name = HF_MODEL_ID_TO_FILENAMES[self.model_id]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported SAM2 model id: {self.model_id}") from exc
+        if on_status:
+            on_status("Checking installed SAM2 model")
+        from backend.model_catalog import load_catalog
+        from backend.model_runtime import acquire_model_artifact
+
+        artifact = next((
+            art for art in load_catalog().artifacts.values()
+            if art.kind == "hf_cache_file" and art.repo_id == self.model_id
+        ), None)
+        if artifact is None:
+            raise ValueError(f"SAM2 model id is not present in the model catalog: {self.model_id}")
+        if artifact.hf_filename != checkpoint_name:
+            raise RuntimeError(
+                f"SAM2 catalog mismatch for {self.model_id}: expected "
+                f"{artifact.hf_filename}, runtime expects {checkpoint_name}. Update or repair the app."
+            )
+        lease = acquire_model_artifact(artifact.id)
+        try:
+            ckpt_path = lease.path
+            self._validate_checkpoint(str(ckpt_path))
+            self._predictor = build_sam2_video_predictor(
+                config_file=config_name,
+                ckpt_path=str(ckpt_path),
+                device=self.device,
+                vos_optimized=self.vos_optimized,
+            )
+        except Exception:
+            lease.close()
+            raise
+        self._model_asset_lease = lease
         return self._predictor
 
     def track_video(

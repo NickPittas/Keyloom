@@ -1,0 +1,3228 @@
+{
+  "artifacts": {
+    "birefnet-BiRefNet": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "af0deeca4d249a5a06b42ca5fe79e3c84ce1339f",
+          "layout_path": ".gitignore",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitignore",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1908
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "83cda9675fd4096e9b3a65bb4e1f8fa3d652929f",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 9965
+        },
+        {
+          "git_blob_sha1": "8dea801e2b56facb8486ba351e6f91c3e664eb6d",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 91896
+        },
+        {
+          "git_blob_sha1": "06d8fa9d7f2f4c6f1cf0dc6e7bfd194153176a42",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 405
+        },
+        {
+          "git_blob_sha1": "a7125cb498ca55e30b3632caa474056dff1f59a5",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4762
+        },
+        {
+          "git_blob_sha1": "3b958f6368413c833b0abc357a1357cb78ce6d52",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "9ab37426bf4de0567af6b5d21b16151357149139362e6e8992021b8ce356a154",
+          "sha256_source": "hf-lfs-oid",
+          "size": 444473596
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet General",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet-COD": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "210732c0e0890a811d9ac25cc61bf1879de59dab",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 3942
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "a963a0615e765bac824ca1c81d9f56194cd0265b",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 409
+        },
+        {
+          "git_blob_sha1": "215445c253e8a6d823feeedaeafd2895fa3134e6",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4703
+        },
+        {
+          "git_blob_sha1": "a8d328df095e189efe67d0c9d0832225f7213092",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "6c321deba6f15147f325566d0470e75e7258bf481f5e0b6c667659530d40019e",
+          "sha256_source": "hf-lfs-oid",
+          "size": 884878856
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet-COD",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet COD",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet-COD",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet-COD",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet-COD",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "6aa747035f7b70caa1c66cd5c128d6e9c654ddd0",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet-DIS5K": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "5c8c18fe290d96ba59bcc2e49efbb09ee03ace8b",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 3925
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "16f4fcb017629f1b36ea7f183116ff364cb2fc52",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 411
+        },
+        {
+          "git_blob_sha1": "5df6062053221a6b507eda51c2520a6c3d64dbe4",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4703
+        },
+        {
+          "git_blob_sha1": "496d8e54f68907c6af12000982b4a2d658645fdb",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "6641691e0484f458e1f72ec15ecf2856c07de1bd9500a05895ba57f9b9da7bee",
+          "sha256_source": "hf-lfs-oid",
+          "size": 884878856
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet-DIS5K",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet DIS",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet-DIS5K",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet-DIS5K",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet-DIS5K",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "343602b3219a0e905a86c5012935d5a4a0882390",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet-DIS5K-TR_TEs": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "aa38d8fc1c8d0784a10c552a0ffece2e3548c753",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 3905
+        },
+        {
+          "git_blob_sha1": "e299c886ab6d8a40013430ca1d1d5c5cf069b507",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92141
+        },
+        {
+          "git_blob_sha1": "2391973614a00abb5fbebee28d0a6dbb665aa30a",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 418
+        },
+        {
+          "git_blob_sha1": "0227a5f593e10944bb1979ca43ee7a96a92b3e8b",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4710
+        },
+        {
+          "git_blob_sha1": "4307630f6f429ac905f2dfd918057c67af758004",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "27bdb96351f57acb5c49b737c2f5d33ed25505b3919d09c7203a712ced5ecfd9",
+          "sha256_source": "hf-lfs-oid",
+          "size": 884878856
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet-DIS5K-TR_TEs",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet DIS TR_TEs",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet-DIS5K-TR_TEs",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet-DIS5K-TR_TEs",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet-DIS5K-TR_TEs",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "487f440314ea7ab8ea7d184861953a4010b55587",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet-HRSOD": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "ecbae3c7229aad030bda0fddb4013268504ce4a3",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 3972
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "721f434e18dfc24adf198295d5539f5d805df843",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 411
+        },
+        {
+          "git_blob_sha1": "b4788a1cbacdddde248c4238412fe11e886fd956",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4705
+        },
+        {
+          "git_blob_sha1": "9e3ab6dc11ac1f03c0ec529e32b84e5502ec96b8",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "dcc61b9f2074f5d4cb36c022c060543359047811cab426aa6dfa8a48f5034b8c",
+          "sha256_source": "hf-lfs-oid",
+          "size": 884878856
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet-HRSOD",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet HRSOD",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet-HRSOD",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet-HRSOD",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet-HRSOD",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "8a0b1035861383b8a63a622a89a015419194e68d",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet-legacy": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "1b70239c6c86cb495d17f320cd9fdba6f91a9b31",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4110
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "fc17c2210cb8a1cc535f9997611cdc4d0a4642e4",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 412
+        },
+        {
+          "git_blob_sha1": "1593d0d00661588588027d9252d36c7700977cd3",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4714
+        },
+        {
+          "git_blob_sha1": "a056d5d0f9d3462efc70e83554fda7648307ca7c",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "40e4ef76d28bc11380c7833fb2a834c327a90fae698797fca3c2afbf9d9a42cc",
+          "sha256_source": "hf-lfs-oid",
+          "size": 884878856
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet-legacy",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet General Legacy",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet-legacy",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet-legacy",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet-legacy",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "39bdbfc112efe2b2da0da75522fb3d5c51993f3a",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet-matting": {
+      "capability": "hint-auto",
+      "default_variant": true,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "2ed9a9176704c8b74e554672799624d616b15792",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4724
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "a90e853725c77d46f395583b265df9125f40f672",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 413
+        },
+        {
+          "git_blob_sha1": "8b841031c46fde741573b777ec783431c493dcca",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4707
+        },
+        {
+          "git_blob_sha1": "0b751a199714732a4d17a4658728f1399e790314",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "a9875de5b1e6c8eb5fdaa8c727a82927ce442cdc87ba3abee6a77e6fa46c25bb",
+          "sha256_source": "hf-lfs-oid",
+          "size": 884878856
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet-matting",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet Matting",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet-matting",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet-matting",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet-matting",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "eccde0a8cbdce7ac5fecfeb06340fe7b949e85d9",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 940000000,
+      "size_human": "~940 MB"
+    },
+    "birefnet-BiRefNet-portrait": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "af0deeca4d249a5a06b42ca5fe79e3c84ce1339f",
+          "layout_path": ".gitignore",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitignore",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1908
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "a12a39db26373924ebb11f2bcfe224a9797e2f21",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4580
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "ae6983f30e124410c2e70711e603778b909fb811",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 414
+        },
+        {
+          "git_blob_sha1": "55ed163abe034149adfd4f137a3bb5492a07596d",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4708
+        },
+        {
+          "git_blob_sha1": "fa2cb143e1454aa5e4328c07b5f006270f0dff15",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "4a4eb3a5469b75f0cccaec6772c22fc30e6c12ed429c2c0ba71b43e3d8d97182",
+          "sha256_source": "hf-lfs-oid",
+          "size": 884878856
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet-portrait",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet Portrait",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet-portrait",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet-portrait",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet-portrait",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "b6561965a70070d9143fd9e558f6ca3c481510db",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet_512x512": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "a404c4662f6748848a1a52ecf73f49a9feadb2cf",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 5848
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "b3116907be53ab163a883f30ab0a2596a8d85d4d",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 413
+        },
+        {
+          "git_blob_sha1": "d8e804da3a6383a837bdb0f6657a98f6b67efbee",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4709
+        },
+        {
+          "git_blob_sha1": "596ed763a1ecb5f043c1405b6c310515f4084c5a",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "d94ae0eefb2d2020192001e984ecd6b367478118257a3132e6a484bbf18b0f41",
+          "sha256_source": "hf-lfs-oid",
+          "size": 444473596
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet_512x512",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet General 512",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet_512x512",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet_512x512",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet_512x512",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "678c37f9158280a2b3000b566ecd12bfbfd1a09c",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet_HR": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "116c74f73d7e3bb5335102bd49a1143a18682caf",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 10995
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "929f098ac42106c836917bc33c27426df14ee295",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 408
+        },
+        {
+          "git_blob_sha1": "faa0bca677149c1dd75a8bff1a9045f2a48632f5",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4710
+        },
+        {
+          "git_blob_sha1": "29ac24d6c2be25975739412d7343cfb637152025",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "9d678bafec0b0019fbb073b7fd02f05ede25dc4b15254f23b2fb0be333200c0d",
+          "sha256_source": "hf-lfs-oid",
+          "size": 444473596
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet_HR",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet General HR",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet_HR",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet_HR",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet_HR",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "a7a562f6fd16021180f2f4348f4de003a2d3d1e1",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet_HR-Matting": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "68cc045f0962621ebdab649959eda127b912b55b",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 11522
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "d2df8d136bf89699c8ca429a8e542de1cbcfd98e",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 416
+        },
+        {
+          "git_blob_sha1": "7d9940fe23eff2dc4a648a949d476fe2e790c338",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4765
+        },
+        {
+          "git_blob_sha1": "389840ee5d3ed950cbae97eb91d32815a77f5997",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "a5a4de698739ea5e0e8bbab28e1b293dde95092b87a442d566cbc585c53cef55",
+          "sha256_source": "hf-lfs-oid",
+          "size": 444473596
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet_HR-Matting",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet Matting HR",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet_HR-Matting",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet_HR-Matting",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet_HR-Matting",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "5d6b6f8adcb5b417c871b1d84ceaae9871355b7f",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet_dynamic": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "1ecf90d123cc075829e2a619d46b65cbe5648e00",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 11184
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "c89ae3b3cec8352baa366fdf7f07188ff25c8d83",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 413
+        },
+        {
+          "git_blob_sha1": "525bb8c047e1555971ecd1d2d39d633cfa4172ee",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 5256
+        },
+        {
+          "git_blob_sha1": "2744b15335ee7d7b3b5cd9a904d23932ef43e296",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "e3d2e4884e51ff30f0cd630edc6b1e41b06b7f23a0a2a5169f7b7cb33a711c2d",
+          "sha256_source": "hf-lfs-oid",
+          "size": 444473596
+        },
+        {
+          "git_blob_sha1": "3af359c55a02bbaea4d9f3a95a12c48cad2209f3",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet_dynamic",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet General Dynamic",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet_dynamic",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet_dynamic",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet_dynamic",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "280306042f57b7a33854319da62fd86aaa89ec4c",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet_dynamic-matting": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "2f5b4a20c36de875f391a22ab45cfb80314b6400",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 10838
+        },
+        {
+          "git_blob_sha1": "237ac4e21c0999b007381742a387ec1276e6c684",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "e4b8c4f78a28ae8d21ab26f509b17ba2ff9a05b8",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 421
+        },
+        {
+          "git_blob_sha1": "a4d0380f4238170b989ee28046d0bde1007b7520",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 5256
+        },
+        {
+          "git_blob_sha1": "ca1697d63ed34a11ce4292a8baa18d79c24c307c",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "ae177d331c79dcb849ef5b8aea39cea6effd6ca0df36b5a41431658f990e9ee7",
+          "sha256_source": "hf-lfs-oid",
+          "size": 444473596
+        },
+        {
+          "git_blob_sha1": "3af359c55a02bbaea4d9f3a95a12c48cad2209f3",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet_dynamic-matting",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet Matting Dynamic",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet_dynamic-matting",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet_dynamic-matting",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet_dynamic-matting",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "074df545be87034e74a96bf71566ecbbc4c15f0a",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet_lite": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "df99efd9b00adc33c0a27e565e47c7ca9ec5a935",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 8727
+        },
+        {
+          "git_blob_sha1": "fc9d83875236591d89dc9f5faf3951d3c55441e5",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "65faefc95631b8ab29e7134903fabd6a57bf7cb4",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 410
+        },
+        {
+          "git_blob_sha1": "1c4e0425127d3f3457b3be3133238149cb802d73",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4712
+        },
+        {
+          "git_blob_sha1": "fa51d7521bf93eaf4b1cb30b3ad78797a3bcd850",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "4417d89795250e698c3cb0ae8df15743810065f646f48a694fdfa7ca052d0815",
+          "sha256_source": "hf-lfs-oid",
+          "size": 177634392
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet_lite",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet General Lite",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet_lite",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet_lite",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet_lite",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "aa62cd87eafb9cc43056d08ef3615a14628b831d",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet_lite-2K": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "e991137b0463ce5393abb77d7cad95eb3888e106",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 5319
+        },
+        {
+          "git_blob_sha1": "fc9d83875236591d89dc9f5faf3951d3c55441e5",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "65faefc95631b8ab29e7134903fabd6a57bf7cb4",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 410
+        },
+        {
+          "git_blob_sha1": "06eafbcd3836a5d45fc693abb92bd196e8b417b4",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4715
+        },
+        {
+          "git_blob_sha1": "d80bff5738ab92e6340967e06f71e633412601db",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "aa2e4a5af5eb3904694feb40f2b39ec5dd7cd9110906590cfeb982f09a46021d",
+          "sha256_source": "hf-lfs-oid",
+          "size": 177634392
+        },
+        {
+          "git_blob_sha1": "ed8583eb7e7264c7a0c76523882b265a3297423f",
+          "layout_path": "requirements.txt",
+          "lfs": false,
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "path": "requirements.txt",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 149
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet_lite-2K",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet General Lite 2K",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet_lite-2K",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet_lite-2K",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet_lite-2K",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "3f789d2ba403e2ee59ce08ee9250d4c1c590b418",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-BiRefNet_lite-matting": {
+      "capability": "hint-auto",
+      "default_variant": false,
+      "depends": [
+        "birefnet-runtime"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "af0deeca4d249a5a06b42ca5fe79e3c84ce1339f",
+          "layout_path": ".gitignore",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitignore",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1908
+        },
+        {
+          "git_blob_sha1": "37c8ac58bec2f52dac34204978a7b61b69e3da76",
+          "layout_path": "BiRefNet_config.py",
+          "lfs": false,
+          "path": "BiRefNet_config.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 298
+        },
+        {
+          "git_blob_sha1": "014e98390ae97728a7038be30e4b890309eca505",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4959
+        },
+        {
+          "git_blob_sha1": "fc9d83875236591d89dc9f5faf3951d3c55441e5",
+          "layout_path": "birefnet.py",
+          "lfs": false,
+          "path": "birefnet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 92134
+        },
+        {
+          "git_blob_sha1": "89814e5e74e58b793bd08309c81fed2e074cb853",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 418
+        },
+        {
+          "git_blob_sha1": "a4d7dadcd3eae59a55201d0ecc8ad21e01b9a2c1",
+          "layout_path": "handler.py",
+          "lfs": false,
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "path": "handler.py",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4875
+        },
+        {
+          "git_blob_sha1": "2e7dccb37c364f7df29da38f604dcc63a926b8f9",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "ce8bcfc045e336322c0424a5863dcfb7e9ce8fed0a5fd4d1b2b20adf12d97243",
+          "sha256_source": "hf-lfs-oid",
+          "size": 88965896
+        }
+      ],
+      "gated": false,
+      "id": "birefnet-BiRefNet_lite-matting",
+      "kind": "hf_snapshot",
+      "label": "BiRefNet Matting Lite",
+      "layout_rel": "modules/BiRefNetModule/checkpoints/BiRefNet_lite-matting",
+      "layout_root": "data_dir",
+      "notes": [
+        "Pinned upstream closure audit: config.json auto_map loads birefnet.BiRefNet and BiRefNet_config.BiRefNetConfig; birefnet.py imports .BiRefNet_config. All 16 pinned repo trees were checked: nets.py and builds.py are absent and are not imported by the pinned sources.",
+        "Remote code direct imports include timm.layers, torch, torchvision, numpy, kornia.filters, einops and transformers; wrapper.py also imports cv2 and PIL. These modules plus the exact timm==1.0.24 pin are tracked by birefnet-runtime."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet_lite-matting",
+        "weights_license": "MIT label per upstream README/HF card (recorded, not adjudicated); custom code fetched via trust_remote_code carries its own headers"
+      },
+      "repo_id": "ZhengPeng7/BiRefNet_lite-matting",
+      "required_overrides": {
+        "handler.py": {
+          "note": "HF endpoint handler; wrapper loads AutoModelForImageSegmentation via config.json auto_map.",
+          "required": false
+        },
+        "requirements.txt": {
+          "note": "Upstream environment example; the app runtime dependency closure is tracked by birefnet-runtime.",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "99c33412e3f58e1f33187abdc8c435c645243690",
+      "revision_status": "pinned",
+      "size_bytes_estimate": null,
+      "size_human": null
+    },
+    "birefnet-runtime": {
+      "capability": "hint-auto",
+      "id": "birefnet-runtime",
+      "install_hint": "Install the project runtime dependencies. BiRefNet imports timm, torch, torchvision, numpy, kornia, einops, transformers, cv2 and PIL; timm must be 1.0.24.",
+      "kind": "local_package",
+      "label": "BiRefNet Python runtime dependencies",
+      "layout_rel": null,
+      "layout_root": null,
+      "notes": [
+        "Probe set comes from modules/BiRefNetModule/wrapper.py and AST inspection of each unique birefnet.py source at the catalog pins."
+      ],
+      "pip_spec": "timm==1.0.24",
+      "probe_imports": [
+        "cv2",
+        "PIL",
+        "numpy",
+        "torch",
+        "torchvision",
+        "transformers",
+        "timm",
+        "kornia",
+        "einops"
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as runtime evidence, not a package installation.",
+        "source": "https://huggingface.co/ZhengPeng7/BiRefNet"
+      },
+      "required_profile": false
+    },
+    "corridorkey-code": {
+      "capability": "key",
+      "files": [
+        {
+          "layout_path": "corridorkey/runtime.py",
+          "lfs": false,
+          "note": "representative entry; status validates package presence via backend.v2_paths",
+          "path": "corridorkey/runtime.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": null
+        },
+        {
+          "layout_path": "third_party/MoGe",
+          "lfs": false,
+          "note": "vendored MoGe/DINOv2 code directory (Apache-2.0 notices inside)",
+          "path": "third_party/MoGe",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": null
+        }
+      ],
+      "id": "corridorkey-code",
+      "kind": "local_code",
+      "label": "CorridorKey 2.0 engine code (vendored)",
+      "layout_rel": "",
+      "layout_root": "v2_package_root",
+      "notes": [
+        "Repo content, not downloaded; not manager-installable."
+      ],
+      "provenance": {
+        "code_license": "Corridor Key Licence v2 (CC BY-NC-SA 4.0 + additional terms) per CorridorKeyV2/LICENSE; MoGe code MIT; DINOv2 code Apache-2.0 (vendored notices)",
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "notices": "CorridorKeyV2/LICENSE, CorridorKeyV2/THIRD_PARTY_NOTICES.md",
+        "source": "vendored CorridorKeyV2/ in this repository"
+      },
+      "required_profile": true,
+      "size_human": "vendored in repo"
+    },
+    "corridorkey-weights": {
+      "capability": "key",
+      "depends": [
+        "corridorkey-code",
+        "cradio",
+        "moge",
+        "rvm"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "1039dc455ce185de08adbd5674df1bf4caa3701b",
+          "layout_path": "corridorkey_v2.safetensors",
+          "lfs": true,
+          "path": "corridorkey_v2.safetensors",
+          "required": true,
+          "sha256": "c43596de98cc8866d577c8a9f9ea239acdf3f7a130ff24e25db4375a50590436",
+          "sha256_source": "hf-lfs-oid",
+          "size": 2661698720
+        },
+        {
+          "git_blob_sha1": "6aa92fe695755846bb1c04a69cc8d04a9e5e5cfe",
+          "layout_path": "foundation_stats.safetensors",
+          "lfs": true,
+          "path": "foundation_stats.safetensors",
+          "required": true,
+          "sha256": "924783ceddd293fd470126332ce328166faea6c4c8d2f36402d5b95187166af3",
+          "sha256_source": "hf-lfs-oid",
+          "size": 18864
+        }
+      ],
+      "gated": false,
+      "id": "corridorkey-weights",
+      "kind": "hf_files",
+      "label": "CorridorKey 2.0 weights",
+      "layout_rel": "weights",
+      "layout_root": "v2_models_dir",
+      "notes": [
+        "Cross-check digests recorded in docs/design/rust-ui/remote-validation.md (2026-10-22, RTX 4090 run): corridorkey_v2.safetensors sha256 c43596de98cc8866d577c8a9f9ea239acdf3f7a130ff24e25db4375a50590436; foundation_stats.safetensors sha256 924783ceddd293fd470126332ce328166faea6c4c8d2f36402d5b95187166af3. Comparison evidence only; authoritative hashes come from HF LFS metadata."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "gated": false,
+        "notices": "CorridorKeyV2/LICENSE, CorridorKeyV2/THIRD_PARTY_NOTICES.md",
+        "source": "https://huggingface.co/nikopueringer/CorridorKey2.0",
+        "weights_license": "Corridor Key Licence v2 (license_name corridor-key-licence-2.0 on HF card; CC BY-NC-SA 4.0 with additional terms) per CorridorKeyV2/LICENSE"
+      },
+      "repo_id": "nikopueringer/CorridorKey2.0",
+      "required_profile": true,
+      "revision": "cf44a8db3f024bb49fd59daa408848ccf05f7477",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 2600000000,
+      "size_human": "~2.6 GB (part of ~5 GB bundle)"
+    },
+    "cradio": {
+      "capability": "key",
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "50d8db78effa543819dc32ae2eb0b72b8757e5b5",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 14000
+        },
+        {
+          "git_blob_sha1": "8f5cd7e3fc96a7a497c304a9af2747da285e7049",
+          "layout_path": "adaptor_attn.py",
+          "lfs": false,
+          "path": "adaptor_attn.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1796
+        },
+        {
+          "git_blob_sha1": "b8bdeb867f292f32078b1fa7d0054828357a8b6a",
+          "layout_path": "adaptor_base.py",
+          "lfs": false,
+          "path": "adaptor_base.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1693
+        },
+        {
+          "git_blob_sha1": "67b220b9499ead894a7486df0172d2d0c8d8b086",
+          "layout_path": "adaptor_generic.py",
+          "lfs": false,
+          "path": "adaptor_generic.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 3747
+        },
+        {
+          "git_blob_sha1": "8343bd55ed548eba018f0632d9a79c002e771686",
+          "layout_path": "adaptor_mlp.py",
+          "lfs": false,
+          "path": "adaptor_mlp.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4025
+        },
+        {
+          "git_blob_sha1": "f7df3bedd782348014f177df4a17da9dee94fa21",
+          "layout_path": "adaptor_module_factory.py",
+          "lfs": false,
+          "path": "adaptor_module_factory.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 3278
+        },
+        {
+          "git_blob_sha1": "a1dea8e898fe3b49fac1b647e20b6d818cb82bd1",
+          "layout_path": "adaptor_registry.py",
+          "lfs": false,
+          "path": "adaptor_registry.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1371
+        },
+        {
+          "git_blob_sha1": "349461abe34e1a99147c7be2eebee4bd43efe300",
+          "layout_path": "c-radio_v4-so400m_half.pth.tar",
+          "lfs": true,
+          "note": "excluded by downloader ignore pattern; unused duplicate",
+          "path": "c-radio_v4-so400m_half.pth.tar",
+          "required": false,
+          "sha256": "d02697ede20f2716c4db12a9d3dab1c5a9b47d15a16cdcd46a69d08062b77aaf",
+          "sha256_source": "hf-lfs-oid",
+          "size": 1205920113
+        },
+        {
+          "git_blob_sha1": "b41351238f557303456575916d7d520cc789b487",
+          "layout_path": "cls_token.py",
+          "lfs": false,
+          "path": "cls_token.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1787
+        },
+        {
+          "git_blob_sha1": "d1df62c1e68bc33d31967c9c3b15423e0d23017e",
+          "layout_path": "common.py",
+          "lfs": false,
+          "path": "common.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 7160
+        },
+        {
+          "git_blob_sha1": "f9f5dc124f4e5f06c22f7185670035ddc094a026",
+          "layout_path": "config.json",
+          "lfs": false,
+          "path": "config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 7571
+        },
+        {
+          "git_blob_sha1": "1ba9e8ba645194b4b9c742b2e80e712e3af8d67a",
+          "layout_path": "dinov2_arch.py",
+          "lfs": false,
+          "path": "dinov2_arch.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 35529
+        },
+        {
+          "git_blob_sha1": "da30449d526001e7c918ad02cf55ff810aab5270",
+          "layout_path": "dual_hybrid_vit.py",
+          "lfs": false,
+          "path": "dual_hybrid_vit.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 7179
+        },
+        {
+          "git_blob_sha1": "b81378307edea10f616fa70a4be925b65e3d9a27",
+          "layout_path": "enable_cpe_support.py",
+          "lfs": false,
+          "path": "enable_cpe_support.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 6557
+        },
+        {
+          "git_blob_sha1": "9f139f8848dab1d487fbb8b8953e036335e11efe",
+          "layout_path": "enable_damp.py",
+          "lfs": false,
+          "path": "enable_damp.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1290
+        },
+        {
+          "git_blob_sha1": "dc2d6d10f8809e32b630e5660fd9f1ad35497119",
+          "layout_path": "enable_spectral_reparam.py",
+          "lfs": false,
+          "path": "enable_spectral_reparam.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 11004
+        },
+        {
+          "git_blob_sha1": "a8733a97030f49257650a9592e6ee082610c9753",
+          "layout_path": "eradio_model.py",
+          "lfs": false,
+          "path": "eradio_model.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 58289
+        },
+        {
+          "git_blob_sha1": "1a80626ef1ba28caf6581c7404ea0ba464b6cf47",
+          "layout_path": "extra_models.py",
+          "lfs": false,
+          "path": "extra_models.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 5763
+        },
+        {
+          "git_blob_sha1": "a578c9c3ef17632ad7ba861887157353b70f3a00",
+          "layout_path": "extra_timm_models.py",
+          "lfs": false,
+          "path": "extra_timm_models.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 9892
+        },
+        {
+          "git_blob_sha1": "7d4cd2706328bdea36bc9857102545102ef136d7",
+          "layout_path": "feature_normalizer.py",
+          "lfs": false,
+          "path": "feature_normalizer.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 4399
+        },
+        {
+          "git_blob_sha1": "364137c8c991ad1eacabfd478d8550d335e2640e",
+          "layout_path": "forward_intermediates.py",
+          "lfs": false,
+          "path": "forward_intermediates.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 5604
+        },
+        {
+          "git_blob_sha1": "a5bc580d2918249c16199c48aa0bfda45b24b7f8",
+          "layout_path": "hf_model.py",
+          "lfs": false,
+          "path": "hf_model.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 7935
+        },
+        {
+          "git_blob_sha1": "63ad07a0c95ee1f45e0a977f59de5252d16e68ef",
+          "layout_path": "input_conditioner.py",
+          "lfs": false,
+          "path": "input_conditioner.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1492
+        },
+        {
+          "git_blob_sha1": "276c51473642ccbb594a3e11ab6a2471e0d58cd7",
+          "layout_path": "model.safetensors",
+          "lfs": true,
+          "path": "model.safetensors",
+          "required": true,
+          "sha256": "23e0c117de49d4ce909150fe6658d470829e6639647c7a5b035ce82e0d5b763c",
+          "sha256_source": "hf-lfs-oid",
+          "size": 1724986512
+        },
+        {
+          "git_blob_sha1": "c96766a179a8a8120e18384aa1d09a77af72f399",
+          "layout_path": "open_clip_adaptor.py",
+          "lfs": false,
+          "path": "open_clip_adaptor.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1623
+        },
+        {
+          "git_blob_sha1": "005782cf4a3da74a8e0503e1bd7305525dc520f8",
+          "layout_path": "preprocessor_config.json",
+          "lfs": false,
+          "path": "preprocessor_config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 331
+        },
+        {
+          "git_blob_sha1": "4acf510d5341b7b3835a96480d5df2398469ef69",
+          "layout_path": "radio_model.py",
+          "lfs": false,
+          "path": "radio_model.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 14018
+        },
+        {
+          "git_blob_sha1": "a9bca7b1612d896f0652cb6e3b67709add42aca9",
+          "layout_path": "siglip2_adaptor.py",
+          "lfs": false,
+          "path": "siglip2_adaptor.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 3307
+        },
+        {
+          "git_blob_sha1": "5026c70fa30fc97b13706278dc49311155d816fa",
+          "layout_path": "utils.py",
+          "lfs": false,
+          "path": "utils.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1109
+        },
+        {
+          "git_blob_sha1": "704b82851a4d70c130c42e84a2a9869b4caa08f1",
+          "layout_path": "vit_patch_generator.py",
+          "lfs": false,
+          "path": "vit_patch_generator.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 11475
+        },
+        {
+          "git_blob_sha1": "bfd1b413fbc38ae6c49d7feab806803de566f7a9",
+          "layout_path": "vitdet.py",
+          "lfs": false,
+          "path": "vitdet.py",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 6318
+        }
+      ],
+      "gated": false,
+      "id": "cradio",
+      "ignore_patterns": [
+        "*.pth.tar"
+      ],
+      "kind": "hf_snapshot",
+      "label": "C-RADIO v4 SO400M (foundation)",
+      "layout_rel": "vfms/cradio/C-RADIOv4-SO400M",
+      "layout_root": "v2_models_dir",
+      "notes": [
+        "The half-precision .pth.tar duplicates model.safetensors and is unused; excluded by ignore_patterns."
+      ],
+      "provenance": {
+        "code_license": "Imported Python code ships in the snapshot (hf_model.py, adaptor_*.py) under NVIDIA terms; custom_code model",
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "notices": "CorridorKeyV2/THIRD_PARTY_NOTICES.md",
+        "source": "https://huggingface.co/nvidia/C-RADIOv4-SO400M",
+        "weights_license": "NVIDIA Open Model License per vendored CorridorKeyV2/THIRD_PARTY_NOTICES.md and HF card (license: other)"
+      },
+      "repo_id": "nvidia/C-RADIOv4-SO400M",
+      "required_profile": true,
+      "revision": "c0457f5dc26ca145f954cd4fc5bb6114e5705ad8",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 1300000000,
+      "size_human": "~1.2 GB (part of ~5 GB bundle)"
+    },
+    "gvm": {
+      "capability": "hint-auto",
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "f42c811fa9bde760daaba7b5b47e7384dd9125cd",
+          "layout_path": "scheduler/scheduler_config.json",
+          "lfs": false,
+          "path": "scheduler/scheduler_config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 274
+        },
+        {
+          "git_blob_sha1": "7c94199e3c531aabb12caabef4e1c79ecfad9133",
+          "layout_path": "unet/adapter_config.json",
+          "lfs": false,
+          "note": "not read by UNetSpatioTemporalConditionModel.from_pretrained; upstream training-side config",
+          "path": "unet/adapter_config.json",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 873
+        },
+        {
+          "git_blob_sha1": "e58f9e9763883df6d003d1ffc4a6fbd9d09db9d7",
+          "layout_path": "unet/config.json",
+          "lfs": false,
+          "path": "unet/config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1060
+        },
+        {
+          "git_blob_sha1": "f522351f4a9cfc5e853e1eb07cc191d121e8358b",
+          "layout_path": "unet/diffusion_pytorch_model.safetensors",
+          "lfs": true,
+          "path": "unet/diffusion_pytorch_model.safetensors",
+          "required": true,
+          "sha256": "7cca8daebbbdd9325acb8a0231f81cf5f83f39b805e3579ade5ec7263c9ee0e8",
+          "sha256_source": "hf-lfs-oid",
+          "size": 6088185968
+        },
+        {
+          "git_blob_sha1": "0d89c31c44e9864b9d17f9d6a0fa435ae962c91d",
+          "layout_path": "unet/pytorch_lora_weights.pt",
+          "lfs": true,
+          "note": "LoRA weights loaded only when lora_base is explicitly passed; the app never passes it",
+          "path": "unet/pytorch_lora_weights.pt",
+          "required": false,
+          "sha256": "4f128ef4cf7b2eee10f1c17886bbe12b7679e08f96dd05aae817d50797d13c0d",
+          "sha256_source": "hf-lfs-oid",
+          "size": 2687354
+        },
+        {
+          "git_blob_sha1": "cbc917a4d7c8fb64dfede2531c8e84919e32e6f6",
+          "layout_path": "vae/config.json",
+          "lfs": false,
+          "path": "vae/config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 561
+        },
+        {
+          "git_blob_sha1": "83238b2c25fa37ef2f82d7131dad491ad5a1558b",
+          "layout_path": "vae/diffusion_pytorch_model.safetensors",
+          "lfs": true,
+          "path": "vae/diffusion_pytorch_model.safetensors",
+          "required": true,
+          "sha256": "5d92aa595a53d9da9faf594f09910ee869d5d567c8bb0362d5095673c69997d6",
+          "sha256_source": "hf-lfs-oid",
+          "size": 391017740
+        }
+      ],
+      "gated": false,
+      "id": "gvm",
+      "kind": "hf_snapshot",
+      "label": "GVM alpha generator",
+      "layout_rel": "gvm_core/weights",
+      "layout_root": "data_dir",
+      "notes": [
+        "Runtime closure (gvm_core/wrapper.py): unet/ (UNetSpatioTemporalConditionModel), vae/ (AutoencoderKLTemporalDecoder), scheduler/ (FlowMatchEulerDiscreteScheduler) and repo configs.",
+        "Wrapper has an HF fallback (live repo id) when weights are absent; provisioning must pre-satisfy this so offline use never triggers that path."
+      ],
+      "provenance": {
+        "code_license": "gvm_core code vendored in this repository under the same notice; note mentions SVD-derived terms - not independently verified",
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "notices": "gvm_core/LICENSE.md",
+        "source": "https://huggingface.co/geyongtao/gvm (upstream github.com/aim-uofa/GVM)",
+        "weights_license": "CC BY-NC-SA 4.0 per vendored gvm_core/LICENSE.md"
+      },
+      "repo_id": "geyongtao/gvm",
+      "required_overrides": {
+        "unet/adapter_config.json": {
+          "note": "not read by UNetSpatioTemporalConditionModel.from_pretrained; upstream training-side config",
+          "required": false
+        },
+        "unet/pytorch_lora_weights.pt": {
+          "note": "LoRA weights loaded only when lora_base is explicitly passed; the app never passes it",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "4c925740e7fb034590b4b896822183ad05d396db",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 6500000000,
+      "size_human": "~6.5 GB (repo snapshot; ~6.1 GB UNet is the required bulk)"
+    },
+    "matanyone2": {
+      "capability": "hint-guided",
+      "files": [
+        {
+          "git_blob_sha1": null,
+          "layout_path": "matanyone2.pth",
+          "lfs": false,
+          "path": "matanyone2.pth",
+          "required": true,
+          "sha256": "5e9821e4087231427376b437c85bb6e072b41e582314f06fd524f75bc4af5914",
+          "sha256_source": "github-release-digest",
+          "size": 141429115
+        }
+      ],
+      "id": "matanyone2",
+      "kind": "http_file",
+      "label": "MatAnyone2 checkpoint",
+      "layout_rel": "modules/MatAnyone2Module/checkpoints",
+      "layout_root": "data_dir",
+      "notes": [
+        "This repository implements MatAnyone2 (pq-yang/MatAnyone2); no MatAnyone v1 exists in this tree.",
+        "Release tag v1.0.0 asset matanyone2.pth; size from GitHub release metadata; sha256 from the asset digest when GitHub supplies one."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://github.com/pq-yang/MatAnyone2/releases/tag/v1.0.0",
+        "weights_license": "CONFLICT RECORDED: vendored modules/MatAnyone2Module/LICENSE.txt is S-Lab License 1.0 (non-commercial); upstream README section claims Apache 2.0. Vendored text governs until the owner resolves it; no conclusion drawn here."
+      },
+      "required_profile": false,
+      "revision": "v1.0.0",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 141429115,
+      "size_human": "141 MB",
+      "url": "https://github.com/pq-yang/MatAnyone2/releases/download/v1.0.0/matanyone2.pth"
+    },
+    "moge": {
+      "capability": "key",
+      "files": [
+        {
+          "git_blob_sha1": "87d30ba64eb8f37caf5b3f7557356ca640ca3cf5",
+          "layout_path": "model.pt",
+          "lfs": true,
+          "path": "model.pt",
+          "required": true,
+          "sha256": "16b8110e86d5dc5a849db120ca96ef3a223fd30b0c9146d1d81db504073da5f6",
+          "sha256_source": "hf-lfs-oid",
+          "size": 419110160
+        }
+      ],
+      "gated": false,
+      "id": "moge",
+      "kind": "hf_files",
+      "label": "MoGe-2 ViT-B normal (foundation)",
+      "layout_rel": "vfms/moge",
+      "layout_root": "v2_models_dir",
+      "provenance": {
+        "code_license": "MoGe/DINOv2 code vendored under CorridorKeyV2/third_party/MoGe (MIT / Apache-2.0 notices inside)",
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "notices": "CorridorKeyV2/THIRD_PARTY_NOTICES.md",
+        "source": "https://huggingface.co/Ruicheng/moge-2-vitb-normal",
+        "weights_license": "MIT per vendored notices and HF card (license: mit)"
+      },
+      "repo_id": "Ruicheng/moge-2-vitb-normal",
+      "required_profile": true,
+      "revision": "ca5f0e07ff01d3e5a364c1d954ed12ee1814b368",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 100000000,
+      "size_human": "~90 MB (part of ~5 GB bundle)"
+    },
+    "rvm": {
+      "capability": "key",
+      "files": [
+        {
+          "git_blob_sha1": null,
+          "layout_path": "pretrain_rvm_small16_256_204031069.npz",
+          "lfs": false,
+          "note": "no content hash offered by server metadata; verify via md5_b64 if upstream supplies one",
+          "path": "pretrain_rvm_small16_256_204031069.npz",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 270086372
+        }
+      ],
+      "id": "rvm",
+      "kind": "http_file",
+      "label": "Robust Video Matting small (foundation)",
+      "layout_rel": "vfms/rvm",
+      "layout_root": "v2_models_dir",
+      "md5_b64": "ZJb6kj8+tasiJbVeplXu7Q==",
+      "notes": [
+        "MD5 (base64) ZJb6kj8+tasiJbVeplXu7Q== is upstream-published and enforced by the vendored downloader pre/post copy.",
+        "GCS offers no sha256 metadata; sha256 stays explicitly unresolved and this artifact reports installed-unverified after md5 gate.",
+        "Recurrent video matting checkpoint (rvm_small16), not a similarly named matting model."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "notices": "CorridorKeyV2/THIRD_PARTY_NOTICES.md",
+        "source": "https://storage.googleapis.com/representations4d/checkpoints/pretrain_rvm_small16_256_204031069.npz (Google DeepMind representations4d)",
+        "weights_license": "CC-BY 4.0 weights, Apache-2.0 code, per vendored notices distinguishing the two"
+      },
+      "required_profile": true,
+      "revision": "https://storage.googleapis.com/representations4d/checkpoints/pretrain_rvm_small16_256_204031069.npz",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 15000000,
+      "size_human": "~14 MB (part of ~5 GB bundle)",
+      "url": "https://storage.googleapis.com/representations4d/checkpoints/pretrain_rvm_small16_256_204031069.npz"
+    },
+    "sam2-base-plus": {
+      "capability": "hint-track",
+      "default_variant": true,
+      "depends": [
+        "sam2-package"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "1466bad0cd2125f1be02ffdc1cf98718592636b4",
+          "layout_path": "sam2.1_hiera_base_plus.pt",
+          "lfs": true,
+          "path": "sam2.1_hiera_base_plus.pt",
+          "required": true,
+          "sha256": "a2345aede8715ab1d5d31b4a509fb160c5a4af1970f199d9054ccfb746c004c5",
+          "sha256_source": "hf-lfs-oid",
+          "size": 323606802
+        }
+      ],
+      "gated": false,
+      "hf_filename": "sam2.1_hiera_base_plus.pt",
+      "id": "sam2-base-plus",
+      "kind": "hf_cache_file",
+      "label": "SAM2.1 Hiera base-plus checkpoint",
+      "notes": [
+        "Lives in the shared HF hub cache (models--<repo>/snapshots/<revision>/), not the app data dir; cache dir honours HF_HUB_CACHE / HF_HOME.",
+        "Default tracker variant (Qt tracking/sam2_model default base-plus)."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/facebook/sam2.1-hiera-base-plus",
+        "weights_license": "Apache-2.0 per upstream facebookresearch/sam2 README licenses section (recorded, not adjudicated)"
+      },
+      "repo_id": "facebook/sam2.1-hiera-base-plus",
+      "required_profile": false,
+      "revision": "b7320756a13354e7530a63935656d35b2f91a290",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 324000000,
+      "size_human": "324 MB"
+    },
+    "sam2-large": {
+      "capability": "hint-track",
+      "default_variant": false,
+      "depends": [
+        "sam2-package"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a4229617ddc0bd034440718c11588c0bbcf85a70",
+          "layout_path": "sam2.1_hiera_large.pt",
+          "lfs": true,
+          "path": "sam2.1_hiera_large.pt",
+          "required": true,
+          "sha256": "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318",
+          "sha256_source": "hf-lfs-oid",
+          "size": 898083611
+        }
+      ],
+      "gated": false,
+      "hf_filename": "sam2.1_hiera_large.pt",
+      "id": "sam2-large",
+      "kind": "hf_cache_file",
+      "label": "SAM2.1 Hiera large checkpoint",
+      "notes": [
+        "Lives in the shared HF hub cache (models--<repo>/snapshots/<revision>/), not the app data dir; cache dir honours HF_HUB_CACHE / HF_HOME."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/facebook/sam2.1-hiera-large",
+        "weights_license": "Apache-2.0 per upstream facebookresearch/sam2 README licenses section (recorded, not adjudicated)"
+      },
+      "repo_id": "facebook/sam2.1-hiera-large",
+      "required_profile": false,
+      "revision": "665f8e2ad61cf5f53d65644ff27c8ee525124610",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 898000000,
+      "size_human": "898 MB"
+    },
+    "sam2-package": {
+      "capability": "hint-track",
+      "id": "sam2-package",
+      "install_hint": "Install via the project extras: pip install -e \".[tracker]\" (pinned by pyproject.toml)",
+      "kind": "local_package",
+      "label": "SAM2 Python package (sam-2)",
+      "notes": [
+        "Presence probed via importlib spec for sam2.build_sam (the module the runtime imports).",
+        "Manager reports status only; pip installs belong to the installer/runtime slice."
+      ],
+      "pip_spec": "sam-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4",
+      "provenance": {
+        "code_license": "Apache-2.0 per upstream repository LICENSE; label from historical README, recorded not adjudicated",
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://github.com/facebookresearch/sam2 @ 2b90b9f5ceec907a1c18123530e92e794ad901a4 (pyproject [tracker] extra)"
+      },
+      "required_profile": false,
+      "size_human": "pip package"
+    },
+    "sam2-small": {
+      "capability": "hint-track",
+      "default_variant": false,
+      "depends": [
+        "sam2-package"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "eb980035dd665a3f45871f79ee945634915bc31e",
+          "layout_path": "sam2.1_hiera_small.pt",
+          "lfs": true,
+          "path": "sam2.1_hiera_small.pt",
+          "required": true,
+          "sha256": "6d1aa6f30de5c92224f8172114de081d104bbd23dd9dc5c58996f0cad5dc4d38",
+          "sha256_source": "hf-lfs-oid",
+          "size": 184416285
+        }
+      ],
+      "gated": false,
+      "hf_filename": "sam2.1_hiera_small.pt",
+      "id": "sam2-small",
+      "kind": "hf_cache_file",
+      "label": "SAM2.1 Hiera small checkpoint",
+      "notes": [
+        "Lives in the shared HF hub cache (models--<repo>/snapshots/<revision>/), not the app data dir; cache dir honours HF_HUB_CACHE / HF_HOME."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/facebook/sam2.1-hiera-small",
+        "weights_license": "Apache-2.0 per upstream facebookresearch/sam2 README licenses section (recorded, not adjudicated)"
+      },
+      "repo_id": "facebook/sam2.1-hiera-small",
+      "required_profile": false,
+      "revision": "ee5bba1d82bb8749febdf90f45e84b687142ba03",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 184000000,
+      "size_human": "184 MB"
+    },
+    "videomama": {
+      "capability": "hint-guided",
+      "depends": [
+        "videomama-svd"
+      ],
+      "files": [
+        {
+          "git_blob_sha1": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1519
+        },
+        {
+          "git_blob_sha1": "31029fa98ead197ff0f580211a1e5e56cbb1dbc7",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 414
+        },
+        {
+          "git_blob_sha1": "106cd357288d4b7af863386104390db5038d2caa",
+          "layout_path": "dino_projection_mlp.pth",
+          "lfs": true,
+          "note": "not referenced by VideoMaMaInferenceModule inference code (training-side asset)",
+          "path": "dino_projection_mlp.pth",
+          "required": false,
+          "sha256": "cd0bdd8253bfee2a777cd41614dd29ef67a39511034761b4fabb2b11425c9b07",
+          "sha256_source": "hf-lfs-oid",
+          "size": 13646720
+        },
+        {
+          "git_blob_sha1": "a28d9ab350a058f73103088cfe59410e425885ef",
+          "layout_path": "VideoMaMa/unet/config.json",
+          "lfs": false,
+          "path": "unet/config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 937
+        },
+        {
+          "git_blob_sha1": "14a385d293ada96ce2957c64dfddfcc9c605b2be",
+          "layout_path": "VideoMaMa/unet/diffusion_pytorch_model.safetensors",
+          "lfs": true,
+          "path": "unet/diffusion_pytorch_model.safetensors",
+          "required": true,
+          "sha256": "f2442bf16ededad25c1c272ae7535b6411c43cee5c27b012bb6f7fda72d07b8c",
+          "sha256_source": "hf-lfs-oid",
+          "size": 6098728544
+        }
+      ],
+      "gated": false,
+      "id": "videomama",
+      "kind": "hf_snapshot",
+      "label": "VideoMaMa UNet checkpoint",
+      "layout_rel": "VideoMaMaInferenceModule/checkpoints",
+      "layout_root": "data_dir",
+      "notes": [
+        "RUNTIME LAYOUT RESOLVED (loader contract, VideoMaMaInferenceModule/pipeline.py): the pipeline calls UNetSpatioTemporalConditionModel.from_pretrained(<ckpts>/VideoMaMa, subfolder='unet'), so the required layout is VideoMaMa/unet/{config.json, diffusion_pytorch_model.safetensors}. The HF repo has unet/ at top level; path_remap unet/ -> VideoMaMa/unet/ implements it.",
+        "The legacy setup_models.py rename unet/ -> VideoMaMa/ produced VideoMaMa/{config,diffusion...} directly, which does NOT satisfy the loader (searched subfolder unet/ missing). Installs with that flat layout must be repaired to the nested layout; detection now checks the nested closure.",
+        "Requires the SVD img2vid-xt base (videomama-svd) for image encoder, feature extractor and temporal VAE."
+      ],
+      "path_remap": {
+        "unet/": "VideoMaMa/unet/"
+      },
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/SammyLim/VideoMaMa",
+        "weights_license": "Per VideoMaMaInferenceModule/LICENSE.md: code CC BY-NC 4.0; checkpoint weights under upstream VideoMaMa terms"
+      },
+      "repo_id": "SammyLim/VideoMaMa",
+      "required_overrides": {
+        "dino_projection_mlp.pth": {
+          "note": "not referenced by VideoMaMaInferenceModule inference code (training-side asset)",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "e289a7acc8403c4fbe4dea2a1de5a9749ebc9bf5",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 6200000000,
+      "size_human": "~6.1 GB (UNet closure) + ~1.5 GB SVD base closure"
+    },
+    "videomama-svd": {
+      "capability": "hint-guided",
+      "files": [
+        {
+          "git_blob_sha1": "78ff5b07c33f29189b6901023fc9f4d5724f31f7",
+          "layout_path": ".gitattributes",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": ".gitattributes",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 1571
+        },
+        {
+          "git_blob_sha1": "1d9ce2ee1067327543544de197291726e4fc57a4",
+          "layout_path": "LICENSE.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "LICENSE.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 11852
+        },
+        {
+          "git_blob_sha1": "16b65b7ca9bd5a548fe89ff5463a1d6733ead1f7",
+          "layout_path": "README.md",
+          "lfs": false,
+          "note": "documentation/notice file",
+          "path": "README.md",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 8156
+        },
+        {
+          "git_blob_sha1": "6a355280c143517c8472151ef8715061c6f436b8",
+          "layout_path": "comparison.png",
+          "lfs": false,
+          "note": "repository media, not a runtime asset",
+          "path": "comparison.png",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 146654
+        },
+        {
+          "git_blob_sha1": "0d9d33b883843d1b370da781f3943051067e1b2c",
+          "layout_path": "feature_extractor/preprocessor_config.json",
+          "lfs": false,
+          "path": "feature_extractor/preprocessor_config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 518
+        },
+        {
+          "git_blob_sha1": "1f5518ccff586593a40f4eaf0e75c066dca54bec",
+          "layout_path": "image_encoder/config.json",
+          "lfs": false,
+          "path": "image_encoder/config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 685
+        },
+        {
+          "git_blob_sha1": "29848b356a3062d1da3b773a82d62de5e49a8f89",
+          "layout_path": "image_encoder/model.fp16.safetensors",
+          "lfs": true,
+          "path": "image_encoder/model.fp16.safetensors",
+          "required": true,
+          "sha256": "ae616c24393dd1854372b0639e5541666f7521cbe219669255e865cb7f89466a",
+          "sha256_source": "hf-lfs-oid",
+          "size": 1264217240
+        },
+        {
+          "git_blob_sha1": "ce6103b0c71f00f25075c03e9d5108f15f957310",
+          "layout_path": "image_encoder/model.safetensors",
+          "lfs": true,
+          "note": "fp32 variant; runtime loads variant='fp16'",
+          "path": "image_encoder/model.safetensors",
+          "required": false,
+          "sha256": "ed1e5af7b4042ca30ec29999a4a5cfcac90b7fb610fd05ace834f2dcbb763eab",
+          "sha256_source": "hf-lfs-oid",
+          "size": 2528371296
+        },
+        {
+          "git_blob_sha1": "814cc99f8674db1df84d0fff0d4e5535e745d328",
+          "layout_path": "model_index.json",
+          "lfs": false,
+          "path": "model_index.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 496
+        },
+        {
+          "git_blob_sha1": "5adcd559625989ca53a08d1b0d317f0071a2f8b0",
+          "layout_path": "output_tile.gif",
+          "lfs": true,
+          "note": "repository media, not a runtime asset",
+          "path": "output_tile.gif",
+          "required": false,
+          "sha256": "2340a9809e36fa9634633c7cc5fd256737c620ba47151726c85173512dc5c8ff",
+          "sha256_source": "hf-lfs-oid",
+          "size": 18630497
+        },
+        {
+          "git_blob_sha1": "05ea60ddb0d95607f9306e020e4ea355664d0275",
+          "layout_path": "scheduler/scheduler_config.json",
+          "lfs": false,
+          "note": "VideoInferencePipeline is single-step; no scheduler is loaded from the base repo",
+          "path": "scheduler/scheduler_config.json",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 533
+        },
+        {
+          "git_blob_sha1": "834e6b8c6f74a1a5e530eda031edd5c43993b4e2",
+          "layout_path": "svd_xt.safetensors",
+          "lfs": true,
+          "note": "single-file full-model export; not used by the diffusers component layout",
+          "path": "svd_xt.safetensors",
+          "required": false,
+          "sha256": "b2652c23d64a1da5f14d55011b9b6dce55f2e72e395719f1cd1f8a079b00a451",
+          "sha256_source": "hf-lfs-oid",
+          "size": 9559625980
+        },
+        {
+          "git_blob_sha1": "678dae8b11151c95b7adc710055ba7af1049e7ff",
+          "layout_path": "svd_xt_image_decoder.safetensors",
+          "lfs": true,
+          "note": "single-file full-model export; not used by the diffusers component layout",
+          "path": "svd_xt_image_decoder.safetensors",
+          "required": false,
+          "sha256": "99aa889bf6d1ca28e026755b83ba37e3072ad79b45dd4c94fae14bee7482263b",
+          "sha256_source": "hf-lfs-oid",
+          "size": 9503252964
+        },
+        {
+          "git_blob_sha1": "2a30c09f6764459c04d7dc10bf5b4bbf1e5ebc73",
+          "layout_path": "unet/config.json",
+          "lfs": false,
+          "note": "SVD unet not loaded; the fine-tuned VideoMaMa UNet is used instead",
+          "path": "unet/config.json",
+          "required": false,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 984
+        },
+        {
+          "git_blob_sha1": "94136ad164b8599413d2c232829bd570fd0aa858",
+          "layout_path": "unet/diffusion_pytorch_model.fp16.safetensors",
+          "lfs": true,
+          "note": "SVD unet not loaded; the fine-tuned VideoMaMa UNet is used instead",
+          "path": "unet/diffusion_pytorch_model.fp16.safetensors",
+          "required": false,
+          "sha256": "9fbc02e90f37d422f5e3a4aeaee95f6629dc8c45ca211b951626e930daf2bddf",
+          "sha256_source": "hf-lfs-oid",
+          "size": 3049435868
+        },
+        {
+          "git_blob_sha1": "d60e3f9ff310ac05f4e57eb84f76f8e2ea006f19",
+          "layout_path": "unet/diffusion_pytorch_model.safetensors",
+          "lfs": true,
+          "note": "SVD unet not loaded; the fine-tuned VideoMaMa UNet is used instead",
+          "path": "unet/diffusion_pytorch_model.safetensors",
+          "required": false,
+          "sha256": "7783d82729af04f26ded4641a5952617fe331fc46add332fb9e47674fecc6ad7",
+          "sha256_source": "hf-lfs-oid",
+          "size": 6098682464
+        },
+        {
+          "git_blob_sha1": "7c27c35b4e6ab0e705d46306f60d36839b680c03",
+          "layout_path": "vae/config.json",
+          "lfs": false,
+          "path": "vae/config.json",
+          "required": true,
+          "sha256": null,
+          "sha256_source": null,
+          "size": 607
+        },
+        {
+          "git_blob_sha1": "76c1b086f4ca2c1060a3ba7c8dea11d522a67584",
+          "layout_path": "vae/diffusion_pytorch_model.fp16.safetensors",
+          "lfs": true,
+          "path": "vae/diffusion_pytorch_model.fp16.safetensors",
+          "required": true,
+          "sha256": "af602cd0eb4ad6086ec94fbf1438dfb1be5ec9ac03fd0215640854e90d6463a3",
+          "sha256_source": "hf-lfs-oid",
+          "size": 195531910
+        },
+        {
+          "git_blob_sha1": "83238b2c25fa37ef2f82d7131dad491ad5a1558b",
+          "layout_path": "vae/diffusion_pytorch_model.safetensors",
+          "lfs": true,
+          "note": "fp32 variant; runtime loads variant='fp16'",
+          "path": "vae/diffusion_pytorch_model.safetensors",
+          "required": false,
+          "sha256": "5d92aa595a53d9da9faf594f09910ee869d5d567c8bb0362d5095673c69997d6",
+          "sha256_source": "hf-lfs-oid",
+          "size": 391017740
+        }
+      ],
+      "gated": false,
+      "id": "videomama-svd",
+      "kind": "hf_snapshot",
+      "label": "Stable Video Diffusion img2vid-xt base (VideoMaMa dependency)",
+      "layout_rel": "VideoMaMaInferenceModule/checkpoints/stable-video-diffusion-img2vid-xt",
+      "layout_root": "data_dir",
+      "notes": [
+        "Runtime closure (VideoMaMaInferenceModule/pipeline.py VideoInferencePipeline.__init__): model_index.json (identity marker), feature_extractor/preprocessor_config.json, image_encoder/{config.json, model.fp16.safetensors} (variant='fp16'), vae/{config.json, diffusion_pytorch_model.fp16.safetensors} (variant='fp16'). The SVD UNet, fp32 variants and single-file exports are not loaded and stay required=false.",
+        "Gating status is recorded from HF metadata per revision; if gated, downloads need license acceptance or a token kept out of logs/settings/catalogs."
+      ],
+      "provenance": {
+        "disclaimer": "Recorded as evidence for review; not a legal conclusion.",
+        "source": "https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt",
+        "weights_license": "Stability AI Community License per repository card (recorded); verify exact terms/gating at the pinned revision before distribution"
+      },
+      "repo_id": "stabilityai/stable-video-diffusion-img2vid-xt",
+      "required_overrides": {
+        "comparison.png": {
+          "note": "repository media, not a runtime asset",
+          "required": false
+        },
+        "image_encoder/model.safetensors": {
+          "note": "fp32 variant; runtime loads variant='fp16'",
+          "required": false
+        },
+        "output_tile.gif": {
+          "note": "repository media, not a runtime asset",
+          "required": false
+        },
+        "scheduler/scheduler_config.json": {
+          "note": "VideoInferencePipeline is single-step; no scheduler is loaded from the base repo",
+          "required": false
+        },
+        "svd_xt.safetensors": {
+          "note": "single-file full-model export; not used by the diffusers component layout",
+          "required": false
+        },
+        "svd_xt_image_decoder.safetensors": {
+          "note": "single-file full-model export; not used by the diffusers component layout",
+          "required": false
+        },
+        "unet/config.json": {
+          "note": "SVD unet not loaded; the fine-tuned VideoMaMa UNet is used instead",
+          "required": false
+        },
+        "unet/diffusion_pytorch_model.fp16.safetensors": {
+          "note": "SVD unet not loaded; the fine-tuned VideoMaMa UNet is used instead",
+          "required": false
+        },
+        "unet/diffusion_pytorch_model.safetensors": {
+          "note": "SVD unet not loaded; the fine-tuned VideoMaMa UNet is used instead",
+          "required": false
+        },
+        "vae/diffusion_pytorch_model.safetensors": {
+          "note": "fp32 variant; runtime loads variant='fp16'",
+          "required": false
+        }
+      },
+      "required_profile": false,
+      "revision": "9e43909513c6714f1bc78bcb44d96e733cd242aa",
+      "revision_status": "pinned",
+      "size_bytes_estimate": 1459773035,
+      "size_human": "~1.46 GB (runtime files and notices; full repo is ~32.6 GB)"
+    }
+  },
+  "catalog_version": 1,
+  "meta": {
+    "hash_policy": "sha256 recorded only when upstream metadata supplies it: HF LFS lfs.oid (content sha256) or GitHub release asset digest. Git blob SHA-1 (HF tree oid) is stored separately as git_blob_sha1 and is NOT a content hash. Hashes are never invented and never derived from downloaded bytes (self-authored checksums are forbidden).",
+    "license_note": "License labels are recorded evidence only, not legal clearance.",
+    "profiles": {
+      "full": "every exposed artifact: CK2 bundle, SAM2 package + all 3 SAM2.1 variants, GVM, VideoMaMa + SVD base, MatAnyone2, all 16 BiRefNet variants and shared BiRefNet runtime probe",
+      "required": "corridorkey bundle (weights + C-RADIO + MoGe + RVM + vendored code)"
+    },
+    "revision_policy": "All HF/GitHub artifacts pin immutable revisions (commit sha or release tag). Pinned artifacts never follow upstream HEAD; refresh records drift instead of following it.",
+    "runtime_notes": {
+      "birefnet_runtime": "All 16 catalog-pinned BiRefNet trees were checked via HF tree metadata; each config auto_map names birefnet.py and BiRefNet_config.py, with no nets.py/builds.py. Their source imports are covered by the shared module probe; timm is version-pinned to 1.0.24.",
+      "openexr_windows": "OpenEXR on Windows does NOT require VS Build Tools when the supported wheel route works: the cp312 win_amd64 wheel OpenEXR 3.5.2 bundles both OpenEXR and Imath extensions (dependencies: numpy only), verified 2026-10-22 on the RTX 4090 validation host (pip --target install, offline wheel). The local-model-install-audit.md build-tools claim is superseded by that verification; keep the wheel pin route."
+    },
+    "verification_policy": "verified=true requires every required file to match a trusted sha256 recorded in the local stat-keyed hash cache. Files or artifacts without trusted hashes report verified=false with reason no-trusted-hash. Unresolved metadata can never report verified."
+  },
+  "updated": "2026-10-22"
+}

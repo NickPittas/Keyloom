@@ -213,10 +213,10 @@ class TestValidateCheckpoint:
         with pytest.raises(RuntimeError, match="not accessible"):
             SAM2Tracker._validate_checkpoint(ckpt)
 
-    def test_error_message_includes_delete_path(self, tmp_path):
+    def test_error_message_includes_repair_action(self, tmp_path):
         ckpt = str(tmp_path / "snapshots" / "abc123" / "model.pt")
         os.makedirs(os.path.dirname(ckpt))
         with open(ckpt, 'wb') as f:
             f.write(b"\x00" * 50)
-        with pytest.raises(RuntimeError, match="Delete this folder"):
+        with pytest.raises(RuntimeError, match="Repair the installed SAM2 model"):
             SAM2Tracker._validate_checkpoint(ckpt)

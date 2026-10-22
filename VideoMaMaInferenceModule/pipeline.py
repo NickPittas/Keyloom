@@ -863,14 +863,25 @@ class VideoInferencePipeline:
 
         # Load models from pretrained paths
         try:
-            self.feature_extractor = CLIPImageProcessor.from_pretrained(base_model_path, subfolder="feature_extractor")
+            self.feature_extractor = CLIPImageProcessor.from_pretrained(
+                base_model_path, subfolder="feature_extractor", local_files_only=True
+            )
             self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(base_model_path,
                                                                                subfolder="image_encoder",
-                                                                               variant="fp16")
-            self.vae = AutoencoderKLTemporalDecoder.from_pretrained(base_model_path, subfolder="vae", variant="fp16")
-            self.unet = UNetSpatioTemporalConditionModel.from_pretrained(unet_checkpoint_path, subfolder="unet")
+                                                                               variant="fp16",
+                                                                               local_files_only=True)
+            self.vae = AutoencoderKLTemporalDecoder.from_pretrained(
+                base_model_path, subfolder="vae", variant="fp16", local_files_only=True
+            )
+            self.unet = UNetSpatioTemporalConditionModel.from_pretrained(
+                unet_checkpoint_path, subfolder="unet", local_files_only=True
+            )
         except Exception as e:
-            raise IOError(f"Fatal error loading models: {e}")
+            raise IOError(
+                f"VideoMaMa local model assets are incomplete under {base_model_path} and "
+                f"{unet_checkpoint_path}. Repair the model/runtime installation; inference "
+                f"does not fetch missing files. Details: {e}"
+            ) from e
 
         # Use the configured inference dtype on CUDA; CPU falls back to FP32.
         self.image_encoder.to(self.device, dtype=self.model_dtype).eval()

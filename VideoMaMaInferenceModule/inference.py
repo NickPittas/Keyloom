@@ -11,7 +11,6 @@ import cv2
 import numpy as np
 from PIL import Image
 from typing import Callable, Iterator, List, Optional
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -21,49 +20,6 @@ if current_dir not in sys.path:
     sys.path.append(current_dir)
 
 from .pipeline import VideoInferencePipeline
-
-_BUNDLED_CHECKPOINT_DIR = os.path.join(current_dir, "checkpoints")
-
-
-def _candidate_checkpoint_dirs() -> List[str]:
-    """Return checkpoint directories to search, in priority order.
-
-    Order:
-      1. ``get_data_dir()/VideoMaMaInferenceModule/checkpoints`` — where
-         ``scripts/setup_models.py`` writes in frozen builds and where the
-         installer is expected to drop downloads.
-      2. The bundled directory next to this file. In dev mode this is the
-         repo's ``VideoMaMaInferenceModule/checkpoints``. In PyInstaller
-         onedir builds this lives under ``_internal/...`` — kept as a
-         fallback so existing manual installs continue to work.
-    """
-    dirs: List[str] = []
-    try:
-        from backend.project import get_data_dir  # Lazy import: avoid cycles
-        data_dir = get_data_dir()
-        if data_dir:
-            dirs.append(os.path.join(data_dir, "VideoMaMaInferenceModule", "checkpoints"))
-    except Exception:
-        pass
-    if _BUNDLED_CHECKPOINT_DIR not in dirs:
-        dirs.append(_BUNDLED_CHECKPOINT_DIR)
-    return dirs
-
-
-def _resolve_checkpoint(subpath: str) -> tuple[Optional[str], List[str]]:
-    """Locate ``subpath`` under the first candidate dir that contains it.
-
-    Returns ``(found_path, searched_paths)``. ``found_path`` is ``None`` if
-    the file/folder does not exist in any candidate location.
-    """
-    searched: List[str] = []
-    for base in _candidate_checkpoint_dirs():
-        candidate = os.path.join(base, subpath)
-        searched.append(candidate)
-        if os.path.exists(candidate):
-            return candidate, searched
-    return None, searched
-
 
 def load_videomama_model(base_model_path: Optional[str] = None, unet_checkpoint_path: Optional[str] = None, device: str = "cuda") -> VideoInferencePipeline:
     """
@@ -81,42 +37,52 @@ def load_videomama_model(base_model_path: Optional[str] = None, unet_checkpoint_
     Returns:
         VideoInferencePipeline: Loaded pipeline instance.
     """
-    base_searched: List[str] = []
-    unet_searched: List[str] = []
+    from backend.model_runtime import acquire_model_artifact, validate_local_model_path
 
-    if base_model_path is None:
-        base_model_path, base_searched = _resolve_checkpoint("stable-video-diffusion-img2vid-xt")
-    if unet_checkpoint_path is None:
-        unet_checkpoint_path, unet_searched = _resolve_checkpoint("VideoMaMa")
-
-    if base_model_path is None:
-        raise FileNotFoundError(
-            "Stable Video Diffusion base model not found. Download "
-            "'stabilityai/stable-video-diffusion-img2vid-xt' (~9.5 GB) into one "
-            "of these locations:\n  " + "\n  ".join(base_searched)
+    lease = None
+    if base_model_path is None and unet_checkpoint_path is None:
+        lease = acquire_model_artifact("videomama")
+        base_model_path = str(lease.paths["videomama-svd"])
+        unet_checkpoint_path = str(lease.paths["videomama"])
+    elif base_model_path is None:
+        lease = acquire_model_artifact("videomama-svd")
+        base_model_path = str(lease.path)
+        unet_checkpoint_path = str(validate_local_model_path(
+            "videomama", unet_checkpoint_path, components=("unet",)
+        ))
+    elif unet_checkpoint_path is None:
+        lease = acquire_model_artifact(
+            "videomama", exclude_dependencies=("videomama-svd",)
         )
-    if unet_checkpoint_path is None:
-        raise FileNotFoundError(
-            "VideoMaMa UNet checkpoint not found. Download "
-            "'SammyLim/VideoMaMa' into one of these locations:\n  "
-            + "\n  ".join(unet_searched)
-        )
+        unet_checkpoint_path = str(lease.path)
+        base_model_path = str(validate_local_model_path("videomama-svd", base_model_path))
+    else:
+        base_model_path = str(validate_local_model_path("videomama-svd", base_model_path))
+        unet_checkpoint_path = str(validate_local_model_path(
+            "videomama", unet_checkpoint_path, components=("unet",)
+        ))
 
     logger.info(f"Loading Base model from {base_model_path}...")
     logger.info(f"Loading VideoMaMa UNet from {unet_checkpoint_path}...")
 
-    # Final existence check for explicit user-provided paths.
-    if not os.path.exists(base_model_path):
-        raise FileNotFoundError(f"Base model path not found: {base_model_path}")
-    if not os.path.exists(unet_checkpoint_path):
-        raise FileNotFoundError(f"UNet checkpoint path not found: {unet_checkpoint_path}")
+    try:
+        if not os.path.isdir(base_model_path):
+            raise FileNotFoundError(f"Local Stable Video Diffusion model directory is missing: {base_model_path}")
+        if not os.path.isdir(unet_checkpoint_path):
+            raise FileNotFoundError(f"Local VideoMaMa checkpoint directory is missing: {unet_checkpoint_path}")
 
-    pipeline = VideoInferencePipeline(
-        base_model_path=base_model_path,
-        unet_checkpoint_path=unet_checkpoint_path,
-        weight_dtype=torch.float16, # Use float16 for inference by default
-        device=device
-    )
+        pipeline = VideoInferencePipeline(
+            base_model_path=base_model_path,
+            unet_checkpoint_path=unet_checkpoint_path,
+            weight_dtype=torch.float16, # Use float16 for inference by default
+            device=device
+        )
+    except Exception:
+        if lease is not None:
+            lease.close()
+        raise
+    if lease is not None:
+        pipeline._model_asset_lease = lease
     
     logger.info("VideoMaMa pipeline loaded successfully")
     return pipeline

@@ -23,32 +23,6 @@ from .gvm.utils.inference_utils import VideoReader, VideoWriter, ImageSequenceRe
 from .gvm.models.unet_spatio_temporal_condition import UNetSpatioTemporalConditionModel
 
 
-_BUNDLED_WEIGHTS_DIR = osp.join(osp.dirname(__file__), "weights")
-
-
-def _resolve_gvm_weights_dir():
-    """Return the first existing GVM weights directory, or None.
-
-    Checks ``<data_dir>/gvm_core/weights`` first (where ``setup_models.py``
-    writes in frozen builds), then falls back to the bundled directory
-    beside this file so existing manual installs keep working.
-    """
-    candidates = []
-    try:
-        from backend.project import get_data_dir  # Lazy import: avoid cycles
-        data_dir = get_data_dir()
-        if data_dir:
-            candidates.append(osp.join(data_dir, "gvm_core", "weights"))
-    except Exception:
-        pass
-    if _BUNDLED_WEIGHTS_DIR not in candidates:
-        candidates.append(_BUNDLED_WEIGHTS_DIR)
-    for path in candidates:
-        if osp.isdir(path):
-            return path
-    return None
-
-
 def seed_all(seed: int = 0):
     random.seed(seed)
     np.random.seed(seed)
@@ -89,16 +63,37 @@ class GVMProcessor:
         self.device = torch.device(device)
         # MPS float16 GroupNorm / attention produce NaN; run full pipeline in float32
         self._dtype = torch.float32 if self.device.type == 'mps' else torch.float16
+        self._model_asset_lease = None
 
-        # Resolve default weights path from installed data dir first, then the
-        # bundled module dir, finally falling back to the HuggingFace repo ID.
+        # Defaults must follow the provisioner's catalog root; explicit local
+        # model roots remain supported for existing callers.
+        from backend.model_runtime import acquire_model_artifact, validate_local_model_path
+
+        lease = None
+        if lora_base is not None and not osp.isdir(lora_base):
+            raise FileNotFoundError(f"Explicit GVM LoRA directory is missing: {lora_base}")
+
         if model_base is None:
-            local_weights = _resolve_gvm_weights_dir()
-            if local_weights is not None:
-                model_base = local_weights
-            else:
-                model_base = "geyongtao/gvm"
-            
+            if unet_base is not None:
+                unet_base = str(validate_local_model_path(
+                    "gvm", unet_base, components=("unet",)
+                ))
+            lease = acquire_model_artifact(
+                "gvm", exclude_components=("unet",) if unet_base is not None else ()
+            )
+            model_base = str(lease.path)
+        else:
+            model_base = str(validate_local_model_path(
+                "gvm",
+                model_base,
+                components=("vae", "scheduler") if unet_base is not None else None,
+            ))
+
+        if unet_base is not None and model_base is not None and lease is None:
+            unet_base = str(validate_local_model_path(
+                "gvm", unet_base, components=("unet",)
+            ))
+
         self.model_base = model_base
         self.unet_base = unet_base
         self.lora_base = lora_base
@@ -108,34 +103,48 @@ class GVMProcessor:
         seed_all(seed)
         
         logger.info(f"Loading GVM models from {model_base}...")
-        self.vae = AutoencoderKLTemporalDecoder.from_pretrained(model_base, subfolder="vae", torch_dtype=self._dtype)
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_base, subfolder="scheduler")
-        
         unet_folder = unet_base if unet_base is not None else model_base
-        self.unet = UNetSpatioTemporalConditionModel.from_pretrained(
-            unet_folder, 
-            subfolder="unet", 
-            class_embed_type=None,
-            torch_dtype=self._dtype
-        )
+        try:
+            self.vae = AutoencoderKLTemporalDecoder.from_pretrained(
+                model_base, subfolder="vae", torch_dtype=self._dtype, local_files_only=True
+            )
+            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model_base, subfolder="scheduler", local_files_only=True
+            )
+            self.unet = UNetSpatioTemporalConditionModel.from_pretrained(
+                unet_folder,
+                subfolder="unet",
+                class_embed_type=None,
+                torch_dtype=self._dtype,
+                local_files_only=True,
+            )
+        except Exception as exc:
+            if lease is not None:
+                lease.close()
+            raise RuntimeError(
+                f"GVM local model assets or runtime dependencies are incomplete at {model_base}. "
+                f"Repair the model/runtime installation; inference does not fetch missing files. "
+                f"Details: {exc}"
+            ) from exc
 
-        self.pipe = GVMPipeline(vae=self.vae, unet=self.unet, scheduler=self.scheduler)
-        if lora_base:
-            # Check if lora_base is None or points to valid path, otherwise try default
-            if lora_base is None and osp.exists(osp.join(model_base, "unet")):
-                 # Often lora weights are just the unet weights in this codebase based on demo.py usage
-                 pass 
-            elif lora_base:
-                self.pipe.load_lora_weights(lora_base)
-                
-        self.pipe = self.pipe.to(self.device, dtype=self._dtype)
+        try:
+            self.pipe = GVMPipeline(vae=self.vae, unet=self.unet, scheduler=self.scheduler)
+            if lora_base:
+                self.pipe.load_lora_weights(lora_base, local_files_only=True)
 
-        # MPS SDPA triggers Metal matmul assertion at non-trivial resolutions;
-        # fall back to vanilla attention (AttnProcessor) on Apple Silicon.
-        if self.device.type == 'mps':
-            from diffusers.models.attention_processor import AttnProcessor
-            self.unet.set_attn_processor(AttnProcessor())
-            self.vae.set_attn_processor(AttnProcessor())
+            self.pipe = self.pipe.to(self.device, dtype=self._dtype)
+
+            # MPS SDPA can assert at non-trivial resolutions; use vanilla attention.
+            if self.device.type == 'mps':
+                from diffusers.models.attention_processor import AttnProcessor
+                self.unet.set_attn_processor(AttnProcessor())
+                self.vae.set_attn_processor(AttnProcessor())
+        except Exception:
+            if lease is not None:
+                lease.close()
+            raise
+
+        self._model_asset_lease = lease
 
         logger.info("Models loaded.")
 
@@ -149,6 +158,14 @@ class GVMProcessor:
         # vae/unet are owned by pipe, but move explicitly in case of ref drift
         if self.vae is not None:
             self.vae = self.vae.to(device, dtype=self._dtype)
+
+    def unload(self) -> None:
+        if self.pipe is not None:
+            self.pipe.to("cpu")
+        self.pipe = self.vae = self.unet = self.scheduler = None
+        if self._model_asset_lease is not None:
+            self._model_asset_lease.close()
+            self._model_asset_lease = None
         if self.unet is not None:
             self.unet = self.unet.to(device, dtype=self._dtype)
         return self

@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import cv2
@@ -29,62 +30,22 @@ from torchvision import transforms
 
 logger = logging.getLogger(__name__)
 
-_BUNDLED_CHECKPOINT_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "checkpoints"
-)
 
+def _resolve_model_dir(repo_name: str, *, roots=None) -> tuple[Optional[str], str]:
+    """Return installed and target paths for lightweight diagnostics only."""
+    from backend.model_catalog import load_catalog
+    from backend.model_runtime import model_artifact_dir
 
-def _candidate_checkpoint_dirs() -> List[str]:
-    """Return BiRefNet checkpoint directories to search, in priority order.
+    artifact = load_catalog().get(f"birefnet-{repo_name}")
+    model_dir = model_artifact_dir(artifact.id, roots=roots)
+    weight_paths = [
+        model_dir / file.layout_path
+        for file in artifact.required_files()
+        if Path(file.layout_path).suffix.lower() in {".safetensors", ".bin"}
+    ]
+    existing = str(model_dir) if any(path.is_file() for path in weight_paths) else None
+    return existing, str(model_dir)
 
-    Order:
-      1. ``<data_dir>/modules/BiRefNetModule/checkpoints`` — writable on
-         every platform. The setup wizard downloads here in frozen builds
-         and the lazy runtime download in ``_ensure_loaded`` writes here
-         too. This is the only path that works on installed macOS builds
-         because ``/Applications/EZ-CorridorKey.app/Contents/...`` is
-         read-only for non-admin users.
-      2. ``_BUNDLED_CHECKPOINT_DIR`` — the directory next to this file.
-         In dev mode this is ``modules/BiRefNetModule/checkpoints``. In
-         frozen builds this lives inside the bundle and is read-only on
-         macOS, but stays as a fallback so existing manual/dev installs
-         keep working.
-    """
-    dirs: List[str] = []
-    try:
-        from backend.project import get_data_dir  # Lazy import: avoid cycles
-        data_dir = get_data_dir()
-        if data_dir:
-            dirs.append(
-                os.path.join(
-                    data_dir, "modules", "BiRefNetModule", "checkpoints"
-                )
-            )
-    except Exception:
-        pass
-    if _BUNDLED_CHECKPOINT_DIR not in dirs:
-        dirs.append(_BUNDLED_CHECKPOINT_DIR)
-    return dirs
-
-
-def _resolve_model_dir(repo_name: str) -> Tuple[Optional[str], str]:
-    """Locate an already-downloaded BiRefNet variant.
-
-    Returns ``(existing_dir_or_None, preferred_download_dir)``. The
-    preferred download dir is always the first candidate — the writable
-    data-dir location — so a cold lazy download never targets the
-    read-only bundled path.
-    """
-    candidates = _candidate_checkpoint_dirs()
-    for base in candidates:
-        candidate = os.path.join(base, repo_name)
-        if os.path.isdir(candidate) and any(
-            f.endswith((".safetensors", ".bin"))
-            for f in os.listdir(candidate)
-            if os.path.isfile(os.path.join(candidate, f))
-        ):
-            return candidate, os.path.join(candidates[0], repo_name)
-    return None, os.path.join(candidates[0], repo_name)
 
 # ── Model registry ──────────────────────────────────────────────────────────
 # Display name → HuggingFace repo suffix under ZhengPeng7/
@@ -150,10 +111,13 @@ class BiRefNetProcessor:
         self,
         device: str = "cuda",
         usage: str = DEFAULT_MODEL,
+        model_path: str | os.PathLike[str] | None = None,
     ):
         self._device = device
         self._usage = usage
+        self._model_path = Path(model_path).expanduser() if model_path is not None else None
         self._model = None
+        self._model_asset_lease = None
         self._resolution: Tuple[int, int] | None = None
         self._half = True  # FP16 by default
 
@@ -169,57 +133,49 @@ class BiRefNetProcessor:
                 f"Available: {list(BIREFNET_MODELS.keys())}"
             )
 
-        repo_id = f"ZhengPeng7/{repo_name}"
-
-        # Look for an existing checkpoint in the data-dir location first,
-        # then fall back to the bundled directory (dev/manual installs).
-        # If nothing exists, ``download_target`` is the writable data-dir
-        # path — never the read-only bundled path, which is what caused
-        # the "Permission denied" crash on installed macOS builds where
-        # the module lives inside /Applications/*.app/Contents/...
-        existing, download_target = _resolve_model_dir(repo_name)
-        if existing is not None:
-            model_local_dir = existing
-            logger.info(f"BiRefNet model cached: {model_local_dir}")
+        lease = None
+        if self._model_path is None:
+            from backend.model_runtime import acquire_model_artifact
+            lease = acquire_model_artifact(f"birefnet-{repo_name}")
+            model_local_dir = lease.path
         else:
-            model_local_dir = download_target
-            if on_status:
-                on_status(f"Downloading {repo_name}...")
-            logger.info(
-                f"Downloading BiRefNet model: {repo_id} -> {model_local_dir}"
-            )
-            os.makedirs(model_local_dir, exist_ok=True)
-            from huggingface_hub import snapshot_download
-            from backend.net_proxy import friendly_proxy_error, sanitized_proxy_env
-            try:
-                with sanitized_proxy_env():
-                    snapshot_download(
-                        repo_id=repo_id,
-                        local_dir=model_local_dir,
-                        local_dir_use_symlinks=False,
-                    )
-            except Exception as exc:
-                friendly = friendly_proxy_error(exc)
-                if friendly is None:
-                    raise
-                raise RuntimeError(friendly) from exc
+            model_local_dir = self._model_path
+            if not model_local_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Explicit BiRefNet model directory is missing: {model_local_dir}"
+                )
 
-        if on_status:
-            on_status(f"Loading BiRefNet ({self._usage})...")
+        repo_id = f"ZhengPeng7/{repo_name}"
+        logger.info(f"Using installed BiRefNet model: {model_local_dir} ({repo_id})")
 
         t0 = time.monotonic()
-
-        # Enable TF32 for Ampere+ GPUs
-        torch.set_float32_matmul_precision('high')
-
-        from transformers import AutoModelForImageSegmentation
-        self._model = AutoModelForImageSegmentation.from_pretrained(
-            model_local_dir, trust_remote_code=True
-        )
-        self._model.to(self._device)
-        self._model.eval()
-        if self._half:
-            self._model.half()
+        try:
+            if on_status:
+                on_status(f"Loading BiRefNet ({self._usage})...")
+            torch.set_float32_matmul_precision('high')
+            from transformers import AutoModelForImageSegmentation
+            self._model = AutoModelForImageSegmentation.from_pretrained(
+                str(model_local_dir), trust_remote_code=True, local_files_only=True
+            )
+        except Exception as exc:
+            if lease is not None:
+                lease.close()
+            raise RuntimeError(
+                f"BiRefNet local snapshot or its pinned runtime dependencies is incomplete at "
+                f"{model_local_dir}. Repair the model/runtime installation; inference does "
+                f"not fetch missing code or weights. Details: {exc}"
+            ) from exc
+        try:
+            self._model.to(self._device)
+            self._model.eval()
+            if self._half:
+                self._model.half()
+        except Exception:
+            if lease is not None:
+                lease.close()
+            self._model = None
+            raise
+        self._model_asset_lease = lease
 
         # Set resolution based on model variant
         self._resolution = _MODEL_RESOLUTIONS.get(repo_name, _DEFAULT_RESOLUTION)
@@ -233,6 +189,16 @@ class BiRefNetProcessor:
         if self._model is not None:
             self._model.to(device)
         self._device = device
+
+    def unload(self) -> None:
+        if self._model is not None:
+            try:
+                self._model.to("cpu")
+            finally:
+                self._model = None
+        if self._model_asset_lease is not None:
+            self._model_asset_lease.close()
+            self._model_asset_lease = None
 
     @torch.inference_mode()
     def process_frames(

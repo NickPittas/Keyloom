@@ -45,7 +45,24 @@ def get_v2_models_dir() -> Path:
     override = os.environ.get(MODELS_DIR_ENV)
     if override:
         return Path(override).expanduser()
+    d = _install_descriptor_models_dir()
+    if d is not None:
+        return d
     return _app_data_base() / APP_DATA_NAME / V2_ASSET_SUBDIR
+
+
+def _install_descriptor_models_dir() -> Path | None:
+    """Models root from the shared install descriptor (backend/install_paths.py).
+
+    No descriptor (developer checkout) -> None (platform default). A descriptor that exists but
+    is unusable RAISES InstallDescriptorError: never silently fall back to another location.
+    """
+    from backend import install_paths
+
+    install = install_paths.discover()
+    if install is None:
+        return None
+    return install.models
 
 
 def _prefer_safetensors(root: Path, stem: str) -> Path:

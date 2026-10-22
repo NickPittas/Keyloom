@@ -19,7 +19,8 @@ import logging
 import os
 import sys
 import time
-from typing import Callable, List, Optional
+from pathlib import Path
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -27,85 +28,21 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Checkpoint URL for auto-download
-_CKPT_URL = "https://github.com/pq-yang/MatAnyone2/releases/download/v1.0.0/matanyone2.pth"
-_CKPT_NAME = "matanyone2.pth"
 
-_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-_BUNDLED_CHECKPOINT_DIR = os.path.join(_MODULE_DIR, "checkpoints")
-
-
-def _candidate_checkpoint_dirs() -> List[str]:
-    """Return MatAnyone2 checkpoint directories to search, in priority order.
-
-    Order:
-      1. ``<data_dir>/modules/MatAnyone2Module/checkpoints`` — writable
-         on every platform. ``scripts/setup_models.py`` writes here in
-         frozen builds and the lazy runtime download targets here too.
-         This is the only path that works on installed macOS builds
-         because ``/Applications/EZ-CorridorKey.app/Contents/...`` is
-         read-only for non-admin users.
-      2. ``_BUNDLED_CHECKPOINT_DIR`` — the bundled directory beside
-         this file. In dev mode this is the repo's checkpoints folder;
-         in frozen builds this lives inside the bundle and is
-         read-only on macOS, but we keep it as a fallback so existing
-         manual/dev installs still work.
-      3. ``<project_root>/pretrained_models`` — legacy fallback from
-         the original MatAnyone2 repo layout.
-    """
-    dirs: List[str] = []
-    try:
-        from backend.project import get_data_dir  # Lazy import: avoid cycles
-        data_dir = get_data_dir()
-        if data_dir:
-            dirs.append(
-                os.path.join(
-                    data_dir, "modules", "MatAnyone2Module", "checkpoints"
-                )
-            )
-    except Exception:
-        pass
-    if _BUNDLED_CHECKPOINT_DIR not in dirs:
-        dirs.append(_BUNDLED_CHECKPOINT_DIR)
-    legacy = os.path.join(
-        os.path.dirname(os.path.dirname(_MODULE_DIR)), "pretrained_models"
-    )
-    if legacy not in dirs:
-        dirs.append(legacy)
-    return dirs
+def _candidate_checkpoint_dirs(*, roots=None) -> list[str]:
+    """Return the provisioned checkpoint directory without loading the model."""
+    from backend.model_runtime import model_artifact_dir
+    return [str(model_artifact_dir("matanyone2", roots=roots))]
 
 
 def _ensure_checkpoint(ckpt_path: str | None = None) -> str:
-    """Return path to matanyone2.pth, downloading if needed.
-
-    Resolution order:
-        1. Explicit ``ckpt_path`` if provided and exists.
-        2. The first candidate dir (see ``_candidate_checkpoint_dirs``)
-           that already contains ``matanyone2.pth``.
-        3. Download to the first candidate dir — always the writable
-           data-dir location — so a cold download never targets a
-           read-only bundle path.
-    """
-    if ckpt_path and os.path.isfile(ckpt_path):
-        return ckpt_path
-
-    candidates = _candidate_checkpoint_dirs()
-    for base in candidates:
-        local_path = os.path.join(base, _CKPT_NAME)
-        if os.path.isfile(local_path):
-            return local_path
-
-    # Nothing found — download to the writable data-dir target.
-    download_dir = candidates[0]
-    local_path = os.path.join(download_dir, _CKPT_NAME)
-    logger.info(
-        "MatAnyone2 checkpoint not found, downloading to %s", local_path
-    )
-    os.makedirs(download_dir, exist_ok=True)
-    from torch.hub import download_url_to_file
-    download_url_to_file(_CKPT_URL, local_path)
-    logger.info(f"Downloaded checkpoint to {local_path}")
-    return local_path
+    """Validate an explicit checkpoint; managed loads retain a lease in the processor."""
+    if ckpt_path is None:
+        raise ValueError("managed MatAnyone2 loads must keep their ModelArtifactLease")
+    path = Path(ckpt_path).expanduser()
+    if not path.is_file() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"Explicit MatAnyone2 checkpoint is missing or empty: {path}")
+    return str(path)
 
 
 class MatAnyone2Processor:
@@ -134,6 +71,7 @@ class MatAnyone2Processor:
         self._max_internal_size = max_internal_size
         self._processor = None  # InferenceCore, loaded lazily
         self._model = None      # MatAnyone2 nn.Module
+        self._model_asset_lease = None
 
     def _ensure_loaded(self, on_status: Optional[Callable[[str], None]] = None):
         """Load model + InferenceCore if not already loaded."""
@@ -148,19 +86,34 @@ class MatAnyone2Processor:
         if module_dir not in sys.path:
             sys.path.insert(0, module_dir)
 
-        ckpt_path = _ensure_checkpoint(self._ckpt_path)
-
-        from matanyone2.utils.get_default_model import get_matanyone2_model
-        from matanyone2.inference.inference_core import InferenceCore
-
-        # Enable TF32 for Ampere+ GPUs (RTX 30xx/40xx/50xx) — ~15-30% speedup
-        torch.set_float32_matmul_precision('high')
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        lease = None
+        if self._ckpt_path is None:
+            from backend.model_runtime import acquire_model_artifact
+            lease = acquire_model_artifact("matanyone2")
+            ckpt_path = str(lease.path)
+        else:
+            ckpt_path = _ensure_checkpoint(self._ckpt_path)
 
         t0 = time.monotonic()
-        self._model = get_matanyone2_model(ckpt_path, device=self._device)
-        self._processor = InferenceCore(self._model, cfg=self._model.cfg)
+        try:
+            from matanyone2.utils.get_default_model import get_matanyone2_model
+            from matanyone2.inference.inference_core import InferenceCore
+
+            # Enable TF32 for Ampere+ GPUs (RTX 30xx/40xx/50xx).
+            torch.set_float32_matmul_precision('high')
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            self._model = get_matanyone2_model(ckpt_path, device=self._device)
+            self._processor = InferenceCore(self._model, cfg=self._model.cfg)
+        except Exception as exc:
+            if lease is not None:
+                lease.close()
+            raise RuntimeError(
+                f"MatAnyone2 checkpoint or runtime dependencies are incomplete at {ckpt_path}. "
+                "Repair the model/runtime installation; inference does not fetch missing files. "
+                f"Details: {exc}"
+            ) from exc
+        self._model_asset_lease = lease
 
         # Override max_internal_size so we don't process at full 4K resolution.
         # Alpha hints are guides — they get resized during CorridorKey inference anyway.
@@ -373,6 +326,18 @@ class MatAnyone2Processor:
         """Reset internal state (memory) for a new sequence."""
         if self._processor is not None:
             self._processor.clear_memory()
+
+    def unload(self) -> None:
+        if self._processor is not None:
+            try:
+                self._processor.clear_memory()
+            except Exception:
+                logger.debug("MatAnyone2 memory clear skipped during unload", exc_info=True)
+        self._processor = None
+        self._model = None
+        if self._model_asset_lease is not None:
+            self._model_asset_lease.close()
+            self._model_asset_lease = None
 
 
 class _CancelledError(Exception):

@@ -235,51 +235,87 @@ def _checkpoint_info(path: str | os.PathLike[str]) -> dict[str, object]:
     }
 
 
-def _verify_birefnet_model_load(model_dir: str | os.PathLike[str]) -> dict[str, object]:
-    import gc
+def _clear_mps_cache() -> None:
+    """Clear the MPS cache only when the MPS backend is actually usable.
+
+    torch.mps.empty_cache() raises RuntimeError on builds without the
+    backend, so an attribute-presence check alone is not enough.
+    """
     import torch
+
+    if hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+def _verify_birefnet_model_load(
+    artifact_id: str,
+    *,
+    roots: Roots,
+) -> dict[str, object]:
+    """Load the selected managed BiRefNet snapshot offline and CPU-only.
+
+    require_model_artifact must reject unverified or digest-mismatched
+    snapshots before trust_remote_code executes snapshot-shipped Python.
+    The returned lease stays alive for the loaded-model lifetime and is
+    closed deterministically with the model cleanup on every path.
+    """
+    import gc
+    from backend.model_runtime import require_model_artifact
     from transformers import AutoConfig, AutoModelForImageSegmentation
 
-    model_path = Path(model_dir)
-    config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
-    model = AutoModelForImageSegmentation.from_pretrained(
-        str(model_path),
-        trust_remote_code=True,
-    )
-    model.to("cpu")
-    model.eval()
-    info = {
-        "path": str(model_path),
-        "model_type": getattr(config, "model_type", None),
-        "parameter_count": sum(p.numel() for p in model.parameters()),
-    }
-    del model
+    lease = require_model_artifact(artifact_id, roots=roots)
+    model = None
+    try:
+        model_path = Path(lease)
+        config = AutoConfig.from_pretrained(
+            os.fspath(model_path), trust_remote_code=True, local_files_only=True
+        )
+        model = AutoModelForImageSegmentation.from_pretrained(
+            os.fspath(model_path),
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        model.to("cpu")
+        model.eval()
+        info = {
+            "path": str(model_path),
+            "model_type": getattr(config, "model_type", None),
+            "parameter_count": sum(p.numel() for p in model.parameters()),
+        }
+    finally:
+        model = None
+        lease.close()
     gc.collect()
-    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-        torch.mps.empty_cache()
+    _clear_mps_cache()
     return info
 
 
-def _verify_matanyone2_model_load(ckpt_path: str | os.PathLike[str]) -> dict[str, object]:
+def _verify_matanyone2_model_load(*, roots: Roots) -> dict[str, object]:
+    """Load the managed MatAnyone2 checkpoint under a lease held until cleanup."""
     import gc
-    import torch
+    from backend.model_runtime import acquire_model_artifact
     from modules.MatAnyone2Module.wrapper import MatAnyone2Processor
 
-    p = Path(ckpt_path)
-    processor = MatAnyone2Processor(device="cpu", ckpt_path=str(p), n_warmup=0)
-    processor._ensure_loaded()
-    model = processor._model
-    info = _checkpoint_info(p)
-    info["parameter_count"] = (
-        sum(param.numel() for param in model.parameters())
-        if model is not None
-        else None
-    )
-    processor.clear()
-    del processor
+    lease = acquire_model_artifact("matanyone2", roots=roots)
+    try:
+        p = Path(lease)
+        processor = MatAnyone2Processor(device="cpu", ckpt_path=str(p), n_warmup=0)
+        try:
+            processor._ensure_loaded()
+            model = processor._model
+            info = _checkpoint_info(p)
+            info["parameter_count"] = (
+                sum(param.numel() for param in model.parameters())
+                if model is not None
+                else None
+            )
+        finally:
+            processor.clear()
+            del processor
+    finally:
+        lease.close()
     gc.collect()
-    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-        torch.mps.empty_cache()
+    _clear_mps_cache()
     return info
 
 
@@ -305,9 +341,13 @@ def run_model_path_check(
 
     try:
         from backend.project import get_data_dir, set_app_dir
+        from backend.model_status import Roots
 
-        resolved_data_dir = os.path.abspath(get_data_dir())
+        resolved_data_dir = os.path.abspath(
+            data_dir if data_dir else get_data_dir()
+        )
         set_app_dir(resolved_data_dir)
+        diagnostic_roots = Roots.defaults(data_dir=Path(resolved_data_dir))
 
         from backend.v2_paths import (
             get_v2_asset_paths,
@@ -357,9 +397,9 @@ def run_model_path_check(
         from modules.MatAnyone2Module import wrapper as matanyone2_wrapper
 
         _existing_birefnet, birefnet_download_dir = (
-            birefnet_wrapper._resolve_model_dir("BiRefNet-matting")
+            birefnet_wrapper._resolve_model_dir("BiRefNet-matting", roots=diagnostic_roots)
         )
-        matanyone2_candidates = matanyone2_wrapper._candidate_checkpoint_dirs()
+        matanyone2_candidates = matanyone2_wrapper._candidate_checkpoint_dirs(roots=diagnostic_roots)
         result["birefnet_download_dir"] = birefnet_download_dir
         result["matanyone2_download_dir"] = matanyone2_candidates[0]
 
@@ -396,6 +436,10 @@ def run_model_path_check(
             else:
                 setup_models = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(setup_models)
+                # Public root interface: resolves Roots for the diagnostic
+                # data dir and synchronizes the legacy derived paths before
+                # they are read (import-time PROJECT_ROOT is the script root).
+                setup_manager = setup_models.create_provision_manager(roots=diagnostic_roots)
                 result["setup_models_project_root"] = str(setup_models.PROJECT_ROOT)
                 if os.path.abspath(str(setup_models.PROJECT_ROOT)) != resolved_data_dir:
                     errors.append(
@@ -421,9 +465,9 @@ def run_model_path_check(
                         errors.append(f"{key} target outside data dir: {target_abs}")
 
                 if verify_optional_model_downloads:
-                    if not setup_models.download_matanyone2():
+                    if not setup_models.download_matanyone2(manager=setup_manager):
                         errors.append("MatAnyone2 download failed")
-                    if not setup_models.download_birefnet():
+                    if not setup_models.download_birefnet(manager=setup_manager):
                         errors.append("BiRefNet download failed")
 
                 if verify_model_loads:
@@ -437,7 +481,7 @@ def run_model_path_check(
                     if matanyone2_ckpt.is_file():
                         try:
                             model_loads["matanyone2"] = _verify_matanyone2_model_load(
-                                matanyone2_ckpt
+                                roots=diagnostic_roots
                             )
                         except Exception as exc:
                             errors.append(f"MatAnyone2 model load failed: {exc}")
@@ -447,13 +491,17 @@ def run_model_path_check(
                             "expected_path": str(matanyone2_ckpt),
                         }
 
+                    birefnet_repo = "BiRefNet-matting"
                     existing_birefnet, _download_dir = (
-                        birefnet_wrapper._resolve_model_dir("BiRefNet-matting")
+                        birefnet_wrapper._resolve_model_dir(
+                            birefnet_repo, roots=diagnostic_roots
+                        )
                     )
                     if existing_birefnet:
                         try:
                             model_loads["birefnet"] = _verify_birefnet_model_load(
-                                existing_birefnet
+                                f"birefnet-{birefnet_repo}",
+                                roots=diagnostic_roots,
                             )
                         except Exception as exc:
                             errors.append(f"BiRefNet model load failed: {exc}")

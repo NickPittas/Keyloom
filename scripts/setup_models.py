@@ -19,13 +19,17 @@ from __future__ import annotations
 import argparse
 import glob
 import importlib.util
+import json
 import os
+import re
 import shutil
 import sys
 import urllib.request
 from pathlib import Path
 
 _SCRIPT_ROOT = Path(__file__).resolve().parent.parent
+if str(_SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_ROOT))
 
 
 def _proxy_guard():
@@ -47,17 +51,15 @@ def _proxy_guard():
 def _data_root() -> Path:
     """Writable root for model downloads.
 
-    In dev mode: project root.
-    In frozen PyInstaller builds: delegates to backend.project.get_data_dir().
-    Falls back to standalone logic when backend is not importable (script run directly).
+    Use the shared descriptor/platform resolution so Qt, the manager and the
+    legacy setup entry points install to the same data root.
     """
-    if not getattr(sys, "frozen", False):
-        return _SCRIPT_ROOT
     try:
-        from backend.project import get_data_dir
-        return Path(get_data_dir())
+        from backend.model_status import Roots
+        return Roots.defaults().data_dir
     except ImportError:
-        pass
+        if not getattr(sys, "frozen", False):
+            return _SCRIPT_ROOT
     # Standalone fallback (script run outside frozen app)
     try:
         from PySide6.QtCore import QSettings
@@ -74,8 +76,40 @@ def _data_root() -> Path:
         return Path.home() / ".local" / "share" / "EZ-CorridorKey"
 
 
-PROJECT_ROOT = _data_root()
-HF_CACHE_DIR = Path.home() / ".cache" / "huggingface" / "hub"
+# Importing this module is also how the setup wizard reuses its downloaders.
+# Resolve install descriptors only when an operation runs so CLI errors can
+# be returned through the structured terminal event instead of import failure.
+PROJECT_ROOT = _SCRIPT_ROOT
+
+
+def hf_cache_dir() -> Path:
+    """HF hub cache honouring HF_HUB_CACHE / HF_HOME at call time.
+
+    Single source of truth: backend.model_catalog.hf_hub_cache_dir, shared with
+    the wizard, the status engine and the provision manager so detection and
+    download can never disagree (audit 2026-10-22 mismatch fix).
+    """
+    from backend.model_catalog import hf_hub_cache_dir as _resolve
+    return _resolve()
+
+
+# Kept as a module-level name for backwards compatibility with existing
+# callers; new code should call hf_cache_dir() so late env changes are seen.
+HF_CACHE_DIR: Path | None = None
+
+
+def _catalog():
+    """Load the authoritative catalog; download paths must fail closed."""
+    from backend.model_catalog import load_catalog
+    return load_catalog()
+
+
+def _pin(artifact_id: str) -> str | None:
+    from backend.model_catalog import CatalogError
+    art = _catalog().get(artifact_id)
+    if art.revision_status != "pinned" or not art.revision:
+        raise CatalogError(f"{artifact_id} has no immutable catalog revision; metadata refresh required")
+    return art.revision
 
 MODELS = {
     "corridorkey": {
@@ -94,9 +128,12 @@ MODELS = {
     "videomama": {
         "repo_id": "SammyLim/VideoMaMa",
         "local_dir": PROJECT_ROOT / "VideoMaMaInferenceModule" / "checkpoints",
-        "check_file": "VideoMaMa/diffusion_pytorch_model.safetensors",
-        "size_human": "~37 GB",
-        "size_bytes": 40_000_000_000,
+        # Loader contract (VideoMaMaInferenceModule/pipeline.py) reads
+        # <checkpoints>/VideoMaMa/unet/… ; the old flat sentinel matched a
+        # layout the runtime cannot load.
+        "check_file": "VideoMaMa/unet/diffusion_pytorch_model.safetensors",
+        "size_human": "~6.1 GB + ~1.46 GB SVD base",
+        "size_bytes": 7_558_504_449,
         "required": False,
         "base_model": {
             "repo_id": "stabilityai/stable-video-diffusion-img2vid-xt",
@@ -128,6 +165,40 @@ BIREFNET_DEFAULT_CHECKPOINT = {
     "size_human": "~940 MB",
     "size_bytes": 940_000_000,
 }
+
+
+def _configure_legacy_roots(*, roots=None, data_dir: Path | None = None):
+    """Refresh root-derived legacy paths from one shared root resolution."""
+    global PROJECT_ROOT, HF_CACHE_DIR
+    if roots is None:
+        from backend.model_status import Roots
+        roots = Roots.defaults(data_dir=data_dir)
+    PROJECT_ROOT = roots.data_dir
+    HF_CACHE_DIR = roots.hf_cache
+    MODELS["gvm"]["local_dir"] = PROJECT_ROOT / "gvm_core" / "weights"
+    MODELS["videomama"]["local_dir"] = PROJECT_ROOT / "VideoMaMaInferenceModule" / "checkpoints"
+    MATANYONE2_CHECKPOINT["local_dir"] = PROJECT_ROOT / "modules" / "MatAnyone2Module" / "checkpoints"
+    BIREFNET_DEFAULT_CHECKPOINT["local_dir"] = (
+        PROJECT_ROOT / "modules" / "BiRefNetModule" / "checkpoints" / "BiRefNet-matting")
+    return roots
+
+
+def create_provision_manager(*, roots=None, data_dir: Path | None = None,
+                             v2_models_dir: Path | None = None,
+                             hf_cache: Path | None = None,
+                             cache_dir: Path | None = None,
+                             operation_id: str | None = None,
+                             emit=None):
+    """Build the shared manager and synchronize legacy paths from its Roots."""
+    from backend.model_catalog import load_catalog
+    from backend.model_provision import ProvisionManager
+    from backend.model_status import Roots
+
+    if roots is None:
+        roots = Roots.defaults(data_dir=data_dir, v2_models_dir=v2_models_dir,
+                               hf_cache=hf_cache, cache_dir=cache_dir)
+    _configure_legacy_roots(roots=roots)
+    return ProvisionManager(load_catalog(), roots, emit=emit, operation_id=operation_id)
 
 SAM2_MODELS = {
     "small": {
@@ -190,17 +261,13 @@ def is_installed(name: str) -> bool:
 
 
 def is_sam2_installed(name: str) -> bool:
-    """Check whether a SAM2 checkpoint is present in the HF cache."""
-    from huggingface_hub import try_to_load_from_cache
-    from huggingface_hub.file_download import _CACHED_NO_EXIST
+    """Check the pinned SAM2 snapshot path without touching the network."""
+    from backend.model_catalog import hf_cache_snapshot_path
 
-    cfg = SAM2_MODELS[name]
-    cached = try_to_load_from_cache(
-        repo_id=cfg["repo_id"],
-        filename=cfg["filename"],
-        cache_dir=HF_CACHE_DIR,
-    )
-    return isinstance(cached, str) and cached != _CACHED_NO_EXIST and os.path.isfile(cached)
+    art = _catalog().get(f"sam2-{name}")
+    f = art.required_files()[0]
+    path = hf_cache_snapshot_path(hf_cache_dir(), art.repo_id, art.revision, art.hf_filename)
+    return path.is_file() and (f.size is None or path.stat().st_size == f.size)
 
 
 def check_disk_space(needed_bytes: int, path: Path) -> bool:
@@ -228,200 +295,76 @@ def _load_v2_downloader():
     return mod
 
 
+def _legacy_download(target: str, *, manager=None, roots=None) -> bool:
+    """Route setup-wizard and legacy CLI calls through the verified manager."""
+    def human_event(event):
+        kind = event.get("event")
+        if kind == "artifact-start":
+            print(f"  Downloading {event['artifact']} ({event.get('bytes_total', 0):,} bytes)...")
+            print("  This may take a while. Downloads resume when the transport supports it.")
+        elif kind == "progress":
+            if event.get("unit") == "bytes":
+                print(f"\r  {event.get('bytes', 0):,}/{event.get('bytes_total', 0):,} bytes",
+                      end="", flush=True)
+            elif event.get("path"):
+                print(f"  Downloaded {event['path']}")
+        elif kind == "artifact-done":
+            print(f"  [OK] {event['artifact']} ready at {event.get('path') or 'the package root'}")
+        elif kind == "artifact-error":
+            print(f"  [ERROR] {event['artifact']}: {event.get('message', event.get('error'))}")
+
+    try:
+        mgr = manager or create_provision_manager(roots=roots, emit=human_event)
+        with _proxy_guard():
+            result = mgr.op_download([target])
+        if result.get("cancelled"):
+            print("\n  [CANCELLED] Download stopped before publication")
+        return bool(result.get("ok"))
+    except Exception as exc:
+        print(f"  [ERROR] Download failed: {exc}")
+        return False
+
+
 def download_corridorkey() -> bool:
     """Download CorridorKey 2.0 weights + C-RADIO, MoGe and RVM foundation models."""
-    v2 = _v2_paths()
-    if v2.v2_assets_ready():
-        print("  [OK] CorridorKey 2.0 already installed")
-        return True
-    root = v2.get_v2_models_dir()
-    print(f"  Downloading CorridorKey 2.0 assets ({MODELS['corridorkey']['size_human']}) to {root}")
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        if not check_disk_space(MODELS["corridorkey"]["size_bytes"], root):
-            print("  [ERROR] Not enough disk space for CorridorKey 2.0")
-            return False
-        dl = _load_v2_downloader()
-        dl.download_corridorkey(root, dl.CORRIDORKEY_REPO, None)
-        dl.download_cradio(root)
-        dl.download_moge(root)
-        dl.download_rvm(root)
-    except Exception as e:
-        print(f"  [ERROR] Download failed: {e}")
-        print(f"  Manual download: https://huggingface.co/nikopueringer/CorridorKey2.0")
-        return False
-    problems = v2.validate_v2_assets()
-    if problems:
-        print("  [ERROR] Assets incomplete after download:")
-        for p in problems:
-            print(f"    - {p}")
-        return False
-    print(f"  Saved to: {root}")
-    return True
+    return _legacy_download("corridorkey")
 
 
 def download_sam2(name: str) -> bool:
     """Download a SAM2 checkpoint into the shared Hugging Face cache."""
-    from huggingface_hub import hf_hub_download
-
-    cfg = SAM2_MODELS[name]
-    HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    print(f"  Downloading SAM2 {name} checkpoint ({cfg['size_human']})...")
-    try:
-        downloaded = hf_hub_download(
-            repo_id=cfg["repo_id"],
-            filename=cfg["filename"],
-            cache_dir=HF_CACHE_DIR,
-        )
-        print(f"  Saved to cache: {downloaded}")
-        return True
-    except Exception as e:
-        print(f"  [ERROR] Download failed: {e}")
-        print(f"  Manual download: https://huggingface.co/{cfg['repo_id']}")
-        return False
+    if name not in SAM2_MODELS:
+        raise KeyError(name)
+    return _legacy_download(f"sam2-{name}")
 
 
 def download_repo(name: str) -> bool:
     """Download a full HuggingFace repo (GVM or VideoMaMa)."""
-    from huggingface_hub import snapshot_download
-
-    cfg = MODELS[name]
-    local_dir = cfg["local_dir"]
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    # Download base model dependency first (e.g. SVD for VideoMaMa)
-    if "base_model" in cfg:
-        base = cfg["base_model"]
-        base_dir = local_dir / base["subfolder"]
-        base_check = base.get("check_file")
-        if base_check and (local_dir / base_check).is_file():
-            print(f"  [OK] Base model already downloaded")
-        else:
-            print(f"  Downloading base model ({base['repo_id']})...")
-            print("  This may take a while. Downloads resume if interrupted.")
-            try:
-                snapshot_download(
-                    repo_id=base["repo_id"],
-                    local_dir=str(base_dir),
-                )
-                print(f"  [OK] Base model saved to: {base_dir}")
-            except Exception as e:
-                print(f"  [ERROR] Base model download failed: {e}")
-                print(f"  Manual download: https://huggingface.co/{base['repo_id']}")
-                return False
-
-    print(f"  Downloading {name} weights ({cfg['size_human']})...")
-    print("  This may take a while. Downloads resume if interrupted.")
-    try:
-        snapshot_download(
-            repo_id=cfg["repo_id"],
-            local_dir=str(local_dir),
-        )
-        # SammyLim/VideoMaMa repo has unet/ but code expects VideoMaMa/
-        if name == "videomama":
-            unet_dir = local_dir / "unet"
-            videomama_dir = local_dir / "VideoMaMa"
-            if unet_dir.is_dir() and not videomama_dir.is_dir():
-                unet_dir.rename(videomama_dir)
-                print(f"  Renamed unet/ -> VideoMaMa/")
-        print(f"  Saved to: {local_dir}")
-        return True
-    except Exception as e:
-        print(f"  [ERROR] Download failed: {e}")
-        print(f"  Manual download: https://huggingface.co/{cfg['repo_id']}")
-        return False
+    if name not in ("gvm", "videomama"):
+        raise KeyError(name)
+    return _legacy_download(name)
 
 
 def download_model(name: str) -> bool:
     """Download a model's weights, skipping if already present."""
-    cfg = MODELS[name]
-
-    if name == "corridorkey":
-        with _proxy_guard():
-            return download_corridorkey()
-
-    if is_installed(name):
-        print(f"  [OK] {name} weights already installed")
-        return True
-
-    # Disk space check
-    if not check_disk_space(cfg["size_bytes"], cfg["local_dir"]):
-        usage = shutil.disk_usage(cfg["local_dir"])
-        free_gb = usage.free / (1024**3)
-        print(f"  [ERROR] Not enough disk space for {name} ({cfg['size_human']})")
-        print(f"  Available: {free_gb:.1f} GB")
-        return False
-
-    with _proxy_guard():
-        return download_repo(name)
+    if name not in MODELS:
+        raise KeyError(name)
+    return _legacy_download(name)
 
 
 def download_sam2_model(name: str) -> bool:
     """Download one SAM2 checkpoint, skipping if already cached."""
-    cfg = SAM2_MODELS[name]
-
-    if is_sam2_installed(name):
-        print(f"  [OK] sam2-{name} checkpoint already cached")
-        return True
-
-    if not check_disk_space(cfg["size_bytes"], HF_CACHE_DIR):
-        usage = shutil.disk_usage(HF_CACHE_DIR)
-        free_gb = usage.free / (1024**3)
-        print(f"  [ERROR] Not enough disk space for SAM2 {name} ({cfg['size_human']})")
-        print(f"  Available: {free_gb:.1f} GB")
-        return False
-
-    with _proxy_guard():
-        return download_sam2(name)
+    return download_sam2(name)
 
 
 def is_matanyone2_installed() -> bool:
     """Check if the MatAnyone2 checkpoint is already present."""
+    _configure_legacy_roots()
     return (MATANYONE2_CHECKPOINT["local_dir"] / MATANYONE2_CHECKPOINT["filename"]).is_file()
 
 
-def download_matanyone2() -> bool:
+def download_matanyone2(*, manager=None, roots=None) -> bool:
     """Download the MatAnyone2 checkpoint from GitHub Releases."""
-    cfg = MATANYONE2_CHECKPOINT
-    local_dir = cfg["local_dir"]
-    local_dir.mkdir(parents=True, exist_ok=True)
-    dest = local_dir / cfg["filename"]
-
-    if dest.is_file():
-        print(f"  [OK] MatAnyone2 checkpoint already installed")
-        return True
-
-    if not check_disk_space(cfg["size_bytes"], local_dir):
-        usage = shutil.disk_usage(local_dir)
-        free_gb = usage.free / (1024**3)
-        print(f"  [ERROR] Not enough disk space for MatAnyone2 ({cfg['size_human']})")
-        print(f"  Available: {free_gb:.1f} GB")
-        return False
-
-    print(f"  Downloading MatAnyone2 checkpoint ({cfg['size_human']})...")
-    tmp_dest = dest.with_suffix(".pth.tmp")
-    try:
-        def _progress(block_num, block_size, total_size):
-            downloaded = block_num * block_size
-            if total_size > 0:
-                pct = min(100, downloaded * 100 // total_size)
-                mb = downloaded / (1024 * 1024)
-                total_mb = total_size / (1024 * 1024)
-                print(f"\r  {mb:.0f}/{total_mb:.0f} MB ({pct}%)", end="", flush=True)
-
-        urllib.request.urlretrieve(cfg["url"], str(tmp_dest), reporthook=_progress)
-        print()  # newline after progress
-
-        tmp_dest.rename(dest)
-        print(f"  Saved to: {dest}")
-        return True
-    except Exception as e:
-        print(f"\n  [ERROR] Download failed: {e}")
-        print(f"  Manual download: {cfg['url']}")
-        print(f"  Place in: {local_dir}/")
-        tmp_dest.unlink(missing_ok=True)
-        return False
+    return _legacy_download("matanyone2", manager=manager, roots=roots)
 
 
 def is_birefnet_installed() -> bool:
@@ -431,6 +374,7 @@ def is_birefnet_installed() -> bool:
     snapshot_download pulls a handful of files and any usable
     BiRefNet-matting snapshot will contain at least one .safetensors.
     """
+    _configure_legacy_roots()
     local_dir = BIREFNET_DEFAULT_CHECKPOINT["local_dir"]
     try:
         if not local_dir.is_dir():
@@ -440,7 +384,7 @@ def is_birefnet_installed() -> bool:
         return False
 
 
-def download_birefnet() -> bool:
+def download_birefnet(*, manager=None, roots=None) -> bool:
     """Download the default BiRefNet Matting variant to the data-dir path.
 
     The wrapper's ``_resolve_model_dir`` will find this at first use and
@@ -448,37 +392,7 @@ def download_birefnet() -> bool:
     setup get the same content lazy-downloaded on demand — this is
     strictly a UX improvement for pre-selecting the default variant.
     """
-    cfg = BIREFNET_DEFAULT_CHECKPOINT
-    local_dir = cfg["local_dir"]
-    local_dir.mkdir(parents=True, exist_ok=True)
-
-    if is_birefnet_installed():
-        print(f"  [OK] BiRefNet ({cfg['repo_name']}) already installed")
-        return True
-
-    if not check_disk_space(cfg["size_bytes"], local_dir):
-        usage = shutil.disk_usage(local_dir)
-        free_gb = usage.free / (1024**3)
-        print(f"  [ERROR] Not enough disk space for BiRefNet ({cfg['size_human']})")
-        print(f"  Available: {free_gb:.1f} GB")
-        return False
-
-    print(f"  Downloading BiRefNet ({cfg['repo_name']}, {cfg['size_human']})...")
-    try:
-        from huggingface_hub import snapshot_download
-        with _proxy_guard():
-            snapshot_download(
-                repo_id=cfg["repo_id"],
-                local_dir=str(local_dir),
-                local_dir_use_symlinks=False,
-            )
-        print(f"  Saved to: {local_dir}")
-        return True
-    except Exception as e:
-        print(f"\n  [ERROR] Download failed: {e}")
-        print(f"  Manual download: https://huggingface.co/{cfg['repo_id']}")
-        print(f"  Place in: {local_dir}/")
-        return False
+    return _legacy_download("birefnet-BiRefNet-matting", manager=manager, roots=roots)
 
 
 def check_all():
@@ -524,7 +438,7 @@ def check_all():
     tracker_mark = "[OK]" if tracker_installed else "[--]"
     tracker_status = "INSTALLED" if tracker_installed else "NOT INSTALLED"
     print(f"  {tracker_mark} sam2-tracker  python pkg   {tracker_status} (optional)")
-    print(f"       -> cache: {HF_CACHE_DIR}")
+    print(f"       -> cache: {hf_cache_dir()}")
     for name, cfg in SAM2_MODELS.items():
         installed = is_sam2_installed(name)
         status = "CACHED" if installed else "NOT CACHED"
@@ -534,6 +448,96 @@ def check_all():
             label += " (default)"
         print(f"  {mark} {label:18s} {cfg['size_human']:>8s}  {status}")
     print()
+
+
+def _run_manager_op(op: str, args) -> int:
+    """New structured surface: NDJSON events on stdout, logs on stderr.
+
+    catalog/check/verify are fully offline; download/repair/cancel supervise
+    downloads with staging, pinned revisions and cooperative cancellation.
+    """
+    from backend.install_paths import InstallDescriptorError
+    from backend.model_catalog import CatalogError
+    if op in ("download", "repair", "cancel") and (
+            not args.operation_id
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", args.operation_id)):
+        event = {"event": "op-done", "op": op, "ok": False,
+                 "operation_id": args.operation_id,
+                 "error": "invalid-operation-id",
+                 "message": "pass --operation-id matching [A-Za-z0-9][A-Za-z0-9_-]{0,127}"}
+        if op == "cancel":
+            event["request_id"] = __import__("uuid").uuid4().hex
+        sys.stdout.write(json.dumps(event, sort_keys=True) + "\n")
+        sys.stdout.flush()
+        return 2
+    try:
+        mgr = create_provision_manager(
+            data_dir=Path(args.data_dir).expanduser() if args.data_dir else None,
+            v2_models_dir=Path(args.v2_models_dir).expanduser() if args.v2_models_dir else None,
+            hf_cache=Path(args.hf_cache).expanduser() if args.hf_cache else None,
+            cache_dir=Path(args.cache_dir).expanduser() if args.cache_dir else None,
+            operation_id=args.operation_id,
+        )
+    except Exception as e:
+        code = ("install-descriptor" if isinstance(e, InstallDescriptorError) else
+                "catalog" if isinstance(e, CatalogError) else "operation-initialization")
+        import json as _json
+        sys.stderr.write(f"[model-provision] {e}\n")
+        event = {"event": "op-done", "op": op, "ok": False,
+                 "error": code, "message": str(e)}
+        if args.operation_id:
+            event["operation_id"] = args.operation_id
+        if op == "cancel":
+            event["request_id"] = __import__("uuid").uuid4().hex
+        sys.stdout.write(_json.dumps(event) + "\n")
+        return 2
+    targets = list(args.target) if args.target else None
+    def guarded(call):
+        terminal_before = mgr._terminal_count
+        try:
+            return call()
+        except Exception as e:
+            sys.stderr.write(f"[model-provision] {op} failed: {e}\n")
+            if mgr._terminal_count == terminal_before:
+                mgr.emit({"event": "op-done", "op": op, "ok": False,
+                          "error": "operation-failed", "message": str(e)})
+            return None
+
+    if op == "catalog":
+        return 0 if guarded(mgr.op_catalog) is not None else 1
+    if op == "check":
+        return 0 if guarded(lambda: mgr.op_check(targets)) is not None else 2
+    if op == "verify":
+        result = guarded(lambda: mgr.op_verify(targets))
+        if result is None:
+            return 2
+        return 0 if result["ok"] else 1
+    if op == "download":
+        if args.profile and targets:
+            mgr.emit({"event": "op-done", "op": op, "ok": False,
+                      "error": "ambiguous-target", "message": "use --target or --profile"})
+            return 2
+        if args.profile:
+            targets = mgr.catalog.profile(args.profile)
+        result = guarded(lambda: mgr.op_download(targets or []))
+        if result is None:
+            return 1
+        return 0 if result["ok"] else 1
+    if op == "repair":
+        if args.profile:
+            mgr.emit({"event": "op-done", "op": op, "ok": False,
+                      "error": "profile-not-supported", "message": "use --target with --repair"})
+            return 2
+        result = guarded(lambda: mgr.op_repair(targets or []))
+        if result is None:
+            return 1
+        return 0 if result["ok"] else 1
+    if op == "cancel":
+        result = guarded(lambda: mgr.cancel_running_download(args.operation_id))
+        if result is None:
+            return 1
+        return 0 if result["ok"] else (2 if result.get("error") == "invalid-operation-id" else 1)
+    raise SystemExit(f"unknown manager op {op}")
 
 
 def main():
@@ -547,12 +551,60 @@ def main():
         help="Download SAM2 checkpoint(s): small, base-plus, large, or all (default: base-plus)",
     )
     parser.add_argument("--gvm", action="store_true", help="Download GVM weights (~6GB, optional)")
-    parser.add_argument("--videomama", action="store_true", help="Download VideoMaMa weights (~37GB, optional)")
+    parser.add_argument("--videomama", action="store_true", help="Download VideoMaMa weights (~6.1GB + ~1.5GB SVD base, optional)")
     parser.add_argument("--matanyone2", action="store_true", help="Download MatAnyone2 weights (~141MB, optional)")
     parser.add_argument("--birefnet", action="store_true", help="Download default BiRefNet Matting variant (~940MB, optional)")
     parser.add_argument("--all", action="store_true", help="Download all models")
     parser.add_argument("--check", action="store_true", help="Check installation status")
+    manager = parser.add_argument_group(
+        "shared manager",
+        "structured JSON-event operations shared by installer/startup/Settings "
+        "(catalog/check/verify are offline; download/repair/cancel supervise downloads)")
+    manager.add_argument("--catalog", action="store_true",
+                         help="Dump the pinned model catalog as a JSON event (offline)")
+    manager.add_argument("--verify", action="store_true",
+                         help="Rehash artifacts against trusted digests (JSON events)")
+    manager.add_argument("--download", action="store_true",
+                         help="Download artifacts (JSON events; pinned, staged, cancellable)")
+    manager.add_argument("--repair", action="store_true",
+                         help="Repair invalid/unverified artifacts (JSON events)")
+    manager.add_argument("--cancel", action="store_true",
+                         help="Signal cancellation to a running download")
+    manager.add_argument("--operation-id", default=None, metavar="ID",
+                         help="App-chosen ID shared by one download/repair and its --cancel request")
+    manager.add_argument("--target", action="append", default=[], metavar="ID",
+                         help="Artifact id or legacy group (corridorkey/gvm/videomama/...); repeatable")
+    manager.add_argument("--profile", choices=["required", "full"], default=None,
+                         help="Target set for --download: required (CK2 bundle) or full (every artifact)")
+    manager.add_argument("--json", action="store_true",
+                         help="With --check: emit structured JSON status events instead of human text")
+    manager.add_argument("--data-dir", default=None, help="Override app data root")
+    manager.add_argument("--v2-models-dir", default=None, help="Override CorridorKeyV2 models dir")
+    manager.add_argument("--hf-cache", default=None, help="Override HF hub cache dir")
+    manager.add_argument("--cache-dir", default=None, help="Override app cache/diagnostics root")
     args = parser.parse_args()
+
+    # New structured verbs take precedence; they never print human text on stdout.
+    if args.catalog:
+        return _run_manager_op("catalog", args)
+    if args.verify:
+        return _run_manager_op("verify", args)
+    if args.download:
+        return _run_manager_op("download", args)
+    if args.repair:
+        return _run_manager_op("repair", args)
+    if args.cancel:
+        return _run_manager_op("cancel", args)
+    if args.check and args.json:
+        return _run_manager_op("check", args)
+
+    try:
+        _configure_legacy_roots()
+    except Exception as e:
+        sys.stderr.write(f"[model-provision] {e}\n")
+        sys.stdout.write(json.dumps({"event": "op-done", "op": "setup", "ok": False,
+                                    "error": "install-descriptor", "message": str(e)}) + "\n")
+        return 2
 
     # Default to --check if no flags
     if not any([args.corridorkey, args.sam2, args.gvm, args.videomama, args.matanyone2, args.birefnet, args.all, args.check]):
@@ -628,4 +680,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
