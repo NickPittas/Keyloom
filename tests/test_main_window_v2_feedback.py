@@ -4,6 +4,9 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Headless runs have no GPU, so deferred startup diagnostics would open a
+# modal dialog nobody can dismiss (same opt-out scripts/ci_smoke.py uses).
+os.environ.setdefault("CORRIDORKEY_SKIP_STARTUP_DIAGNOSTICS", "1")
 
 import threading
 import time

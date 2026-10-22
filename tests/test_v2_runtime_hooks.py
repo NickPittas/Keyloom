@@ -101,6 +101,9 @@ class _FakeStage1(nn.Module):
         super().__init__()
         self.p = nn.Parameter(torch.zeros(1))
 
+    def cuda(self, device=None):
+        return self  # CPU-resident fake: run_inference moves stage1 to GPU only in low_vram
+
     def forward(self, rgb, hint, moge_feat, cradio_feat=None, rvm_feat=None,
                 t_stride=1.0, hint_quality=None):
         Tc = rgb.shape[1]
@@ -230,6 +233,9 @@ class _Stage2(nn.Module):
 
     def forward(self, rgb, baton):
         return torch.zeros(1, rgb.shape[1], 4, H, W)
+
+    def cuda(self, device=None):
+        return self  # CPU-resident fake: run_inference moves stage2 to GPU on the normal path
 
 
 @pytest.fixture
