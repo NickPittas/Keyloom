@@ -1116,17 +1116,29 @@ class ProvisionManager:
         payload = staging / "payload"
         payload.mkdir(parents=True, exist_ok=True)
         self._assert_safe_tree(payload, root)
-        self._discard_invalid_stage_files(art, payload)
-        self._run_download_worker(
-            {"action": "snapshot", "repo_id": art.repo_id,
-             "revision": art.revision, "local_dir": str(payload),
-             "cache_dir": str(staging / "hub-cache"),
-             "allow_patterns": [f.path for f in art.download_files()],
-             "ignore_patterns": list(art.ignore_patterns),
-             "files_total": len(art.download_files())}, art.id)
+        # A cancelled attempt may already have remapped weights and notices.
+        top = self._artifact_top_dir(art)
+        for f in art.download_files():
+            path = payload / f.layout_path
+            notice = payload / top / ".upstream" / f.layout_path
+            if top and not f.required and not path.exists() and notice.is_file():
+                self._assert_safe_path(path, root)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                notice.replace(path)
+        valid = self._discard_invalid_stage_files(art, payload)
+        pending = [f.path for f in art.download_files() if f.path not in valid]
+        if pending:
+            self._run_download_worker(
+                {"action": "snapshot", "repo_id": art.repo_id,
+                 "revision": art.revision, "local_dir": str(payload),
+                 "cache_dir": str(staging / "hub-cache"),
+                 "allow_patterns": pending,
+                 "ignore_patterns": list(art.ignore_patterns),
+                 "files_total": len(art.download_files())}, art.id)
         return payload, staging
 
-    def _discard_invalid_stage_files(self, art: Artifact, root: Path) -> None:
+    def _discard_invalid_stage_files(self, art: Artifact, root: Path) -> set[str]:
+        verified = set()
         for f in art.download_files():
             path = root / f.layout_path
             if not os.path.lexists(path):
@@ -1141,6 +1153,9 @@ class ProvisionManager:
                 raise ArtifactError("file-changed", f"{f.layout_path} changed while staging")
             if not valid:
                 self._remove_path(path, self._asset_root(art))
+            elif dg is not None:
+                verified.add(f.path)
+        return verified
 
     def _artifact_top_dir(self, art: Artifact) -> str:
         """Single top-level directory all required layout paths share, else "".

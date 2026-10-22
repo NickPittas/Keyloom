@@ -880,3 +880,29 @@ class TestEventStream:
                             lambda **kwargs: RecordingManager())
         assert getattr(setup_models, helper)(*args) is True
         assert requested == [target]
+
+
+def test_cancelled_remapped_snapshot_reuses_verified_staging(roots, monkeypatch):
+    from dataclasses import replace
+    weight = replace(make_filespec('unet/weights.bin', b'weights'),
+                     layout_path='VideoMaMa/unet/weights.bin')
+    notice = replace(make_filespec('README.md', b'notice'), required=False,
+                     note='documentation/notice file')
+    art = snapshot_artifact('remapped', 'checkpoints', [weight, notice],
+                            remap={'unet/': 'VideoMaMa/unet/'})
+    cat = Catalog(1, 't', {}, {'remapped': art})
+    fake_snapshot_repo(monkeypatch, {'t/remapped': {
+        'unet/weights.bin': b'weights', 'README.md': b'notice'}})
+    mgr = manager(cat, roots)
+    mgr._emit_fn = lambda e: mgr.cancel_event.set() if e['event'] == 'file-done' else None
+    assert mgr.op_download(['remapped'])['cancelled']
+    assert not (roots.data_dir / 'checkpoints/VideoMaMa').exists()
+
+    def no_transfer(*args):
+        pytest.fail('verified remapped staging must not be downloaded again')
+    monkeypatch.setattr(mp.ProvisionManager, '_run_download_worker', no_transfer)
+    resumed = manager(cat, roots)
+    assert resumed.op_download(['remapped'])['ok']
+    final = roots.data_dir / 'checkpoints/VideoMaMa'
+    assert (final / 'unet/weights.bin').read_bytes() == b'weights'
+    assert (final / '.upstream/README.md').read_bytes() == b'notice'
