@@ -30,18 +30,11 @@ class HintKeyframeMixin:
 
         INPUT-only view (output viewer in INPUT mode) presents through the input
         viewer; every other view presents through the output viewer. The viewers'
-        index is the painted/landed frame, never the playback clock target
+        presented index is the painted frame, never the playback clock target
         (playback is stopped before a mutation lands on the exact frame).
         """
         viewer = self._hint_keyframe_viewer()
-        if viewer is None:
-            return None
-        out = getattr(viewer, "output_viewer", None)
-        inp = getattr(viewer, "input_viewer", None)
-        mode = getattr(viewer, "current_output_mode", None)
-        mode_name = getattr(mode, "name", None)
-        source = inp if (mode_name == "INPUT" and inp is not None) else out
-        idx = getattr(source, "current_stem_index", None)
+        idx = getattr(viewer, "current_presented_source_index", None)
         if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
             return None
         return idx
@@ -110,7 +103,9 @@ class HintKeyframeMixin:
 
     def _refresh_hint_keyframe_tools(self, *_args) -> None:
         """Push count / marked / availability / ticks for the selected clip."""
-        panel = self._param_panel
+        panel = getattr(self, "_param_panel", None)
+        if not hasattr(panel, "set_hint_keyframe_context"):
+            return  # partially built window / minimal test double
         clip = getattr(self, "_current_clip", None)
         if clip is None:
             panel.set_hint_keyframe_context(

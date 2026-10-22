@@ -72,6 +72,7 @@ class ClipMixin:
             )
 
         self._refresh_export_thumbnail(clip)
+        self._refresh_hint_keyframe_tools()
 
     @Slot(int)
     def _on_clip_count_changed(self, count: int) -> None:
@@ -97,6 +98,7 @@ class ClipMixin:
         else:
             self._current_clip = None
             self._dual_viewer.show_placeholder(_tr("No clip selected"))
+            self._refresh_hint_keyframe_tools()
             self._refresh_button_state()
 
     @Slot(object)

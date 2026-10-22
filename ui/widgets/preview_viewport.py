@@ -286,6 +286,11 @@ class PreviewViewport(QWidget):
         """Current stem index for reprocess targeting."""
         return self._current_stem_idx
 
+    @property
+    def presented_stem_index(self) -> int:
+        """Stem index of the frame actually painted (-1 before first paint)."""
+        return self._shown_stem
+
     # ── Public API ──
 
     def lock_mode(self, mode: ViewMode) -> None:

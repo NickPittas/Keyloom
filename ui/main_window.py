@@ -70,7 +70,7 @@ from ui.main_window_mixins import (
     MenuMixin, ShortcutsMixin, ClipMixin, ImportMixin,
     InferenceMixin, AlphaImportMixin, ModelRunMixin, CancelMixin,
     WorkerMixin, AnnotationMixin,
-    ExportMixin, SessionMixin, SettingsMixin, HintResetMixin,
+    ExportMixin, SessionMixin, SettingsMixin, HintResetMixin, HintKeyframeMixin,
 )
 from ui.main_window_mixins.batch_pipeline_mixin import BatchPipelineMixin
 from ui.main_window_mixins.chroma_key_mixin import ChromaKeyMixin
@@ -208,7 +208,7 @@ class MainWindow(
     MenuMixin, ShortcutsMixin, ClipMixin, ImportMixin,
     InferenceMixin, AlphaImportMixin, ModelRunMixin, CancelMixin,
     WorkerMixin, AnnotationMixin, ChromaKeyMixin, BatchPipelineMixin,
-    ExportMixin, SessionMixin, SettingsMixin, HintResetMixin,
+    ExportMixin, SessionMixin, SettingsMixin, HintResetMixin, HintKeyframeMixin,
 ):
     """CorridorKey main application window."""
 
@@ -526,6 +526,9 @@ class MainWindow(
         self._param_panel.applevision_requested.connect(self._on_run_applevision)
         self._param_panel.gvm_requested.connect(self._on_run_gvm)
         self._param_panel.reset_hint_requested.connect(self._on_reset_hint)
+        self._param_panel.hint_keyframe_toggle_requested.connect(self._on_toggle_hint_keyframe)
+        self._dual_viewer.input_viewer.frame_presented.connect(self._refresh_hint_keyframe_tools)
+        self._dual_viewer.output_viewer.frame_presented.connect(self._refresh_hint_keyframe_tools)
         self._io_tray.set_hint_mutation_guard(self._hint_mutation_allowed)
         self._io_tray.selection_changed.connect(self._refresh_hint_button_state)
         self._param_panel.birefnet_requested.connect(self._on_run_birefnet)

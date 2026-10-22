@@ -33,7 +33,7 @@ class FakePanel:
 
 class FakeViewport:
     def __init__(self, idx=0):
-        self.current_stem_index = idx
+        self.presented_stem_index = idx
 
 
 class FakeViewer:
@@ -48,11 +48,17 @@ class FakeViewer:
         self.stopped = 0
         self.land_on = None  # simulated landing frame after stop
 
+    @property
+    def current_presented_source_index(self):
+        src = self.input_viewer if self.current_output_mode == ViewMode.INPUT \
+            else self.output_viewer
+        return src.presented_stem_index
+
     def stop_playback(self):
         self.stopped += 1
         if self.land_on is not None:
-            self.input_viewer.current_stem_index = self.land_on
-            self.output_viewer.current_stem_index = self.land_on
+            self.input_viewer.presented_stem_index = self.land_on
+            self.output_viewer.presented_stem_index = self.land_on
 
 
 class Host(HintKeyframeMixin, QWidget):
@@ -93,8 +99,8 @@ def _make_clip(tmp_path, n=6, alpha_frames=None, name="clip"):
 
 
 def _set_frame(host, idx):
-    host._dual_viewer.input_viewer.current_stem_index = idx
-    host._dual_viewer.output_viewer.current_stem_index = idx
+    host._dual_viewer.input_viewer.presented_stem_index = idx
+    host._dual_viewer.output_viewer.presented_stem_index = idx
 
 
 def _stems(clip):
@@ -140,12 +146,12 @@ def test_input_only_view_uses_input_viewer(tmp_path, warnings):
     clip = _make_clip(tmp_path)
     host = Host(clip)
     v = host._dual_viewer
-    v.input_viewer.current_stem_index = 4
-    v.output_viewer.current_stem_index = 1
+    v.input_viewer.presented_stem_index = 4
+    v.output_viewer.presented_stem_index = 1
     assert host._current_presented_hint_index() == 1
     v.current_output_mode = ViewMode.INPUT
     assert host._current_presented_hint_index() == 4
-    v.input_viewer.current_stem_index = -1
+    v.input_viewer.presented_stem_index = -1
     assert host._current_presented_hint_index() is None
 
 

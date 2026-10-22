@@ -157,6 +157,21 @@ class DualViewerPanel(QWidget):
         return self._output_viewer.current_stem_index
 
     @property
+    def current_presented_source_index(self) -> int:
+        """Painted frame index of the viewer presenting the current view (-1 if none)."""
+        if self.current_output_mode == ViewMode.INPUT:
+            return self._input_viewer.presented_stem_index
+        return self._output_viewer.presented_stem_index
+
+    def set_keyframes(self, indices) -> None:
+        """Show hint keyframe ticks on the shared scrubber."""
+        self._scrubber.set_keyframes(indices)
+
+    def stop_playback(self) -> None:
+        """Stop scrubber playback (lands on the exact frame)."""
+        self._scrubber.stop_playback()
+
+    @property
     def current_output_mode(self) -> ViewMode:
         """Current output viewer mode."""
         return self._output_viewer._current_mode
@@ -224,6 +239,7 @@ class DualViewerPanel(QWidget):
     def set_clip(self, clip: ClipEntry) -> None:
         """Load a clip into both viewers and configure the scrubber."""
         self._end_playback_context()
+        self._scrubber.set_keyframes(())
         self._clip = clip
         self._start_fps_resolve(clip)
 
@@ -297,6 +313,7 @@ class DualViewerPanel(QWidget):
     def show_placeholder(self, text: str = "No clip selected") -> None:
         """Show placeholder on both viewers."""
         self._end_playback_context()
+        self._scrubber.set_keyframes(())
         self._input_viewer.show_placeholder(text)
         self._output_viewer.show_placeholder(text)
         self._scrubber.set_range(0)
