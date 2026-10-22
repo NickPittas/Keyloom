@@ -11,3 +11,8 @@ modules/MatAnyone2Module/checkpoints/
 modules/BiRefNetModule/checkpoints/*
 !modules/BiRefNetModule/checkpoints/.gitkeep
 VideoMaMaInferenceModule/checkpoints/
+
+# Local build output (multi-GB, never commit)
+rust-ui/target-oldglibc/
+rust-ui/target/
+packaging/dist/
