@@ -189,8 +189,8 @@ def test_selection_changed_honours_use_alpha_hint_toggle():
     flags = []
     clips = [SimpleNamespace(name="a"), SimpleNamespace(name="b")]
 
-    def _route(c, use_alpha_hint=True):
-        flags.append(use_alpha_hint)
+    def _route(c, use_alpha_hint=True, hint_mode=None):
+        flags.append(hint_mode == "full" if hint_mode else use_alpha_hint)
         return clip_mixin.PipelineRoute.SKIP
 
     win = SimpleNamespace(
@@ -221,3 +221,11 @@ def test_worker_status_phase_prefix_sets_progress_phase():
     WorkerMixin._on_worker_status(win, "j", PHASE_PREFIX + "Stage 1")
     WorkerMixin._on_worker_status(win, "j", "Loading model...")
     assert calls[0] == ("pp", "Stage 1") and calls[1][0] == "p"
+
+
+def test_legacy_chain_forces_full_over_keyframes(clip):
+    win = _Win(clip, InferenceParams(hint_mode="keyframes"))
+    win._pipeline_steps[clip.name] = [JobType.INFERENCE]
+    win._on_worker_clip_finished("j1", clip.name, JobType.GVM_ALPHA.value)
+    jobs = _queued(win)
+    assert jobs[0].params["_inference_params"].hint_mode == "full"

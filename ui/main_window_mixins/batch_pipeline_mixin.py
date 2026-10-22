@@ -328,7 +328,9 @@ class BatchPipelineMixin:
                     self._batch_dialog.set_clip_error(
                         clip.name, "Clip cannot run inference.")
                 return None, [], None
-            p = dataclasses.replace(params, use_alpha_hint=use_hint)
+            p = dataclasses.replace(
+                params, use_alpha_hint=use_hint,
+                hint_mode="full" if use_hint else "none")
             job = create_inference_job(
                 clip, p, output_config, frame_range=clip_frame_range(clip))
         elif job_type in (JobType.VIDEOMAMA_ALPHA, JobType.MATANYONE2_ALPHA,
@@ -343,7 +345,8 @@ class BatchPipelineMixin:
         if job is not None and job_type != JobType.INFERENCE:
             next_steps = [JobType.INFERENCE]
             settings = {
-                "params": dataclasses.replace(params, use_alpha_hint=True),
+                "params": dataclasses.replace(
+                    params, use_alpha_hint=True, hint_mode="full"),
                 "output_config": output_config,
                 "frame_range": clip_frame_range(clip),
             }

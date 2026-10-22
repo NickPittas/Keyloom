@@ -169,7 +169,9 @@ class WorkerMixin:
                         # Legacy chain: always follows a hint generator, so the hint is used.
                         job = create_inference_job(
                             clip,
-                            dataclasses.replace(self._param_panel.get_params(), use_alpha_hint=True),
+                            dataclasses.replace(
+                                self._param_panel.get_params(),
+                                use_alpha_hint=True, hint_mode="full"),
                             self._param_panel.get_output_config(),
                             frame_range=clip_frame_range(clip),
                         )

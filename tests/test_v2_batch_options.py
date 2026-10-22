@@ -237,3 +237,25 @@ def test_clear_pipeline_cancels_queued_and_running_batch_jobs(_app):
     assert running.is_cancelled
     assert queued.status == JobStatus.CANCELLED
     assert other.status == JobStatus.QUEUED
+
+
+def test_mixin_keyframes_panel_overridden_by_explicit_choice(_app):
+    kf = InferenceParams(hint_mode="keyframes")
+    h = _Host(_entry(ClipState.READY, alpha=True),
+              _cfg(JobType.INFERENCE, True, HINT_EXISTING))
+    job, _, _ = h._create_batch_job(
+        h._clip_model.clips[0], h._batch_configs["c"], kf, OutputConfig())
+    assert job.params["_inference_params"].hint_mode == "full"
+    h = _Host(_entry(ClipState.RAW), _cfg(JobType.INFERENCE, False, HINT_NONE_V2))
+    job, _, _ = h._create_batch_job(
+        h._clip_model.clips[0], h._batch_configs["c"], kf, OutputConfig())
+    assert job.params["_inference_params"].hint_mode == "none"
+
+
+@pytest.mark.parametrize("jt", [JobType.GVM_ALPHA, JobType.BIREFNET_ALPHA,
+                                JobType.MATANYONE2_ALPHA, JobType.VIDEOMAMA_ALPHA])
+def test_mixin_generator_chain_forces_full_over_keyframes(_app, jt):
+    h = _Host(_entry(ClipState.RAW), _cfg(jt, True, "generated"))
+    h._param_panel.get_params = lambda: InferenceParams(hint_mode="keyframes")
+    h._submit_batch_jobs()
+    assert h._pipeline_settings["c"]["params"].hint_mode == "full"
