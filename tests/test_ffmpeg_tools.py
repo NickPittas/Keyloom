@@ -18,6 +18,8 @@ class TestProbeVideo:
             "width": 1920,
             "height": 1080,
             "r_frame_rate": "25/1",
+            "avg_frame_rate": "25/1",
+            "time_base": "1/25",
             "nb_frames": "100",
             "duration": "4.0",
             "pix_fmt": "yuv422p10le",
@@ -58,6 +60,31 @@ class TestProbeVideo:
         assert info["color_range"] == "tv"
         assert info["chroma_location"] == "left"
         assert info["bits_per_raw_sample"] == 10
+        assert info["r_frame_rate"] == info["avg_frame_rate"] == "25/1"
+        assert info["time_base"] == "1/25"
+        assert info["frame_count_exact"] is True
+
+    def test_probe_marks_duration_based_frame_count_as_estimated(self, monkeypatch):
+        payload = json.dumps({
+            "streams": [{"codec_type": "video", "r_frame_rate": "25/1",
+                         "avg_frame_rate": "25/1", "duration": "4.0"}],
+            "format": {},
+        })
+        fake_validation = ffmpeg_tools.FFmpegValidationResult(
+            ok=True, message="ok", ffmpeg_path="ffmpeg", ffprobe_path="ffprobe",
+        )
+        monkeypatch.setattr(_probe, "require_ffmpeg_install", lambda require_probe=True: fake_validation)
+        monkeypatch.setattr(
+            _probe.subprocess, "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0], 0, stdout=payload, stderr="",
+            ),
+        )
+
+        info = ffmpeg_tools.probe_video("clip.mov")
+
+        assert info["frame_count"] == 100
+        assert info["frame_count_exact"] is False
 
 
 class TestBuildExrVf:
@@ -191,7 +218,7 @@ class TestExtractFrames:
         assert "-vsync" not in commands[0]
 
     def test_extract_frames_resume_branch_uses_fps_mode_not_vsync(self, monkeypatch, tmp_path):
-        """The resume/seek branch (start_frame > 0) must also use -fps_mode:v."""
+        """Resume filters by decoded ordinal instead of seeking in seconds."""
         commands = []
 
         class _FakeProc:
@@ -240,7 +267,9 @@ class TestExtractFrames:
 
         assert commands, "no FFmpeg command captured"
         cmd = commands[0]
-        assert "-ss" in cmd, "resume branch should seek with -ss"
+        assert "-ss" not in cmd
+        assert "select='gte(n,47)'" in cmd[cmd.index("-vf") + 1]
+        assert cmd[cmd.index("-start_number") + 1] == "47"
         assert "-fps_mode:v" in cmd
         assert cmd[cmd.index("-fps_mode:v") + 1] == "passthrough"
         assert "-vsync" not in cmd
@@ -381,12 +410,10 @@ class TestCorruptFrameRetry:
         assert extracted == 3
         assert len(commands) == 1
 
-    def test_hw_decode_failure_on_resume_restarts_from_zero(
+    def test_hw_decode_failure_on_resume_preserves_prefix_ordinal(
         self, monkeypatch, tmp_path,
     ):
-        """Hardware-decode failure wipes ALL frames (including the resume
-        prefix), so the software retry must restart from frame 0 — not seek
-        to the old resume point and silently drop the prefix."""
+        """A failed hardware suffix is retried from the same decoded ordinal."""
         out_dir = tmp_path / "frames"
         out_dir.mkdir()
         # Pre-seed frames so the resume branch picks start_frame > 0
@@ -423,10 +450,10 @@ class TestCorruptFrameRetry:
         )
 
         assert len(commands) == 2
-        assert "-ss" in commands[0], "resume branch should seek initially"
-        assert "-ss" not in commands[1], "software retry must not seek"
+        assert "-ss" not in commands[0] and "-ss" not in commands[1]
         sn = commands[1].index("-start_number")
-        assert commands[1][sn + 1] == "0", "software retry must restart at 0"
+        assert commands[1][sn + 1] == "17", "software retry must keep the prefix"
+        assert "select='gte(n,17)'" in commands[1][commands[1].index("-vf") + 1]
 
 
 class TestAdaptiveEncoderThreads:

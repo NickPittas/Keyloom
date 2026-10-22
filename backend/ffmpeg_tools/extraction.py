@@ -6,14 +6,45 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from typing import Callable, Optional
 
 from .color import build_exr_vf
 from .discovery import find_ffmpeg, require_ffmpeg_install
-from .probe import probe_video
+from .probe import probe_video, stop_process_tree
 
 logger = logging.getLogger(__name__)
+
+
+def _frame_index(name: str, pattern: str) -> int | None:
+    indexed = re.sub(r"%0?\d*d", lambda _match: r"(\d+)", re.escape(pattern))
+    match = re.fullmatch(indexed, name, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _remove_frames_from(out_dir: str, pattern: str, start_frame: int) -> None:
+    for name in os.listdir(out_dir):
+        index = _frame_index(name, pattern)
+        if index is not None and index >= start_frame:
+            os.remove(os.path.join(out_dir, name))
+
+
+def _write_done_marker(marker: str) -> None:
+    fd, temporary = tempfile.mkstemp(
+        prefix=".dwab_done.", suffix=".tmp", dir=os.path.dirname(marker),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("done")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 # ---------------------------------------------------------------------------
 # Hardware-accelerated decode — cross-platform auto-detection
@@ -217,6 +248,13 @@ def _recompress_one_exr(args: tuple) -> bool:
         img = imread_unicode(src, cv2.IMREAD_UNCHANGED)
         if img is None:
             return False
+        exr = OpenEXR.InputFile(src)
+        try:
+            is_dwab = exr.header()["compression"].v == OpenEXR.Compression.DWAB_COMPRESSION.value
+        finally:
+            exr.close()
+        if is_dwab:
+            return True
         HALF = Imath.Channel(Imath.PixelType(Imath.PixelType.HALF))
         h, w = img.shape[:2]
         hdr = OpenEXR.Header(w, h)
@@ -294,8 +332,7 @@ def _recompress_sequential(
                        f"frame(s) unreadable (corrupt): {failed[:5]}")
         return failed
 
-    with open(marker, 'w') as f:
-        f.write("done")
+    _write_done_marker(marker)
     logger.info(f"DWAB recompression complete: {total} frames")
     return []
 
@@ -317,10 +354,10 @@ def _recompress_multiprocess(
     Returns filenames of frames that failed to read back (corrupt).
     """
     import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
     logger.info(f"Recompressing {total} EXR frames to DWAB (multiprocess)...")
-    workers = max(1, min((os.cpu_count() or 4) // 2, 16))
+    workers = max(1, min((os.cpu_count() or 4) // 2, 16, total))
     done = 0
     failed: list[str] = []
 
@@ -328,27 +365,52 @@ def _recompress_multiprocess(
     work = [(os.path.join(out_dir, f), os.path.join(out_dir, f + ".tmp"))
             for f in exr_files]
 
-    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-        futs = {pool.submit(_recompress_one_exr, item): item for item in work}
-        for fut in as_completed(futs):
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+    futs = {}
+    try:
+        for item in work:
+            futs[pool.submit(_recompress_one_exr, item)] = item
+        pending = set(futs)
+        while pending:
             if cancel_event and cancel_event.is_set():
-                pool.shutdown(wait=False, cancel_futures=True)
                 logger.info("DWAB recompression cancelled")
-                return []
-            # A worker terminated abruptly (BrokenProcessPool: AV kill, OOM,
-            # native crash) must not abort the whole pass — mark the item
-            # failed so the safe-mode retry in extract_frames can heal it.
-            try:
-                ok = fut.result()
-            except Exception as exc:
-                logger.warning(f"DWAB worker failed for "
-                               f"{os.path.basename(futs[fut][0])}: {exc}")
-                ok = False
-            if not ok:
-                failed.append(os.path.basename(futs[fut][0]))
-            done += 1
-            if on_progress:
-                on_progress(done, total)
+                raise InterruptedError("DWAB recompression cancelled")
+            completed, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+            for fut in completed:
+                # A worker terminated abruptly (BrokenProcessPool: AV kill, OOM,
+                # native crash) must not abort the whole pass — mark the item
+                # failed so the safe-mode retry in extract_frames can heal it.
+                try:
+                    ok = fut.result()
+                except Exception as exc:
+                    logger.warning(f"DWAB worker failed for "
+                                   f"{os.path.basename(futs[fut][0])}: {exc}")
+                    ok = False
+                if not ok:
+                    failed.append(os.path.basename(futs[fut][0]))
+                done += 1
+                if on_progress:
+                    on_progress(done, total)
+    except BaseException:
+        # ProcessPoolExecutor has no public terminate API; join every owned worker
+        # before releasing the staging directory.
+        workers_by_pid = list((pool._processes or {}).values())
+        for worker in workers_by_pid:
+            if worker.is_alive():
+                worker.terminate()
+        for worker in workers_by_pid:
+            worker.join(timeout=5)
+            if worker.is_alive():
+                worker.kill()
+                worker.join(timeout=5)
+        pool.shutdown(wait=True, cancel_futures=True)
+        if cancel_event and cancel_event.is_set():
+            return []
+        raise
+    else:
+        pool.shutdown(wait=True)
+        if cancel_event and cancel_event.is_set():
+            return []
 
     if failed:
         failed.sort()
@@ -356,8 +418,7 @@ def _recompress_multiprocess(
                        f"unreadable (corrupt): {failed[:5]}")
         return failed
 
-    with open(marker, 'w') as f:
-        f.write("done")
+    _write_done_marker(marker)
     logger.info(f"DWAB recompression complete: {total} frames")
     return []
 
@@ -377,8 +438,8 @@ def _recompress_subprocess(
     python = sys.executable
 
     script_content = r'''
-import os, sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing, os, sys, threading
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
@@ -396,6 +457,13 @@ def recompress_one(args):
             img = None
         if img is None:
             return False
+        exr = OpenEXR.InputFile(src)
+        try:
+            is_dwab = exr.header()["compression"].v == OpenEXR.Compression.DWAB_COMPRESSION.value
+        finally:
+            exr.close()
+        if is_dwab:
+            return True
         HALF = Imath.Channel(Imath.PixelType(Imath.PixelType.HALF))
         h, w = img.shape[:2]
         hdr = OpenEXR.Header(w, h)
@@ -439,13 +507,25 @@ if __name__ == "__main__":
     total = len(files)
     if total == 0:
         sys.exit(0)
-    workers = max(1, min((os.cpu_count() or 4) // 2, 16))
+    workers = max(1, min((os.cpu_count() or 4) // 2, 16, total))
     work = [(os.path.join(out_dir, f), os.path.join(out_dir, f + ".tmp"))
             for f in files]
+    cancelled = threading.Event()
+    def listen_for_cancel():
+        for line in sys.stdin:
+            if line.strip() == "CANCEL":
+                cancelled.set()
+                return
+    threading.Thread(target=listen_for_cancel, daemon=True).start()
     done = 0
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(recompress_one, item): item for item in work}
-        for fut in as_completed(futs):
+    # This supervisor already has a stdin listener thread; spawn avoids forking
+    # Python with live threads and deadlocking the workers on some runtimes.
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
+    futs = {pool.submit(recompress_one, item): item for item in work}
+    pending = set(futs)
+    while pending and not cancelled.is_set():
+        completed, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+        for fut in completed:
             # Worker died abruptly (BrokenProcessPool etc.) -> mark item
             # failed instead of aborting the whole pass.
             try:
@@ -456,6 +536,22 @@ if __name__ == "__main__":
                 print(f"FAILED {os.path.basename(futs[fut][0])}", flush=True)
             done += 1
             print(f"PROGRESS {done} {total}", flush=True)
+    if cancelled.is_set():
+        for fut in pending:
+            fut.cancel()
+        workers_by_pid = list((pool._processes or {}).values())
+        for worker in workers_by_pid:
+            if worker.is_alive():
+                worker.terminate()
+        for worker in workers_by_pid:
+            worker.join(timeout=5)
+            if worker.is_alive():
+                worker.kill()
+                worker.join(timeout=5)
+        pool.shutdown(wait=True, cancel_futures=True)
+        print("CANCELLED", flush=True)
+        sys.exit(0)
+    pool.shutdown(wait=True)
     print("DONE", flush=True)
 '''
 
@@ -467,41 +563,51 @@ if __name__ == "__main__":
 
     proc = subprocess.Popen(
         [python, script_path, out_dir],
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8", errors="replace",
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        start_new_session=os.name != "nt",
     )
 
     import queue as _queue
     line_q: _queue.Queue[str | None] = _queue.Queue()
 
     def _reader():
-        for ln in proc.stdout:
-            line_q.put(ln.strip())
+        try:
+            for ln in proc.stdout:
+                line_q.put(ln.strip())
+        except (OSError, ValueError):
+            pass
         line_q.put(None)
 
     reader_thread = threading.Thread(target=_reader, daemon=True)
     reader_thread.start()
 
     failed: list[str] = []
+    stderr_out = ""
+
+    def cancel_and_join() -> None:
+        try:
+            if getattr(proc, "stdin", None) is not None:
+                proc.stdin.write("CANCEL\n")
+                proc.stdin.flush()
+            proc.wait(timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            stop_process_tree(proc)
+
     try:
         while True:
             if cancel_event and cancel_event.is_set():
-                proc.kill()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
+                cancel_and_join()
                 logger.info("DWAB recompression cancelled")
                 return []
 
             try:
                 line = line_q.get(timeout=0.2)
             except _queue.Empty:
-                if proc.poll() is not None:
-                    break
                 continue
 
             if line is None:
@@ -519,22 +625,35 @@ if __name__ == "__main__":
                 break
 
         proc.wait(timeout=60)
+        if proc.stderr is not None:
+            stderr_out = proc.stderr.read()
     except subprocess.TimeoutExpired:
-        proc.kill()
+        cancel_and_join()
         logger.error("DWAB recompression subprocess timed out")
         # The pass did not complete, so no frame is verified — report every
         # frame as suspect so extract_frames runs the safe-mode retry
         # (which re-validates with the pool-free sequential pass) instead of
         # treating a crashed recompress as clean.
         return list(exr_files)
+    except BaseException:
+        cancel_and_join()
+        raise
     finally:
+        if proc.poll() is None:
+            stop_process_tree(proc)
+        for stream in (getattr(proc, "stdin", None), proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        reader_thread.join(timeout=5)
         try:
             os.remove(script_path)
         except OSError:
             pass
 
     if proc.returncode != 0:
-        stderr_out = proc.stderr.read() if proc.stderr else ""
         # Log the TAIL of stderr — the actual exception sits at the bottom
         # of a Python traceback, a head-slice hides it.
         logger.error(f"DWAB recompression failed (code {proc.returncode}): "
@@ -548,8 +667,7 @@ if __name__ == "__main__":
                        f"unreadable (corrupt): {failed[:5]}")
         return failed
 
-    with open(marker, 'w') as f:
-        f.write("done")
+    _write_done_marker(marker)
     logger.info(f"DWAB recompression complete: {total} frames")
     return []
 
@@ -562,6 +680,9 @@ def extract_frames(
     on_recompress_progress: Optional[Callable[[int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     total_frames: int = 0,
+    *,
+    stream_index: int | None = None,
+    expected_frame_count: int | None = None,
 ) -> int:
     """Extract video frames to EXR DWAB half-float image sequence.
 
@@ -591,11 +712,12 @@ def extract_frames(
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # Always probe — we need color metadata for the filter chain,
-    # and total_frames for progress
+    # Always probe — we need color metadata, the selected stream, and progress.
     video_info = None
     try:
         video_info = probe_video(video_path)
+        if stream_index is None:
+            stream_index = video_info.get("stream_index")
         if total_frames <= 0:
             total_frames = video_info.get("frame_count", 0)
     except Exception:
@@ -614,8 +736,10 @@ def extract_frames(
     if os.path.isfile(dwab_marker):
         extracted = len([f for f in os.listdir(out_dir)
                          if f.lower().endswith('.exr')])
-        logger.info(f"Extraction already complete: {extracted} DWAB frames")
-        return extracted
+        if expected_frame_count is None or extracted == expected_frame_count:
+            logger.info(f"Extraction already complete: {extracted} DWAB frames")
+            return extracted
+        os.remove(dwab_marker)
 
     existing = sorted([f for f in os.listdir(out_dir)
                        if f.lower().endswith('.exr')])
@@ -629,11 +753,10 @@ def extract_frames(
             logger.info(f"Resuming extraction from frame {start_frame} "
                         f"({len(existing)} existed, rolled back {remove_count})")
 
-    # EXR-specific FFmpeg args: ZIP16 compression, half-float.
+    # EXR-specific FFmpeg filter chain: float RGB conversion before half storage.
     # Build an explicit colour conversion filter from probed metadata
     # so FFmpeg never has to guess missing trc/primaries/matrix.
     vf_chain = build_exr_vf(video_info or {})
-    exr_args = ["-compression", "3", "-format", "1", "-vf", vf_chain]
 
     # Hardware-accelerated decode (NVDEC / VideoToolbox / VAAPI / D3D11VA)
     # Falls back to software decode if none available
@@ -649,38 +772,21 @@ def extract_frames(
     def _build_cmd(hw_flags: list[str],
                    extra_out_args: list[str] | None = None) -> list[str]:
         out_args = extra_out_args or []
-        if start_frame > 0 and total_frames > 0:
-            if video_info is None:
-                _vi = probe_video(video_path)
-            else:
-                _vi = video_info
-            fps = _vi.get("fps", 24.0)
-            seek_sec = start_frame / fps
-            return [
-                ffmpeg,
-                *hw_flags,
-                "-ss", f"{seek_sec:.4f}",
-                "-i", video_path,
-                "-start_number", str(start_frame),
-                # -fps_mode:v passthrough replaces the legacy -vsync passthrough.
-                # -vsync was deprecated in 2023 and is removed in current FFmpeg
-                # git-master builds, which made imports fail with
-                # "Unrecognized option 'vsync'". -fps_mode exists since FFmpeg 5.1
-                # and our minimum is FFmpeg 7, so it is always available.
-                "-fps_mode:v", "passthrough",
-                *exr_args,
-                *out_args,
-                out_dir + "/" + pattern,
-                "-y",
-            ]
+        vf = vf_chain
+        if start_frame > 0:
+            # Decoding from ordinal zero avoids timestamp seeks that can skip
+            # or duplicate frames on rational-rate sources.
+            vf = f"select='gte(n,{start_frame})',{vf_chain}"
+        mapping = ["-map", f"0:{stream_index}"] if stream_index is not None else []
         return [
             ffmpeg,
             *hw_flags,
             "-i", video_path,
-            "-start_number", "0",
+            *mapping,
+            "-start_number", str(start_frame),
             # See note above: -fps_mode:v passthrough replaces removed -vsync.
             "-fps_mode:v", "passthrough",
-            *exr_args,
+            "-compression", "3", "-format", "1", "-vf", vf,
             *out_args,
             out_dir + "/" + pattern,
             "-y",
@@ -704,6 +810,7 @@ def extract_frames(
             text=True,
             encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
         )
 
         frame_re = re.compile(r"frame=\s*(\d+)")
@@ -713,8 +820,11 @@ def extract_frames(
         line_q: _queue.Queue[str | None] = _queue.Queue()
 
         def _reader():
-            for ln in proc.stderr:
-                line_q.put(ln)
+            try:
+                for ln in proc.stderr:
+                    line_q.put(ln)
+            except (OSError, ValueError):
+                pass
             line_q.put(None)
 
         reader_thread = threading.Thread(target=_reader, daemon=True)
@@ -723,19 +833,13 @@ def extract_frames(
         try:
             while True:
                 if cancel_event and cancel_event.is_set():
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
+                    stop_process_tree(proc)
                     logger.info("Extraction cancelled — FFmpeg killed")
                     return 0, ""
 
                 try:
                     line = line_q.get(timeout=0.2)
                 except _queue.Empty:
-                    if proc.poll() is not None:
-                        break
                     continue
 
                 if line is None:
@@ -753,8 +857,21 @@ def extract_frames(
 
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            stop_process_tree(proc)
             raise RuntimeError("FFmpeg extraction timed out")
+        except BaseException:
+            stop_process_tree(proc)
+            raise
+        finally:
+            if proc.poll() is None:
+                stop_process_tree(proc)
+            for stream in (proc.stdin, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            reader_thread.join(timeout=5)
 
         if proc.returncode != 0:
             tail = "\n".join(stderr_tail[-15:])
@@ -769,15 +886,9 @@ def extract_frames(
     if returncode != 0 and hwaccel_flags and not (cancel_event and cancel_event.is_set()):
         logger.warning(f"Hardware decode failed (code {returncode}), "
                        f"retrying with software decode...")
-        # Clean up any partial frames from the failed attempt. ALL frames are
-        # deleted (including any pre-existing resume prefix), so the retry
-        # must restart from frame 0 — leaving start_frame > 0 here would
-        # seek past the beginning and permanently drop the prefix frames.
-        for f in os.listdir(out_dir):
-            if f.lower().endswith('.exr'):
-                os.remove(os.path.join(out_dir, f))
-        start_frame = 0
-        last_frame = 0
+        # Keep the pre-existing prefix; failed output starts at start_frame.
+        _remove_frames_from(out_dir, pattern, start_frame)
+        last_frame = start_frame
         # empty hw flags = software decode
         returncode, stderr_out = _run_ffmpeg([], enc_thread_args)
 
@@ -808,6 +919,17 @@ def extract_frames(
     # Count extracted frames
     extracted = len([f for f in os.listdir(out_dir)
                      if f.lower().endswith('.exr')])
+    if cancel_event and cancel_event.is_set():
+        return extracted
+    if expected_frame_count is not None and extracted != expected_frame_count:
+        try:
+            os.remove(dwab_marker)
+        except FileNotFoundError:
+            pass
+        raise RuntimeError(
+            f"FFmpeg extracted {extracted} frames; expected exact frame count "
+            f"{expected_frame_count}."
+        )
     logger.info(f"Extracted {extracted} EXR frames (ZIP16)")
 
     # Pass 2: Recompress ZIP16 -> DWAB. The recompress workers read every
@@ -831,11 +953,15 @@ def extract_frames(
                 f"{len(corrupt)} corrupt frame(s) in FFmpeg output "
                 f"(e.g. {corrupt[0]}) — re-extracting with software decode, "
                 f"single-threaded encode...")
-            for f in os.listdir(out_dir):
-                if f.lower().endswith('.exr'):
-                    os.remove(os.path.join(out_dir, f))
-            start_frame = 0
-            last_frame = 0
+            bad_prefix = any(
+                (index := _frame_index(name, pattern)) is not None
+                and index < start_frame
+                for name in corrupt
+            )
+            if bad_prefix:
+                start_frame = 0
+            _remove_frames_from(out_dir, pattern, start_frame)
+            last_frame = start_frame
             retried = True
             returncode, stderr_out = _run_ffmpeg([], ["-threads:v", "1"])
             if returncode != 0 and not (cancel_event and cancel_event.is_set()):
@@ -843,6 +969,17 @@ def extract_frames(
                     f"FFmpeg safe-mode retry failed (code {returncode})")
             extracted = len([f for f in os.listdir(out_dir)
                              if f.lower().endswith('.exr')])
+            if cancel_event and cancel_event.is_set():
+                return extracted
+            if expected_frame_count is not None and extracted != expected_frame_count:
+                try:
+                    os.remove(dwab_marker)
+                except FileNotFoundError:
+                    pass
+                raise RuntimeError(
+                    f"FFmpeg safe-mode retry extracted {extracted} frames; "
+                    f"expected exact frame count {expected_frame_count}."
+                )
             # Sequential recompress: immune to worker-pool failures, so a
             # broken pool can't mask the state of the re-extracted frames.
             corrupt = _recompress_sequential(out_dir, on_recompress_progress,
