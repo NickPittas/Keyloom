@@ -24,10 +24,17 @@ _PRODUCT_CHANNELS = {"alpha": 1, "fg": 3, "checker": 3, "cutout": 4}
 def _scratch_root() -> str:
     root = os.environ.get("CORRIDORKEY_V2_SCRATCH_DIR")
     if not root:
+        from ..install_paths import discover, platform_scratch
+        install = discover()
+        if install is not None:
+            root = install.scratch or platform_scratch()
+            if root is None:
+                raise RuntimeError("No writable scratch location; configure roots.scratch in the installation descriptor.")
+    if not root:
         from ..v2_paths import get_v2_models_dir
         root = str(get_v2_models_dir().parent)
     os.makedirs(root, exist_ok=True)
-    return root
+    return str(root)
 
 
 class InferenceMixin:

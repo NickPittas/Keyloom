@@ -5,6 +5,7 @@ and assert the same resolution and error wording: a mismatch here is a contract 
 test nit. Broken descriptors raise instead of falling back anywhere.
 """
 import os
+import json
 import shutil
 from pathlib import Path
 
@@ -34,6 +35,27 @@ def _layout(root: Path, name: str = "install") -> Path:
     install.mkdir(parents=True, exist_ok=True)
     shutil.copy(FIXTURE, install / ip.DESCRIPTOR_NAME)
     return install
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_installed_inference_scratch_uses_writable_descriptor_or_user_area(tmp_path, monkeypatch, configured):
+    from backend.service.inference import _scratch_root
+
+    descriptor = tmp_path / ip.DESCRIPTOR_NAME
+    scratch = tmp_path / "chosen-scratch"
+    descriptor.write_text(json.dumps({"schema": 1, "roots": {
+        "python": "python", "helper": "app", "models": "/read-only-models",
+        "scratch": str(scratch) if configured else None,
+    }}))
+    monkeypatch.setenv("CK_INSTALL", str(descriptor))
+    monkeypatch.delenv("CORRIDORKEY_V2_SCRATCH_DIR", raising=False)
+    monkeypatch.setattr(ip, "platform_scratch", lambda: tmp_path / "user-scratch")
+    expected = scratch if configured else tmp_path / "user-scratch"
+    assert _scratch_root() == str(expected)
+    assert expected.is_dir()
+    override = tmp_path / "override"
+    monkeypatch.setenv("CORRIDORKEY_V2_SCRATCH_DIR", str(override))
+    assert _scratch_root() == str(override)
 
 
 def test_fixture_resolves_and_relocates(tmp_path, no_install_env):
