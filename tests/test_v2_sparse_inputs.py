@@ -249,3 +249,31 @@ def test_non_int_or_duplicate_marks_write_nothing(tmp_path, marks):
     with pytest.raises(V2InputError):
         _prep(c, tmp_path)
     assert not (tmp_path / "stage" / "hint").exists()
+
+
+def test_scaled_hint_single_mark_source_sized(tmp_path):
+    small = np.full((3, 4), 200, np.uint8)  # 4:3 like 8x6
+    c = _clip(tmp_path, hints={f"f_{i:04d}.png": small for i in range(5)}, marks=(3,))
+    src = tmp_path / "hint_src" / "f_0003.png"
+    before = src.read_bytes()
+    p = _prep(c, tmp_path)
+    assert p.initial_hint_index == 3 and p.initial_hint_path.endswith("hint/000003.png")
+    assert _read(p.initial_hint_path).shape == (H, W) and int(_read(p.initial_hint_path)[0, 0]) == 200
+    assert src.read_bytes() == before
+
+
+def test_scaled_rgba_alpha_sparse(tmp_path):
+    rgba = np.zeros((3, 4, 4), np.uint8)
+    rgba[..., 3] = 90
+    c = _clip(tmp_path, hints={"f_0001.png": rgba, "f_0004.png": _g(7)}, marks=(1, 4))
+    p = _prep(c, tmp_path)
+    assert p.hint_frame_indices == (1, 4)
+    out = _read(str(tmp_path / "stage" / "hint" / "000001.png"))
+    assert out.shape == (H, W) and int(out[0, 0]) == 90
+    assert _read(str(tmp_path / "stage" / "hint" / "000004.png")).shape == (H, W)
+
+
+def test_wrong_aspect_sparse_message(tmp_path):
+    c = _clip(tmp_path, hints={"f_0001.png": np.zeros((8, 8), np.uint8)}, marks=(1,))
+    with pytest.raises(V2InputError, match="aspect ratio"):
+        _prep(c, tmp_path)

@@ -277,3 +277,55 @@ def test_sources_untouched(tmp_path):
     _prep(_clip(tmp_path, d, a), tmp_path, hint=True)
     for p, (m, b) in snap.items():
         assert p.stat().st_mtime_ns == m and p.read_bytes() == b
+
+
+def _hashes(d):
+    import hashlib
+    return {n: hashlib.sha256(open(os.path.join(d, n), "rb").read()).hexdigest()
+            for n in sorted(os.listdir(d))}
+
+
+def test_gvm_sized_hint_staged_to_source_size(tmp_path):
+    # 1920x1080 input vs GVM short-edge-1024 truncation 1820x1024 (scaled 1/10 here)
+    names = ["a.png", "b.png"]
+    d = _seq(tmp_path, names, size=(108, 192))
+    a = _seq(tmp_path, names, sub="alpha", size=(102, 182), gray=True)
+    before = _hashes(a)
+    p = _prep(_clip(tmp_path, d, a), tmp_path, hint=True)
+    assert p.hint_path == str(tmp_path / "stage" / "hint")
+    assert sorted(os.listdir(p.hint_path)) == ["000000.png", "000001.png"]
+    for f in os.listdir(p.hint_path):
+        assert cv2.imread(os.path.join(p.hint_path, f), cv2.IMREAD_UNCHANGED).shape == (108, 192)
+    assert _hashes(a) == before
+
+
+def test_aspect_compatible_hint_mixed_sizes_stage_all(tmp_path):
+    names = ["a.png", "b.png"]
+    d = _seq(tmp_path, names, size=(9, 16))
+    a = _seq(tmp_path, names, sub="alpha", size=(9, 16), gray=True)
+    _write(tmp_path / "alpha" / "b.png", _rgb(3, (18, 32))[..., 0])
+    p = _prep(_clip(tmp_path, d, a), tmp_path, hint=True)
+    assert p.hint_path != str(tmp_path / "alpha")
+    for f in ("000000.png", "000001.png"):
+        assert cv2.imread(os.path.join(p.hint_path, f), cv2.IMREAD_UNCHANGED).shape == (9, 16)
+
+
+def test_wrong_aspect_message(tmp_path):
+    d = _seq(tmp_path, NAMES, size=(9, 16))
+    a = _seq(tmp_path, NAMES, sub="alpha", size=(16, 16), gray=True)
+    with pytest.raises(V2InputError, match="aspect ratio"):
+        _prep(_clip(tmp_path, d, a), tmp_path, hint=True)
+
+
+def test_resize_cancel_before_decode(tmp_path):
+    d = _seq(tmp_path, ["a.png", "b.png"], size=(8, 16))
+    a = _seq(tmp_path, ["a.png", "b.png"], sub="alpha", size=(4, 8), gray=True)
+    n = []
+
+    def cancel():
+        n.append(1)
+        if len(n) == 2:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _prep(_clip(tmp_path, d, a), tmp_path, hint=True, check_cancel=cancel)

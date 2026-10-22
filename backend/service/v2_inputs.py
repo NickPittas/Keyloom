@@ -154,6 +154,11 @@ def _video_frame_count(path: str) -> int:
 
 def validate_dense_hint_alignment(clip, source_stems: list[str]) -> list[str]:
     """Return hint filenames ordered to match ``source_stems`` or raise V2InputError."""
+    return _validate_dense(clip, source_stems)[0]
+
+
+def _validate_dense(clip, source_stems: list[str]) -> tuple[list[str], bool]:
+    """(ordered hint names, True when any hint needs resizing to the input size)."""
     asset = clip.alpha_asset
     if asset is None:
         raise V2InputError(_NO_HINT_MSG)
@@ -161,9 +166,10 @@ def validate_dense_hint_alignment(clip, source_stems: list[str]) -> list[str]:
     _check_duplicate_stems(files, "AlphaHint")
     ordered = _match_hints(files, source_stems)
     want = clip.input_asset.get_dimensions()
+    resize = False
     for f in ordered:
-        _check_hint_dims(want, os.path.join(asset.path, f))
-    return ordered
+        resize |= _check_hint_dims(want, os.path.join(asset.path, f))
+    return ordered, resize
 
 
 def _hint_by_stem(files: list[str]) -> dict[str, list[str]]:
@@ -225,15 +231,32 @@ def _image_size(path: str) -> tuple[int, int] | None:
         return None if img is None else (int(img.shape[1]), int(img.shape[0]))
 
 
-def _check_hint_dims(want, hint_path: str) -> None:
+_ASPECT_TOL = 0.005  # relative; covers truncation rounding (e.g. GVM 1820x1024 vs 1920x1080)
+
+
+def _check_geometry(got, want, label: str) -> bool:
+    """True when ``got`` differs from ``want`` but is aspect-compatible (needs resize).
+
+    Raises V2InputError on a clearly different aspect ratio. Unknown ``want`` -> False.
+    """
+    if want is None or tuple(want) == tuple(got):
+        return False
+    gw, gh = got
+    ww, wh = want
+    if gh > 0 and wh > 0 and ww > 0 and abs((gw / gh) / (ww / wh) - 1.0) <= _ASPECT_TOL:
+        return True
+    raise V2InputError(
+        f"AlphaHint {label} is {gw}x{gh} but the input is {ww}x{wh} — the aspect ratio "
+        "differs. Provide an AlphaHint with the clip's aspect ratio or set the hint mode "
+        "to None.")
+
+
+def _check_hint_dims(want, hint_path: str) -> bool:
+    """Validate one hint header; True when it is a compatible different size."""
     got = _image_size(hint_path)
     if got is None:
         raise V2InputError(f"Could not read AlphaHint frame '{hint_path}'.")
-    if want is not None and tuple(want) != got:
-        raise V2InputError(
-            f"AlphaHint frame '{os.path.basename(hint_path)}' is {got[0]}x{got[1]} but the "
-            f"input is {want[0]}x{want[1]} — "
-            "regenerate the AlphaHint at the clip resolution or turn off 'Use AlphaHint'.")
+    return _check_geometry(got, want, f"frame '{os.path.basename(hint_path)}'")
 
 
 def _prepare_hint(clip, input_stems: list[str], staging: Path, check_cancel) -> str:
@@ -247,10 +270,21 @@ def _prepare_hint(clip, input_stems: list[str], staging: Path, check_cancel) -> 
                 f"AlphaHint video has {got} frames but the input has {want} — regenerate "
                 "the AlphaHint for the whole clip or turn off 'Use AlphaHint'.")
         return asset.path
-    ordered = validate_dense_hint_alignment(clip, input_stems)
+    ordered, resize = _validate_dense(clip, input_stems)
+    dst = staging / "hint"
+    if resize:  # temporary source-sized PNG copies; originals are never touched
+        want = clip.input_asset.get_dimensions()
+        shutil.rmtree(dst, ignore_errors=True)
+        os.makedirs(dst, exist_ok=True)
+        for i, f in enumerate(ordered):
+            if check_cancel is not None:
+                check_cancel()
+            src = os.path.join(asset.path, f)
+            _write_matte(imread_unicode(src, cv2.IMREAD_UNCHANGED), want,
+                         f"frame '{f}'", str(dst / f"{i:06d}.png"))
+        return str(dst)
     if ordered == _runtime_listing(asset.path):
         return asset.path
-    dst = staging / "hint"
     _stage_files([os.path.join(asset.path, f) for f in ordered], str(dst), check_cancel)
     return str(dst)
 
@@ -300,11 +334,10 @@ def _write_matte(img, want, label: str, dst: str) -> None:
     if img is None:
         raise V2InputError(f"Could not read AlphaHint {label}.")
     got = (int(img.shape[1]), int(img.shape[0]))
-    if want is not None and tuple(want) != got:
-        raise V2InputError(
-            f"AlphaHint {label} is {got[0]}x{got[1]} but the input is {want[0]}x{want[1]} — "
-            "regenerate the AlphaHint at the clip resolution.")
-    if not imwrite_unicode(dst, _matte_plane(img, label)):
+    plane = _matte_plane(img, label)
+    if _check_geometry(got, want, label):
+        plane = cv2.resize(plane, (int(want[0]), int(want[1])), interpolation=cv2.INTER_LINEAR)
+    if not imwrite_unicode(dst, plane):
         raise V2InputError(f"Could not write staged AlphaHint '{dst}'.")
 
 
