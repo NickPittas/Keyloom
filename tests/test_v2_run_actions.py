@@ -28,8 +28,9 @@ def _asset(n=3):
     return a
 
 
-def _clip(name="c", state=ClipState.RAW, alpha=False, mask=False, n=3):
+def _clip(name="c", state=ClipState.RAW, alpha=False, mask=False, n=3, marks=()):
     c = ClipEntry(name=name, root_path=f"/tmp/{name}")
+    c.hint_keyframes = tuple(marks)
     c.state = state
     c.input_asset = _asset(n)
     c.alpha_asset = _asset(n) if alpha else None
@@ -39,10 +40,11 @@ def _clip(name="c", state=ClipState.RAW, alpha=False, mask=False, n=3):
 
 class _Panel:
     def __init__(self, hint=False):
-        self.hint = hint
+        self.hint = hint  # bool (none/full) or a canonical mode string
 
     def get_params(self):
-        return InferenceParams(use_alpha_hint=self.hint)
+        mode = self.hint if isinstance(self.hint, str) else ("full" if self.hint else "none")
+        return InferenceParams(hint_mode=mode)
 
     def get_output_config(self):
         return OutputConfig()
@@ -140,9 +142,11 @@ def test_run_passes_frame_range(boxes):
 
 class _FakeBox:
     choice = "nohint"
+    instances: list = []
 
     def __init__(self, *a, **k):
         self.btns = {}
+        _FakeBox.instances.append(self)
 
     def setIcon(self, *a): pass
     def setWindowTitle(self, *a): pass
@@ -317,3 +321,126 @@ def test_session_live_preview_ignored(monkeypatch):
     assert "live_preview" not in data
     SessionMixin._apply_session_data(s, {"live_preview": True, "params": InferenceParams().to_dict()})
     assert "p" in applied
+
+
+# ── canonical hint modes (Keyframes / None / Full) ──
+
+def test_keyframes_partial_alpha_runs_without_dense_dialog(monkeypatch, boxes):
+    monkeypatch.setattr(inference_mixin, "QMessageBox", _FakeBox)
+    _FakeBox.instances = []
+    clip = _clip(alpha=True, n=10, marks=(2, 5))
+    clip.alpha_asset.frame_count = 4  # partial: would trigger the Full dialog
+    clip.in_out_range = InOutRange(6, 8)  # marks lie outside In/Out
+    s = _self([clip], hint="keyframes", current=clip)
+    InferenceMixin._on_run_inference(s)
+    (job,) = _jobs(s)
+    assert job.params["_inference_params"].hint_mode == "keyframes"
+    assert job.params["_clip_snapshot"].hint_keyframes == (2, 5)
+    assert job.params["_frame_range"] == (6, 8)
+    assert not _FakeBox.instances and not boxes["warning"]
+
+
+def test_keyframes_single_reference_snapshot_frozen(boxes):
+    clip = _clip(alpha=True, marks=(1,))
+    s = _self([clip], hint="keyframes", current=clip)
+    InferenceMixin._on_run_inference(s)
+    clip.hint_keyframes = (0, 2)  # later UI mutation must not leak
+    (job,) = _jobs(s)
+    assert job.params["_clip_snapshot"].hint_keyframes == (1,)
+
+
+@pytest.mark.parametrize("kw,needle", [
+    ({"alpha": True, "marks": ()}, "no keyframes marked"),
+    ({"alpha": False, "marks": (1,)}, "no AlphaHint"),
+])
+def test_keyframes_not_ready_actionable(boxes, kw, needle):
+    clip = _clip(**kw)
+    s = _self([clip], hint="keyframes", current=clip)
+    InferenceMixin._on_run_inference(s)
+    assert _jobs(s) == [] and needle in boxes["warning"][0]
+
+
+def test_keyframes_stale_marks_error_actionable(boxes):
+    clip = _clip(alpha=True, marks=(1,))
+    clip.hint_keyframes_error = "stale stem at index 1"
+    s = _self([clip], hint="keyframes", current=clip)
+    InferenceMixin._on_run_inference(s)
+    assert _jobs(s) == [] and "stale stem at index 1" in boxes["warning"][0]
+
+
+def test_keyframes_resume_snapshot(boxes):
+    clip = _clip(state=ClipState.COMPLETE, alpha=True, marks=(0, 2))
+    clip.in_out_range = InOutRange(1, 1)
+    s = _self([clip], hint="keyframes", current=clip)
+    InferenceMixin._on_resume_inference(s)
+    (job,) = _jobs(s)
+    assert job.params["_inference_params"].hint_mode == "keyframes"
+    assert job.params["_clip_snapshot"].hint_keyframes == (0, 2)
+    assert "_frame_range" not in job.params
+
+
+def test_none_mode_raw_runs_and_ignores_marks(boxes):
+    clip = _clip(marks=(1,))
+    s = _self([clip], hint="none", current=clip)
+    InferenceMixin._on_run_inference(s)
+    assert _jobs(s)[0].params["_inference_params"].hint_mode == "none"
+
+
+def test_full_dialog_no_hint_sets_canonical_none(monkeypatch, boxes):
+    monkeypatch.setattr(inference_mixin, "QMessageBox", _FakeBox)
+    _FakeBox.instances = []
+    clip = _clip(state=ClipState.READY, alpha=True, n=10)
+    clip.alpha_asset.frame_count = 4
+    s = _self([clip], hint="full", current=clip)
+    _FakeBox.choice = "nohint"
+    InferenceMixin._on_run_inference(s)
+    (job,) = _jobs(s)
+    assert job.params["_inference_params"].hint_mode == "none"
+    assert job.params["_inference_params"].use_alpha_hint is False
+
+
+def test_mode_change_updates_run_immediately(boxes):
+    clip = _clip(alpha=True, marks=(1,))
+    s = _self([clip], hint="none", current=clip)
+    s._remember_current_clip_input_color_space = lambda: None
+    s._dual_viewer = types.SimpleNamespace(set_input_exr_is_linear=lambda *_: None)
+    s._refresh_input_thumbnail = lambda *a, **k: None
+    s._refresh_button_state = lambda: InferenceMixin._refresh_button_state(s)
+    s._refresh_hint_keyframe_tools = lambda: None
+    InferenceMixin._refresh_button_state(s)
+    assert s._status_bar.calls[-1]["can_run"] is True
+    s._param_panel.hint = "full"  # RAW + alpha: Full cannot run
+    InferenceMixin._on_params_changed(s)
+    assert s._status_bar.calls[-1]["can_run"] is False
+    s._param_panel.hint = "keyframes"
+    InferenceMixin._on_params_changed(s)
+    assert s._status_bar.calls[-1]["can_run"] is True
+
+
+def test_run_all_keyframes_each_clip_own_marks(boxes):
+    clips = [_clip("a", alpha=True, marks=(1,)), _clip("b", alpha=True, marks=(0, 2)),
+             _clip("c", alpha=True), _clip("d", marks=(1,))]
+    s = _self(clips, hint="keyframes")
+    InferenceMixin._on_run_all_ready(s)
+    got = {j.clip_name: j.params["_clip_snapshot"].hint_keyframes for j in _jobs(s)}
+    assert got == {"a": (1,), "b": (0, 2)}
+
+
+def test_pipeline_keyframes_direct_no_generators(boxes):
+    clips = [_clip("a", alpha=True, marks=(1,)), _clip("b", ClipState.MASKED, alpha=True, marks=(0, 2)),
+             _clip("raw")]
+    s = _self(clips, hint="keyframes", selected=3)
+    InferenceMixin._on_run_pipeline(s)
+    jobs = _jobs(s)
+    assert {j.clip_name for j in jobs} == {"a", "b"}
+    assert all(j.job_type == JobType.INFERENCE for j in jobs)
+    assert s._pipeline_steps == {} and s._pipeline_settings == {}
+    assert {j.clip_name: j.params["_clip_snapshot"].hint_keyframes for j in jobs} == {
+        "a": (1,), "b": (0, 2)}
+
+
+def test_pipeline_full_generator_chain_forces_full(boxes):
+    clips = [_clip("raw")]
+    s = _self(clips, hint="full", selected=2)
+    InferenceMixin._on_run_pipeline(s)
+    assert s._pipeline_settings["raw"]["params"].hint_mode == "full"

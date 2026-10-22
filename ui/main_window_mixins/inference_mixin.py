@@ -24,6 +24,30 @@ from ui.workers.job_helpers import (
 logger = logging.getLogger(__name__)
 
 
+def current_hint_mode(params) -> str:
+    """Canonical hint mode (none/full/keyframes) of ``params``."""
+    return params.hint_mode
+
+
+def keyframes_not_ready_text(clip) -> str:
+    """Actionable reason why Keyframes mode cannot run ``clip``."""
+    if clip.state.value in ("EXTRACTING", "ERROR"):
+        return _tr("Clip '%s' in %s state and cannot be keyed.") % (
+            clip.name, clip.state.value)
+    if clip.hint_keyframes_error:
+        return _tr("Clip '%s': keyframe marks are unusable: %s") % (
+            clip.name, clip.hint_keyframes_error)
+    if clip.alpha_asset is None:
+        return _tr(
+            "Clip '%s' has no AlphaHint. Generate or import one, mark "
+            "keyframes on it, or choose another hint mode."
+        ) % clip.name
+    return _tr(
+        "Clip '%s' has no keyframes marked. Mark at least one frame that has "
+        "an AlphaHint, or choose another hint mode."
+    ) % clip.name
+
+
 class InferenceMixin:
     """Inference control, parameter changes, and GPU job submission for MainWindow."""
 
@@ -31,6 +55,7 @@ class InferenceMixin:
     def _on_params_changed(self) -> None:
         """Handle parameter change — keep colour-space state and thumbnails in sync."""
         self._remember_current_clip_input_color_space()
+        self._refresh_button_state()
         self._dual_viewer.set_input_exr_is_linear(
             self._param_panel.get_params().input_is_linear
         )
@@ -139,8 +164,11 @@ class InferenceMixin:
 
         clip = self._current_clip
         params = self._param_panel.get_params()
-        if not can_run_inference(clip, params.use_alpha_hint):
-            if params.use_alpha_hint and clip.alpha_asset is None:
+        mode = current_hint_mode(params)
+        if not can_run_inference(clip, hint_mode=mode):
+            if mode == "keyframes":
+                text = keyframes_not_ready_text(clip)
+            elif mode == "full" and clip.alpha_asset is None:
                 text = _tr(
                     "Clip '%s' has no AlphaHint. Generate one (GVM, BiRefNet, "
                     "VideoMaMa, MatAnyone2…) or turn off 'Use AlphaHint'."
@@ -152,8 +180,8 @@ class InferenceMixin:
             QMessageBox.warning(self, _tr("Not Ready"), text)
             return
 
-        # Dense AlphaHint required: warn if it does not cover all input frames
-        if params.use_alpha_hint and clip.alpha_asset and clip.input_asset:
+        # Dense AlphaHint required (Full only): warn if it does not cover all input frames
+        if mode == "full" and clip.alpha_asset and clip.input_asset:
             alpha_count = clip.alpha_asset.frame_count
             input_count = clip.input_asset.frame_count
             if 0 < alpha_count < input_count:
@@ -183,7 +211,7 @@ class InferenceMixin:
                         )
                     return
                 if clicked == btn_nohint:
-                    params = dataclasses.replace(params, use_alpha_hint=False)
+                    params = dataclasses.replace(params, hint_mode="none")
                 else:
                     return  # Cancel
 
@@ -208,7 +236,7 @@ class InferenceMixin:
 
         clip = self._current_clip
         params = self._param_panel.get_params()
-        if not can_run_inference(clip, params.use_alpha_hint):
+        if not can_run_inference(clip, hint_mode=current_hint_mode(params)):
             return
 
         reset_complete_state(clip)
@@ -233,7 +261,8 @@ class InferenceMixin:
             )
             refresh_hint_tools_if_available(self)
             return
-        can_run = can_run_inference(clip, self._param_panel.get_params().use_alpha_hint)
+        can_run = can_run_inference(
+            clip, hint_mode=current_hint_mode(self._param_panel.get_params()))
         self._status_bar.update_button_state(
             can_run=can_run,
             has_partial=clip.completed_frame_count() > 0,
@@ -246,13 +275,13 @@ class InferenceMixin:
     def _on_run_all_ready(self) -> None:
         """Queue every runnable (not COMPLETE) clip for inference.
 
-        With 'Use AlphaHint' on, only READY clips with an AlphaHint qualify;
-        with it off, any clip that has input frames does.
+        Full needs READY clips with an AlphaHint; Keyframes needs valid marks
+        and an AlphaHint; None accepts any clip that has input frames.
         """
         params = self._param_panel.get_params()
         ready_clips = [
             c for c in self._clip_model.clips
-            if can_run_inference(c, params.use_alpha_hint)
+            if can_run_inference(c, hint_mode=current_hint_mode(params))
             and c.state != ClipState.COMPLETE
         ]
         if not ready_clips:
@@ -299,7 +328,8 @@ class InferenceMixin:
         # Classify all clips
         routes: dict[str, PipelineRoute] = {}
         for clip in selected:
-            route = classify_pipeline_route(clip, params.use_alpha_hint)
+            route = classify_pipeline_route(
+                clip, hint_mode=current_hint_mode(params))
             if route != PipelineRoute.SKIP:
                 routes[clip.name] = route
 
@@ -345,7 +375,7 @@ class InferenceMixin:
                 if next_steps:
                     self._pipeline_steps[clip.name] = next_steps
                     self._pipeline_settings[clip.name] = {
-                        "params": dataclasses.replace(params, use_alpha_hint=True),
+                        "params": dataclasses.replace(params, hint_mode="full"),
                         "output_config": output_config,
                         "frame_range": clip_frame_range(clip),
                     }

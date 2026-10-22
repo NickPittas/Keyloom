@@ -112,9 +112,9 @@ class ClipMixin:
         batch_count = len(clips)
         if batch_count > 1:
             # Check if any clip needs alpha generation (pipeline mode)
-            use_hint = self._param_panel.get_params().use_alpha_hint
+            hint_mode = self._param_panel.get_params().hint_mode
             needs_pipeline = any(
-                classify_pipeline_route(c, use_alpha_hint=use_hint) not in (
+                classify_pipeline_route(c, hint_mode=hint_mode) not in (
                     PipelineRoute.INFERENCE_ONLY, PipelineRoute.SKIP)
                 for c in clips
             )
@@ -172,7 +172,8 @@ class ClipMixin:
         if not self._gpu_worker.isRunning():
             self._status_bar.set_running(False)
 
-        can_run = can_run_inference(clip, self._param_panel.get_params().use_alpha_hint)
+        can_run = can_run_inference(
+            clip, hint_mode=self._param_panel.get_params().hint_mode)
         needs_extraction = clip.state == ClipState.EXTRACTING
         logger.debug(f"Run button enabled: {can_run} (state={clip.state.value})")
         self._status_bar.update_button_state(

@@ -152,3 +152,18 @@ def test_video_stems_are_zero_padded(tmp_path):
     save_hint_keyframes(str(tmp_path), [2], ["00000", "00001", "00002"])
     clip._load_hint_keyframes()
     assert clip.hint_keyframes == (2,)
+
+
+def test_none_raw_full_partial_keyframes_raw_matrix(tmp_path):
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    raw = _make(raw_root, alpha=0)
+    assert can_run_inference(raw, hint_mode="none")
+    assert classify_pipeline_route(raw, hint_mode="none") == PipelineRoute.INFERENCE_ONLY
+    assert not can_run_inference(raw, hint_mode="keyframes")
+    part_root = tmp_path / "part"
+    part_root.mkdir()
+    part = _make(part_root, alpha=3, marks=[1])
+    assert can_run_inference(part, hint_mode="keyframes")
+    assert not can_run_inference(part, hint_mode="full")
+    assert classify_pipeline_route(part, hint_mode="keyframes") == PipelineRoute.INFERENCE_ONLY
