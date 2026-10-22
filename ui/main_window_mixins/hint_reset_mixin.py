@@ -65,6 +65,11 @@ class HintResetMixin:
         panel.set_matanyone2_enabled(guided)
         panel.set_import_alpha_enabled(allowed and clip.state in _PRE_INFERENCE_STATES)
         self._refresh_hint_button_state()
+        # Job submit/finish/error/cancel/queue-idle all land here: keep the
+        # keyframe mark button + ticks in step with the busy guard.
+        keyframe_refresh = getattr(self, "_refresh_hint_keyframe_tools", None)
+        if callable(keyframe_refresh):
+            keyframe_refresh()
 
     def _refresh_hint_button_state(self, *_args) -> None:
         clip = getattr(self, "_current_clip", None)

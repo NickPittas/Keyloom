@@ -319,3 +319,15 @@ def test_no_clip_clears_ui(tmp_path):
     host._refresh_hint_keyframe_tools()
     assert host._param_panel.ctx["has_clip"] is False
     assert host._dual_viewer._scrubber._keyframes == []
+
+
+def test_toggle_refreshes_run_button_state_after_save(tmp_path, warnings):
+    """First/last mark enables/disables Run in Keyframes mode."""
+    clip = _make_clip(tmp_path)
+    host = Host(clip)
+    seen = []
+    host._refresh_button_state = lambda: seen.append(tuple(clip.hint_keyframes))
+    _set_frame(host, 2)
+    host._on_toggle_hint_keyframe()   # mark
+    host._on_toggle_hint_keyframe()   # unmark
+    assert seen == [(2,), ()]

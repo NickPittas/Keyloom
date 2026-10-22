@@ -26,11 +26,12 @@ from .session_mixin import SessionMixin
 from .settings_mixin import SettingsMixin
 from .hint_reset_mixin import HintResetMixin
 from .hint_keyframe_mixin import HintKeyframeMixin
+from .inference_feedback_mixin import InferenceFeedbackMixin
 
 __all__ = [
     "MenuMixin", "ShortcutsMixin", "ClipMixin", "ImportMixin",
     "InferenceMixin", "AlphaImportMixin", "ModelRunMixin", "CancelMixin",
     "WorkerMixin", "AnnotationMixin",
     "ExportMixin", "SessionMixin", "SettingsMixin", "HintResetMixin",
-    "HintKeyframeMixin",
+    "HintKeyframeMixin", "InferenceFeedbackMixin",
 ]

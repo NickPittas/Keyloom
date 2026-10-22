@@ -97,6 +97,7 @@ class ClipMixin:
             self._on_clip_selected(remaining[pick])
         else:
             self._current_clip = None
+            self._clear_inference_feedback()
             self._dual_viewer.show_placeholder(_tr("No clip selected"))
             self._refresh_hint_keyframe_tools()
             self._refresh_button_state()
@@ -163,6 +164,8 @@ class ClipMixin:
         # Load clip into both viewers while preserving the remembered input
         # interpretation for the selected clip.
         self._sync_selected_clip_view(clip)
+        # Probe the selected source off-thread (clears old estimates/notice now)
+        self._request_inference_feedback(clip)
 
         # Refresh annotation coverage bar (annotations loaded from disk above)
         self._update_annotation_info()
@@ -196,6 +199,7 @@ class ClipMixin:
         logger.info(f"Scanning clips directory: {dir_path}")
         previous_clips_dir = self._clips_dir
         self._clips_dir = dir_path
+        self._clear_inference_feedback()
         # Reset status bar state on project load (no active job)
         self._status_bar.set_running(False)
         self._status_bar.update_button_state(

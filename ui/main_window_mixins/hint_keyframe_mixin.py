@@ -191,6 +191,10 @@ class HintKeyframeMixin:
             return
         clip.hint_keyframes = tuple(sorted(marks))
         self._refresh_hint_keyframe_tools()
+        # First/last mark enables/disables Run in Keyframes mode.
+        button_refresh = getattr(self, "_refresh_button_state", None)
+        if callable(button_refresh):
+            button_refresh()
 
     def _warn(self, text: str) -> None:
         QMessageBox.warning(self, _tr("Hint keyframe"), text)

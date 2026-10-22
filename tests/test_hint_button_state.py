@@ -166,3 +166,12 @@ def test_inference_mixin_refresh_calls_hint_tools():
     s._refresh_hint_tools_if_available = lambda: InferenceMixin._refresh_hint_tools_if_available(s)
     InferenceMixin._refresh_button_state(s)
     assert calls == [1]
+
+
+def test_refresh_hint_tools_also_refreshes_keyframe_tools():
+    """Submit/finish/error/cancel/queue-idle reach the mark button via the central refresh."""
+    calls = []
+    h = _Host(_clip())
+    h._refresh_hint_keyframe_tools = lambda: calls.append(1)
+    h._refresh_hint_tools()
+    assert calls == [1]

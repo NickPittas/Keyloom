@@ -71,6 +71,7 @@ from ui.main_window_mixins import (
     InferenceMixin, AlphaImportMixin, ModelRunMixin, CancelMixin,
     WorkerMixin, AnnotationMixin,
     ExportMixin, SessionMixin, SettingsMixin, HintResetMixin, HintKeyframeMixin,
+    InferenceFeedbackMixin,
 )
 from ui.main_window_mixins.batch_pipeline_mixin import BatchPipelineMixin
 from ui.main_window_mixins.chroma_key_mixin import ChromaKeyMixin
@@ -209,6 +210,7 @@ class MainWindow(
     InferenceMixin, AlphaImportMixin, ModelRunMixin, CancelMixin,
     WorkerMixin, AnnotationMixin, ChromaKeyMixin, BatchPipelineMixin,
     ExportMixin, SessionMixin, SettingsMixin, HintResetMixin, HintKeyframeMixin,
+    InferenceFeedbackMixin,
 ):
     """CorridorKey main application window."""
 
@@ -577,6 +579,7 @@ class MainWindow(
 
         # Parameter panel changes (no live re-key in CorridorKey 2.0)
         self._param_panel.params_changed.connect(self._on_params_changed)
+        self._init_inference_feedback()
 
         # Sync IO tray divider with dual viewer splitter
         self._dual_viewer._viewer_splitter.splitterMoved.connect(self._sync_io_divider)
@@ -793,9 +796,14 @@ class MainWindow(
         self._close_poll_timer.stop()
         self.close()
 
+    def _return_to_welcome(self) -> None:
+        ImportMixin._return_to_welcome(self)
+        self._clear_inference_feedback()  # project closed: no stale estimates/notice
+
     def closeEvent(self, event) -> None:
         """Clean shutdown — auto-save session, stop workers, unload engines."""
         if self._skip_shutdown_cleanup:
+            self._close_inference_feedback()
             super().closeEvent(event)
             return
         if getattr(self, "_close_pending", False):
@@ -844,6 +852,7 @@ class MainWindow(
                 self._close_poll_timer.start()
                 event.ignore()
                 return
+        self._close_inference_feedback()
         self._service.unload_engines()
         if self._debug_console is not None:
             self._debug_console.close_permanently()
