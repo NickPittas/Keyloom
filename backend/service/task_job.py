@@ -1037,7 +1037,7 @@ def _ffprobe_check(path: str, n: int, fps: float, alpha: bool) -> None:
         raise CorridorKeyError("ffprobe not found; cannot validate the export")
     out = subprocess.run(
         [probe, "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
-         "stream=nb_read_packets,r_frame_rate,pix_fmt", "-of", "json", path],
+         "stream=nb_read_packets,r_frame_rate,pix_fmt:stream_tags=alpha_mode", "-of", "json", path],
         capture_output=True, text=True, timeout=60, check=False,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     try:
@@ -1050,8 +1050,63 @@ def _ffprobe_check(path: str, n: int, fps: float, alpha: bool) -> None:
         raise CorridorKeyError(f"Exported video has {got_n} frames, expected {n}; it was not published.")
     if abs(got_fps - fps) > max(0.01, fps * 1e-3):
         raise CorridorKeyError(f"Exported video runs at {got_fps} fps, expected {fps}; it was not published.")
-    if alpha and not str(s.get("pix_fmt", "")).startswith(("yuva", "rgba", "argb", "bgra", "gbrap")):
+    # WebM carries alpha as a side channel: ffprobe shows yuv420p plus the alpha_mode=1 tag
+    tagged = str((s.get("tags") or {}).get("alpha_mode", "")) == "1"
+    if alpha and not tagged and not str(s.get("pix_fmt", "")).startswith(("yuva", "rgba", "argb", "bgra", "gbrap")):
         raise CorridorKeyError(f"Exported video lost its alpha channel (pix_fmt {s.get('pix_fmt')}); not published.")
+
+
+def _read_exr(path: str) -> np.ndarray:
+    """Float32 (H, W, C) in R,G,B[,A] or Y order, via OpenEXR (FFmpeg's decoder rejects DWAB/Y files)."""
+    import Imath
+    import OpenEXR
+    f = OpenEXR.InputFile(path)
+    h = f.header()
+    dw = h["dataWindow"]
+    w, hh = dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1
+    names = set(h["channels"])
+    order = ["R", "G", "B"] + (["A"] if "A" in names else []) if {"R", "G", "B"} <= names \
+        else ["Y"] if "Y" in names else None
+    if order is None:
+        raise CorridorKeyError(f"{path}: expected R,G,B[,A] or Y channels, found {sorted(names)}")
+    flt = Imath.PixelType(Imath.PixelType.FLOAT)
+    return np.stack([np.frombuffer(f.channel(c, flt), np.float32).reshape(hh, w) for c in order], -1)
+
+
+def _raw_frame(img: np.ndarray, srgb: bool) -> bytes:
+    """16-bit raw frame. Colour channels get the sRGB transfer when ``srgb``; alpha and data never do."""
+    from ..frame_io import _linear_to_srgb
+    img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+    if srgb:
+        col = _linear_to_srgb(np.clip(img[..., :3], 0.0, None)) if img.shape[-1] >= 3 else img
+        img = np.concatenate([col, img[..., 3:]], -1) if img.shape[-1] == 4 else col
+    return (np.clip(img, 0.0, 1.0) * 65535.0 + 0.5).astype("<u2").tobytes()
+
+
+def _reap(proc, helpers: list, grace: float = 2.0) -> None:
+    """Stop and reap the child, then join the helper threads (killing the child breaks a blocked pipe
+    write, which is what lets the writer thread finish)."""
+    if proc is not None:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    logger.error("FFmpeg pid %s did not exit after kill", proc.pid)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except (OSError, ValueError):
+                pass
+    for t in helpers:
+        t.join(5)
+        if t.is_alive():
+            logger.error("export helper thread %s did not finish", t.name)
 
 
 def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
@@ -1065,50 +1120,106 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     scratch = os.path.join(_scratch_root(), f"export-{job.job_id}")
     os.makedirs(scratch)
     ext = os.path.splitext(ctx.files[0])[1].lower()
+    raw = ext == ".exr"  # EXR is decoded here and piped as 16-bit; PNG goes straight to FFmpeg
     owned_part = False
+    proc, helpers, stop = None, [], threading.Event()
     try:
-        for i, src in enumerate(ctx.files):  # sequential names only inside our scratch; gaps were rejected
-            _link(src, os.path.join(scratch, f"f{i:08d}{ext}"))
         alpha = p["container"] in _ALPHA_CONTAINERS
-        cmd = [ffmpeg, "-hide_banner", "-n", "-framerate", repr(float(p["fps"])), "-i", os.path.join(scratch, f"f%08d{ext}")]
-        if ext == ".exr" and p["product"] != "matte":  # linear colour -> sRGB, as stitch_video does
-            cmd += ["-vf", "zscale=tin=linear:t=iec61966-2-1:pin=709:p=709:min=gbr:m=gbr:rin=full:r=full"]
-            ev("warning", message="EXR frames are linear; the video is encoded with the sRGB transfer.")
-        elif ext == ".exr":
-            ev("warning", message="Matte EXR values are written as-is (no sRGB curve) to a gray video.")
+        pix = {"mp4": "yuv420p", "mov_prores4444": "yuva444p10le", "webm_alpha": "yuva420p"}[p["container"]]
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-n"]
+        if raw:
+            first = _read_exr(ctx.files[0])
+            hh, ww, ch = first.shape
+            cmd += ["-f", "rawvideo", "-pix_fmt", {1: "gray16le", 3: "rgb48le", 4: "rgba64le"}[ch],
+                    "-s", f"{ww}x{hh}", "-framerate", repr(float(p["fps"])), "-i", "pipe:0"]
+            srgb = p["product"] != "matte"  # matte values are data: never curve-mapped
+            ev("warning", message="EXR frames are linear; the video is encoded with the sRGB transfer."
+               if srgb else "Matte EXR values are written as-is (no sRGB curve) to a gray video.")
+        else:
+            for i, src in enumerate(ctx.files):  # sequential names only inside our scratch; gaps were rejected
+                _link(src, os.path.join(scratch, f"f{i:08d}{ext}"))
+            cmd += ["-framerate", repr(float(p["fps"])), "-i", os.path.join(scratch, f"f%08d{ext}"),
+                    "-progress", "pipe:1", "-nostats"]
+        # BT.709 limited-range YUV made by swscale from full-range RGB/gray
+        cmd += ["-vf", f"scale=in_range=pc:out_color_matrix=bt709:out_range=tv,format={pix}", "-colorspace", "bt709"]
+        if p["product"] != "matte":
+            cmd += ["-color_primaries", "bt709", "-color_trc", "iec61966-2-1"]
         if p["container"] == "mov_prores4444":
-            cmd += ["-c:v", "prores_ks", "-profile:v", "4444", "-qscale:v", "9", "-pix_fmt", "yuva444p10le",
+            cmd += ["-c:v", "prores_ks", "-profile:v", "4444", "-qscale:v", "9", "-pix_fmt", pix,
                     "-vendor", "apl0", "-f", "mov"]
         elif p["container"] == "webm_alpha":
-            cmd += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", "18", "-auto-alt-ref", "0",
+            cmd += ["-c:v", "libvpx-vp9", "-pix_fmt", pix, "-b:v", "0", "-crf", "18", "-auto-alt-ref", "0",
                     "-row-mt", "1", "-f", "webm"]
         else:
-            cmd += ["-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-f", "mp4"]
-            if p["product"] in ("processed",):
+            cmd += ["-c:v", "libx264", "-crf", "18", "-pix_fmt", pix, "-f", "mp4"]
+            if p["product"] == "processed":
                 ev("warning", message="MP4 has no alpha channel; transparency is not kept.")
-        cmd += ["-an", "-progress", "pipe:1", "-nostats", part]
+        cmd += ["-an", part]
         ev("warning", message="Audio is not included in exported videos.")
         owned_part = True
-        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding="utf-8", errors="replace",
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if raw else subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=False,
                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         err: list = []
-        threading.Thread(target=lambda: err.extend(proc.stderr), daemon=True).start()
-        for line in proc.stdout:
+        failure: list = []  # first exception raised on a helper thread
+
+        def pump_stderr():
+            err.extend(proc.stderr)
+
+        def pump_stdout():  # progress lines (PNG path) or just draining so FFmpeg never blocks on it
+            for line in proc.stdout:
+                line = line.decode("utf-8", "replace")
+                if line.startswith("frame=") and not stop.is_set():
+                    try:
+                        ev("progress", phase="export_video", done=min(n, int(line.split("=")[1] or 0)), total=n)
+                    except BaseException as exc:  # noqa: BLE001 - reported by the supervising loop
+                        failure.append(exc)
+
+        def feed():  # decodes EXR frames and writes them; the ONLY blocking pipe write lives here
+            try:
+                for i, src in enumerate(ctx.files):
+                    if stop.is_set():
+                        return
+                    try:
+                        img = first if i == 0 else _read_exr(src)
+                    except Exception as exc:  # noqa: BLE001
+                        raise CorridorKeyError(f"Cannot read frame {i + 1}/{n} ({src}): {exc}") from exc
+                    if img.shape != first.shape:
+                        raise CorridorKeyError(f"Frame {i + 1}/{n} ({src}) is {img.shape[1]}x{img.shape[0]}x"
+                                               f"{img.shape[2]}; the first frame is {ww}x{hh}x{ch}")
+                    data = _raw_frame(img, srgb)
+                    try:
+                        proc.stdin.write(data)
+                    except (BrokenPipeError, OSError):
+                        return  # FFmpeg went away; the supervisor reports its own error text
+                    ev("progress", phase="export_video", done=i + 1, total=n)
+            except BaseException as exc:  # noqa: BLE001
+                failure.append(exc)
+            finally:
+                try:
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    pass
+
+        threads = [threading.Thread(target=pump_stderr, name="export-stderr", daemon=True),
+                   threading.Thread(target=pump_stdout, name="export-stdout", daemon=True)]
+        writer = threading.Thread(target=feed, name="export-feed", daemon=True) if raw else None
+        helpers = threads + ([writer] if writer else [])
+        for t in helpers:
+            t.start()
+        while writer is not None and writer.is_alive() or proc.poll() is None:
             if cancel.is_set():
-                proc.terminate()
-                break
-            if line.startswith("frame="):
-                ev("progress", phase="export_video", done=min(n, int(line.split("=")[1] or 0)), total=n)
-        try:
-            proc.wait(timeout=30 if cancel.is_set() else None)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        if cancel.is_set():
-            raise JobCancelledError("export", 0)
+                raise JobCancelledError("export", 0)
+            if failure:
+                raise failure[0]
+            time.sleep(0.05)  # the job thread keeps polling: a blocked pipe write or hung FFmpeg stays cancellable
+        if failure:
+            raise failure[0]
+        for t in threads:
+            t.join(5)
         if proc.returncode != 0:
-            raise CorridorKeyError("FFmpeg export failed:\n" + "".join(err[-10:]))
+            text = b"".join(err).decode("utf-8", "replace").strip()
+            raise CorridorKeyError("FFmpeg export failed:\n" + "\n".join(text.splitlines()[:20]))
         _ffprobe_check(part, n, float(p["fps"]), alpha)
         _link_noclobber(part, p["dest"])  # hard link then drop the .part; never replaces
         owned_part = False
@@ -1116,6 +1227,8 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
         _rollback(created)
         raise
     finally:
+        stop.set()
+        _reap(proc, helpers)  # FFmpeg must be dead (Windows) before its .part can be deleted
         if owned_part:
             _rm(part)
         shutil.rmtree(scratch, ignore_errors=True)

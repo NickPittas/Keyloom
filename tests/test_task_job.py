@@ -798,3 +798,200 @@ def test_lock_lost_between_moves_restores_old_folder(env, monkeypatch):
 def test_win_liveness_is_unknown(monkeypatch):
     monkeypatch.setattr(task_job.sys, "platform", "win32")
     assert task_job._pid_alive(os.getpid()) is None
+
+
+# ------------------------------------------- real Key-style EXR export (acceptance regression)
+
+def key_style_result(env, tmp_name="keyout", fmt_comp="png", compression="dwab", size=(H, W)):
+    """Float32 EXR FG/Matte/Processed + PNG Comp exactly as run_key_job writes them."""
+    pytest.importorskip("OpenEXR")
+    from backend.service.key_job import _write_exr_float32
+    out = env.tmp / tmp_name
+    files = {}
+    for prod, d in (("fg", "FG"), ("matte", "Matte"), ("comp", "Comp"), ("processed", "Processed")):
+        (out / d).mkdir(parents=True)
+        files[prod] = []
+        for i in range(A, B + 1):
+            ext = "png" if prod == "comp" else "exr"
+            rel = f"{d}/{STEMS[i]}.{ext}"
+            files[prod].append(rel)
+            if prod == "fg":
+                _write_exr_float32(str(out / rel), np.full((*size, 3), 0.2, np.float32), compression)
+            elif prod == "matte":
+                _write_exr_float32(str(out / rel), np.full(size, 0.5, np.float32), compression)
+            elif prod == "processed":
+                px = np.full((*size, 4), 0.2, np.float32)
+                px[:, :, 3] = 0.5
+                _write_exr_float32(str(out / rel), px, compression)
+            else:
+                png(out / rel, 100)
+    m = {"version": 3, "engine": "corridorkey-v2", "clip_id": "proj/clip1",
+         "range": {"in_point": A, "out_point": B, "in_stem": STEMS[A], "out_stem": STEMS[B]},
+         "source_stems": STEMS[A:B + 1], "files": files, "complete": True,
+         "formats": {"fg": "exr", "matte": "exr", "comp": fmt_comp, "processed": "exr"}}
+    (out / ".corridorkey_manifest.json").write_text(json.dumps(m))
+    return out
+
+
+def decode(path, pix="rgba", dec=()):
+    r = subprocess.run(["ffmpeg", "-v", "error", *dec, "-i", str(path), "-f", "rawvideo", "-pix_fmt", pix, "-"],
+                       capture_output=True, timeout=10)
+    assert r.returncode == 0, r.stderr.decode()
+    n = {"rgba": 4, "gray": 1}[pix]
+    return np.frombuffer(r.stdout, np.uint8).reshape(-1, H, W, n)
+
+
+@pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="needs ffmpeg")
+@pytest.mark.parametrize("product,container,expect_rgb,expect_a", [
+    ("fg", "mp4", 123, None),              # linear 0.2 -> sRGB ~0.484
+    ("matte", "mp4", 125, None),           # data: 0.5 as-is (limited range ~125), no curve
+    ("comp", "mp4", 100, None),            # PNG already display-encoded
+    ("processed", "mp4", 123, None),       # alpha dropped, colour still correct
+    ("processed", "mov_prores4444", 123, 127),
+    ("processed", "webm_alpha", 123, 127),
+])
+def test_export_real_key_exr_all_products_and_containers(env, svc, product, container, expect_rgb, expect_a):
+    out = key_style_result(env)
+    dest = env.tmp / "deliver" / f"{product}{CONTAINER_EXT[container]}"
+    events, done = run(svc, export_job(env, out, product=product, container=container, dest=str(dest)))
+    assert done["outcome"] == "complete", done
+    assert done["result"]["frames"] == 3 and done["result"]["alpha"] is (container != "mp4")
+    dec = ("-c:v", "libvpx-vp9") if container == "webm_alpha" else ()
+    px = decode(dest, "rgba", dec)
+    assert px.shape[0] == 3
+    centre = px[:, H // 2, W // 2, :].astype(int)
+    assert all(abs(c[:3] - expect_rgb).max() <= 6 for c in centre), centre
+    if expect_a is not None:
+        assert all(abs(c[3] - expect_a) <= 4 for c in centre), centre
+    else:
+        assert all(c[3] == 255 for c in centre)
+    assert not list((env.tmp / "deliver").glob("*.part*"))
+    with pytest.raises(TaskRejected) as e:  # an existing deliverable is never replaced
+        run(svc, {**export_job(env, out, product=product, container=container, dest=str(dest)),
+                  "job_id": "job-again"})
+    assert e.value.code == "exists"
+
+
+CONTAINER_EXT = {"mp4": ".mp4", "mov_prores4444": ".mov", "webm_alpha": ".webm"}
+
+
+@pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="needs ffmpeg")
+def test_export_failure_reports_ffmpeg_error_and_keeps_nothing(env, svc, monkeypatch):
+    out = key_style_result(env)
+    real = subprocess.Popen
+
+    def bad(cmd, *a, **k):  # an invalid filter makes FFmpeg print a real error
+        cmd = [x if not str(x).startswith("scale=in_range") else "nosuchfilter" for x in cmd]
+        return real(cmd, *a, **k)
+    monkeypatch.setattr(task_job.subprocess, "Popen", bad)
+    _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "x.mp4")))
+    assert done["outcome"] == "failed" and "nosuchfilter" in done["message"].lower()
+    assert not (env.tmp / "deliver" / "x.mp4").exists() and not list((env.tmp / "deliver").glob("*.part*"))
+
+
+@pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="needs ffmpeg")
+def test_export_cancel_leaves_no_part_file(env, svc):
+    out = key_style_result(env)
+    cancel = threading.Event()
+    cancel.set()
+    _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "c.mp4")), cancel)
+    assert done["outcome"] == "cancelled"
+    assert not list((env.tmp / "deliver").glob("c.mp4*"))
+
+
+# ---------------------------------------------- supervised export: hung consumer, bad frames, cleanup
+
+def fake_ffmpeg(tmp, monkeypatch, body="exec sleep 300"):
+    """An 'ffmpeg' that creates its output file, never reads stdin and never exits by itself."""
+    script = tmp / "fake-ffmpeg.sh"
+    script.write_text('#!/bin/sh\nfor a; do last=$a; done\n: > "$last"\n' + body + "\n")
+    script.chmod(0o755)
+    monkeypatch.setattr("backend.ffmpeg_tools.discovery.require_ffmpeg_install",
+                        lambda require_probe=True: types.SimpleNamespace(ffmpeg_path=str(script)))
+    procs = []
+    real = subprocess.Popen
+
+    def spy(cmd, *a, **k):
+        proc = real(cmd, *a, **k)
+        procs.append(proc)
+        return proc
+    monkeypatch.setattr(task_job.subprocess, "Popen", spy)
+    return procs
+
+
+def export_threads():
+    return [t for t in threading.enumerate() if t.name.startswith("export-") and t.is_alive()]
+
+
+def assert_cleaned(env, procs, name):
+    assert procs and all(p.poll() is not None for p in procs)  # child reaped
+    assert not export_threads()                                # helper threads joined
+    assert not list((env.tmp / "deliver").glob(f"{name}*"))    # no .part, no deliverable
+
+
+def cancel_after(delay):
+    ev = threading.Event()
+    threading.Timer(delay, ev.set).start()
+    return ev
+
+
+def test_export_cancel_while_ffmpeg_consumer_is_hung_mid_stream(env, svc, monkeypatch):
+    pytest.importorskip("OpenEXR")
+    out = key_style_result(env, size=(512, 512), compression="zip")  # frames far larger than the pipe buffer
+    procs = fake_ffmpeg(env.tmp, monkeypatch)
+    t0 = __import__("time").monotonic()
+    _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "h.mp4")), cancel_after(0.7))
+    assert done["outcome"] == "cancelled", done
+    assert __import__("time").monotonic() - t0 < 10  # blocked pipe write did not hold the job hostage
+    assert_cleaned(env, procs, "h.mp4")
+
+
+def test_export_cancel_when_ffmpeg_hangs_after_all_frames(env, svc, monkeypatch):
+    out = key_style_result(env)  # tiny frames: every write succeeds, then FFmpeg never finishes
+    procs = fake_ffmpeg(env.tmp, monkeypatch)
+    _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "h2.mp4")), cancel_after(0.7))
+    assert done["outcome"] == "cancelled", done
+    assert_cleaned(env, procs, "h2.mp4")
+
+
+def test_export_bad_second_frame_names_it_and_reaps_child(env, svc, monkeypatch):
+    out = key_style_result(env)
+    (out / "FG" / f"{STEMS[A + 1]}.exr").write_bytes(b"not an exr")
+    procs = fake_ffmpeg(env.tmp, monkeypatch)
+    _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "b.mp4")))
+    assert done["outcome"] == "failed" and "frame 2/3" in done["message"] and STEMS[A + 1] in done["message"], done
+    assert_cleaned(env, procs, "b.mp4")
+
+
+def test_export_wrong_size_frame_is_named(env, svc, monkeypatch):
+    pytest.importorskip("OpenEXR")
+    from backend.service.key_job import _write_exr_float32
+    out = key_style_result(env)
+    _write_exr_float32(str(out / "FG" / f"{STEMS[B]}.exr"), np.full((H + 2, W, 3), 0.2, np.float32), "zip")
+    procs = fake_ffmpeg(env.tmp, monkeypatch)
+    _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "s.mp4")))
+    assert done["outcome"] == "failed" and "frame 3/3" in done["message"].lower(), done
+    assert_cleaned(env, procs, "s.mp4")
+
+
+def test_export_progress_callback_failure_is_reported_and_cleaned(env, svc, monkeypatch):
+    out = key_style_result(env)
+    procs = fake_ffmpeg(env.tmp, monkeypatch)
+    events = []
+
+    def emit(m):
+        if m.get("event") == "progress" and m.get("phase") == "export_video":
+            raise RuntimeError("UI pipe closed")
+        events.append(m)
+    done = run_task_job(svc, TaskJob.from_dict(export_job(env, out, dest=str(env.tmp / "deliver" / "c2.mp4"))),
+                        emit=emit, cancel=threading.Event())
+    assert done["outcome"] == "failed" and "UI pipe closed" in done["message"], done
+    assert_cleaned(env, procs, "c2.mp4")
+
+
+def test_export_ffmpeg_dying_early_reports_its_error(env, svc, monkeypatch):
+    out = key_style_result(env)
+    procs = fake_ffmpeg(env.tmp, monkeypatch, body='echo "boom: bad filter" >&2; exit 3')
+    _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "d.mp4")))
+    assert done["outcome"] == "failed" and "boom: bad filter" in done["message"], done
+    assert_cleaned(env, procs, "d.mp4")
