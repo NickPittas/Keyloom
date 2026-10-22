@@ -58,7 +58,8 @@ def make_job(args, jid, out, mode="new", sha=None):
             "require": {"protocol": 1, "models": {"corridorkey_v2": sha}}}
 
 
-SSH_TIMEOUT = 15  # every non-worker remote command
+SSH_TIMEOUT = 15  # user cap: every non-worker remote command
+WAIT_CAP = 15      # user cap: any single blocking wait on the worker stream (longer silence fails)
 
 
 class Timeout(Exception):
@@ -101,6 +102,7 @@ class Worker:
         return "".join(self.err[-30:])[-2500:]
 
     def read(self, timeout):
+        timeout = min(timeout, WAIT_CAP)  # never block longer than the user cap on one read
         try:
             line = self.q.get(timeout=timeout)
         except queue.Empty:
@@ -114,23 +116,55 @@ class Worker:
     def send(self, obj):
         self.p.stdin.write(json.dumps({"v": 1, **obj}) + "\n"); self.p.stdin.flush()
 
-    def run_job(self, j, idle=30, total=120, cancel_at=None):
-        """idle: max silence between events; total: wall cap for the job."""
-        self.send({"cmd": "key", "job": j}); end = time.time() + total
+    def run_job(self, j, stage_end, cancel_at=None):
+        """Send a key job, return its terminal done/rejected event.
+        stage_end: absolute time.monotonic() deadline; any silent gap > WAIT_CAP fails."""
+        self.send({"cmd": "key", "job": j})
         while True:
-            e = self.read(min(idle, max(1, end - time.time())))
+            rem = stage_end - time.monotonic()
+            if rem <= 0:
+                raise Timeout(f"job {j['job_id']} exceeded stage budget; stderr tail:\n{self.tail()}")
+            e = self.read(min(WAIT_CAP, rem))
             if cancel_at and e["event"] == "progress" and e.get("phase") == "publish" and e["done"] >= cancel_at:
                 self.send({"cmd": "cancel", "job_id": j["job_id"]}); cancel_at = None
             if e["event"] in ("done", "rejected"):
                 return e
-            if time.time() > end:
-                raise Timeout(f"job exceeded {total}s; stderr tail:\n{self.tail()}")
+
+    def read_until(self, pred, stage_end, fail_terminal=True):
+        """Read until pred(event); a terminal done/rejected that misses the predicate fails fast."""
+        while True:
+            rem = stage_end - time.monotonic()
+            if rem <= 0:
+                raise Timeout(f"stage budget exhausted before predicate met; stderr tail:\n{self.tail()}")
+            e = self.read(min(WAIT_CAP, rem))
+            if pred(e):
+                return e
+            if fail_terminal and e["event"] in ("done", "rejected"):
+                raise SystemExit(f"terminal {e['event']} before predicate met: {e}; stderr tail:\n{self.tail()}")
 
     def wait_exit(self, timeout=15):
         try:
             return self.p.wait(timeout)
         except subprocess.TimeoutExpired:
             return "STILL RUNNING after %ss" % timeout
+
+    def drain_terminal(self, stage_end):
+        """Read events after stdin EOF until a terminal done/rejected or the absolute monotonic
+        stage deadline; every read capped at WAIT_CAP (no unbounded reads)."""
+        last = None
+        while True:
+            rem = stage_end - time.monotonic()
+            if rem <= 0:
+                raise Timeout(f"no terminal event before stage deadline; last={last}; stderr tail:\n{self.tail()}")
+            last = self.read(min(WAIT_CAP, rem))
+            if last["event"] in ("done", "rejected"):
+                return last
+
+    def assert_exit(self, what, timeout=15):
+        """wait_exit must yield 0 — nonzero or 'STILL RUNNING' fails the stage, never reports green."""
+        rc = self.wait_exit(timeout)
+        assert rc == 0, f"{what}: worker exit was {rc!r}; stderr tail:\n{self.tail()}"
+        return rc
 
 
 def diagnose(args):
@@ -148,40 +182,70 @@ def main():
     for k in ("sock", "host", "task", "python", "models"): ap.add_argument("--" + k, required=True)
     ap.add_argument("--expect-sha256"); ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--fmt", choices=("exr", "png"), default="exr", help="png when OpenEXR/Imath are not installed remotely")
-    ap.add_argument("--stage", choices=("hello", "job", "full"), default="hello",
-                    help="hello: hello + stdin EOF exit only (no model); job: + one key job; full: everything")
-    ap.add_argument("--job-total", type=int, default=120)
-    args = ap.parse_args(); rep = {}
+    ap.add_argument("--stage", choices=("hello", "job", "full", "eofmid"), default="hello",
+                    help="hello: hello + stdin EOF exit only (no model); job: + one key job; "
+                         "full: everything; eofmid: hello + one job killed by stdin EOF mid-job, "
+                         "drained to the terminal done event")
+    ap.add_argument("--stage-budget", type=int, default=None,
+                    help="absolute monotonic budget in seconds for the WHOLE invocation "
+                         "(required for job/full/eofmid: GPU model load alone exceeds the 15s wait cap, "
+                         "so the longer bound must be explicit, not a hidden default). "
+                         "Any single silent gap still fails at %ss." % WAIT_CAP)
+    args = ap.parse_args()
+    if args.stage != "hello" and not args.stage_budget:
+        ap.error("--stage-budget is required for stages that run the GPU (job/full/eofmid)")
+    args.stage_budget = args.stage_budget or SSH_TIMEOUT  # hello needs no budget beyond the wait cap
+    rep = {"stage": args.stage, "stage_budget_s": args.stage_budget}
+    stage_end = time.monotonic() + args.stage_budget
+    print(f"STAGE {args.stage} budget {args.stage_budget}s (single-wait cap {WAIT_CAP}s)", file=sys.stderr, flush=True)
     w = None
     try:
         r = ssh(args, f'"{args.python}" - {args.task}\\work\\proj\\clips\\clip1', FIXTURE_SRC)
         assert "fixture ok" in r.stdout, r
         out = args.task + "\\work\\out" + str(int(time.time()))  # fresh folder per run
-        w = Worker(args); h = w.read(20); assert h["event"] == "hello", h
+        w = Worker(args); h = w.read(WAIT_CAP); assert h["event"] == "hello", h
         rep["hello"] = {k: h[k] for k in ("host", "gpu", "capabilities", "worker_rev", "models")}
         sha = h["models"]["corridorkey_v2"].get("sha256")
         if args.expect_sha256: assert sha == args.expect_sha256, ("model sha mismatch", sha)
         assert h["capabilities"]["key"], w.tail()
         if args.stage == "hello":
-            w.p.stdin.close(); rep["eof_idle_exit"] = w.wait_exit()
+            w.p.stdin.close(); rep["eof_idle_exit"] = w.assert_exit("hello EOF idle")
+        elif args.stage == "eofmid":
+            out_e = args.task + "\\work\\oute" + str(int(time.time()))
+            w.send({"cmd": "key", "job": make_job(args, "e1", out_e + "\\v001", sha=sha)})
+            w.read_until(lambda e: e["event"] == "accepted", stage_end)
+            w.p.stdin.close()
+            term = w.drain_terminal(stage_end)
+            assert term["event"] == "done" and term.get("outcome") == "cancelled", term
+            rep["eof_midjob_done"] = {k: term.get(k) for k in ("outcome", "published", "manifest_complete")}
+            rep["eof_midjob_exit"] = w.assert_exit("eofmid")
+            ls = ssh(args, f"dir /b \"{out_e}\\v001\"")
+            rep["v001_after"] = ls.stdout.split()
+            rep["lock_left"] = ".corridorkey_job.lock" in ls.stdout
+            assert not rep["lock_left"], ls.stdout
+            rep["owned_pids_after_exit"] = owned_pids(args)
+            assert not rep["owned_pids_after_exit"], rep["owned_pids_after_exit"]
         else:
-            d1 = w.run_job(make_job(args, "w1", out + "\\v001", sha=sha), total=args.job_total)
+            d1 = w.run_job(make_job(args, "w1", out + "\\v001", sha=sha), stage_end)
             rep["job1"] = {k: d1.get(k) for k in ("outcome", "message", "error_kind", "published", "expected", "manifest_complete")}
             assert d1["outcome"] == "complete", (d1, w.tail())
             if args.stage == "full":
-                d2 = w.run_job(make_job(args, "w2", out + "\\v002"), cancel_at=2)
+                d2 = w.run_job(make_job(args, "w2", out + "\\v002"), stage_end, cancel_at=2)
                 rep["job2_cancel"] = {k: d2.get(k) for k in ("outcome", "published", "manifest_complete")}
                 assert d2["outcome"] == "cancelled", d2
-                d3 = w.run_job(make_job(args, "w3", out + "\\v001"))
+                d3 = w.run_job(make_job(args, "w3", out + "\\v001"), stage_end)
                 rep["job3_noclobber"] = {k: d3.get(k) for k in ("event", "code")}
                 assert d3["event"] == "rejected" and d3["code"] == "exists", d3
-            w.p.stdin.close(); rep["eof_idle_exit"] = w.wait_exit()
+            w.p.stdin.close(); rep["eof_idle_exit"] = w.assert_exit("job EOF idle")
             if args.stage == "full":
-                w2 = Worker(args); w2.read(20)
+                w2 = Worker(args); w2.read(WAIT_CAP)
                 w2.send({"cmd": "key", "job": make_job(args, "w4", out + "\\v004")})
-                while w2.read(30)["event"] != "accepted": pass
-                w2.p.stdin.close(); rep["eof_midjob_exit"] = w2.wait_exit()
-                rep["eof_midjob_last"] = w2.events[-1].get("event"), w2.events[-1].get("outcome")
+                w2.read_until(lambda e: e["event"] == "accepted", stage_end)
+                w2.p.stdin.close()
+                term = w2.drain_terminal(stage_end)
+                rep["eof_midjob_done"] = {k: term.get(k) for k in ("outcome", "published", "manifest_complete")}
+                assert term["event"] == "done" and term.get("outcome") == "cancelled", term
+                rep["eof_midjob_exit"] = w2.assert_exit("full w4")
         rep["stderr_tail"] = w.tail()[-800:]
     except Timeout as e:
         print("TIMEOUT:", e, file=sys.stderr)
@@ -195,6 +259,7 @@ def main():
             if w.wait_exit(10) != 0 and w.p.poll() is None: w.p.kill()
         cleanup(args)
         rep["leftover_owned_pids"] = owned_pids(args)
+        rep["stage_elapsed_s"] = round(args.stage_budget - (stage_end - time.monotonic()), 1)
     print(json.dumps(rep, indent=2, default=str))
 
 

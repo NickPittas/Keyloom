@@ -49,3 +49,66 @@ CK_SSH_SOCKET=<socket> CK_SMOKE_HOST=<ip> CK_SMOKE_USER=<user> CK_SMOKE_DEPLOY=/
 CK_SMOKE_CLIP=<shared clip root> CK_SMOKE_OUT=<new shared dir> CK_SMOKE_SHA=<sha> \
 CARGO_HOME=$HOME/.cargo RUSTC=/usr/bin/rustc /usr/bin/cargo test --offline --test linux_remote_smoke -- --ignored --nocapture
 ```
+
+## Windows worker (`nick@192.168.100.152`, hostname `Kamino-3`)
+
+Validated 2026-10-22 over an authenticated ssh ControlMaster socket (`/tmp/ck-windows-smoke-ssh`; no keys installed, no
+auth config changed). OpenSSH default shell is `cmd.exe`; PowerShell 5 is available for the encoded launcher.
+
+**Machine:** RTX 4090 (GPU 0, 24 GB), Windows with a ComfyUI-Easy-Install environment on `C:`.
+
+**Deployment** (`C:\Users\Nick\ck-wsmoke-1022a\`, new task dir, nothing existing touched, no global installs):
+- `repo/` — worker code; the four worker-runtime files are byte-verified (sha256) against the local checkpoint commit
+  `9c4712a`: `backend/worker/__init__.py` `db644341…`, `backend/service/key_job.py` `c711f79f…`,
+  `backend/frame_io.py` `2a803cb9…`, `backend/worker/__main__.py` `90255e99…`.
+- `py/` — copy of the embedded Python 3.12.10 (`python312._pth` disabled by rename); `py\Lib\site-packages\ck.pth`
+  appends the CorridorKey2 `runtime-deps` and the ComfyUI `python_embeded` site-packages (torch 2.11 cu130, scipy;
+  runtime-deps' cv2 4.11 shadows ComfyUI's newer cv2). The original ComfyUI tree is untouched.
+- `ext/` — task-local `openexr` 3.5.2 cp312/win_amd64 wheel installed with `pip --target` from an offline wheel
+  (scp'd from the UI host; the single wheel provides both the `OpenEXR` and `Imath` modules, dependency numpy already
+  present, no legacy pins), wired in via `py\Lib\site-packages\exr.pth`.
+- Models are read from `…\ComfyUI\models\CorridorKey2\upstream`; hello reports `corridorkey_v2.safetensors`
+  `c43596de…` (same as the UI host and the Linux deployment).
+
+**Driver:** `rust-ui/tools/win_smoke_worker.py`. The launcher is the production `remote_command()` output wrapped in
+`powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand …`. Timeout bookkeeping (hardened after the recorded
+runs below): every non-worker remote command is capped at 15 s; **every single wait on the worker stream is capped at
+15 s** (`WAIT_CAP` — longer silence fails); each invocation carries **one absolute monotonic stage budget**
+(`--stage-budget`, required for `job`/`full`/`eofmid` because GPU model load alone exceeds 15 s — the longer bound must
+be explicit, never a hidden default; `full`'s whole chain runs inside that one budget); accept-wait and drain loops
+**fail fast on terminal/rejected events**; every worker exit is asserted `0` (`assert_exit` — nonzero or
+"STILL RUNNING" fails the stage); the budget and elapsed time are printed and recorded in the report JSON. Verified by
+the local mock selfcheck `rust-ui/tools/test_win_smoke_worker.py` (10 checks; `timeout 60 python3 …`). The 2026-10-22
+recorded runs below used the pre-hardening driver (job-total default 120 s, 20–30 s idles) — outcomes stand; only the
+bookkeeping changed, so no remote rerun was needed.
+
+**Tests and outcomes**
+1. `--stage hello` (+ EOF idle): RTX 4090, `capabilities.key=true`, model SHA match, exit 0.
+2. `--stage full --fmt exr` (real EXR output through the production `_write_exr_float32` path): w1 `complete` 7/7 with
+   a complete manifest; w2 `cancelled` at 3 published; w3 rejected `exists`; EOF-idle exit 0; reconnect + EOF mid-job
+   drained to the terminal event. Job artifacts verified on disk: Fg `shot_*.exr` channels B/G/R all **FLOAT
+   (float32)**, Matte Y **FLOAT**, compression **PIZ_COMPRESSION**, EXR magic `76 2f 31 01`;
+   `.corridorkey_manifest.json` records `exr_pixel_type: float32`, `exr_compression: piz`, `complete: true`. (An earlier
+   half-float round-trip pre-check exercised `frame_io.write_exr`'s HALF default — test-only, not the job path.)
+3. `--stage eofmid` (driver fix, rerun of only this stage): stdin EOF mid-job **drains with a bounded deadline to the
+   terminal `done` event** and asserts `outcome=cancelled`, exit 0, `.corridorkey_job.lock` released, and no owned
+   pids left (published 0 — EOF landed during warm-up before the first publish).
+4. scipy blocked-stdin deadlock probe (`dl.py`: native import while another thread blocks on stdin): imports in 0.7 s
+   with the production PolledStdin; previously hung indefinitely.
+
+**Models location without an env prefix (open, proposal verified).** `backend/v2_paths.py` resolves
+`CORRIDORKEY_V2_MODELS_DIR` (read at call time) and otherwise falls back to `%LOCALAPPDATA%\EZ-CorridorKey2\CorridorKeyV2`.
+The recorded runs still launch the worker with a test-only `set CORRIDORKEY_V2_MODELS_DIR=…&& ` cmd prefix. Proposal
+(mechanism verified 2026-10-22 on the remote interpreter): a task-local
+`py\Lib\site-packages\ckmodels.pth` whose import line does
+`os.environ.setdefault("CORRIDORKEY_V2_MODELS_DIR", <upstream models dir>)` — site.py executes it at interpreter start,
+so `Target.python = C:\Users\Nick\ck-wsmoke-1022a\py\python.exe` works exactly, with a byte-identical production
+launcher and no env prefix; `setdefault` never overrides an explicit env. A production-fidelity alternative for a later
+run is populating/junctioning the `%LOCALAPPDATA%` default itself. The next GPU run should switch to the `.pth` route
+and drop the prefix — not yet exercised end-to-end.
+
+**Limits.** NAS UNC paths (`\\192.168.100.10\Projects`) **not tested** over this worker (auth unresolved; no guessing).
+The models-config item above is verified only at the interpreter level, not yet in a full GPU run. Single Windows host,
+synthetic 256×256 7-frame clip; PowerShell progress records add CLIXML noise to stderr (harmless); runtime-deps' cv2
+4.11 shadows ComfyUI's newer cv2 (worker EXR path uses the OpenEXR bindings, not cv2). Not deployment-ready: the NAS
+item and the `.pth`-route GPU run must land first.
