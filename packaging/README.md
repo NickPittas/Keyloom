@@ -32,7 +32,7 @@ build recipe, `_C.so` hash); `--reuse-runtime` rejects a runtime whose recipe or
 the `manylinux_2_28` tag so e.g. cryptography stays low.
 Prerequisites: `uv`, `git`, `curl`, system `rustc`/`cargo`, network (wheels, zig, FFmpeg, CUDA 12.8.1 parts, micromamba/GCC 13) for wheels/zig/FFmpeg;
 Windows also needs Inno Setup 6 (`ISCC.exe`). Linux FFmpeg is 7.0.2 (backend accepts any non-development release >= 7
-on Linux; the Windows 8.1.2 pin is separate and untested here).
+on Linux; Windows uses the separate 8.1.2 pin).
 The build ends with a real launch validation of the staged tree (`selfcheck.py` + the UI's own `--self-check`).
 Regenerate a lock after editing `runtime.in`:
 `uv pip compile packaging/runtime.in --python-version 3.11 --python-platform x86_64-unknown-linux-gnu|x86_64-pc-windows-msvc --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match --generate-hashes --emit-index-url -o packaging/locks/<os>-x86_64.txt`
@@ -55,7 +55,7 @@ Later: `PREFIX/bin/corridorkey-setup {status [--verify] | models | repair | roll
 `X.run --repair` restores damaged files from the payload (models re-verified only with `--models full`).
 Two versions are kept (active + previous). Concurrent installers on one prefix are not supported.
 
-## Windows: `CorridorKey-<id>-windows-x86_64-setup.exe` (Inno Setup, per-user by default) — NOT built or run here
+## Windows: `CorridorKey-<id>-windows-x86_64-setup.exe` (Inno Setup, per-user by default)
 Installs to `%LOCALAPPDATA%\Programs\CorridorKey\versions\<id>`, then runs the same `lifecycle.py`
 (validation, Start Menu shortcut, receipt, optional full models task with a visible console). Drive-root folders and an
 already-installed identical build are refused; a failed launch validation sets a nonzero setup exit code
@@ -63,7 +63,7 @@ already-installed identical build are refused; a failed launch validation sets a
 and the uninstaller come from Inno. Uninstall deletes only the exact version dir Inno created plus receipt-validated
 versions carrying our own manifest; the running version is removed by a detached `cmd`. The Start Menu shortcut targets
 the exe directly, so it does not scrub PYTHONPATH (the Rust side must). Repair of damaged files on Windows =
-reinstall after uninstall. `/TASKS="!models"` makes a silent app-only install. All Windows behaviour is unverified.
+reinstall after uninstall. `/TASKS="!models"` makes a silent app-only install. Native build and installation checks are recorded in the acceptance document below.
 
 ## Preserved on uninstall/update/repair
 Projects, outputs, models, HF cache and settings live outside the install prefix and are never
@@ -73,6 +73,5 @@ removed. Uninstall trusts only `receipt.json` and refuses a prefix without one.
 `bash rust-ui/tools/isolated-test.sh /usr/bin/timeout 14 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_packaging.py`
 (tiny fake payloads; no network, runtime or models).
 
-## Not verified here
-Real runtime build/torch install, the Windows script/Inno compile and PowerShell shortcuts (not
-runnable on this Linux host), CUDA hardware checks, and the multi-GB model download were not run.
+## Acceptance evidence
+See [local workflow acceptance](../docs/design/rust-ui/local-workflow-acceptance.md) for the exact installer builds, installed-file checks, model verification and real GPU workflow results. Unit tests use tiny fixtures; they are not the evidence for native installation or GPU acceptance.
