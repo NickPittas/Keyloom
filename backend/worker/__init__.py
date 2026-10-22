@@ -100,10 +100,38 @@ def probe_hello(gpu_arg: int | None) -> dict:
         sys.stderr.write(f"GPU probe failed: {exc}\n")
     if gpu is None:
         sys.stderr.write("no usable CUDA GPU: Key is unavailable on this worker\n")
+    caps = probe_task_capabilities(gpu is not None)
+    tasks = caps["tasks"]
+    hint_kinds = ("gvm", "birefnet", "chroma", "sam_track", "matanyone2", "videomama")
     return {"worker_rev": _worker_rev(), "engine": "corridorkey-v2", "host": socket.gethostname(),
             "platform": sys.platform, "gpu": gpu, "models": models,
-            "capabilities": {"key": not problems and gpu is not None, "generate_hint": False,
+            "capabilities": {"key": not problems and gpu is not None,
+                             "generate_hint": any(tasks[k] for k in hint_kinds),
+                             "tasks": tasks, "birefnet_variants": caps["birefnet_variants"],
+                             "sam_models": caps["sam_models"], "task_unavailable": caps["reasons"],
                              "publish_modes": ["final"]}}
+
+
+def probe_task_capabilities(gpu_ok: bool) -> dict:
+    """Per-task capability from the catalog status (verified artifacts only); unknown -> disabled."""
+    from backend.service.task_job import birefnet_repos, task_capabilities
+    status = repos = None
+    try:
+        from backend.model_catalog import load_catalog
+        from backend.model_status import Roots, StatusChecker
+        status = StatusChecker(load_catalog(), Roots.defaults()).status()
+    except Exception as exc:  # noqa: BLE001 - an unreadable catalog means "not ready", never a crash
+        sys.stderr.write(f"model status unavailable: {exc!r}\n")
+    try:
+        repos = birefnet_repos()
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"BiRefNet variants unavailable: {exc!r}\n")
+    try:
+        from backend.ffmpeg_tools.discovery import validate_ffmpeg_install
+        ffmpeg = bool(validate_ffmpeg_install(require_probe=False).ok)
+    except Exception:  # noqa: BLE001
+        ffmpeg = False
+    return task_capabilities(status, gpu=gpu_ok, ffmpeg=ffmpeg, repos=repos)
 
 
 class Worker:
@@ -130,8 +158,8 @@ class Worker:
                 self._closed = True
                 self._cancel.set()
 
-    def _reject(self, job_id, code: str, message: str) -> None:
-        self.emit({"event": "rejected", "job_id": job_id, "code": code, "message": message})
+    def _reject(self, job_id, code: str, message: str, **extra) -> None:
+        self.emit({"event": "rejected", "job_id": job_id, "code": code, "message": message, **extra})
 
     # -- commands
     def _handle_key(self, msg: dict) -> None:
@@ -179,6 +207,78 @@ class Worker:
             self._thread = threading.Thread(target=run, name=f"key-{job.job_id}", daemon=True)
             self._thread.start()
 
+    def _handle_task(self, msg: dict) -> None:
+        from backend.service.key_job import KeyJobRejected
+        from backend.service.task_job import TaskJob, run_task_job
+        raw = msg.get("job")
+        jid = raw.get("job_id") if isinstance(raw, dict) and isinstance(raw.get("job_id"), str) else None
+        try:
+            job = TaskJob.from_dict(raw)
+        except KeyJobRejected as exc:
+            return self._reject(jid, exc.code, exc.message, **getattr(exc, "extra", {}))
+        caps = self.hello["capabilities"].get("tasks") or {}
+        if not caps.get(job.kind):
+            why = "; ".join((self.hello["capabilities"].get("task_unavailable") or {}).values())
+            return self._reject(jid, "model_missing", f"'{job.kind}' is unavailable on this worker: its "
+                                f"models or tools are not installed and verified{': ' + why if why else ''}")
+        if job.kind == "birefnet" and job.params["variant"] not in self.hello["capabilities"].get("birefnet_variants", ()):
+            return self._reject(jid, "model_missing", f"BiRefNet variant {job.params['variant']!r} is not installed")
+        if job.kind in ("sam_preview", "sam_track") and job.params["tracker_model"] not in self.hello["capabilities"].get("sam_models", ()):
+            return self._reject(jid, "model_missing", f"SAM2 model {job.params['tracker_model']!r} is not installed")
+        for name, want in job.require["models"].items():
+            if want is not None and (self.hello["models"].get(name) or {}).get("sha256") != want:
+                return self._reject(jid, "invalid", f"Cannot verify model '{name}' hash on this worker")
+        with self._state:
+            if self._thread is not None or job.job_id in self._seen:
+                return self._reject(jid, "busy", "Worker is running a job or already ran this job_id")
+            self._cancel = cancel = threading.Event()
+            self._current = job.job_id
+
+            def emit(m):
+                if m.get("event") == "accepted":
+                    with self._state:
+                        self._seen.add(job.job_id)
+                self.emit(m)
+
+            def run():
+                try:
+                    self.emit(run_task_job(self.service, job, emit=emit, cancel=cancel))
+                except KeyJobRejected as exc:
+                    self._reject(job.job_id, exc.code, exc.message, **getattr(exc, "extra", {}))
+                except Exception as exc:  # noqa: BLE001 - never die silently mid-protocol
+                    sys.stderr.write(f"internal worker error: {exc!r}\n")
+                    self._reject(job.job_id, "invalid", f"internal error before start: {exc}")
+                finally:
+                    with self._state:
+                        self._thread = self._current = None
+            self._thread = threading.Thread(target=run, name=f"task-{job.job_id}", daemon=True)
+            self._thread.start()
+
+    def _handle_lock_cmd(self, msg: dict) -> None:
+        """inspect_hint_lock / clear_hint_lock: UI-driven recovery of an orphaned hint lock."""
+        from backend.service.key_job import _clean_abs, _JOB_ID_RE
+        from backend.service.task_job import KeyJobRejected, clear_hint_lock, inspect_hint_lock
+        rid = msg.get("request_id")
+        if not isinstance(rid, str) or not _JOB_ID_RE.match(rid):
+            return self._reject(None, "protocol", "request_id must match [A-Za-z0-9._-]{1,64}")
+        try:
+            root = _clean_abs(msg.get("clip_root"), "clip_root")
+        except KeyJobRejected as exc:
+            return self._reject(None, exc.code, exc.message, request_id=rid)
+        with self._state:
+            if self._thread is not None:  # a running job may be the lock's owner; never race it
+                return self._reject(None, "busy", "Worker is running a job; try again when it ends", request_id=rid)
+            if msg["cmd"] == "inspect_hint_lock":
+                return self.emit({"event": "hint_lock", "request_id": rid, "clip_root": root,
+                                  "lock": inspect_hint_lock(root, self.hello["host"])})
+            res = clear_hint_lock(root, msg.get("expect"), msg.get("reason"), rid, self.hello["host"])
+        if res["cleared"]:
+            self.emit({"event": "hint_lock_cleared", "request_id": rid, "clip_root": root,
+                       "recovered": res["recovered"], "warning": res.get("warning")})
+        else:
+            self.emit({"event": "hint_lock_refused", "request_id": rid, "clip_root": root,
+                       "code": res["code"], "message": res["message"], "lock": res["lock"]})
+
     def _stop_job(self) -> None:
         with self._state:
             t = self._thread
@@ -211,6 +311,10 @@ class Worker:
             cmd = msg.get("cmd")
             if cmd == "key":
                 self._handle_key(msg)
+            elif cmd in ("inspect_hint_lock", "clear_hint_lock"):
+                self._handle_lock_cmd(msg)
+            elif cmd == "task":
+                self._handle_task(msg)
             elif cmd == "cancel":
                 with self._state:
                     if msg.get("job_id") == self._current:
@@ -337,6 +441,7 @@ def main(argv=None, stdin=None, out=None, service=None, hello=None) -> int:
     if service is None:
         from backend.service import CorridorKeyService
         service = CorridorKeyService()
+        service.detect_device()  # after CUDA_VISIBLE_DEVICES; the default device is 'cpu' until detected
     if hasattr(out, "reconfigure"):  # Windows text mode would turn "\n" into "\r\n"
         out.reconfigure(newline="\n")
     worker = Worker(service, out, hello if hello is not None else probe_hello(args.gpu))

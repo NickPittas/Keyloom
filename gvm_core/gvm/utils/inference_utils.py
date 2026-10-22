@@ -169,7 +169,7 @@ class ImageSequenceWriter:
             if filenames is None:
                 filename = str(self.counter).zfill(4) + '.' + self.extension
             else:
-                filename = filenames[t].split('.')[0] + '.' + self.extension
+                filename = os.path.splitext(filenames[t])[0] + '.' + self.extension
 
             to_pil_image(frames[t]).save(os.path.join(
                 self.path, filename))

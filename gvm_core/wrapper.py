@@ -266,16 +266,6 @@ class GVMProcessor:
                 transform=transform
             )
 
-        # Get upscaled shape from first frame
-        first_frame = reader[0]
-        if isinstance(first_frame, dict):
-             first_frame = first_frame['image']
-        
-        current_upscaled_shape = list(first_frame.shape[1:]) # H, W
-        if current_upscaled_shape[0] % 2 != 0: current_upscaled_shape[0] -= 1
-        if current_upscaled_shape[1] % 2 != 0: current_upscaled_shape[1] -= 1
-        current_upscaled_shape = tuple(current_upscaled_shape)
-
         # Output preparation
         fps = reader.frame_rate if hasattr(reader, 'frame_rate') else 24.0
         
@@ -330,7 +320,7 @@ class GVMProcessor:
             # Checkpoint: skip batch if ALL output frames already exist.
             # Always reprocess last 3 batches as safety margin against
             # partially-written files from an interrupted run.
-            out_names = [fn.split('.')[0] + '.' + _out_ext for fn in filenames]
+            out_names = [os.path.splitext(fn)[0] + '.' + _out_ext for fn in filenames]
             is_tail = batch_id >= total_batches - 3
             if (not is_tail
                     and all(osp.exists(osp.join(_checkpoint_dir, n)) for n in out_names)):
@@ -369,8 +359,8 @@ class GVMProcessor:
             image = image[:, :, pad_t:end_h, pad_l:end_w]
             alpha = alpha[:, :, pad_t:end_h, pad_l:end_w]
 
-            # Resize to ensure exact match if there's any discrepancy
-            alpha = F.interpolate(alpha, current_upscaled_shape, mode='bilinear')
+            # Publish in source coordinates, independently of the inference resolution.
+            alpha = F.interpolate(alpha, (orig_h, orig_w), mode='bilinear', align_corners=False)
 
             # Threshold
             alpha[alpha>=upper_bound] = 1.0

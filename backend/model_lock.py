@@ -60,6 +60,7 @@ class DestinationLock:
         self.path: Path | None = None
         self._file = None
         self._overlapped = None
+        self._fcntl = None  # kept from acquire: imports fail during interpreter shutdown
 
     def acquire(self) -> "DestinationLock":
         path = self.path = _lock_path(self.destination)
@@ -75,6 +76,7 @@ class DestinationLock:
             else:
                 import fcntl
 
+                self._fcntl = fcntl
                 mode = fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX
                 fcntl.flock(fd, mode | fcntl.LOCK_NB)
         except OSError as exc:
@@ -123,14 +125,13 @@ class DestinationLock:
                     wintypes.DWORD(0), wintypes.DWORD(1), wintypes.DWORD(0),
                     ctypes.byref(self._overlapped),
                 )
-            elif os.name != "nt":
-                import fcntl
-
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            elif self._fcntl is not None:
+                self._fcntl.flock(self._file.fileno(), self._fcntl.LOCK_UN)
         finally:
             self._file.close()
             self._file = None
             self._overlapped = None
+            self._fcntl = None
 
     def __enter__(self) -> "DestinationLock":
         return self.acquire()
