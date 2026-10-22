@@ -8,3 +8,6 @@ Projects/
 logs/
 gvm_core/weights/
 modules/MatAnyone2Module/checkpoints/
+modules/BiRefNetModule/checkpoints/*
+!modules/BiRefNetModule/checkpoints/.gitkeep
+VideoMaMaInferenceModule/checkpoints/

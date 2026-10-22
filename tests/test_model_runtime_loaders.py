@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,28 @@ class FakeLease:
 
     def close(self):
         self.closed = True
+
+
+def test_runtime_checks_package_dependencies_without_inventing_model_paths(monkeypatch, tmp_path):
+    from backend import model_status
+
+    package = replace(_artifact("runtime-package", "", (), kind="local_package"),
+                      layout_root=None, layout_rel=None)
+    model = _artifact("model", "weights", ("model.bin",),
+                      depends=(package.id,), sha256="a" * 64)
+    catalog = Catalog(1, "", {}, {model.id: model, package.id: package})
+    monkeypatch.setattr(model_runtime, "load_catalog", lambda: catalog)
+    monkeypatch.setattr(model_status, "_check_local_package", lambda _: (True, "installed", []))
+    roots = Roots(tmp_path, tmp_path / "v2", tmp_path / "code", tmp_path / "hf", tmp_path / "cache")
+    (tmp_path / "weights").mkdir()
+    (tmp_path / "weights/model.bin").write_bytes(b"synthetic")
+    _seed_verified(catalog, roots)
+    with model_runtime.acquire_model_artifact(model.id, roots=roots) as lease:
+        assert lease.paths == {model.id: tmp_path / "weights"}
+    monkeypatch.setattr(model_status, "_check_local_package",
+                        lambda _: (False, "missing", ["runtime missing"]))
+    with pytest.raises(model_runtime.ModelAssetsUnavailableError, match="runtime missing"):
+        model_runtime.acquire_model_artifact(model.id, roots=roots)
 
 
 def _artifact(

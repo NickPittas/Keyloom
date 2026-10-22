@@ -199,6 +199,8 @@ def acquire_model_artifact(
 
         paths = {}
         for dependency in selected:
+            if dependency.kind == "local_package":
+                continue  # Package readiness is checked above; it has no model-file path.
             if dependency.kind in ("hf_cache_file", "http_file"):
                 required = dependency.required_files()
                 path = checker.file_path(dependency, required[0]) if required else None
