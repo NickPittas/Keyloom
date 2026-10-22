@@ -58,8 +58,31 @@ class HintKeyframeMixin:
             return None, _tr("The clip has no source frames.")
         return [os.path.splitext(f)[0] for f in files], None
 
-    def _hint_keyframe_matte_problem(self, clip, stems, index: int) -> str | None:
-        """None if the exact selected AlphaHint exists for ``index``; else the reason."""
+    def _invalidate_hint_keyframe_context(self) -> None:
+        """Drop the cached source/AlphaHint listings (selection or reload changed)."""
+        self._hint_kf_cache = None
+
+    def _hint_keyframe_cache(self, clip) -> dict:
+        """Single active listing cache keyed on clip/root and both asset objects.
+
+        Built lazily (one listing per selection/reload, never per painted frame).
+        """
+        cache = getattr(self, "_hint_kf_cache", None)
+        src = getattr(clip, "input_asset", None)
+        alpha = getattr(clip, "alpha_asset", None)
+        if (cache is None or cache["clip"] is not clip or cache["root"] != clip.root_path
+                or cache["src"] is not src or cache["alpha"] is not alpha):
+            cache = {"clip": clip, "root": clip.root_path, "src": src, "alpha": alpha}
+            self._hint_kf_cache = cache
+        return cache
+
+    def _hint_keyframe_matte_problem(
+            self, clip, stems, index: int, alpha_files=None) -> str | None:
+        """None if the exact selected AlphaHint exists for ``index``; else the reason.
+
+        ``alpha_files`` is an already-listed sequence filename list (UI refresh cache);
+        None lists the directory now (mutation path).
+        """
         stem = stems[index]
         asset = getattr(clip, "alpha_asset", None)
         if asset is None:
@@ -76,7 +99,9 @@ class HintKeyframeMixin:
                     count, index, stem)
             return None
         try:
-            _resolve_selected(asset.get_frame_files(), stems, [index])
+            if alpha_files is None:
+                alpha_files = asset.get_frame_files()
+            _resolve_selected(alpha_files, stems, [index])
         except V2InputError as exc:
             return str(exc)
         except OSError as exc:
@@ -108,6 +133,7 @@ class HintKeyframeMixin:
             return  # partially built window / minimal test double
         clip = getattr(self, "_current_clip", None)
         if clip is None:
+            self._invalidate_hint_keyframe_context()
             panel.set_hint_keyframe_context(
                 has_clip=False, frame_available=False, is_marked=False, count=0, error=None)
             panel.set_hint_keyframe_mutation_enabled(False)
@@ -123,13 +149,32 @@ class HintKeyframeMixin:
             if idx is None:
                 error = _tr("No frame is shown.")
             else:
-                stems, why = self._hint_keyframe_source_stems(clip)
+                cache = self._hint_keyframe_cache(clip)
+                if "stems" not in cache:
+                    cache["stems"] = self._hint_keyframe_source_stems(clip)
+                stems, why = cache["stems"]
                 if stems is None:
                     error = why
                 elif idx >= len(stems):
                     error = _tr("The current frame is outside the source frames.")
                 else:
-                    error = self._hint_keyframe_matte_problem(clip, stems, idx)
+                    alpha = cache["alpha"]
+                    alpha_files = None
+                    error = None
+                    if alpha is not None and alpha.asset_type != "video":
+                        if "alpha_files" not in cache and "alpha_error" not in cache:
+                            try:
+                                cache["alpha_files"] = alpha.get_frame_files()
+                            except OSError as exc:
+                                cache["alpha_error"] = exc
+                        if "alpha_error" in cache:
+                            error = _tr("Could not list the AlphaHint frames: %s") % (
+                                cache["alpha_error"])
+                        else:
+                            alpha_files = cache["alpha_files"]
+                    if error is None:
+                        error = self._hint_keyframe_matte_problem(
+                            clip, stems, idx, alpha_files)
                     available = error is None
         elif is_marked:
             available = True

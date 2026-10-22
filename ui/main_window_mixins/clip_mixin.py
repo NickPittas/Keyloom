@@ -60,6 +60,7 @@ class ClipMixin:
 
     def _sync_selected_clip_view(self, clip: ClipEntry) -> None:
         """Reload the selected clip while preserving its remembered input interpretation."""
+        self._invalidate_hint_keyframe_context()
         self._dual_viewer.set_clip(clip)
 
         if clip.input_asset is not None:

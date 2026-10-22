@@ -171,7 +171,7 @@ class InferenceMixin:
             elif mode == "full" and clip.alpha_asset is None:
                 text = _tr(
                     "Clip '%s' has no AlphaHint. Generate one (GVM, BiRefNet, "
-                    "VideoMaMa, MatAnyone2…) or turn off 'Use AlphaHint'."
+                    "VideoMaMa, MatAnyone2…) or choose hint mode 'None'."
                 ) % clip.name
             else:
                 text = _tr("Clip '%s' in %s state and cannot be keyed.") % (

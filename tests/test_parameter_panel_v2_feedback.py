@@ -85,7 +85,8 @@ def test_colour_notice_thresholds_and_action(panel):
     panel.input_colour_switch_requested.connect(got.append)
     panel.set_input_colour_notice(S(0.9), True)
     assert not panel._colour_notice.isHidden() and not panel._colour_action.isHidden()
-    assert "may be" in panel._colour_notice.text()
+    assert "may be display-coded" in panel._colour_notice.text()
+    assert "Sampled RGB peak 0.9 " in panel._colour_notice.text()
     panel.set_input_is_linear(True)
     panel._colour_action.click()
     assert got == [False]
@@ -116,3 +117,12 @@ def test_no_cuda_probe(monkeypatch):
     p.set_params(InferenceParams(temporal_window="8/4"))
     p.get_params()
     p.set_temporal_context(width=1280, height=720, frame_count=50, budget_gib=8.0)
+
+
+def test_colour_notice_shows_actual_peak_both_branches(panel):
+    panel.set_input_colour_notice(S(0.99), True)
+    t = panel._colour_notice.text()
+    assert "0.99" in t and "Sampled" in t and "may" in t
+    panel.set_input_colour_notice(S(2.5), False)
+    t = panel._colour_notice.text()
+    assert "2.5" in t and "Sampled" in t and "may" in t

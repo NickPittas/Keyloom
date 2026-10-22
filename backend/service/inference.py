@@ -57,7 +57,7 @@ class InferenceMixin:
         mode = self._v2_hint_mode(params)
         if mode != "none" and clip.alpha_asset is None:
             raise CorridorKeyError(
-                f"Clip '{clip.name}' has no AlphaHint; turn off 'Use AlphaHint' or generate one"
+                f"Clip '{clip.name}' has no AlphaHint; choose hint mode 'None' or generate/import an AlphaHint"
             )
         if mode == "keyframes":
             if clip.hint_keyframes_error:

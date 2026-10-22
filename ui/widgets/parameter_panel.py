@@ -893,11 +893,11 @@ class ParameterPanel(QWidget):
         text = action = ""
         self._colour_switch_target = None
         if peak is not None and input_is_linear and peak <= 1.0:
-            text = self.tr("Values stay within 0-1: footage may be display-coded.")
+            text = self.tr("Sampled RGB peak %.3g (within 0-1): footage may be display-coded.") % peak
             action = self.tr("Switch to sRGB")
             self._colour_switch_target = False
         elif peak is not None and not input_is_linear and peak > 1.0:
-            text = self.tr("Values exceed 1.0: footage may be scene-linear.")
+            text = self.tr("Sampled RGB peak %.3g (above 1): footage may be linear.") % peak
             action = self.tr("Switch to Linear")
             self._colour_switch_target = True
         self._colour_notice.setText(text)

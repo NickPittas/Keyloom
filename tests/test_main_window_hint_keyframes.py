@@ -239,3 +239,94 @@ def test_bad_sidecar_reports_error_not_deleted(tmp_path):
     assert host._param_panel.ctx["error"]
     assert host._param_panel.enabled is False
     assert os.path.exists(sa)
+
+
+def test_refresh_caches_listings_until_invalidated(tmp_path, monkeypatch):
+    clip = _make_clip(tmp_path)
+    host = _Host(None)
+    host._current_clip = clip
+    calls = []
+    orig = ClipAsset.get_frame_files
+
+    def counting(self):
+        calls.append(self.path)
+        return orig(self)
+
+    monkeypatch.setattr(ClipAsset, "get_frame_files", counting)
+    monkeypatch.setattr(host, "_current_presented_hint_index", lambda: host._idx)
+    for i in (0, 1, 2, 3, 1, 2):
+        host._idx = i
+        host._refresh_hint_keyframe_tools()
+        assert host._param_panel.ctx["frame_available"] is True
+    assert len(calls) == 2  # source + AlphaHint, once
+
+    # Matte removed on disk: cached UI is unchanged, but the mutation path is fresh.
+    os.remove(os.path.join(clip.root_path, "AlphaHint", "frame_00002.png"))
+    host._idx = 2
+    host._refresh_hint_keyframe_tools()
+    assert host._param_panel.ctx["frame_available"] is True
+    assert len(calls) == 2
+    assert host._hint_keyframe_matte_problem(
+        clip, host._hint_keyframe_source_stems(clip)[0], 2) is not None
+
+    # Reload/selection invalidation rescans and picks up the change.
+    host._invalidate_hint_keyframe_context()
+    host._refresh_hint_keyframe_tools()
+    assert host._param_panel.ctx["frame_available"] is False
+    n = len(calls)
+    host._refresh_hint_keyframe_tools()
+    assert len(calls) == n
+
+    # Asset object replacement invalidates without an explicit call.
+    clip.alpha_asset = ClipAsset(os.path.join(clip.root_path, "AlphaHint"), "sequence")
+    host._refresh_hint_keyframe_tools()
+    assert len(calls) > n
+
+    # No selected clip clears the cache.
+    host._current_clip = None
+    host._refresh_hint_keyframe_tools()
+    assert host._hint_kf_cache is None
+
+
+def test_cached_oserror_listing_not_retried_until_invalidated(tmp_path, monkeypatch):
+    clip = _make_clip(tmp_path)
+    host = _Host(None)
+    host._current_clip = clip
+    calls = []
+    orig = ClipAsset.get_frame_files
+
+    def flaky(self):
+        if self.path.endswith("AlphaHint"):
+            calls.append(1)
+            raise OSError("boom")
+        return orig(self)
+
+    monkeypatch.setattr(ClipAsset, "get_frame_files", flaky)
+    monkeypatch.setattr(host, "_current_presented_hint_index", lambda: host._idx)
+    for i in (0, 1, 2, 1):
+        host._idx = i
+        host._refresh_hint_keyframe_tools()
+        assert host._param_panel.ctx["frame_available"] is False
+        assert "boom" in host._param_panel.ctx["error"]
+    assert len(calls) == 1
+    host._invalidate_hint_keyframe_context()
+    host._refresh_hint_keyframe_tools()
+    assert len(calls) == 2
+
+
+def test_toggle_after_cached_available_then_matte_deleted_does_not_save(tmp_path, monkeypatch):
+    clip = _make_clip(tmp_path)
+    host = _Host(None)
+    host._current_clip = clip
+    host._idx = 2
+    warns = []
+    host._warn = warns.append
+    monkeypatch.setattr(host, "_current_presented_hint_index", lambda: host._idx)
+    monkeypatch.setattr(host, "_stop_playback_for_keyframe", lambda: None)
+    host._refresh_hint_keyframe_tools()
+    assert host._param_panel.ctx["frame_available"] is True  # cached
+    os.remove(os.path.join(clip.root_path, "AlphaHint", "frame_00002.png"))
+    host._on_toggle_hint_keyframe()
+    assert warns
+    assert not os.path.exists(os.path.join(clip.root_path, KEYFRAMES_FILENAME))
+    assert tuple(clip.hint_keyframes) == ()
