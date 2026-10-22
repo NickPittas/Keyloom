@@ -1040,6 +1040,7 @@ class ProvisionManager:
             process.stdin.write(json.dumps(request) + "\n")
             process.stdin.close()
             failure = None
+            stdout_closed = False
             while True:
                 if self._cancelled():
                     process.terminate()
@@ -1053,6 +1054,8 @@ class ProvisionManager:
                     line = lines.get(timeout=0.1)
                 except queue.Empty:
                     line = ""
+                if line is None:
+                    stdout_closed = True
                 if line:
                     try:
                         event = json.loads(line)
@@ -1067,7 +1070,7 @@ class ProvisionManager:
                                    **({"path": event["path"]} if event.get("path") else {})})
                     elif event.get("type") == "error":
                         failure = str(event.get("message", "Hugging Face transport failed"))
-                if process.poll() is not None and line is None:
+                if process.poll() is not None and stdout_closed:
                     break
             code = process.wait()
             if code:

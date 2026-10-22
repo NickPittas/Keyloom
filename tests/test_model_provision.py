@@ -481,6 +481,26 @@ class TestCancellation:
             mgr._supervise([sys.executable, "-c", "import time; time.sleep(10)"], {}, "test")
         assert time.monotonic() - started < 2
 
+    @pytest.mark.parametrize("exit_code", [0, 1])
+    def test_supervise_remembers_eof_before_process_exit(self, roots, exit_code):
+        mgr = manager(Catalog(1, "t", {}, {}), roots, Collector())
+        # Bound a regression without leaving a hung child or test behind.
+        watchdog = threading.Timer(2, mgr.cancel_event.set)
+        watchdog.start()
+        command = [sys.executable, "-c",
+                   "import os,sys,time; sys.stdin.readline(); "
+                   "print('{\"type\":\"error\",\"message\":\"transfer failed\"}', flush=True); "
+                   f"os.close(1); time.sleep(0.3); os._exit({exit_code})"]
+        try:
+            if exit_code:
+                with pytest.raises(mp.ArtifactError, match="transfer failed"):
+                    mgr._supervise(command, {}, "test")
+            else:
+                mgr._supervise(command, {}, "test")
+            assert not mgr.cancel_event.is_set()
+        finally:
+            watchdog.cancel()
+
     def test_cancel_marker_write_failure_is_a_failed_terminal(self, roots, monkeypatch):
         col = Collector()
         operation_id = "write-failure"
