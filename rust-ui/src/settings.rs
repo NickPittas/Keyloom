@@ -1,0 +1,532 @@
+//! Persistent native preferences: one versioned JSON file outside project data, validated before
+//! save, written atomically. Unreadable or newer-version files are never overwritten in place:
+//! they are renamed aside on the first successful Apply. UI-free (see `ui::settings`).
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::path::{Path, PathBuf};
+
+pub const VERSION: u32 = 1;
+/// Mirrors backend `VALID_VRAM_PROFILES`; an engine policy, not an allocation cap.
+pub const VRAM_PROFILES: [&str; 2] = ["auto", "low"];
+/// Mirrors backend `VALID_HINT_MODES`.
+pub const HINT_MODES: [&str; 3] = ["none", "full", "keyframes"];
+/// Mirrors backend `VALID_TEMPORAL_WINDOWS`.
+pub const TEMPORAL_WINDOWS: [&str; 6] = ["auto", "80/40", "48/24", "24/12", "8/4", "1/1"];
+/// (label, size, id) as in the Qt preferences dialog.
+pub const TRACKER_MODELS: [(&str, &str, &str); 3] = [
+    ("Fast", "184 MB", "facebook/sam2.1-hiera-small"),
+    (
+        "Base+ (default)",
+        "324 MB",
+        "facebook/sam2.1-hiera-base-plus",
+    ),
+    ("Highest quality", "898 MB", "facebook/sam2.1-hiera-large"),
+];
+pub const CACHE_MIB: std::ops::RangeInclusive<u32> = 64..=65536;
+pub const WORKERS: std::ops::RangeInclusive<u32> = 0..=32;
+pub const UI_SCALE: std::ops::RangeInclusive<f32> = 0.75..=2.0;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Playback {
+    /// Decoded-frame RAM preview budget; 0 = Auto (`frames::default_cache_mb`).
+    pub cache_mib: u32,
+    /// 0 = Auto (`frames::default_workers`).
+    pub decode_workers: u32,
+    pub loop_default: bool,
+    /// Keys this build does not know: carried through saves untouched.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Interface {
+    pub ui_scale: f32,
+    /// Keys this build does not know: carried through saves untouched.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Backend `InferenceParams` defaults. They seed a clip's Key workflow only until that clip (or the Qt
+/// session) has its own values; `input_is_linear` is not consumed (the clip's own interpretation is used).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ai {
+    pub vram_profile: String,
+    pub input_is_linear: bool,
+    pub hint_mode: String,
+    pub hint_quality: f32,
+    pub carry_hint: bool,
+    pub carry_hint_quality: f32,
+    pub despill_strength: f32,
+    pub cutout_linear: bool,
+    pub temporal_window: String,
+    /// Keys this build does not know: carried through saves untouched.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Mask/hint tool defaults; awaiting native mask-tool integration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Masks {
+    pub tracker_model: String,
+    /// Keys this build does not know: carried through saves untouched.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub version: u32,
+    pub playback: Playback,
+    pub interface: Interface,
+    pub ai: Ai,
+    pub masks: Masks,
+    /// AI worker targets. Empty = one implicit local target (GPU 0).
+    pub ai_targets: Vec<crate::worker::Target>,
+    /// Keys this build does not know (same version): carried through saves untouched.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Default for Playback {
+    fn default() -> Self {
+        Self {
+            cache_mib: 0,
+            decode_workers: 0,
+            loop_default: true,
+            extra: Map::new(),
+        }
+    }
+}
+impl Default for Interface {
+    fn default() -> Self {
+        Self {
+            ui_scale: 1.0,
+            extra: Map::new(),
+        }
+    }
+}
+impl Default for Ai {
+    fn default() -> Self {
+        Self {
+            vram_profile: "auto".into(),
+            input_is_linear: false,
+            hint_mode: "none".into(),
+            hint_quality: 0.95,
+            carry_hint: true,
+            carry_hint_quality: 0.95,
+            despill_strength: 0.5,
+            cutout_linear: false,
+            temporal_window: "auto".into(),
+            extra: Map::new(),
+        }
+    }
+}
+impl Default for Masks {
+    fn default() -> Self {
+        Self {
+            tracker_model: TRACKER_MODELS[1].2.into(),
+            extra: Map::new(),
+        }
+    }
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            version: VERSION,
+            playback: Default::default(),
+            interface: Default::default(),
+            ai: Default::default(),
+            masks: Default::default(),
+            ai_targets: vec![],
+            extra: Map::new(),
+        }
+    }
+}
+
+impl Settings {
+    pub fn validate(&self) -> Result<(), String> {
+        let one_of = |name: &str, v: &str, ok: &[&str]| {
+            ok.contains(&v)
+                .then_some(())
+                .ok_or_else(|| format!("{name} must be one of {ok:?}, got {v:?}"))
+        };
+        let unit = |name: &str, v: f32| {
+            (0.0..=1.0)
+                .contains(&v)
+                .then_some(())
+                .ok_or_else(|| format!("{name} must be in [0, 1], got {v}"))
+        };
+        if self.playback.cache_mib != 0 && !CACHE_MIB.contains(&self.playback.cache_mib) {
+            return Err(format!(
+                "RAM budget must be Auto (0) or {}–{} MiB",
+                CACHE_MIB.start(),
+                CACHE_MIB.end()
+            ));
+        }
+        if !WORKERS.contains(&self.playback.decode_workers) {
+            return Err(format!(
+                "decode workers must be {}–{} (0 = Auto)",
+                WORKERS.start(),
+                WORKERS.end()
+            ));
+        }
+        if !UI_SCALE.contains(&self.interface.ui_scale) {
+            return Err(format!(
+                "UI scale must be {}–{}",
+                UI_SCALE.start(),
+                UI_SCALE.end()
+            ));
+        }
+        let a = &self.ai;
+        one_of("vram_profile", &a.vram_profile, &VRAM_PROFILES)?;
+        one_of("hint_mode", &a.hint_mode, &HINT_MODES)?;
+        one_of("temporal_window", &a.temporal_window, &TEMPORAL_WINDOWS)?;
+        unit("hint_quality", a.hint_quality)?;
+        unit("carry_hint_quality", a.carry_hint_quality)?;
+        unit("despill_strength", a.despill_strength)?;
+        for (i, t) in self.ai_targets.iter().enumerate() {
+            t.validate()?;
+            if self.ai_targets[..i].iter().any(|o| o.id == t.id) {
+                return Err(format!("duplicate AI target id {}", t.id));
+            }
+        }
+        if !TRACKER_MODELS
+            .iter()
+            .any(|m| m.2 == self.masks.tracker_model)
+        {
+            return Err(format!(
+                "unknown tracker model {:?}",
+                self.masks.tracker_model
+            ));
+        }
+        Ok(())
+    }
+
+    /// Factory defaults with every unknown key (top-level and per-section) carried over.
+    pub fn reset_keeping_unknown(&mut self) {
+        let old = std::mem::take(self);
+        self.extra = old.extra;
+        self.playback.extra = old.playback.extra;
+        self.interface.extra = old.interface.extra;
+        self.ai.extra = old.ai.extra;
+        self.masks.extra = old.masks.extra;
+        self.ai_targets = old.ai_targets; // machines are not a preference default
+    }
+
+    /// Workers to hand to `frames::Loader`: Auto resolves here.
+    pub fn workers(&self) -> usize {
+        match self.playback.decode_workers {
+            0 => crate::frames::default_workers(),
+            n => n as usize,
+        }
+    }
+
+    /// Cache budget for a new viewer; an explicit `--cache-mb` wins over the saved default.
+    pub fn cache_mb(&self, cli: Option<usize>) -> usize {
+        cli.unwrap_or(match self.playback.cache_mib {
+            0 => crate::frames::default_cache_mb(),
+            n => n as usize,
+        })
+    }
+}
+
+/// `$XDG_CONFIG_HOME` or `~/.config`, then `corridorkey-native/settings.json`.
+pub fn default_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("corridorkey-native").join("settings.json"))
+}
+
+/// Saved settings plus the file they came from. Cloning `saved()` gives an editable draft.
+pub struct Store {
+    path: Option<PathBuf>,
+    saved: Settings,
+    /// Why the existing file was not used; shown by the UI until the next successful save.
+    pub problem: Option<String>,
+    /// The file on disk is unusable and must be moved aside before it is replaced.
+    preserve: bool,
+}
+
+impl Store {
+    /// Never fails: a missing file gives defaults silently, a bad one gives defaults + `problem`.
+    pub fn load(path: Option<PathBuf>) -> Self {
+        let mut s = Self {
+            path,
+            saved: Settings::default(),
+            problem: None,
+            preserve: false,
+        };
+        let Some(p) = s.path.clone() else {
+            s.problem =
+                Some("No settings location available; changes last for this session only.".into());
+            return s;
+        };
+        match std::fs::read(&p) {
+            Ok(bytes) => match Self::parse(&bytes) {
+                Ok(v) => s.saved = v,
+                Err(e) => {
+                    s.problem = Some(format!(
+                        "Settings file {} was not used ({e}). Defaults are active; the file is kept and renamed aside if you Apply.",
+                        p.display()
+                    ));
+                    s.preserve = true;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                s.problem = Some(format!(
+                    "Cannot read {}: {e}. Defaults are active.",
+                    p.display()
+                ));
+                s.preserve = true;
+            }
+        }
+        s
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Settings, String> {
+        let raw: Value = serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
+        match raw.get("version").and_then(Value::as_u64) {
+            Some(v) if v == VERSION as u64 => {}
+            Some(v) => {
+                return Err(format!(
+                    "unsupported settings version {v}, this build reads {VERSION}"
+                ))
+            }
+            None => return Err("missing settings version".into()),
+        }
+        let s: Settings = serde_json::from_value(raw).map_err(|e| e.to_string())?;
+        s.validate()?;
+        Ok(s)
+    }
+
+    pub fn saved(&self) -> &Settings {
+        &self.saved
+    }
+
+    /// The file on disk was not usable, so defaults are active and Apply must still be offered.
+    pub fn needs_repair(&self) -> bool {
+        self.preserve
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Validate, move an unusable old file aside, then atomically replace. On error nothing changes.
+    pub fn save(&mut self, new: Settings) -> Result<(), String> {
+        new.validate()?;
+        let Some(path) = self.path.clone() else {
+            self.saved = new;
+            return Ok(());
+        };
+        let dir = path.parent().ok_or("settings path has no folder")?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let json = serde_json::to_vec_pretty(&new).map_err(|e| e.to_string())?;
+        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_all()
+        };
+        write().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("cannot write {}: {e}", tmp.display())
+        })?;
+        let mut aside = None;
+        if self.preserve && path.exists() {
+            let a = (0..)
+                .map(|n| path.with_extension(format!("json.unusable{n}")))
+                .find(|p| !p.exists())
+                .expect("unbounded range");
+            std::fs::rename(&path, &a).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("cannot preserve old settings as {}: {e}", a.display())
+            })?;
+            aside = Some(a);
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            if let Some(a) = &aside {
+                let _ = std::fs::rename(a, &path); // put the old file back
+            }
+            format!("cannot replace {}: {e}", path.display())
+        })?;
+        self.saved = new;
+        self.preserve = false;
+        self.problem = None;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ck-settings-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn defaults_match_backend_and_validate() {
+        let mut s = Settings::default();
+        s.validate().unwrap();
+        assert_eq!(
+            (
+                s.ai.vram_profile.as_str(),
+                s.ai.hint_quality,
+                s.ai.despill_strength
+            ),
+            ("auto", 0.95, 0.5)
+        );
+        assert!(s.playback.loop_default && s.playback.decode_workers == 0);
+        assert_eq!(s.cache_mb(Some(7)), 7);
+        assert_eq!(s.cache_mb(None), crate::frames::default_cache_mb());
+        s.playback.cache_mib = 300;
+        assert_eq!(s.cache_mb(None), 300);
+        assert_eq!(s.workers(), crate::frames::default_workers());
+    }
+
+    #[test]
+    fn apply_roundtrips_and_keeps_unknown_keys() {
+        let p = dir("rt").join("s.json");
+        std::fs::write(
+            &p,
+            r#"{"version":1,"future_key":{"a":1},"playback":{"cache_mib":2048}}"#,
+        )
+        .unwrap();
+        let mut st = Store::load(Some(p.clone()));
+        assert!(st.problem.is_none());
+        assert_eq!(st.saved().playback.cache_mib, 2048);
+        let mut n = st.saved().clone();
+        n.playback.decode_workers = 3;
+        n.ai.vram_profile = "low".into();
+        st.save(n).unwrap();
+        let again = Store::load(Some(p.clone()));
+        assert_eq!(again.saved().playback.decode_workers, 3);
+        assert_eq!(again.saved().workers(), 3);
+        assert_eq!(again.saved().ai.vram_profile, "low");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("future_key"));
+        assert_eq!(
+            std::fs::read_dir(p.parent().unwrap()).unwrap().count(),
+            1,
+            "no temp files left"
+        );
+    }
+
+    #[test]
+    fn invalid_values_are_rejected_without_touching_the_file() {
+        let p = dir("inv").join("s.json");
+        let mut st = Store::load(Some(p.clone()));
+        st.save(Settings::default()).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        for bad in [
+            |s: &mut Settings| s.playback.cache_mib = 1,
+            |s: &mut Settings| s.interface.ui_scale = f32::NAN,
+            |s: &mut Settings| s.ai.vram_profile = "8gb".into(),
+            |s: &mut Settings| s.ai.hint_quality = 1.5,
+            |s: &mut Settings| s.masks.tracker_model = "x".into(),
+        ] {
+            let mut n = Settings::default();
+            bad(&mut n);
+            assert!(st.save(n).is_err());
+        }
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        assert_eq!(st.saved(), &Settings::default());
+    }
+
+    #[test]
+    fn corrupt_and_newer_files_are_preserved_on_apply() {
+        for (name, body) in [
+            ("corrupt", "{not json".to_string()),
+            (
+                "newer",
+                r#"{"version":2,"playback":{"cache_mib":99}}"#.to_string(),
+            ),
+            (
+                "range",
+                r#"{"version":1,"playback":{"cache_mib":1}}"#.to_string(),
+            ),
+        ] {
+            let p = dir(name).join("s.json");
+            std::fs::write(&p, &body).unwrap();
+            let mut st = Store::load(Some(p.clone()));
+            assert!(st.problem.is_some(), "{name}");
+            assert_eq!(st.saved(), &Settings::default());
+            assert_eq!(
+                std::fs::read_to_string(&p).unwrap(),
+                body,
+                "load must not modify {name}"
+            );
+            st.save(Settings::default()).unwrap();
+            assert!(st.problem.is_none());
+            let kept = p.with_extension("json.unusable0");
+            assert_eq!(std::fs::read_to_string(kept).unwrap(), body, "{name}");
+            assert_eq!(Store::load(Some(p)).saved(), &Settings::default());
+        }
+    }
+
+    #[test]
+    fn failed_write_reports_and_keeps_saved_state() {
+        let d = dir("ro");
+        let blocker = d.join("file");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut st = Store::load(Some(blocker.join("s.json"))); // parent is a file
+        let mut n = Settings::default();
+        n.playback.cache_mib = 512;
+        assert!(st.save(n).is_err());
+        assert_eq!(st.saved().playback.cache_mib, 0);
+    }
+
+    #[test]
+    fn nested_unknown_keys_survive_apply_and_reset() {
+        let p = dir("nested").join("s.json");
+        std::fs::write(
+            &p,
+            r#"{"version":1,"playback":{"x_p":1},"interface":{"x_i":"a"},"ai":{"x_a":[1]},"masks":{"x_m":{"k":true}}}"#,
+        )
+        .unwrap();
+        let mut st = Store::load(Some(p.clone()));
+        assert!(st.problem.is_none());
+        let mut n = st.saved().clone();
+        n.playback.decode_workers = 2;
+        st.save(n).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(v["playback"]["x_p"], 1);
+        assert_eq!(v["interface"]["x_i"], "a");
+        assert_eq!(v["ai"]["x_a"][0], 1);
+        assert_eq!(v["masks"]["x_m"]["k"], true);
+        assert_eq!(v["playback"]["decode_workers"], 2);
+
+        let mut r = Store::load(Some(p)).saved().clone();
+        r.reset_keeping_unknown();
+        assert_eq!(r.playback.decode_workers, 0);
+        assert_eq!(r.playback.extra["x_p"], 1);
+        assert_eq!(r.interface.extra["x_i"], "a");
+        assert_eq!(r.ai.extra["x_a"][0], 1);
+        assert_eq!(r.masks.extra["x_m"]["k"], true);
+    }
+
+    #[test]
+    fn needs_repair_tracks_unusable_file() {
+        let p = dir("repair").join("s.json");
+        std::fs::write(&p, "{nope").unwrap();
+        let mut st = Store::load(Some(p));
+        assert!(st.needs_repair());
+        st.save(Settings::default()).unwrap();
+        assert!(!st.needs_repair());
+        assert!(!Store::load(None).needs_repair());
+    }
+}

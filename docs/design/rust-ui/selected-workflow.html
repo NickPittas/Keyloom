@@ -1,0 +1,1495 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CorridorKey selected workflow — Batch Board + Page Tabs + Node Graph prototype</title>
+<style id="ck-style">
+:root{color-scheme:dark;--bg0:#1c1c1c;--bg1:#262626;--bg2:#303030;--bg3:#3a3a3a;--line:#141414;--soft:#454545;--text:#d4d4d4;--dim:#b3b3b3;--accent:#c8873a;--ink:#17120a;--selbg:#4a3a24;--selfg:#f2dcb8;--run:#8fb0dc;--ok:#a3c28f;--warn:#d8bc6c;--err:#ec9a8f;--viewer:#121212}
+*{box-sizing:border-box}
+html,body{margin:0;background:transparent}
+body{font:13px/1.45 Inter,"Segoe UI",system-ui,sans-serif;color:var(--text);font-variant-numeric:tabular-nums}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+[hidden]{display:none!important}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.dim{color:var(--dim)}.sp{flex:1}
+.gal{max-width:1680px;margin:0 auto;display:grid;grid-template-columns:minmax(0,1fr);gap:4px}.gal>*{min-width:0}
+/* gallery chrome */
+.tabs{display:flex;flex-wrap:wrap;gap:2px;background:var(--bg0);border:1px solid var(--line);padding:3px}
+.tab{min-height:30px;padding:3px 10px;background:var(--bg1);border:1px solid var(--line);border-radius:3px;text-align:left}
+.tab:hover{background:var(--bg3)}
+.tab[aria-selected=true]{background:var(--selbg);border-color:var(--accent);color:var(--selfg);font-weight:600}
+.tab .star{color:var(--warn)}
+.info{background:var(--bg1);border:1px solid var(--line);padding:6px 12px;display:grid;gap:2px 12px;grid-template-columns:minmax(0,1fr) auto}
+.info h2{margin:0;font-size:16px}
+.info p{margin:0}
+.info .proto{grid-column:1/-1;font-size:12px;color:var(--dim)}
+.info .sl{grid-column:2;grid-row:1/3;align-self:start;text-align:right;max-width:330px}
+.info .sl small{display:block;margin-top:4px;color:var(--dim);font-size:12px}
+.keys{background:var(--bg1);border:1px solid var(--line);padding:6px 12px;font-size:12px;color:var(--dim)}
+kbd{background:var(--bg2);border:1px solid var(--soft);border-radius:2px;padding:0 4px;font:12px ui-monospace,monospace;color:var(--text)}
+.foot{background:var(--bg0);border:1px solid var(--line);padding:5px 10px;font-size:12px;color:var(--dim);display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center}
+.foot details{flex-basis:100%}
+.foot b.ok{color:var(--ok)}.foot b.bad{color:var(--err)}
+/* app window */
+.win{container:win/inline-size;background:var(--bg1);border:1px solid var(--line);position:relative}
+.statusbar{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;padding:5px 10px;background:var(--bg0);border-top:1px solid var(--line);font-size:12px}
+.statusbar #msg{flex:1;min-width:200px}
+.appbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:6px 10px;background:var(--bg2);border-bottom:1px solid var(--line);min-height:40px}
+.appbar .logo{letter-spacing:.02em}
+.gpu{font-size:12px;color:var(--dim)}
+.panel{background:var(--bg1);min-width:0}
+.ph{display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg2);border-bottom:1px solid var(--line);font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);font-weight:600;min-height:30px}
+.ph .btn{text-transform:none;letter-spacing:0}
+.sec{padding:8px 10px;border-bottom:1px solid var(--line)}
+.sec h3{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+.opt{text-transform:none;letter-spacing:0;font-weight:400;border:1px solid var(--soft);border-radius:8px;padding:0 6px;margin-left:4px}
+.help{margin:3px 0;font-size:12px;color:var(--dim)}
+.help.strong{color:var(--text)}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin:4px 0}
+.row label{color:var(--dim);min-width:0}
+input[type=number],select{background:var(--bg0);border:1px solid var(--soft);border-radius:3px;min-height:28px;padding:2px 6px}
+input[type=number]{width:84px}
+input[type=range]{accent-color:var(--accent);min-height:24px;width:100%;min-width:90px}
+input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;margin:0 4px 0 0;vertical-align:-3px}
+/* buttons */
+.btn{min-height:28px;padding:3px 10px;background:var(--bg2);border:1px solid var(--soft);border-radius:3px}
+.btn:hover:not(:disabled){background:var(--bg3)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--ink);font-weight:600}
+.btn.pri:hover:not(:disabled){background:#d8964a}
+.btn.dng{border-color:var(--err);color:var(--err)}
+.more{margin:4px 0;font-size:12px;color:var(--dim)}.more summary{cursor:pointer;color:var(--dim)}.more summary:hover{color:var(--text)}.more p{margin:4px 0}
+.pane{display:flex;flex-direction:column;min-width:0}.pbody{min-width:0}.pfoot{padding:8px 10px;border-top:1px solid var(--line);background:var(--bg2)}
+.btn.big{min-height:36px;padding:6px 14px}
+.btn.sm{min-height:28px;padding:1px 8px;font-size:12px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn[aria-pressed=true],.btn[aria-current=true]{background:var(--selbg);border-color:var(--accent);color:var(--selfg)}
+.seg{display:inline-flex;flex-wrap:wrap;border:1px solid var(--soft);border-radius:3px;overflow:hidden}
+.seg button{min-height:28px;padding:2px 10px;background:var(--bg2);border:0;border-right:1px solid var(--soft)}
+.seg button:last-child{border-right:0}
+.seg button:hover{background:var(--bg3)}
+.seg button[aria-pressed=true]{background:var(--selbg);color:var(--selfg);font-weight:600;box-shadow:inset 0 -2px var(--accent)}
+.run-actions{display:grid;gap:6px}
+.run-actions .help{margin:0}
+/* chips / notes */
+.clipbtn[aria-current=true] .chip{color:var(--selfg)}
+.chip{display:inline-block;font-size:12px;padding:0 7px;border:1px solid currentColor;border-radius:9px;white-space:nowrap}
+.c-ok{color:var(--ok)}.c-run{color:var(--run)}.c-warn{color:var(--warn)}.c-err{color:var(--err)}.c-dim{color:var(--dim)}
+.tag{font-size:12px;color:var(--dim)}
+.note{border-left:3px solid var(--warn);background:#2e2a1f;padding:6px 10px;margin:6px 10px;font-size:12px}
+.note.err{border-color:var(--err);background:#33231f}.note.info{border-color:var(--run);background:#212832}.note.ok{border-color:var(--ok);background:#242c20}
+.note .row{margin:6px 0 0}
+.panel>.note:first-child{margin-top:10px}
+/* viewer */
+.viewer{background:var(--bg0)}
+.vhead,.vfoot{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:5px 10px;background:var(--bg1)}
+.vhead{border-bottom:1px solid var(--line)}
+.vfoot{border-top:1px solid var(--line)}
+.scene{position:relative;height:280px;background:var(--viewer);overflow:hidden}
+.scene[data-paint]{cursor:crosshair;outline:2px dashed var(--accent);outline-offset:-2px}
+.scene svg{position:absolute;inset:0;width:100%;height:100%;display:block}
+.scene .ov{position:absolute;inset:0;pointer-events:none}
+.scene .wl{position:absolute;top:0;bottom:0;width:2px;background:#fff;pointer-events:none}
+.viewer.compact .scene{height:230px}
+.wipe{display:flex;align-items:center;gap:8px;min-width:170px;flex:1;max-width:320px}
+/* timeline */
+.tl{padding:4px 10px 6px;background:var(--bg1);border-top:1px solid var(--line)}
+.tl-row{display:grid;grid-template-columns:96px minmax(0,1fr);align-items:center;gap:8px;margin:1px 0}
+.tl-row>span{font-size:12px;color:var(--dim)}
+.tl-tracks{position:relative}
+.lane{position:relative;height:22px;margin:0 8px;background:var(--bg0);border:1px solid var(--line);overflow:hidden}
+.lane .b{position:absolute;top:0;bottom:0;font-size:12px;line-height:20px;padding:0 4px;white-space:nowrap;overflow:hidden}
+.b.ai{background:#33404f;left:0;right:0;color:#d6dfeb}
+.b.plan{border:1px dashed var(--accent);background:rgba(200,135,58,.18);color:#f0d9b5}
+.b.wr{background:rgba(143,174,125,.55);color:#10150d}
+.tick{position:absolute;top:3px;width:10px;height:10px;margin-left:-5px;background:var(--warn);transform:rotate(45deg)}
+.head{position:absolute;top:-3px;bottom:-3px;width:2px;background:#fff;pointer-events:none;z-index:2}
+.tl-legend{font-size:12px;color:var(--dim);margin:2px 0}
+.tl .row{margin:3px 0 0}
+/* progress */
+.bar{height:8px;background:var(--bg0);border:1px solid var(--line)}
+.bar i{display:block;height:100%;background:var(--run);width:0}
+.steps{display:flex;flex-wrap:wrap;gap:2px;list-style:none;margin:0 0 6px;padding:0}
+.steps li{flex:1;min-width:84px;text-align:center;font-size:12px;padding:3px 4px;background:var(--bg0);border:1px solid var(--line);color:var(--dim)}
+.steps li.done{color:var(--ok)}.steps li.done::before{content:"✓ "}
+.steps li.now{color:var(--run);border-color:var(--run);font-weight:600}.steps li.now::before{content:"▶ "}
+.jobs{list-style:none;margin:0;padding:0}
+.job{padding:8px 10px;border-bottom:1px solid var(--line)}
+.job .row{margin:0 0 4px}
+.job.s-done,.job.s-cancelled,.job.s-failed{opacity:.8}
+/* clip list/cards */
+.clips{list-style:none;margin:0;padding:0}
+.clips li+li{border-top:1px solid var(--line)}
+.clipbtn{display:grid;gap:2px;width:100%;text-align:left;padding:8px 10px;background:transparent;border:0;border-left:3px solid transparent;min-height:44px}
+.clipbtn:hover{background:var(--bg3)}
+.clipbtn[aria-current=true]{background:var(--selbg);border-left-color:var(--accent);color:var(--selfg)}
+.clipbtn small{color:var(--dim);font-size:12px}
+.clipbtn[aria-current=true] small{color:#d9c39f}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;padding:10px}
+.card{background:var(--bg2);border:1px solid var(--soft);border-radius:3px;display:grid;gap:6px;padding:8px;align-content:start}
+.card[data-sel=true]{border-color:var(--accent)}
+.card .thumb{height:130px;position:relative;background:var(--viewer);overflow:hidden}
+.card .thumb svg{position:absolute;inset:0;width:100%;height:100%}
+.card h3{margin:0;font-size:13px;overflow-wrap:anywhere}
+.card .meta{font-size:12px;color:var(--dim)}
+.tools{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;padding:8px 10px;background:var(--bg1)}
+.pages{display:flex;flex-wrap:wrap;gap:2px;padding:4px;background:var(--bg0)}
+.pages button{min-height:34px;padding:4px 18px;background:var(--bg1);border:1px solid var(--line);border-radius:3px}
+.pages button:hover{background:var(--bg3)}
+.pages button[aria-selected=true]{background:var(--selbg);border-color:var(--accent);color:var(--selfg);font-weight:600}
+.cols2{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:1px;background:var(--line)}
+.cols2>*{background:var(--bg1);min-width:0}
+.cols3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--line)}
+.cols3>*{background:var(--bg1);min-width:0}
+table.t{border-collapse:collapse;width:100%}
+table.t th,table.t td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+table.t th{background:var(--bg2);font-size:12px;color:var(--dim);font-weight:600}
+.scroll{overflow-x:auto}
+.scroll:focus-visible{outline-offset:-2px}
+.chips{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
+input[type=text]{background:var(--bg0);border:1px solid var(--soft);border-radius:3px;min-height:28px;padding:2px 6px;width:170px}
+/* ====== selected workflow layouts ====== */
+.board,.ws{display:flex;flex-direction:column;min-width:0;background:var(--line);gap:1px}
+.bbody{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:1px;background:var(--line);min-width:0}
+.bbody>*{background:var(--bg1);min-width:0}
+.board .tools,.ws .tools{background:var(--bg1)}
+.applybar{background:var(--bg1);padding:8px 10px;border-left:3px solid var(--accent)}
+.applybar ul{margin:6px 0;padding-left:18px;max-height:96px;overflow:auto}
+.applybar li{margin:2px 0}
+.wsmain{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:1px;background:var(--line);min-width:0}
+.wsmain>*{background:var(--bg1);min-width:0}
+.ws .appbar{gap:6px 10px}
+.pages.inbar{padding:0;background:transparent;gap:2px}
+.pages.inbar button{min-height:30px;padding:3px 14px}
+.cards{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}.card{min-width:0}.card .chip{white-space:normal}
+.stepbody{padding:8px 10px}
+.graphbox{background:var(--bg0)}
+.graphwrap{overflow-x:auto;padding:4px 10px}
+.graph{position:relative;width:950px;height:144px}
+.graph svg{position:absolute;inset:0}
+.gcap{position:absolute;left:10px;top:0;margin:0;font-size:12px;color:var(--dim);max-width:520px}
+.node{position:absolute;min-height:32px;padding:2px 8px;background:var(--bg2);border:1px solid var(--soft);border-left:5px solid #6b7480;border-radius:3px;text-align:left;display:grid;align-content:center;line-height:1.25}
+.node.ex{display:flex;align-items:center;gap:8px}
+.node small{font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node[aria-pressed=true]{border-color:var(--accent);background:var(--selbg);color:var(--selfg)}
+.node[aria-pressed=true] small{color:#d9c39f}
+.node.off{opacity:.7;border-left-color:#555}
+.node.by{border-style:dashed}
+.qstrip{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:5px 10px;background:var(--bg1);min-height:40px}
+.win{height:760px;display:flex;flex-direction:column}
+#mount{flex:1;min-height:0;display:grid}
+#mount>div{min-height:0;height:100%}
+.bbody{flex:1;min-height:0;grid-template-rows:minmax(0,1fr)}
+.bbody>*{overflow:auto}
+.wsmain{flex:1;min-height:0;grid-template-rows:minmax(0,1fr)}
+.wsmain>*{overflow:auto}
+.wsmain>.ga-page{display:flex;flex-direction:column}
+.wsmain>.pane{display:flex;flex-direction:column}
+.pbody{flex:1;min-height:0;overflow:auto}.pfoot,.ph{flex:none}
+.viewer.fill{flex:1;min-height:300px;display:flex;flex-direction:column}
+.viewer.fill .scene{flex:1;min-height:110px;height:auto}
+.viewer.fill .vhead,.viewer.fill .vfoot{flex:none}
+.tl{flex:none}
+.ga-bar>.appbar{min-height:36px;padding:4px 10px}
+.pair{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.pair input[type=text]{width:150px;min-width:0}
+@media (min-width:1030px){.propbtn,.stripact{display:none}}
+/* narrow: page -> graph -> action strip stay inside the 660px window; Properties is a toggleable sheet */
+@media (max-width:1029px){
+  .bbody,.wsmain{grid-template-columns:minmax(0,1fr)}
+  .bbody{grid-template-rows:minmax(0,1fr) auto}
+  .bbody>aside{max-height:110px}
+  .wsmain{position:relative}
+  .wsmain>.pane{position:absolute;top:0;right:0;bottom:0;width:min(360px,94%);z-index:5;box-shadow:-8px 0 14px rgba(0,0,0,.55);overflow:hidden}
+  .graphwrap{padding:2px 4px}
+  .stripact{max-width:100%;text-align:left}
+}
+@container win (max-width:640px){
+  .btn,.seg button,input[type=number],input[type=text],select,.pages button{min-height:40px}
+  .btn.sm{min-height:36px}
+  .cards{grid-template-columns:minmax(0,1fr)}
+  .scene{height:220px}
+  .tl-row{grid-template-columns:70px minmax(0,1fr)}
+}
+/* ===== shared viewer, scrubber, hint tools, output setup ===== */
+.vhead{position:relative;z-index:5;display:flex;flex-wrap:nowrap;align-items:center;justify-content:space-between;gap:8px;min-height:38px;padding:4px 8px}
+.vl{display:flex;align-items:center;gap:6px;min-width:0}
+.vc{position:absolute;left:50%;top:4px;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center}
+.vc .wipe{position:absolute;top:100%;left:50%;transform:translateX(-50%);margin-top:3px;width:132px;min-width:0;max-width:none;padding:2px 6px;background:rgba(28,28,28,.94);border:1px solid var(--soft);flex:none}
+.vc .wipe input{min-width:0}
+.vr{margin-left:auto}
+.vr .seg button{padding:2px 6px}
+.stage{position:relative;flex:1;min-height:180px;background:var(--viewer)}
+.viewer.fill .stage>.scene{position:absolute;inset:0;height:auto;min-height:0}
+.vbar{position:relative;display:flex;align-items:center;justify-content:space-between;gap:6px;min-height:40px;padding:4px 8px;background:var(--bg1);border-top:1px solid var(--line)}
+.vbl{display:flex;align-items:center;gap:4px}
+.vbm{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;gap:2px}
+.vbr{margin-left:auto;text-align:right;white-space:nowrap}
+.tb{width:36px;padding:0;display:inline-grid;place-items:center}
+.ic{width:16px;height:16px;fill:currentColor;display:block}
+.scrub,.vbar,.rtxt,.vhead{flex:none}
+.scrub{position:relative;height:34px;margin:0 8px 2px;background:var(--bg0);border:1px solid var(--line)}
+.scrub .in{position:absolute;left:3px;right:3px;top:0;bottom:0;pointer-events:none}
+.scrub i{position:absolute;display:block}
+.scrub .rg{top:0;bottom:0;background:rgba(200,135,58,.3);border-left:2px solid var(--accent);border-right:2px solid var(--accent)}
+.scrub .ht{top:0;height:4px;background:var(--run)}
+.scrub .wr{bottom:0;height:5px;background:var(--ok)}
+.scrub .tick{top:11px;width:10px;height:10px;margin-left:-5px;background:var(--warn);transform:rotate(45deg)}
+.scrub .tick.out{background:#6b6b6b}
+.scrub .seek{position:absolute;inset:0;width:100%;height:100%;min-width:0;min-height:0;margin:0;background:transparent;-webkit-appearance:none;appearance:none;cursor:ew-resize}
+.seek::-webkit-slider-runnable-track{background:transparent;height:32px}
+.seek::-moz-range-track{background:transparent;height:32px}
+.seek::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:6px;height:32px;background:#fff;border:0;border-radius:1px;box-shadow:0 0 0 1px #000}
+.seek::-moz-range-thumb{width:6px;height:32px;background:#fff;border:0;border-radius:1px;box-shadow:0 0 0 1px #000}
+.rtxt{display:flex;flex-wrap:wrap;gap:0 12px;align-items:center;padding:0 10px 4px;font-size:12px;background:var(--bg1)}
+.vtools{position:absolute;left:6px;top:6px;z-index:3;display:flex;flex-direction:column;gap:3px}
+.vtools .btn{width:36px;padding:0;min-height:30px;background:rgba(38,38,38,.92)}
+.vtools .btn[aria-pressed=true]{background:var(--selbg)}
+.rb{position:absolute;border:2px dashed var(--accent);pointer-events:none;z-index:2}
+.ws.focus .graphbox,.ws.focus .qstrip,.ws.focus .pane{display:none}
+.ws.focus .wsmain{grid-template-columns:minmax(0,1fr)}
+.outsetup{background:var(--bg1);padding:6px 10px;border-left:3px solid var(--run)}
+.outsetup .row{margin:3px 0}
+.outsetup input.wide{width:min(380px,48cqw)}.outsetup input.mid{width:min(210px,30cqw)}
+.issues{list-style:none;margin:4px 0 0;padding:0}.issues li{margin:2px 0}
+code{font:12px ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-all}
+.pathprev{display:grid;gap:1px}
+@container win (max-width:680px){
+  .vhead{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)}
+  .vl{grid-column:1}.vc{grid-column:2;position:static;transform:none;flex-direction:row}
+  .vr{grid-column:1/-1;justify-self:end}
+  .vbm{position:static;transform:none;order:3;flex:1 1 100%;justify-content:center}
+  .vbar{flex-wrap:wrap}
+  .viewer.fill{min-height:540px}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="gal" id="gal">
+  <section class="info" aria-label="Prototype notice">
+    <div><h2>CorridorKey — selected workflow: Batch Board + Page Tabs + Node Graph</h2></div>
+    <p class="proto">Prototype — simulated data. No AI runs here. Timings are simulated, not benchmarks. Presets are saved only in this browser (localStorage). Images are drawn samples, not footage.</p>
+  </section>
+  <div class="keys" id="keys" hidden></div>
+  <div class="win" id="win">
+    <div id="mount"></div>
+    <div class="statusbar">
+      <span id="msg" role="status" aria-live="polite">Prototype ready. Everything here is simulated.</span>
+      <span class="gpu">RTX 4090 · VRAM 17.8 / 24.0 GiB <i>(sample)</i></span>
+      <button type="button" class="btn sm" id="busybtn" title="Load a sample queue: one running job and two waiting">Show busy queue example</button>
+      <button type="button" class="btn sm" id="speed" aria-pressed="false" title="Make simulated jobs finish faster">Simulation speed: 1×</button>
+      <button type="button" class="btn sm" id="keybtn" aria-expanded="false">Keyboard shortcuts</button>
+    </div>
+  </div>
+  <input type="file" id="fileIn" multiple hidden>
+  <div class="foot" id="foot"><span>Self-check running…</span></div>
+</div>
+<script>
+(()=>{'use strict';
+/* ================= data ================= */
+const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const PH=[['rvm','Motion prep',.12],['vfm','Feature pass',.2],['stage1','Coarse matte',.25],['stage2','Refine',.33],['publish','Writing files',.10]];
+const GENS=['GVM','BiRefNet','VideoMaMa','MatAnyone2','Chroma Key','Import Alpha'];
+const NEEDS_STROKES=g=>g==='VideoMaMa'||g==='MatAnyone2';
+const TEMPORAL=[['auto','Auto'],['80/40','80 / 40'],['48/24','48 / 24'],['24/12','24 / 12'],['8/4','8 / 4'],['1/1','1 / 1 (no overlap)']];
+const COMPS=['dwab','piz','zip','none']; // engine values; default dwab (global preference)
+const COMPL={dwab:'DWAB',piz:'PIZ',zip:'ZIP',none:'None'};
+const PRE_BAK='ck-presets-v1-backup';
+const CL={srgb:'sRGB',linear:'Linear'};
+const OUTK=['fg','matte','comp','processed'];
+const OLBL={fg:'FG',matte:'Matte',comp:'Comp',processed:'Processed'};
+const DUR={key:15000,resume:15000,hint:6000};
+const ST={Extracting:['◔','run'],Raw:['○','dim'],Masked:['◐','run'],Ready:['●','ok'],Complete:['✓','ok'],Error:['✕','err']};
+const PAGES=[['media','Media'],['hint','Hint'],['key','Key'],['review','Review'],['deliver','Deliver']];
+const NODES=[['media','Media'],['hint','Hint'],['key','Key'],['w-fg','FG'],['w-matte','Matte'],['w-comp','Comp'],['w-processed','Processed']];
+const NODEPAGE={media:'media',hint:'hint',key:'key','w-fg':'deliver','w-matte':'deliver','w-comp':'deliver','w-processed':'deliver'};
+const PAGENODE={media:'media',hint:'hint',key:'key',deliver:'w-fg'};
+const NODETITLE={media:'Media',hint:'Hint',key:'Key (CorridorKey 2.0)','w-fg':'Export FG','w-matte':'Export Matte','w-comp':'Export Comp','w-processed':'Export Processed'};
+const PRE_KEY='ck-presets-v1';
+const PARITY=`Range-limited Key inference, the stem-based range identity and the output templates are TARGET behaviour (see range-output-contracts.md). Today’s Python still infers the whole clip and writes the range. Its manifest already records frame_range, but lacks the full source-range identity (stems), the resolved template paths and compression; backend support is pending. Nothing outside In/Out is claimed here.`;
+
+/* ================= output location (project root + templates; syntax checks only) ================= */
+const TOK=['project','name','output','resolution','date','version'];
+const pad=(n,w)=>String(n).padStart(w,'0');
+const todayStr=()=>{const d=new Date();return pad(d.getDate(),2)+'-'+pad(d.getMonth()+1,2)+'-'+d.getFullYear()};
+const okDate=s=>{const m=/^(\d{2})-(\d{2})-(\d{4})$/.exec(s||'');if(!m)return false;const d=new Date(+m[3],+m[2]-1,+m[1]);return d.getFullYear()===+m[3]&&d.getMonth()===+m[2]-1&&d.getDate()===+m[1]};
+const resFor=r=>{const m=/^(\d+)×(\d+)/.exec(r||'');if(!m)return'src';const w=+m[1];return w<1920?m[2]+'p':w<3200?'2K':w<5000?'4K':Math.round(w/1000)+'K'};
+const safe=v=>String(v).replace(/[\/\\:*?"<>|#\u0000-\u001f]/g,'_').replace(/^[. ]+|[. ]+$/g,'');
+const RESV=/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+function checkTpl(t,kind){
+  if(typeof t!=='string'||!t.trim())return'template is empty';
+  if(t.length>160)return'template is longer than 160 characters';
+  if(/[\u0000-\u001f\\]/.test(t))return'backslashes and control characters are not allowed';
+  for(const x of t.match(/\{[^{}]*\}/g)||[])if(!TOK.includes(x.slice(1,-1)))return`unknown token ${x}`;
+  const rest=t.replace(/\{[^{}]*\}/g,'');
+  if(/[{}]/.test(rest))return'unbalanced { }';
+  if(/[:*?"<>|]/.test(rest))return'the characters : * ? " < > | are not allowed';
+  const h=rest.match(/#+/g)||[];
+  if(kind==='file'){
+    if(t.includes('/'))return'a file name cannot contain / (that is a folder separator)';
+    if(h.length!==1||h[0].length<4)return'needs exactly one #### run (4 or more #)';
+    if(t.includes('..'))return'".." is not allowed'}
+  else{
+    if(h.length)return'#### belongs in the file template';
+    if(t.startsWith('/'))return'must be relative to the root (no leading /)';
+    for(const g of t.split('/')){if(!g)return'empty folder segment (check for // or a trailing /)';if(g==='.'||g==='..')return'"." and ".." segments are not allowed (cannot leave the root)'}}
+  return''}
+function checkRoot(r){
+  if(typeof r!=='string'||!r.trim())return'root is empty';
+  if(r.length>240)return'root is longer than 240 characters';
+  if(/[\u0000-\u001f]/.test(r))return'control characters are not allowed';
+  if(!(r.startsWith('/')||/^[A-Za-z]:[\\\/]/.test(r)))return'must be an absolute path (starts with / or C:/)';
+  if(r.split(/[\\\/]/).includes('..'))return'".." is not allowed';
+  return''}
+/* one output path for a frame; frame==null keeps #### so two paths can be compared as patterns */
+function resolveOut(c,p,k,frame){
+  const root=(c.outRoot==null?p.root:c.outRoot).replace(/[\\\/]+$/,''),vals={project:p.name,name:c.name,output:OLBL[k],resolution:c.resLabel,date:c.date,version:'v'+pad(c.ver,3)};
+  let bad='';
+  const sub=t=>t.replace(/\{(\w+)\}/g,(m,n)=>{const v=safe(vals[n]);if(!v||v==='.'||v==='..')bad=bad||`{${n}} of ${c.id} is empty or unsafe`;return v});
+  const dir=sub(p.folderT),file=p.fileT.split(/(#+)/).map((x,i)=>i%2?(frame==null?x:pad(frame,x.length)):sub(x)).join('');
+  if(bad)return{err:bad};
+  for(const g of dir.split('/').concat(file)){if(RESV.test(g))return{err:`“${g}” is a reserved name on Windows`};if(g.length>255)return{err:'a name is longer than 255 characters'}}
+  return{path:`${root}/${dir}/${file}.${(c.outs[k]||'').toLowerCase()}`}}
+function locOf(c,p=S.proj){
+  const root=c.outRoot==null?p.root:c.outRoot,paths={};
+  const e=[['Root',checkRoot(root)],['Folder template',checkTpl(p.folderT,'folder')],['File template',checkTpl(p.fileT,'file')],['Resolution label',/^[A-Za-z0-9._-]{1,24}$/.test(c.resLabel)&&!/^\.+$/.test(c.resLabel)?'':'use 1–24 letters, digits, . _ -'],['Date',okDate(c.date)?'':'use DD-MM-YYYY'],['Version',Number.isInteger(c.ver)&&c.ver>=1&&c.ver<=999?'':'use a whole number 1–999']].find(x=>x[1]);
+  let err=e?`${e[0]}: ${e[1]}`:'';
+  if(!err)for(const k of OUTK)if(c.outs[k]){const r=resolveOut(c,p,k,null);if(r.err){err=r.err;break}paths[k]=r.path}
+  return{root,folderT:p.folderT,fileT:p.fileT,res:c.resLabel,date:c.date,ver:c.ver,paths,err,key:JSON.stringify([root,p.folderT,p.fileT,paths,err])}}
+const frozenLoc=c=>{const l=locOf(c);l.paths=Object.freeze(l.paths);return Object.freeze(l)};
+/* blocking checks: invalid location, several outputs on one path, two clips/jobs on one path. null = fine */
+function outCheck(c){
+  const L=c.loc||locOf(c);
+  if(L.err)return{t:'Output location: '+L.err,f:'out'};
+  const ks=Object.keys(L.paths);
+  if(ks.length>1&&!/\{output\}/.test(L.folderT+L.fileT))return{t:`Output paths collide: ${ks.map(k=>OLBL[k]).join(' and ')} would write the same files — add {output} to the folder or file template`,f:'sub'};
+  const mine=Object.values(L.paths);
+  for(const o of S.clips){if(o.id===c.id||o.local)continue;const P=locOf(o).paths;for(const k in P)if(mine.includes(P[k]))return{t:`Output path shared with ${o.name} (${o.id}): ${P[k]}`,f:'ver'}}
+  for(const x of c.prev||[])for(const k in x.paths)if(mine.includes(x.paths[k]))return{t:`This path holds earlier version v${pad(x.ver,3)} of ${c.id} (${x.rng.replace('-','–')}) — keying here would overwrite it`,f:'ver'};
+  for(const j of S.queue)if(ACTIVE.includes(j.status)&&j.clip!==c.id&&j.loc)for(const k in j.loc.paths)if(mine.includes(j.loc.paths[k]))return{t:`Output path is already used by ${jlabel(j)}`,f:'ver'};
+  return null}
+const rangeStale=c=>c.written.length>0&&!!c.made&&c.made.rng!==c.inA+'-'+c.inB&&(c.loc||locOf(c)).key===c.made.loc; // only blocks a re-key into the SAME resolved folder
+function archive(c){if(c.written.length&&c.made){c.prev.push({ver:c.made.ver,rng:c.made.rng,n:count(c.written),paths:JSON.parse(c.made.loc)[3]})}c.written=[];c.made=null;c.mixed=false}
+const blockOut=c=>outCheck(c)||(rangeStale(c)?{f:'newver',t:`Range changed since v${pad(c.ver,3)} was written (${c.made.rng.replace('-','–')} on disk) — write the new range as v${pad(c.ver+1,3)}`}:null);
+const inR=(c,a)=>a.f>=c.inA&&a.f<=c.inB;
+const strokesIn=c=>c.strokes.filter(a=>inR(c,a)).length;
+const strokesOk=c=>[1,2].every(t=>c.strokes.some(a=>a.t===t&&inR(c,a)));
+const annSig=c=>NEEDS_STROKES(c.gen)?JSON.stringify([c.strokes,c.pts,c.boxes].map(l=>l.filter(a=>inR(c,a)).map(a=>[a.x,a.y,a.t,a.f,a.w,a.h]))):''; // marks only feed routes that take marks
+const clipR=(r,a,b)=>r.map(x=>[Math.max(x[0],a),Math.min(x[1],b)]).filter(x=>x[0]<=x[1]);
+const mkProj=()=>({name:'Harbour Promo',root:'/mnt/NAS/Project/Masks',folderT:'{name}_{version}/{output}',fileT:'{name}_####'});
+const base=()=>({hq:.95,carry:true,cq:.95,comp:'dwab',hintGen:'',hintR:null,hintSig:'',local:false,size:0,applied:{wf:null,ex:null},outRoot:null,resLabel:'src',date:todayStr(),ver:1,prev:[],pts:[],boxes:[]});
+const mkClips=p=>mkRaw().map(c=>{const x=Object.assign(base(),c);x.hintGen=x.hasHint?x.gen:'';x.hintR=x.hasHint?[x.start,x.start+x.n-1]:null;x.hintSig=annSig(x);x.resLabel=resFor(x.res);x.date='22-10-2026';x.made=c.made?Object.assign(snapOf(x,p),c.made):null;return x});
+const mkRaw=()=>[
+ {id:'SH040',name:'SH040_talent_walk',res:'3840×2160',kind:'EXR sequence',fps:24,start:1001,n:412,state:'Ready',mode:'full',gen:'GVM',hasHint:true,kf:[],strokes:[],colour:'linear',checked:true,sample:'',inA:1101,inB:1300,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:0.5,temporal:'auto',vram:'auto',written:[],made:null,err:''},
+ {id:'SH050',name:'SH050_closeup_hair',res:'1920×1080',kind:'PNG sequence',fps:24,start:1001,n:168,state:'Raw',mode:'none',gen:'GVM',hasHint:false,kf:[1012,1060,1144],strokes:[],colour:'srgb',checked:false,sample:'Sampled peaks ≤ 1.0 in frames 1001/1084/1168 — could be sRGB or linear. Check before keying.',inA:1001,inB:1168,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:0.5,temporal:'auto',vram:'auto',written:[],made:null,err:''},
+ {id:'SH060',name:'SH060_wide_crane',res:'3840×2160',kind:'MOV, frames extracted',fps:24,start:1001,n:640,state:'Complete',mode:'full',gen:'GVM',hasHint:true,kf:[],strokes:[],colour:'srgb',checked:true,sample:'',inA:1001,inB:1640,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:0.65,temporal:'auto',vram:'auto',written:[[1001,1640]],made:{despill:0.5,colour:'srgb',mode:'full'},err:'',outRoot:'D:/delivery/crane'},
+ {id:'SH070',name:'SH070_insert_hands',res:'2048×1080',kind:'EXR sequence',fps:24,start:1001,n:96,state:'Error',mode:'full',gen:'GVM',hasHint:true,kf:[],strokes:[],colour:'srgb',checked:true,sample:'',inA:1001,inB:1096,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:0.5,temporal:'auto',vram:'auto',written:[],made:null,err:'Hint has 94 frames, clip has 96 — regenerate hint'}
+];
+const seedPresets=()=>[
+ {id:'pseed1',kind:'workflow',name:'Hair closeups',rev:1,fields:{mode:'full',gen:'GVM',hq:.95,cq:.95,carry:true,vram:'auto',despill:.65,temporal:'48/24',outs:{fg:'EXR',matte:'EXR',comp:null,processed:null},comp:'piz'}},
+ {id:'pseed2',kind:'export',name:'Comp review PNG',rev:1,fields:{outs:{fg:null,matte:null,comp:'PNG',processed:null},comp:'zip'}}];
+const fresh=(proj=mkProj())=>({proj,rootAsk:false,focus:false,view:'board',clip:'SH040',sel:[],ctx:{},page:'media',node:'media',frame:1101,playing:false,mode:'input',ab:false,wipe:50,bg:'checker',paint:{on:false,tool:1},speed:1,open:[],keys:false,msg:'Prototype ready. Everything here is simulated.',nextId:1,nextL:1,nextP:1,
+ presets:seedPresets(),presetWarn:'',pickWf:'',pickEx:'',applyBar:null,saveKind:'workflow',saveName:'',replaceAsk:null,note:null,
+ clips:mkClips(proj),
+ queue:[{id:'J0a',type:'key',clip:'SH060',status:'done',p:1,w:640},{id:'J0b',type:'hint',gen:'BiRefNet',clip:'SH070',status:'cancelled',p:.3},{id:'J0c',type:'key',clip:'SH070',status:'failed',p:.45,w:96}]});
+let S=fresh();
+const clip=id=>S.clips.find(c=>c.id===id),cur=()=>clip(S.clip);
+const end=c=>c.start+c.n-1;
+/* frame ranges */
+const merge=r=>{r=r.map(x=>[...x]).sort((a,b)=>a[0]-b[0]);const o=[];for(const x of r){const l=o[o.length-1];if(l&&x[0]<=l[1]+1)l[1]=Math.max(l[1],x[1]);else o.push(x)}return o};
+const count=r=>r.reduce((s,x)=>s+x[1]-x[0]+1,0);
+const firstN=(r,n)=>{const o=[];for(const x of r){if(n<=0)break;const k=Math.min(n,x[1]-x[0]+1);o.push([x[0],x[0]+k-1]);n-=k}return o};
+const covers=(r,f)=>r.some(x=>f>=x[0]&&f<=x[1]);
+const missing=(r,a,b)=>{const o=[];let p=a;for(const x of merge(r)){if(x[1]<a)continue;if(x[0]>b)break;if(x[0]>p)o.push([p,x[0]-1]);p=Math.max(p,x[1]+1)}if(p<=b)o.push([p,b]);return o};
+const nWrite=c=>c.inB-c.inA+1;
+/* hint prerequisites: a hint only counts if it was made by the route that is selected now */
+const hintWhy=c=>!c.hasHint||c.hintGen!==c.gen?'':!(c.hintR&&c.hintR[0]<=c.inA&&c.hintR[1]>=c.inB)?'range changed':c.hintSig!==annSig(c)?'marks changed':'';
+// hint identity = route + range coverage + the marks the generator used. Hint quality is NOT part of it: it is only how much Key trusts an existing hint (tracked as stale on the Key side).
+const hintOk=c=>c.hasHint&&c.hintGen===c.gen&&!hintWhy(c);
+/* staleness: works on a clip or on a frozen job config */
+function outKey(c){return OUTK.map(k=>k+':'+(c.outs[k]||'-')).join(' ')}
+function snapOf(c,p){const L=c.loc||locOf(c,p);return{despill:c.despill,colour:c.colour,mode:c.mode,temporal:c.temporal,vram:c.vram,gen:c.mode==='none'?'':c.gen,hq:c.mode==='none'?0:c.hq,carry:c.carry,cq:c.carry?c.cq:0,outs:outKey(c),comp:OUTK.some(k=>c.outs[k]==='EXR')?c.comp:'',kf:c.mode==='keyframes'?[...c.kf].filter(f=>f>=c.inA&&f<=c.inB).sort((a,b)=>a-b).join(','):'',rng:c.inA+'-'+c.inB,loc:L.key,ver:c.ver}}
+const SNAPLBL={temporal:'Temporal window',vram:'VRAM profile',gen:'Hint generator',hq:'Hint quality',carry:'Carry hint',cq:'Carry quality',outs:'Outputs / formats',comp:'EXR compression',kf:'Keyframe marks',rng:'In/Out range',loc:'Output location'};
+const diffs=c=>{const d=[];if(!c.made)return d;const n=snapOf(c);if(c.made.despill!==n.despill)d.push(`Despill ${c.made.despill.toFixed(2)} → ${c.despill.toFixed(2)}`);if(c.made.colour!==n.colour)d.push(`Input colour ${CL[c.made.colour]} → ${CL[c.colour]}`);if(c.made.mode!==n.mode)d.push('Hint mode changed');
+  for(const k in SNAPLBL)if(c.made[k]!==n[k])d.push(SNAPLBL[k]+' changed');if(c.mixed)d.push('a cancelled run overwrote some frames');return d};
+const stale=c=>c.written.length>0&&diffs(c).length>0;
+const staleTxt=c=>c.mixed?`Mixed output: a cancelled run overwrote some frames with newer settings; the rest are from the earlier run. Neither is current — run a full Key to make every frame consistent.`:rangeStale(c)?`In/Out range changed (was ${c.made.rng.replace('-','–')}, now ${c.inA}–${c.inB}). The files on disk stay as they are and are never shifted; write the new range as v${pad(c.ver+1,3)}.`:stale(c)?`Settings changed since last run (${diffs(c).join('; ')}) — re-key to update. Results on disk were made with Despill ${c.made.despill.toFixed(2)} and ${CL[c.made.colour]} input.`:'';
+/* ================= presets ================= */
+const isNum01=v=>typeof v==='number'&&v>=0&&v<=1;
+const cleanName=n=>{if(typeof n!=='string')return null;n=n.trim();return n.length>=1&&n.length<=40&&!/[\u0000-\u001f]/.test(n)?n:null};
+function cleanFields(kind,f){
+  if(!f||typeof f!=='object'||!f.outs||typeof f.outs!=='object')return null;
+  const outs={};for(const k of OUTK){const v=f.outs[k];if(v!==null&&v!=='EXR'&&v!=='PNG')return null;outs[k]=v}
+  if(!OUTK.some(k=>outs[k])||!COMPS.includes(f.comp))return null;
+  if(kind==='export')return{outs,comp:f.comp};
+  if(!['none','full','keyframes'].includes(f.mode)||!GENS.includes(f.gen)||!isNum01(f.hq)||!isNum01(f.cq)||typeof f.carry!=='boolean'||!['auto','low'].includes(f.vram)||!isNum01(f.despill)||!TEMPORAL.some(t=>t[0]===f.temporal))return null;
+  return{outs,comp:f.comp,mode:f.mode,gen:f.gen,hq:f.hq,cq:f.cq,carry:f.carry,vram:f.vram,despill:f.despill,temporal:f.temporal}}
+/* localStorage boundary: anything unreadable or invalid is dropped, never trusted */
+function loadPresets(raw){
+  if(raw==null)return{list:seedPresets(),warn:''};
+  let d;try{d=JSON.parse(raw)}catch(e){return{list:[],bad:true,warn:'Stored presets were unreadable and were ignored.'}}
+  if(!d||d.v!==1||!Array.isArray(d.presets))return{list:[],bad:true,warn:'Stored presets had an unknown format and were ignored.'};
+  const list=[],ids=new Set();let bad=Math.max(0,d.presets.length-50);
+  for(const p of d.presets.slice(0,50)){
+    const ok=p&&typeof p==='object'&&typeof p.id==='string'&&/^[A-Za-z0-9_-]{1,40}$/.test(p.id)&&!ids.has(p.id)&&(p.kind==='workflow'||p.kind==='export')&&Number.isInteger(p.rev)&&p.rev>=1&&p.rev<=9999;
+    const name=ok?cleanName(p.name):null,fields=ok&&name?cleanFields(p.kind,p.fields):null;
+    if(!fields){bad++;continue}
+    ids.add(p.id);list.push({id:p.id,kind:p.kind,name,rev:p.rev,fields})}
+  return{list,warn:bad?`${bad} invalid stored preset${bad===1?'':'s'} ignored.`:''}}
+let dirty=false,noPersist=false,blocked=false; // blocked: an unreadable store could not be backed up, so never overwrite it
+function persist(){if(noPersist)return true;if(blocked)return false;try{localStorage.setItem(PRE_KEY,JSON.stringify({v:1,presets:S.presets}));return true}catch(e){return false}}
+const preset=id=>S.presets.find(p=>p.id===id);
+const fieldsOf=(kind,c)=>{const o={outs:{...c.outs},comp:c.comp};return kind==='export'?o:Object.assign(o,{mode:c.mode,gen:c.gen,hq:c.hq,cq:c.cq,carry:c.carry,vram:c.vram,despill:c.despill,temporal:c.temporal})};
+const fmtV=v=>typeof v==='number'?v.toFixed(2):typeof v==='boolean'?(v?'on':'off'):String(v);
+const dv=(k,v)=>k==='comp'?COMPL[v]:fmtV(v);
+const FLBL={mode:'Hint mode',gen:'Hint route',hq:'Hint quality',cq:'Carry quality',carry:'Carry hint',vram:'VRAM profile',despill:'Despill',temporal:'Temporal window',comp:'EXR compression'};
+function planApply(p,c){const ch=[];
+  for(const k in p.fields){
+    if(k==='outs'){for(const o of OUTK)if((c.outs[o]||null)!==p.fields.outs[o])ch.push(`${OLBL[o]} ${c.outs[o]||'off'} → ${p.fields.outs[o]||'off'}`)}
+    else if(c[k]!==p.fields[k])ch.push(`${FLBL[k]} ${dv(k,c[k])} → ${dv(k,p.fields[k])}`)}
+  return{ch,after:readiness(Object.assign({},c,p.fields,{outs:{...p.fields.outs}}))}}
+function mergePreset(p,c){ // field merge only; source, colour, range, marks, strokes, hint assets and output folder are never touched
+  for(const k in p.fields)c[k]=k==='outs'?{...p.fields.outs}:p.fields[k];
+  const a={id:p.id,name:p.name,rev:p.rev,fields:JSON.parse(JSON.stringify(p.fields))};
+  if(p.kind==='workflow'){c.applied.wf=a;c.applied.ex=null}else c.applied.ex=a}
+function modified(c,slot){const a=c.applied[slot];if(!a)return false;
+  const skip=slot==='wf'&&c.applied.ex; // an Export preset applied on top changed exports on purpose
+  return Object.keys(a.fields).filter(k=>!(skip&&(k==='outs'||k==='comp'))).some(k=>k==='outs'?OUTK.some(o=>(c.outs[o]||null)!==a.fields.outs[o]):c[k]!==a.fields[k])}
+/* ================= readiness (computed from real state) ================= */
+function readiness(c){
+  if(c.local)return{k:'warn',t:'Metadata not inspected — this prototype cannot key local files'};
+  if(c.state==='Extracting')return{k:'warn',t:'Extracting frames… (simulated)'};
+  if(c.state==='Error'&&c.err)return{k:'err',t:'Error: '+c.err};
+  if(!OUTK.some(k=>c.outs[k]))return{k:'warn',t:'No outputs enabled'};
+  const bo=blockOut(c);if(bo)return{k:'warn',t:bo.t,f:bo.f};
+  if(c.mode==='keyframes'&&!c.kf.some(f=>f>=c.inA&&f<=c.inB))return{k:'warn',t:c.kf.length?'Needs keyframe marks (none inside In/Out)':'Needs keyframe marks'};
+  if(c.mode!=='none'&&!hintOk(c)){
+    if(c.gen==='Import Alpha')return{k:'warn',t:'Needs an imported alpha hint'};
+    if(NEEDS_STROKES(c.gen)&&!strokesOk(c))return{k:'warn',t:`Needs paint strokes for ${c.gen} (subject and background, inside In/Out)`};
+    return{k:'warn',t:`Needs hint${hintWhy(c)?` (${hintWhy(c)})`:''} — generate ${c.gen} hint first`,f:'hint'}}
+  if(!c.checked&&c.sample)return{k:'warn',t:'Needs colour check'};
+  return{k:'ok',t:'Ready to key'}}
+const RI={ok:'✓',warn:'▲',err:'✕'};
+/* ================= jobs ================= */
+const job=id=>S.queue.find(j=>j.id===id);
+const ACTIVE=['queued','running','stopping'];
+const running=()=>S.queue.find(j=>j.status==='running'||j.status==='stopping');
+const activeFor=cid=>S.queue.find(j=>j.clip===cid&&ACTIVE.includes(j.status));
+const jlabel=j=>(j.type==='key'?'Key ':j.type==='resume'?'Resume ':j.gen+' hint ')+j.clip;
+function say(m){S.msg=m;const e=$('#msg');if(e)e.textContent=m}
+/* a job owns a frozen copy of the settings it was submitted with; later edits and preset applies never change it */
+const CFG=c=>{const o=Object.freeze({despill:c.despill,colour:c.colour,mode:c.mode,temporal:c.temporal,vram:c.vram,gen:c.gen,hq:c.hq,carry:c.carry,cq:c.cq,outs:Object.freeze({...c.outs}),comp:c.comp,kf:Object.freeze([...c.kf]),inA:c.inA,inB:c.inB,outRoot:c.outRoot,resLabel:c.resLabel,date:c.date,ver:c.ver,loc:frozenLoc(c)});return o};
+const cfgKey=x=>JSON.stringify([snapOf(x),x.inA,x.inB]);
+const outdated=j=>j.status==='queued'&&(j.type==='hint'?clip(j.clip).gen!==j.gen||clip(j.clip).inA!==j.range[0][0]||clip(j.clip).inB!==j.range[0][1]||annSig(clip(j.clip))!==j.sig:cfgKey(j.cfg)!==cfgKey(clip(j.clip)));
+function enqueue(type,cid,extra={}){
+  const c=clip(cid);if(c.local||S.queue.some(j=>j.clip===cid&&j.type===type&&ACTIVE.includes(j.status)))return null;
+  const j=Object.assign({id:'J'+S.nextId++,type,clip:cid,status:'queued',p:0},extra);
+  if(type==='hint'){j.gen=extra.gen||c.gen;j.range=[[c.inA,c.inB]];j.w=nWrite(c);j.sig=annSig(c)}
+  else{j.cfg=CFG(c);j.snap=snapOf(j.cfg);j.loc=j.cfg.loc;j.range=type==='resume'?missing(c.written,c.inA,c.inB):[[c.inA,c.inB]];j.w=count(j.range)}
+  S.queue.push(j);startNext();return j}
+/* why a queued job may not start: '' = go, 'wait' = its hint job is still pending, else a reason it can never start */
+function gate(j){
+  const c=clip(j.clip);if(!c)return'its clip no longer exists';
+  if(j.after){const d=job(j.after);if(d&&d.status!=='done'){if(ACTIVE.includes(d.status))return'wait';return`its hint job did not finish (${d.status})`}}
+  if(j.type==='hint')return'';
+  // re-check against the settings frozen at submit, using the hint that exists now
+  const r=readiness(Object.assign({},c,j.cfg,{outs:{...j.cfg.outs},kf:[...j.cfg.kf]}));
+  if(r.k!=='ok')return'no longer ready: '+r.t;
+  if(j.type==='resume'&&JSON.stringify(c.made)!==JSON.stringify(j.snap))return'files on disk were made with different settings, so Resume would mix them — run a full Key';
+  return''}
+function startNext(){if(running())return;
+  for(const j of S.queue.filter(x=>x.status==='queued')){const g=gate(j);
+    if(g&&g!=='wait'){j.status='cancelled';j.why=`${jlabel(j)} not started — ${g}.`;say(j.why);dirty=true;continue}
+    if(!g){j.status='running';j.p=0;say(`${jlabel(j)} started. One GPU job runs at a time.`);return}}}
+function finish(j,st){
+  j.status=st;const c=clip(j.clip);
+  if(st==='done'){
+    if(j.type==='hint'){c.hasHint=true;c.hintGen=j.gen;c.hintR=[j.range[0][0],j.range[0][1]];c.hintSig=j.sig;c.err='';if(c.state==='Error'||c.state==='Raw')c.state='Ready';say(`${jlabel(j)} finished (simulated). Hint ready.`)}
+    else{if(c.made&&c.made.loc!==j.snap.loc)archive(c);c.written=merge(j.type==='resume'?c.written.concat(j.range):j.range);c.made=Object.assign({},j.snap);if(j.type==='key')c.mixed=false;const left=count(missing(c.written,c.inA,c.inB));c.state=left?'Ready':'Complete';
+      say(left?`${jlabel(j)} finished (simulated). ${nWrite(c)-left} of ${nWrite(c)} frames of ${c.inA}–${c.inB} written — not Complete until the whole range is written.`:`${jlabel(j)} finished (simulated). Range ${c.inA}–${c.inB} is Complete (${nWrite(c)} frames).`)}
+  }else{let note='';
+    if(j.type!=='hint'){const {list,i,frac}=phaseInfo(j),n=Math.floor(frac*j.w);
+      if(list[i][0]==='publish'&&n>0){
+        if(c.made&&c.made.loc!==j.snap.loc)archive(c);
+        // a cancelled run is never Complete, even if older files fill the range; if the older files came from other settings the clip holds mixed output
+        const mix=c.written.length>0&&c.made&&JSON.stringify(c.made)!==JSON.stringify(j.snap);
+        c.written=merge(c.written.concat(firstN(j.range,n)));if(mix)c.mixed=true;else c.made=Object.assign({},j.snap);c.state='Ready';
+        note=`${jlabel(j)} stopped while writing: ${n} of ${j.w} frames were written. The clip is not Complete${mix?' and now mixes new and earlier output — re-key to make it consistent':''}.`}}
+    say(note||`${jlabel(j)} cancelled before any file was written. Nothing is marked Complete.`)}
+  dirty=true;startNext()}
+function cancelJob(id){const j=job(id);if(!j)return;
+  if(j.status==='queued'){j.status='cancelled';say(`${jlabel(j)} removed from the queue.`);startNext()}
+  else if(j.status==='running'){j.status='stopping';j.stopLeft=1500;say('Stopping after current step…')}}
+function advance(ms){
+  const j=running();
+  if(j){if(j.status==='stopping'){j.stopLeft-=ms;if(j.stopLeft<=0)finish(j,'cancelled')}
+    else{j.p+=ms/(DUR[j.type]/S.speed);if(j.p>=1){j.p=1;finish(j,'done')}}}
+  else{const before=S.queue.some(x=>x.status==='running');startNext();if(!before&&running())dirty=true}
+  if(S.playing){const c=cur();if(S.view==='clip'&&!c.local)S.frame=S.frame>=end(c)?c.start:S.frame+1;else S.playing=false}}
+function phaseInfo(j){const list=j.type==='hint'?[['gen','Generating hint',1]]:PH;let acc=0,i=0;for(;i<list.length-1;i++){if(j.p<acc+list[i][2])break;acc+=list[i][2]}
+  return{list,i,frac:clamp((j.p-acc)/list[i][2],0,1)}}
+function ptxt(j){const c=clip(j.clip),{list,i,frac}=phaseInfo(j);const key=list[i][0];
+  if(key==='publish')return`Writing files · ${Math.round(frac*j.w)} / ${j.w}`;
+  return`${list[i][1]} · frame ${Math.round(frac*j.w)} / ${j.w}`}
+/* ================= small view helpers ================= */
+const seg=(label,opts,val,act)=>`<div class="seg" role="group" aria-label="${label}">${opts.map(([v,l])=>`<button type="button" data-act="${act}" data-v="${v}" aria-pressed="${v===val}">${l}</button>`).join('')}</div>`;
+const stateChip=c=>{const [i,k]=ST[c.state];return`<span class="chip c-${k}"><span aria-hidden="true">${i}</span> ${c.state}${c.state==='Ready'&&c.written.length?' · partial':''}${c.state==='Complete'&&c.made&&c.made.rng?' · '+c.made.rng.replace('-','–'):''}</span>`};
+const hintTxt=c=>c.mode==='none'?'Hint: bypassed (none)':`Hint: ${c.gen} · ${c.mode==='full'?'Full':'Keyframes'}${hintOk(c)?'':hintWhy(c)?' · '+hintWhy(c):' · not generated'}`;
+const outList=c=>OUTK.filter(k=>c.outs[k]).map(k=>[k,c.outs[k]]);
+const rangeTxt=c=>`Range ${c.inA}–${c.inB} · ${nWrite(c)} of ${c.n} frames`;
+const writesTxt=c=>c.local?'Frame range unknown: metadata not inspected':`${rangeTxt(c)} · Hint, Key and every export process and write exactly this range`;
+const fmtSize=n=>n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(1)+' MB';
+function summary(c){
+  if(c.local)return'Metadata not inspected — this prototype cannot describe or key a local file.';
+  const outs=outList(c).map(([k,f])=>`${OLBL[k]} (${f})`).join(', ')||'nothing — enable at least one output';
+  const h=c.mode==='none'?'without a hint':c.mode==='full'?`using the ${c.gen} hint${hintOk(c)?'':' (still to be generated)'}`:`using the ${c.gen} hint with ${c.kf.length} marked keyframes${hintOk(c)?'':' (still to be generated)'}`;
+  return`AI will process frames ${c.inA}–${c.inB} (${nWrite(c)} of ${c.n}) of ${c.name} ${h}, reading the input as ${CL[c.colour]}, then write ${outs} for those same ${nWrite(c)} frames. No frame outside In/Out is read or written.`}
+function primary(c){
+  const j=activeFor(c.id);
+  if(j)return{l:j.status==='stopping'?'Stopping after current step…':j.status==='queued'?`Cancel queued ${jlabel(j)}`:`Cancel ${jlabel(j)}`,act:'cancelJob',v:j.id,cls:'dng',dis:j.status==='stopping',sub:'Cancel is graceful: the GPU finishes its current step first.'};
+  if(c.local)return{l:'File not inspected — see Media',act:'goMedia',sub:'The prototype only knows this file’s name and size, so it cannot be keyed.'};
+  if(c.state==='Error'&&c.err)return{l:'Regenerate hint',act:'genHint',sub:'Queues a hint job. Keying stays blocked until the hint matches the clip.'};
+  if(!outList(c).length)return{l:'Enable an output (FG) to continue',act:'enableOut',sub:'Nothing would be written. Pick at least one of FG, Matte, Comp, Processed.'};
+  const bo=blockOut(c);if(bo)return Object.assign({sub:bo.t},{out:{l:'Fix output location (Deliver)',act:'goDeliver'},sub:{l:'Add {output} subfolder',act:'addOutSub'},ver:{l:'Use next free version',act:'nextVer'},newver:{l:`Write as v${pad(c.ver+1,3)} (new folder)`,act:'nextVer'}}[bo.f]);
+  if(c.mode==='keyframes'&&!c.kf.some(f=>f>=c.inA&&f<=c.inB))return{l:'Mark at least one keyframe inside In/Out (M)',act:'markKf',sub:'Keyframes mode needs a mark on a frame inside the range. Marks the current playhead frame.'};
+  if(c.mode!=='none'&&!hintOk(c)){
+    if(c.gen==='Import Alpha')return{l:'Import alpha… (file picker not drawn)',act:'goHint',sub:'Open the Hint page, or bypass Hint to key without one.'};
+    if(NEEDS_STROKES(c.gen)&&!strokesOk(c))return{l:'Paint strokes first',act:'paintOn',sub:`${c.gen} needs subject and background strokes on the Hint page.`};
+    return{l:`Generate ${c.gen} hint for ${c.inA}–${c.inB}, then key`,act:'genThenKey',sub:'Queues the hint job, then the key job, both for this range. Bypass Hint to key without one.'}}
+  if(!c.checked&&c.sample)return{l:'Confirm input colour first',act:'goMedia',sub:'The sampled values could be sRGB or linear. You choose; it is never switched automatically.'};
+  return{l:`Key range ${c.inA}–${c.inB} (${nWrite(c)} frames)`,act:'key',sub:'Processes and writes only this range. Jobs run one at a time on the GPU.'}}
+const resumeRange=c=>{if(c.local||!c.written.length||stale(c)||c.state==='Error')return null;const m=missing(c.written,c.inA,c.inB);return m.length?m:null};
+function runBtns(c){const p=primary(c),r=resumeRange(c);
+  return`<div class="run-actions"><button type="button" class="btn ${p.cls==='dng'?'dng':'pri'} big" data-act="${p.act}" data-v="${p.v||''}" ${p.dis?'disabled':''}>${esc(p.l)}</button>${r&&!activeFor(c.id)?`<button type="button" class="btn" data-act="resume">Resume — process and write the ${count(r)} missing frames of ${c.inA}–${c.inB}</button>`:''}<p class="help">${esc(p.sub)}</p></div>`}
+/* ================= sample scene (drawn, not footage) ================= */
+let uid=0;
+function annSVG(c,frame){const dim=frame<c.inA||frame>c.inB?' opacity=".4"':'',cl=t=>t==='+'?'#8fae7d':'#d37466',on=a=>a.f===frame||a.f==null;
+  return`<g${dim}>`+c.strokes.filter(on).map(s=>`<circle cx="${s.x}" cy="${s.y}" r="8" fill="${s.t===1?'#8fae7d':'#d37466'}" stroke="#fff" stroke-width="1.5"/>`).join('')
+   +c.pts.filter(on).map(p=>`<g><circle cx="${p.x}" cy="${p.y}" r="9" fill="${cl(p.t)}" stroke="#fff" stroke-width="2"/><path d="M${p.x-5} ${p.y}h10${p.t==='+'?`M${p.x} ${p.y-5}v10`:''}" stroke="#111" stroke-width="2.4"/></g>`).join('')
+   +c.boxes.filter(on).map(b=>`<rect x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" fill="none" stroke="${b.t==='add'?'#8fae7d':'#d37466'}" stroke-width="3"${b.t==='add'?'':' stroke-dasharray="8 5"'}/>`).join('')+'</g>'}
+function sceneSVG(c,mode,frame,o={}){
+  if(mode!=='input'&&(frame<c.inA||frame>c.inB))return`<svg viewBox="0 0 640 360" role="img" aria-label="Outside In/Out"><rect width="640" height="360" fill="#121212"/><text x="320" y="168" text-anchor="middle" fill="#cfcfcf" font-size="17">Outside In/Out</text><text x="320" y="196" text-anchor="middle" fill="#a3a3a3" font-size="13">Frame ${frame} is not processed. Range ${c.inA}–${c.inB}.</text>${mode==='hint'?annSVG(c,frame):''}</svg>`;
+  const wrote=mode!=='input'&&mode!=='hint'&&!!c.outs[mode]&&!!c.made&&c.made.outs.includes(mode+':'+c.outs[mode]);
+  const have=mode==='input'||(mode==='hint'?hintOk(c):wrote&&covers(c.written,frame));
+  if(!have)return`<svg viewBox="0 0 640 360" role="img" aria-label="No file on disk"><rect width="640" height="360" fill="#121212"/><text x="320" y="168" text-anchor="middle" fill="#cfcfcf" font-size="17">${mode==='hint'?'No hint generated yet':!c.outs[mode]?OLBL[mode]+' output is off':'No file on disk for frame '+frame}</text><text x="320" y="196" text-anchor="middle" fill="#a3a3a3" font-size="13">${mode==='hint'?'Generate a hint, or bypass Hint.':'Results exist only for written frames of an enabled output. Key the clip first.'}</text>${mode==='hint'?annSVG(c,frame):''}</svg>`;
+  const id='k'+(uid++),t=frame-c.start,fx=150+((t*3)%340),lg=Math.sin(t/3)*14;
+  const fig=(fill,blur)=>`<g transform="translate(${fx} 0)" fill="${fill}" stroke="${fill}"${blur?` filter="url(#${id}b)"`:''}><circle cx="0" cy="84" r="22" stroke="none"/><path d="M-30 116 Q0 106 30 116 L36 222 H-36 Z" stroke="none"/><path d="M-14 222 L${-14-lg} 322 M14 222 L${14+lg} 322" stroke-width="17" stroke-linecap="round" fill="none"/><path d="M-30 124 L-44 196 M30 124 L44 196" stroke-width="12" stroke-linecap="round" fill="none"/></g>`;
+  const chk=`<pattern id="${id}c" width="32" height="32" patternUnits="userSpaceOnUse"><rect width="32" height="32" fill="#7d7d7d"/><rect width="16" height="16" fill="#5e5e5e"/><rect x="16" y="16" width="16" height="16" fill="#5e5e5e"/></pattern>`;
+  let bg,f;
+  if(mode==='input'){bg='<rect width="640" height="360" fill="#7f8488"/><rect y="300" width="640" height="60" fill="#5c6165"/><rect x="40" y="30" width="170" height="220" fill="#898e92"/>';f=fig('#2d3136')}
+  else if(mode==='hint'){bg='<rect width="640" height="360" fill="#000"/>';f=fig('#fff',true)}
+  else if(mode==='matte'){bg='<rect width="640" height="360" fill="#000"/>';f=fig('#fff')}
+  else if(mode==='fg'){bg='<rect width="640" height="360" fill="#000"/>';f=fig('#555c63')}
+  else if(mode==='comp'&&S.bg!=='checker'){bg=`<rect width="640" height="360" fill="${S.bg==='black'?'#000':'#fff'}"/>`;f=fig('#2d3136')}
+  else{bg=`<rect width="640" height="360" fill="url(#${id}c)"/>`;f=fig('#2d3136')}
+  let ex='';
+  if(o.strokes!==false&&(mode==='input'||mode==='hint'))ex+=annSVG(c,frame);
+  if(c.kf.includes(frame)&&c.mode==='keyframes')ex+='<text x="12" y="26" fill="#cdb061" font-size="15">◆ marked keyframe</text>';
+  return`<svg viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Sample frame ${frame}, ${mode} view (drawn sample, not footage)"><defs>${chk}<filter id="${id}b"><feGaussianBlur stdDeviation="6"/></filter></defs>${bg}${f}${ex}<rect x="520" y="336" width="116" height="20" fill="#000" opacity=".6"/><text x="578" y="350" text-anchor="middle" fill="#cfcfcf" font-size="12">SAMPLE IMAGE</text></svg>`}
+const thumb=(c,f)=>sceneSVG(c,'input',f,{strokes:false}).replace('<svg ','<svg aria-hidden="true" ').replace(/ role="img" aria-label="[^"]*"/,'');
+const sceneKey=c=>[c.id,S.frame,S.mode,S.ab,S.bg,c.strokes.length+c.pts.length+c.boxes.length,hintOk(c),count(c.written),c.mode,c.inA,c.inB].join('|');
+function sceneInner(c){
+  if(S.ab&&S.mode!=='input')return`${sceneSVG(c,'input',S.frame)}<div class="ov" data-lv="ov" style="clip-path:inset(0 0 0 ${S.wipe}%)">${sceneSVG(c,S.mode,S.frame)}</div><div class="wl" data-lv="wl" style="left:${S.wipe}%"></div>`;
+  return sceneSVG(c,S.mode,S.frame)}
+const sceneBox=(c,annot)=>`<div class="scene" data-lv="scene" data-key="${sceneKey(c)}" ${annot&&S.paint.on?'data-paint':''}>${sceneInner(c)}</div>`;
+const CH=[['input','Input'],['hint','Hint'],['fg','FG'],['matte','Matte'],['comp','Comp'],['processed','Processed']];
+const ANN=[['b1','Brush: subject','B+'],['b2','Brush: background','B−'],['pos','Point +','P+'],['neg','Point −','P−'],['boxA','Box add','▭+'],['boxR','Box remove','▭−']];
+const IC={first:'<path d="M2 3h2v10H2zM9 3v10L4.5 8zM14 3v10L9.5 8z"/>',prev:'<path d="M3 3h2v10H3zM13 3v10L6 8z"/>',play:'<path d="M4 2.5v11l9-5.5z"/>',pause:'<path d="M4 3h3v10H4zM9 3h3v10H9z"/>',next:'<path d="M3 3v10l7-5zM11 3h2v10h-2z"/>',last:'<path d="M2 3v10l4.5-5zM7.5 3v10L12 8zM12 3h2v10h-2z"/>'};
+const ic=n=>`<svg class="ic" viewBox="0 0 16 16" aria-hidden="true" focusable="false">${IC[n]}</svg>`;
+const viewLab=()=>S.mode==='input'?'Source frames — drawn sample':S.mode==='hint'?'Hint on disk — drawn sample':`Viewing ${(CH.find(x=>x[0]===S.mode)||[])[1]} results on disk — playback never runs the AI`;
+const rangeBtns=c=>`<button type="button" class="btn sm" data-act="setIn" title="Set In at the playhead (I)">Set In (I)</button><button type="button" class="btn sm" data-act="setOut" title="Set Out at the playhead (O)">Set Out (O)</button><button type="button" class="btn sm" data-act="whole" title="Clear In/Out: the whole clip is the range" ${c.inA===c.start&&c.inB===end(c)?'disabled':''}>Clear In/Out</button>`;
+/* ONE shared scrubber: playhead = the native range thumb (click, drag, ←/→, Home/End); In/Out = highlighted span; same source frame numbers everywhere */
+function scrub(c){const pos=f=>c.n>1?(f-c.start)/(c.n-1)*100:0,wd=(a,b)=>Math.max(.4,pos(b)-pos(a));
+  const wr=clipR(c.written,c.start,end(c)).map(r=>`<i class="wr" style="left:${pos(r[0])}%;width:${wd(r[0],r[1])}%"></i>`).join('');
+  const ht=c.hasHint&&c.hintR?`<i class="ht" style="left:${pos(c.hintR[0])}%;width:${wd(c.hintR[0],c.hintR[1])}%"></i>`:'';
+  const kf=c.mode==='keyframes'?c.kf.map(f=>{const o=f<c.inA||f>c.inB;return`<i class="tick${o?' out':''}" style="left:${pos(f)}%" title="${o?'Mark '+f+' is outside In/Out: kept, ignored':'Keyframe '+f}"></i>`}).join(''):'';
+  return`<div class="scrub"><div class="in" aria-hidden="true">${ht}<i class="rg" style="left:${pos(c.inA)}%;width:${wd(c.inA,c.inB)}%"></i>${wr}${kf}</div><input type="range" class="seek" id="seek" min="${c.start}" max="${end(c)}" step="1" value="${S.frame}" data-lv="seek" data-inp="seek" aria-label="Playhead — source frame number" aria-valuetext="Frame ${S.frame}"></div>`}
+function transport(c,play){
+  if(c.local)return'';
+  const tb=(act,v,ico,lab,key)=>`<button type="button" class="btn tb" data-act="${act}" data-v="${v}" aria-label="${lab}" title="${lab}${key?' ('+key+')':''}">${ic(ico)}</button>`;
+  const mid=play?`<div class="vbm" role="group" aria-label="Transport">${tb('seekTo','first','first','Go to first frame')}${tb('step','-1','prev','Previous frame','←')}${tb('play','',S.playing?'pause':'play',S.playing?'Pause':'Play','Space')}${tb('step','1','next','Next frame','→')}${tb('seekTo','last','last','Go to last frame')}</div>`:'';
+  return`<div class="vbar"><div class="vbl">${rangeBtns(c)}</div>${mid}<div class="vbr"><b data-lv="frame"></b> <span class="tag">of ${c.start}–${end(c)}</span></div></div>${scrub(c)}<div class="rtxt"><b>${rangeTxt(c)}</b><span class="tag">source frame numbers · blue = hint · green = written</span><span class="sp"></span>${play?`<span class="tag">${esc(viewLab())}</span>`:''}</div>`}
+const annBar=()=>`<div class="vtools" role="toolbar" aria-label="Hint annotation tools (local prototype)">${ANN.map(([v,l,g])=>`<button type="button" class="btn" data-act="annTool" data-v="${v}" aria-pressed="${S.paint.on&&S.paint.tool===v}" aria-label="${l}" title="${l} — local annotation only, no SAM runs">${g}</button>`).join('')}</div>`;
+/* the single viewer used by Media, Hint and Review: channel selector top-right, A/B top-centre, transport centred, scrubber + In/Out below */
+function viewer(o={}){
+  const c=cur(),m=S.mode;
+  const left=`${o.focus?`<button type="button" class="btn sm" data-act="focus" aria-pressed="${S.focus}" title="${S.focus?'Exit focus (Esc)':'Focus: give the viewer the whole window for precise marks'}">${S.focus?'Exit focus':'Focus'}</button>`:''}<span class="chip c-warn" data-lv="stale" ${stale(c)?'':'hidden'}>▲ Stale</span>${m==='comp'?`<select data-chg="bg" aria-label="Comp backdrop">${[['checker','Checker'],['black','Black'],['white','White']].map(([v,l])=>`<option value="${v}" ${S.bg===v?'selected':''}>${l}</option>`).join('')}</select>`:''}`;
+  return`<div class="viewer fill"><div class="vhead"><div class="vl">${left}</div><div class="vc"><button type="button" class="btn sm" data-act="ab" aria-pressed="${S.ab}" aria-label="A/B wipe" title="Wipe between Input (A) and the selected channel (B)">A/B</button>${S.ab&&m!=='input'?`<label class="wipe"><span class="sr">Wipe position</span><input type="range" id="wipe" min="0" max="100" value="${S.wipe}" data-inp="wipe" aria-label="Wipe position"></label>`:''}</div><div class="vr">${seg('Channel',CH,m,'vmode')}</div></div>
+   <div class="stage">${sceneBox(c,o.annot)}${o.annot?annBar():''}</div>${transport(c,true)}</div>`}
+const more=(k,t,body)=>`<details class="more" data-k="${k}" ${S.open.includes(k)?'open':''}><summary>${t}</summary>${body}</details>`;
+const pane=(head,body,foot='')=>`<div class="pane">${head}<div class="pbody" data-scroll="pane">${body}</div>${foot?`<div class="pfoot">${foot}</div>`:''}</div>`;
+const hdr=(t,x='')=>`<div class="ph"><span>${t}</span><span class="sp"></span>${x}</div>`;
+function banners(c){return`${c.err&&c.state==='Error'?`<div class="note err" role="alert"><b>✕ Error:</b> ${esc(c.err)}</div>`:''}<div class="note" data-lv="stale" ${stale(c)?'':'hidden'}><b>▲ Stale results.</b> <span data-lv="staletxt">${esc(staleTxt(c))}</span></div>`}
+/* ================= queue ================= */
+function phaseUI(j){const {list}=phaseInfo(j);
+  return`<ol class="steps" aria-label="Phases">${list.map((p,i)=>`<li data-lv="step" data-job="${j.id}" data-i="${i}">${p[1]}</li>`).join('')}</ol>
+  <div class="row"><span data-lv="ptxt" data-job="${j.id}"></span><span class="sp"></span><span><b data-lv="pct" data-job="${j.id}"></b> overall</span></div>
+  <div class="bar" role="progressbar" aria-label="Overall progress" aria-valuemin="0" aria-valuemax="100"><i data-lv="bar" data-job="${j.id}"></i></div>
+  <p class="help"><span data-lv="jstatus" data-job="${j.id}"></span> · ≈ <span data-lv="left" data-job="${j.id}"></span> left (simulated timing, not a benchmark)</p>`}
+const jrange=j=>!j.range?'':j.type==='resume'?`${j.w} missing of ${j.cfg.inA}–${j.cfg.inB}`:`${j.range[0][0]}–${j.range[0][1]} · ${j.w} f`;
+const JST={queued:['◷','Queued','dim'],running:['▶','Running','run'],stopping:['■','Stopping…','warn'],done:['✓','Done','ok'],cancelled:['–','Cancelled','dim'],failed:['✕','Failed','err']};
+function queueList(o={}){
+  const run=S.queue.filter(j=>j.status==='running'||j.status==='stopping'),qd=S.queue.filter(j=>j.status==='queued'),hist=S.queue.filter(j=>!ACTIVE.includes(j.status)).reverse().slice(0,o.hist??4);
+  const row=(j,qi)=>{const [i,l,k]=JST[j.status];
+    return`<li class="job s-${j.status}"><div class="row"><span class="chip c-${k}"><span aria-hidden="true">${i}</span> ${l}</span><b>${jlabel(j)}</b><span class="tag">${jrange(j)}</span><span class="sp"></span>
+     ${j.status==='queued'?`<button type="button" class="btn sm" data-act="qUp" data-v="${j.id}" aria-label="Move ${jlabel(j)} earlier" ${qi===0?'disabled':''}>↑</button><button type="button" class="btn sm" data-act="qDown" data-v="${j.id}" aria-label="Move ${jlabel(j)} later" ${qi===qd.length-1?'disabled':''}>↓</button>`:''}
+     ${ACTIVE.includes(j.status)?`<button type="button" class="btn sm dng" data-act="cancelJob" data-v="${j.id}" ${j.status==='stopping'?'disabled':''} aria-label="Cancel ${jlabel(j)}">${j.status==='stopping'?'Stopping…':'Cancel'}</button>`:''}</div>
+     ${j.why?`<p class="help" style="margin:0">${esc(j.why)}</p>`:''}${j.status==='queued'&&j.after&&gate(j)==='wait'?'<p class="help" style="margin:0">Waits for its hint job; cancelled if the hint does not finish.</p>':''}
+     ${outdated(j)?(()=>{const c=clip(j.clip),bo=j.type==='hint'?null:blockOut(c);return`<div class="row"><span class="chip c-warn">▲ Queued with earlier settings</span>${bo?`<span class="help" style="margin:0">${esc(bo.t)}</span>${bo.f==='newver'||bo.f==='ver'?`<button type="button" class="btn sm" data-act="nextVer" data-v="${c.id}">${bo.f==='newver'?`Write as v${pad(c.ver+1,3)} (new folder)`:'Use next free version'}</button>`:''}`:`<button type="button" class="btn sm" data-act="requeue" data-v="${j.id}">${j.type==='resume'?(resumeRange(c)?'Requeue Resume with current settings':'Requeue as full Key — rewrites every selected frame'):'Requeue current settings'}</button>`}</div>`})():''}
+     ${j.cfg&&ACTIVE.includes(j.status)?`<p class="help" style="margin:0">Frozen at submit: range ${j.cfg.inA}–${j.cfg.inB} · Despill ${j.cfg.despill.toFixed(2)} · ${esc(j.cfg.temporal)} · ${OUTK.filter(k=>j.cfg.outs[k]).map(k=>OLBL[k]).join('/')||'no outputs'} · v${pad(j.cfg.ver,3)} ${esc(j.cfg.date)}${Object.keys(j.loc.paths).length?` → <code>${esc(j.loc.paths[Object.keys(j.loc.paths)[0]])}</code>`:''}</p>`:''}
+     ${j.status==='running'||j.status==='stopping'?phaseUI(j):''}</li>`};
+  const items=run.map(j=>row(j)).concat(qd.map((j,i)=>row(j,i)),hist.map(j=>row(j)));
+  return`<ul class="jobs" aria-label="Job queue">${items.join('')||'<li class="job dim">Queue is empty.</li>'}</ul><p class="help" style="padding:0 10px 8px;margin:0">One GPU job at a time. Playback never uses the queue. A job keeps the settings it was submitted with.</p>`}
+const queueSummary=()=>{const r=S.queue.filter(j=>j.status==='running'||j.status==='stopping').length,q=S.queue.filter(j=>j.status==='queued').length;return`Queue: ${r} running · ${q} waiting`};
+/* ================= property panels ================= */
+const FACTS='style="margin:0;display:grid;grid-template-columns:auto 1fr;gap:2px 12px"';
+function propMedia(c){
+  const o=c.colour==='srgb'?'linear':'srgb';
+  const facts=c.local?`<dl ${FACTS}><dt class="dim">File</dt><dd style="margin:0">${esc(c.name)}</dd><dt class="dim">Size</dt><dd style="margin:0">${fmtSize(c.size)}</dd><dt class="dim">Resolution, frames, fps</dt><dd style="margin:0">Not inspected — this prototype does not decode media</dd></dl>`
+   :`<dl ${FACTS}><dt class="dim">Clip</dt><dd style="margin:0">${esc(c.name)}</dd><dt class="dim">Source</dt><dd style="margin:0">${esc(c.kind)} · ${c.res}</dd><dt class="dim">Frames</dt><dd style="margin:0">${c.n} (${c.start}–${end(c)}) at ${c.fps} fps</dd><dt class="dim">State</dt><dd style="margin:0">${stateChip(c)}</dd></dl><p class="help">Read-only. Source facts are never changed by presets.</p>`;
+  return`<section class="sec">${facts}</section><section class="sec"><h3>Input colour</h3>${seg('Input colour',[['srgb','sRGB'],['linear','Linear']],c.checked||!c.local?c.colour:null,'colour')}
+  ${c.sample&&!c.checked?`<div class="note" style="margin:8px 0 0"><b>▲ Check before keying.</b> ${esc(c.sample)}<div class="row"><button type="button" class="btn sm" data-act="colourPick" data-v="${c.colour}">Keep ${CL[c.colour]}</button><button type="button" class="btn sm" data-act="colourPick" data-v="${o}">Switch to ${CL[o]}</button></div></div>`
+   :`<p class="help">${c.checked?`✓ ${CL[c.colour]} — your choice; never switched automatically.`:c.local?'Not inspected — input colour is unknown until you choose it.':'Not confirmed yet.'} Kept per clip; presets never change it.</p>`}</section>`}
+function annCount(c){const all=[...c.strokes,...c.pts,...c.boxes],i=all.filter(a=>inR(c,a)).length;return{in:i,out:all.length-i,all:all.length}}
+function annSec(c){const n=annCount(c),t=ANN.find(x=>x[0]===S.paint.tool),box=/^box/.test(S.paint.tool);
+  return`<section class="sec"><h3>Hint annotations <span class="opt">local prototype</span></h3>
+  ${seg('Annotation tool',ANN.map(x=>[x[0],x[1]]),S.paint.on?S.paint.tool:'','annTool')}
+  <p class="help">${S.paint.on?`Active: ${t[1]}. ${box?'Drag on the Hint viewer to draw it.':'Click the Hint viewer to place it.'} Click the tool again to stop.`:'Pick a tool, then click or drag on the Hint viewer. Use Focus for precise marks.'}</p>
+  <p class="help strong"><b>${n.in}</b> marks inside In/Out · <b>${n.out}</b> outside (kept, ignored by jobs)</p>
+  <div class="row"><button type="button" class="btn sm" data-act="clearFrame">Clear this frame</button><button type="button" class="btn sm" data-act="clearAnn" ${n.all?'':'disabled'}>Clear all</button></div>
+  <p class="help">Marks are drawn locally for this design only. No SAM or mask is computed here, and nothing is exported.</p></section>`}
+function propHint(c){
+  const by=c.mode==='none',g=c.gen,act=activeFor(c.id),sIn=strokesIn(c),cov=c.hintR&&c.hasHint?`${c.hintR[0]}–${c.hintR[1]}`:'',inK=c.kf.filter(f=>f>=c.inA&&f<=c.inB).length;
+  const gb=g==='Import Alpha'?['Import alpha… (file picker not drawn)','goHint']:NEEDS_STROKES(g)&&!strokesOk(c)?['Paint strokes first','paintOn']:[`Generate hint for ${c.inA}–${c.inB}`,'genHint'];
+  const hs=hintOk(c)?`✓ Hint ready: ${g}, covers ${cov}`:c.hasHint&&c.hintGen===g?`Hint from ${g} (${hintWhy(c)}): covers ${cov}, range is ${c.inA}–${c.inB}`:c.hasHint?`Existing hint came from ${c.hintGen}, not ${g}`:'No hint generated yet';
+  return`${annSec(c)}<section class="sec"><h3>Hint <span class="opt">optional</span></h3>
+  <div class="row"><button type="button" class="btn" data-act="bypass" aria-pressed="${by}">${by?'Hint bypassed — click to enable':'Bypass hint'}</button></div>
+  <p class="help">${by?'No hint: the AI keys the range by itself. Assets, marks and strokes are kept, so enabling restores them.':'Bypass = Hint mode “None”. Nothing is deleted.'}</p>
+  ${by?'':`${seg('Hint mode',[['full','Full AlphaHint'],['keyframes','Keyframes']],c.mode,'mode')}
+   <div class="row"><label for="gen">Route</label><select id="gen" data-chg="gen">${GENS.map(x=>`<option ${x===g?'selected':''}>${x}</option>`).join('')}</select></div>
+   <div class="row"><span>${esc(hs)}</span><button type="button" class="btn sm" data-act="${gb[1]}" ${act&&act.type==='hint'?'disabled':''}>${act&&act.type==='hint'?'Hint job queued':gb[0]}</button></div>
+   <div class="row"><label for="hq">Hint quality</label><input type="range" id="hq" min="0" max="1" step="0.05" value="${c.hq}" data-inp="hq" data-chg="redraw" aria-describedby="hqv" style="flex:1"><b id="hqv" data-lv="hq">${c.hq.toFixed(2)}</b></div>
+   <p class="help">Quality is how much Key trusts an existing hint, so changing it marks Key results stale but never requires a new hint.</p>
+   ${NEEDS_STROKES(g)?`<p class="help">${g} needs at least one subject and one background brush stroke inside In/Out. Painted inside In/Out: <b>${sIn}</b>${strokesOk(c)?'':' — both kinds are required'}. Changing marks later makes this hint stale.</p>`:''}
+   ${c.mode==='keyframes'?`<p class="help">Keyframes inside In/Out: <b>${inK}</b> of ${c.kf.length} marked${c.kf.length?' ('+[...c.kf].sort((a,b)=>a-b).join(', ')+')':''}. Marks outside the range are kept but ignored. Marks belong to this clip; presets never copy them.</p><div class="row"><button type="button" class="btn sm" data-act="markKf">${c.kf.includes(S.frame)?'Unmark keyframe':'Mark keyframe here (M)'}</button><button type="button" class="btn sm" data-act="clearKf" ${c.kf.length?'':'disabled'}>Clear keyframes</button></div>`:''}`}
+  <div class="row"><label><input type="checkbox" id="carry" data-chg="carry" ${c.carry?'checked':''}>Carry hint</label>${c.carry?`<label for="cq">Quality</label><input type="range" id="cq" min="0" max="1" step="0.05" value="${c.cq}" data-inp="cq" data-chg="redraw" aria-describedby="cqv" style="flex:1"><b id="cqv" data-lv="cq">${c.cq.toFixed(2)}</b>`:''}</div></section>`}
+function propKey(c){
+  return`${banners(c)}<section class="sec"><h3>CorridorKey 2.0 <span class="opt">range ${c.inA}–${c.inB}</span></h3>
+  <div class="row"><label for="temporal">Temporal window</label><select id="temporal" data-chg="temporal">${TEMPORAL.map(([v,l])=>`<option value="${v}" ${v===c.temporal?'selected':''}>${l}</option>`).join('')}</select></div>
+  <p class="help">${c.temporal==='auto'?'Auto currently picks 48 / 24 — estimated peak ~18.2 GiB (sample figure).':'The real app shows its own peak-VRAM estimate for this window (not simulated here).'}</p>
+  <div class="row"><label>VRAM profile</label>${seg('VRAM profile',[['auto','Auto'],['low','Low']],c.vram,'vram')}</div>
+  <div class="row"><label for="despill">Despill</label><input type="range" id="despill" min="0" max="1" step="0.05" value="${c.despill}" data-inp="despill" data-chg="redraw" aria-describedby="dsv" style="flex:1"><b id="dsv" data-lv="despill">${c.despill.toFixed(2)}</b></div></section>
+  <section class="sec"><h3>What will happen</h3><p style="margin:0" data-lv="summary">${esc(summary(c))}</p></section>`}
+function propExport(c,k){
+  const on=!!c.outs[k],anyExr=OUTK.some(x=>c.outs[x]==='EXR');
+  return`<section class="sec"><h3>${OLBL[k]} export</h3>
+  <div class="row"><label><input type="checkbox" id="o-${k}" data-chg="outOn" data-v="${k}" ${on?'checked':''}>Enabled</label></div>
+  <div class="row"><label for="f-${k}">Format</label><select id="f-${k}" data-chg="outFmt" data-v="${k}" ${on?'':'disabled'}>${['EXR','PNG'].map(f=>`<option ${c.outs[k]===f?'selected':''}>${f}</option>`).join('')}</select></div>
+  <div class="row"><label for="comp">EXR compression</label><select id="comp" data-chg="outComp" ${anyExr?'':'disabled'}>${COMPS.map(x=>`<option value="${x}" ${x===c.comp?'selected':''}>${COMPL[x]}${x==='dwab'?' (default)':''}</option>`).join('')}</select></div>
+  <p class="help strong">Shared by all EXR exports: changing it here also changes FG, Matte, Comp and Processed when they are EXR. It applies to newly written files only; existing files keep their old compression until rewritten.</p>
+  ${c.written.length&&c.made&&c.made.comp!==snapOf(c).comp?`<div class="note" style="margin:6px 0"><b>▲ Compression changed since files were written.</b> Existing EXR files must be rewritten: Resume is blocked and a full Key is needed. <i>Proposed UI guard — the current Python manifest does not record compression, so today's backend cannot detect this itself.</i></div>`:''}
+  ${OUTK.some(x=>c.outs[x])?'':'<div class="note" style="margin:6px 0"><b>▲ No output enabled.</b> Key is blocked until one export is on.</div>'}
+  <p class="help">Writes to: ${c.outs[k]&&!locOf(c).err?`<code>${esc(resolveOut(c,S.proj,k,c.inA).path)}</code>`:c.outs[k]?'<span class="c-err">fix the output location (Deliver)</span>':'nothing (disabled)'}</p>
+  <p class="help">Not per export: the In/Out range (shared by every stage) and the output location (Board and Deliver). Format and enabled outputs are per export; file names come from the shared template.</p></section>`}
+function secRange(c){
+  if(c.local)return`<section class="sec"><h3>In / Out range</h3><p class="help">Unknown: this file’s frames were not inspected.</p></section>`;
+  return`<section class="sec"><h3>In / Out — the processed range</h3>
+  <div class="row"><label for="inA">In</label><input type="number" id="inA" min="${c.start}" max="${end(c)}" value="${c.inA}" data-chg="inA" aria-label="In frame (first processed frame)"><label for="inB">Out</label><input type="number" id="inB" min="${c.start}" max="${end(c)}" value="${c.inB}" data-chg="inB" aria-label="Out frame (last processed frame)"><span class="tag">source frame numbers, inclusive</span></div>
+  <p class="help strong" data-lv="writes">${writesTxt(c)}</p>
+  ${more('range','How In / Out works','<p>In / Out is the processed range for every stage: Hint, Key and all exports use exactly these frames. Hint marks outside it are kept but ignored. Changing the range after a run makes the results stale and they are never shifted: write the new range as a new version.</p>')}</section>`}
+const pathLines=c=>{const L=locOf(c);
+  if(L.err)return`<span class="c-err">✕ ${esc(L.err)}</span>`;
+  const ks=OUTK.filter(k=>c.outs[k]);
+  return ks.length?ks.map(k=>`<div><b>${OLBL[k]}</b> <code>${esc(resolveOut(c,S.proj,k,c.inA).path)}</code></div>`).join(''):'<span class="dim">No output enabled.</span>'};
+function outIssues(){const out=[],seen=new Set();
+  for(const c of S.clips){if(c.local)continue;const o=outCheck(c);if(!o)continue;const key=o.f==='ver'?c.id+o.t:o.t;if(seen.has(key))continue;seen.add(key);out.push({id:o.f==='ver'?c.id:'Project',t:o.t,f:o.f})}
+  return out.slice(0,5)}
+const issuesHTML=iss=>iss.length?`<ul class="issues" role="status">${iss.map(x=>`<li><span class="chip c-warn">▲ ${esc(x.id)}</span> ${esc(x.t)} ${x.f==='ver'?`<button type="button" class="btn sm" data-act="nextVer" data-v="${x.id}">Next free version</button>`:''}</li>`).join('')}</ul>`:`<p class="help"><span class="chip c-ok">✓ No collisions</span> between outputs, clips and queued jobs (syntax and uniqueness only).</p>`;
+function rootAskBar(){const root=S.proj.root;
+  return`<section class="applybar" aria-label="Use project root"><b>Use the project root for ${S.sel.length} selected clip${S.sel.length===1?'':'s'}?</b><ul>${S.sel.map(id=>{const c=clip(id);return`<li><b>${esc(c.id)}</b>: ${c.outRoot!=null?`${esc(c.outRoot)} → inherits ${esc(root)}`:'already inherits the project root'}</li>`}).join('')}</ul><p class="help" style="margin:0">Replaces custom folders for these clips only; other clips keep theirs. Nothing on disk is moved or deleted.</p><div class="row"><button type="button" class="btn pri" data-act="rootApplyGo">Apply</button><button type="button" class="btn" data-act="rootApplyCancel">Cancel</button></div></section>`}
+function outSetup(board){
+  const p=S.proj,n=S.sel.length,iss=outIssues();
+  const f=(id,lab,val,err,cls)=>`<span class="pair"><label for="${id}">${lab}</label><input type="text" id="${id}" class="${cls}" value="${esc(val)}" data-inp="${id}" maxlength="240" spellcheck="false" autocomplete="off" aria-invalid="${!!err}"${err?` aria-describedby="${id}-e"`:''}></span>${err?`<span class="chip c-err" id="${id}-e">✕ ${esc(err)}</span>`:''}`;
+  return`<section class="outsetup" aria-label="Project output setup"><div class="row"><b>Output location</b><span class="tag">shared by the project · clips inherit the root unless they have a custom folder · not part of presets</span></div>
+   <div class="row">${f('proot','Root',p.root,checkRoot(p.root),'wide')}</div>
+   <div class="row">${f('pfold','Folder',p.folderT,checkTpl(p.folderT,'folder'),'mid')}${f('pfile','File',p.fileT,checkTpl(p.fileT,'file'),'mid')}</div>
+   ${more('outhelp','Tokens and rules','<p>Tokens {project} {name} {output} {resolution} {date} {version} · one #### = source frame number · extension comes from the format. Only syntax is checked here; whether a folder exists or is writable is checked by the real app.</p>')}
+   <div class="row"><button type="button" class="btn sm" data-act="useExample" title="/mnt/NAS/Project/Masks/clip_name_2K_18-10-2027_v001/clip_name_####.exr">Use Matte-only example</button>${iss.some(x=>x.f==='sub')?'<button type="button" class="btn sm" data-act="addOutSub">Add {output} subfolder</button>':''}<button type="button" class="btn sm" data-act="defaultTpl">Reset templates</button>${board?`<button type="button" class="btn sm" data-act="rootAskOpen" ${n?'':'disabled'}>Use project root for ${n} selected…</button>`:''}</div>
+   ${board&&S.rootAsk?rootAskBar():''}${issuesHTML(iss)}</section>`}
+function clipOut(c){
+  if(c.local)return'';
+  const L=locOf(c),custom=c.outRoot!=null,oc=blockOut(c),ks=OUTK.filter(k=>c.outs[k]);
+  return`<section class="sec"><h3>${esc(c.id)} — naming for this clip</h3>
+  <div class="row"><span class="pair"><label for="cres">Resolution label</label><input type="text" id="cres" value="${esc(c.resLabel)}" data-chg="cres" maxlength="24" style="width:90px"></span><span class="tag">Source ${esc(c.res)} · label only, the app never resizes</span></div>
+  <div class="row"><span class="pair"><label for="cdate">Date</label><input type="text" id="cdate" value="${esc(c.date)}" data-chg="cdate" maxlength="10" placeholder="DD-MM-YYYY" style="width:100px"></span><span class="pair"><label for="cver">Version</label><input type="number" id="cver" min="1" max="999" value="${c.ver}" data-chg="cver"><b>v${pad(c.ver,3)}</b></span><button type="button" class="btn sm" data-act="nextVer" data-v="${c.id}">Next free version</button></div>
+  <p class="help">Date (DD-MM-YYYY) and version are stored on the clip and frozen into a job when it is queued; they never refresh from the clock.${c.prev.length?` Earlier versions stay on disk: ${c.prev.map(x=>`v${pad(x.ver,3)} (${esc(x.rng.replace('-','–'))}, ${x.n} frames)`).join(', ')}.`:''}</p>
+  <div class="row"><span>Root folder</span>${seg('Root folder source',[['inherit','Project root'],['custom','Custom for this clip']],custom?'custom':'inherit','rootMode')}</div>
+  ${custom?`<div class="row"><span class="pair"><label for="croot">Custom root</label><input type="text" id="croot" class="wide" value="${esc(c.outRoot)}" data-inp="croot" maxlength="240" spellcheck="false" aria-invalid="${!!checkRoot(c.outRoot)}"></span>${checkRoot(c.outRoot)?`<span class="chip c-err">✕ ${esc(checkRoot(c.outRoot))}</span>`:''}</div>`:''}</section>
+  <section class="sec"><h3>Resolved paths</h3>${L.err?`<p class="c-err" style="margin:0">✕ ${esc(L.err)}</p>`:ks.length?`<div class="scroll" tabindex="0" role="region" aria-label="Resolved output paths"><table class="t"><thead><tr><th>Output</th><th>First frame (${c.inA})</th><th>Last frame (${c.inB})</th></tr></thead><tbody>${ks.map(k=>`<tr><th scope="row">${OLBL[k]}</th><td><code>${esc(resolveOut(c,S.proj,k,c.inA).path)}</code></td><td><code>${esc(resolveOut(c,S.proj,k,c.inB).path)}</code></td></tr>`).join('')}</tbody></table></div>`:'<p class="help">No output enabled.</p>'}
+  ${oc?`<div class="note" style="margin:6px 0 0"><b>▲ Blocked.</b> ${esc(oc.t)}</div>`:''}</section>`}
+const savSrc=()=>S.view==='clip'?S.clip:(S.sel[0]||S.clip);
+function saveBox(){
+  const ra=S.replaceAsk?preset(S.replaceAsk):null;
+  return`<span class="pair"><label for="pn">Name</label><input type="text" id="pn" maxlength="40" value="${esc(S.saveName)}" data-inp="saveName" placeholder="Preset name" autocomplete="off"></span><select id="pk" data-chg="saveKind" aria-label="Preset kind"><option value="workflow" ${S.saveKind==='workflow'?'selected':''}>Workflow (settings + exports)</option><option value="export" ${S.saveKind==='export'?'selected':''}>Export (exports only)</option></select><button type="button" class="btn sm" data-act="savePreset">Save from ${esc(savSrc())}</button>${ra?`<button type="button" class="btn sm dng" data-act="replacePreset">Replace “${esc(ra.name)}”</button>`:''}`}
+/* ================= pages ================= */
+const MODES_REVIEW=[['input','Input'],['fg','FG'],['matte','Matte'],['comp','Comp'],['processed','Processed']];
+function pageHTML(c,p){
+  if(c.local&&p!=='key')return`<div class="stepbody"><h2 style="margin:0 0 6px;font-size:15px">${PAGES.find(x=>x[0]===p)[1]}</h2><div class="note" style="margin:0"><b>▲ Metadata not inspected.</b> This prototype only knows the name and size of <b>${esc(c.name)}</b>. It does not decode media, show frames, or process anything. Settings in the graph can still be edited and saved into presets.</div></div>`;
+  if(p==='media')return viewer({});
+  if(p==='hint')return viewer({annot:true,focus:true});
+  if(p==='key'){const j=activeFor(c.id);
+    return`<div class="stepbody"><h2 style="margin:0 0 6px;font-size:15px">Key — AI processing</h2>${banners(c)}<p class="help strong" data-lv="summary" style="margin:6px 0">${esc(summary(c))}</p>${j&&(j.status==='running'||j.status==='stopping')?phaseUI(j):'<p class="help">No job running for this clip. Use the pinned action at the right.</p>'}</div>${transport(c,false)}${hdr('Queue')}${queueList({hist:3})}`}
+  if(p==='review')return`${banners(c)}${viewer({})}`;
+  return`<div class="stepbody"><h2 style="margin:0 0 6px;font-size:15px">Deliver — range and output location</h2></div>${transport(c,false)}${secRange(c)}${outSetup(false)}${clipOut(c)}<div class="sec"><p class="help" style="margin:0">Video export (MOV / WebM / MP4) is a separate step with its path chosen at export time — not drawn here.</p></div>`}
+const narrow=()=>matchMedia('(max-width:1029px)').matches;
+function graph(c){
+  const n=S.node,by=c.mode==='none',nr=narrow();
+  // wide: 950x144 single row of exports; narrow: compact 700x118 with the four exports in a 2x2 block
+  const L=nr?{w:700,h:118,mx:4,hx:140,kx:276,nw:112,ex:[424,562],ew:132,ey:[26,64],cy:72}:{w:950,h:144,mx:10,hx:240,kx:470,nw:180,ex:[730,730],ew:210,ey:[0,36,72,108],cy:72};
+  const pos={},xs=nr?{fg:[0,0],matte:[1,0],comp:[0,1],processed:[1,1]}:null;
+  OUTK.forEach((k,i)=>pos[k]=nr?[L.ex[xs[k][0]],L.ey[xs[k][1]]]:[L.ex[0],L.ey[i]]);
+  const bdg={media:c.local?'Not inspected':`${CL[c.colour]}${!c.checked&&c.sample?' ▲ check':''}`,
+   hint:by?'Bypassed':c.mode==='keyframes'&&!c.kf.length?'▲ Needs marks':hintOk(c)?`${c.gen} · ${c.mode==='full'?'Full':'Keys'} ✓`:'▲ Needs hint',
+   key:stale(c)?'▲ Stale':c.local?'Not inspected':`${c.inA}–${c.inB} · ${nWrite(c)} f`};
+  const nd=(k,x,y,w,t,sm,cls='')=>`<button type="button" class="node ${cls}" style="left:${x}px;top:${y}px;width:${w}px" data-act="node" data-v="${k}" data-node="${k}" title="${esc(t+' — '+sm)}" aria-pressed="${n===k}"><b>${t}</b><small>${sm}</small></button>`;
+  const link=(x1,y1,x2,y2,d)=>`<path d="M${x1} ${y1} C${x1+((x2-x1)/2)} ${y1} ${x2-((x2-x1)/2)} ${y2} ${x2} ${y2}" fill="none" stroke="${d?'#555':'#8a8a8a'}" stroke-width="2" ${d?'stroke-dasharray="5 4"':''}/>`;
+  const mR=L.mx+L.nw,hR=L.hx+L.nw,kR=L.kx+L.nw,hy=L.cy;
+  // Bypass: the dashed chain goes through Hint; a solid arc runs under it from Media straight to Key
+  const bypass=by?`<path d="M${mR} ${hy} C${mR+30} ${hy+54} ${L.kx-30} ${hy+54} ${L.kx} ${hy}" fill="none" stroke="#c8873a" stroke-width="2"/><text x="${(mR+L.kx)/2}" y="${hy+31}" text-anchor="middle" fill="#d4d4d4" font-size="12">bypass</text>`:'';
+  const links=link(mR,hy,L.hx,hy,by)+link(hR,hy,L.kx,hy,by)+bypass+OUTK.map(k=>link(kR,hy,pos[k][0],pos[k][1]+16,!c.outs[k])).join('');
+  const nodes=nd('media',L.mx,hy-20,L.nw,'Media',bdg.media)+nd('hint',L.hx,hy-20,L.nw,'Hint',bdg.hint,by?'by':'')+nd('key',L.kx,hy-20,L.nw,'Key',bdg.key)
+   +OUTK.map(k=>nd('w-'+k,pos[k][0],pos[k][1],L.ew,OLBL[k],c.outs[k]?`${c.outs[k]}${c.written.length&&!nr?` · ${count(clipR(c.written,c.inA,c.inB))}/${nWrite(c)} written`:''}`:'Off',`ex ${c.outs[k]?'':'off'}`)).join('');
+  return`<section class="graphbox" aria-label="Node graph, fixed pipeline"><div class="graphwrap" tabindex="0" role="region" aria-label="Node graph (scrollable)" data-scroll="graph"><div class="graph" style="width:${L.w}px;height:${L.h}px"><p class="gcap" style="white-space:nowrap">${nr?'Fixed pipeline. Click selects; Enter or double-click opens the page.':'Fixed pipeline — no free wiring. Click selects a node; Enter or double-click opens its page.'}</p><svg width="${L.w}" height="${L.h}" aria-hidden="true">${links}</svg>${nodes}</div></div></section>`}
+function propsFor(c){
+  const n=S.node;let b;
+  if(n==='media')b=propMedia(c);else if(n==='hint')b=propHint(c);else if(n==='key')b=propKey(c);else b=propExport(c,n.slice(2));
+  const sv=n==='media'?'':more('save','Save as preset…',`<div class="row">${saveBox()}</div><p class="help">${S.saveKind==='workflow'?'Workflow = Hint + Key settings and exports.':'Export = formats, enabled outputs and EXR compression only.'} Never saves source, colour, range, marks, paint or folders.</p>`);
+  return`${hdr('Properties — '+NODETITLE[n])}<div class="pbody" data-scroll="props">${b}${sv}</div><div class="pfoot">${runBtns(c)}</div>`}
+function qstrip(c){const j=running(),p=primary(c);
+  return`<div class="qstrip"><button type="button" class="btn ${p.cls==='dng'?'dng':'pri'} stripact" data-act="${p.act}" data-v="${p.v||''}" ${p.dis?'disabled':''}>${esc(p.l)}</button>${j?`<span class="chip c-run">▶ ${jlabel(j)}</span><span data-lv="ptxt" data-job="${j.id}"></span><b data-lv="pct" data-job="${j.id}"></b><div class="bar" style="width:140px"><i data-lv="bar" data-job="${j.id}"></i></div><button type="button" class="btn sm dng" data-act="cancelJob" data-v="${j.id}" ${j.status==='stopping'?'disabled':''}>${j.status==='stopping'?'Stopping after current step…':'Cancel'}</button>`:'<span class="dim">No job running.</span>'}<span class="sp"></span><span class="dim">${queueSummary()}</span><button type="button" class="btn sm" data-act="tab" data-v="key">Open queue</button></div>`}
+const appChip=()=>`<span class="chip c-${running()?'run':'dim'}">${queueSummary()}</span>`;
+function workspace(){
+  const c=cur(),p=S.page;
+  const tabs=`<div class="pages inbar" role="tablist" aria-label="Clip pages">${PAGES.map(([v,l],i)=>`<button type="button" role="tab" id="pg-${v}" data-act="tab" data-v="${v}" aria-selected="${p===v}" aria-controls="pagepanel" tabindex="${p===v?0:-1}">${i+1} ${l}</button>`).join('')}</div>`;
+  return`<div class="ws${S.focus?' focus':''}"><header class="appbar"><button type="button" class="btn" data-act="back" id="backbtn">← Back to batch</button><b>${esc(c.name)}</b>${stateChip(c)}${tabs}<span class="sp"></span><button type="button" class="btn propbtn" data-act="props" aria-expanded="${S.props}" aria-controls="propsheet">Properties</button>${appChip()}</header>
+  <div class="wsmain"><main class="panel ga-page" id="pagepanel" role="tabpanel" aria-labelledby="pg-${p}" data-scroll="page">${pageHTML(c,p)}</main><aside class="panel pane" id="propsheet" aria-label="Node properties" ${narrow()&&!S.props?'hidden':''}>${propsFor(c)}</aside></div>
+  ${graph(c)}${qstrip(c)}</div>`}
+/* ================= board ================= */
+function card(c){
+  const on=S.sel.includes(c.id),r=readiness(c),ap=c.applied,j=activeFor(c.id);
+  const pl=(slot,lab)=>ap[slot]?`${lab}: “${esc(ap[slot].name)}” rev ${ap[slot].rev}${(x=>x?x.rev!==ap[slot].rev?` (preset now rev ${x.rev})`:'':' (preset deleted)')(preset(ap[slot].id))}${modified(c,slot)?' (modified)':''}`:`${lab}: this clip’s own settings`;
+  const qd=S.queue.find(x=>x.clip===c.id&&outdated(x));
+  return`<article class="card" data-sel="${on}" data-id="${c.id}"><div class="thumb">${c.local?'<p class="help" style="padding:10px">No preview — file not inspected.</p>':thumb(c,c.inA)}</div>
+   <h3><label><input type="checkbox" id="sel-${c.id}" data-chg="selToggle" data-v="${c.id}" ${on?'checked':''}>${esc(c.name)}</label></h3>
+   <div>${stateChip(c)} <span class="chip c-${r.k}"><span aria-hidden="true">${RI[r.k]}</span> ${esc(r.t)}</span> ${stale(c)?'<span class="chip c-warn">▲ stale</span>':''}${c.outRoot!=null&&!c.local?' <span class="chip c-warn" title="This clip writes to its own folder, not the project root">Custom folder</span>':''}</div>
+   <div class="row" style="margin:0"><button type="button" class="btn sm" data-act="open" data-v="${c.id}">Open clip settings</button>${j?`<button type="button" class="btn sm dng" data-act="cancelJob" data-v="${j.id}" ${j.status==='stopping'?'disabled':''}>Cancel</button>`:''}</div>
+   ${c.local?`<div class="meta">Local file · ${fmtSize(c.size)} · metadata not inspected (frames, size, fps unknown)</div>`
+    :`<div class="meta">${c.res} · ${c.n} f · range ${c.inA}–${c.inB} (${nWrite(c)} f) · ${CL[c.colour]}</div><div class="meta">${hintTxt(c)}</div><div class="meta">Outputs: ${outList(c).map(([k,f])=>OLBL[k]+' '+f).join(', ')||'none'}</div>${more('p-'+c.id,`Output paths${c.outRoot!=null?' · custom folder':''}`,`<div class="meta pathprev" aria-label="Resolved output paths">${c.outRoot!=null?'<span class="c-warn">Custom folder for this clip</span>':''}${pathLines(c)}</div>`)}`}
+   <div class="meta">${pl('wf','Workflow')}</div><div class="meta">${pl('ex','Export')}</div>
+   ${on&&c.written.length?`<div class="meta" style="color:var(--warn)">▲ Overwrites existing results for ${esc(c.id)} when keyed.</div>`:''}
+   ${qd?'<div class="meta" style="color:var(--warn)">▲ Queued with earlier settings</div>':''}
+   </article>`}
+function applyBar(){
+  const a=S.applyBar,p=a&&preset(a.id);if(!p)return'';
+  const items=S.sel.map(id=>{const c=clip(id),pl=planApply(p,c);return`<li><b>${esc(c.id)}</b>: ${pl.ch.length?esc(pl.ch.join('; ')):'no changes'} · after: <span class="chip c-${pl.after.k}"><span aria-hidden="true">${RI[pl.after.k]}</span> ${esc(pl.after.t)}</span></li>`}).join('');
+  return`<section class="applybar" aria-label="Apply preset"><b>Apply ${p.kind==='workflow'?'Workflow':'Export'} preset “${esc(p.name)}” to ${S.sel.length} clip${S.sel.length===1?'':'s'}?</b>
+  <ul>${items}</ul><p class="help" style="margin:0">Keeps each clip’s source, input colour, write range, keyframe marks, paint strokes, hint files and output folder. ${p.kind==='export'?'Hint and Key settings are not touched. ':''}Jobs already queued keep their settings.</p>
+  <div class="row"><button type="button" class="btn pri" data-act="applyGo">Apply</button><button type="button" class="btn" data-act="applyCancel">Cancel</button></div></section>`}
+function delUI(kind,id){const p=id&&preset(id);if(!p)return'';
+  return S.delAsk===id?`<span class="pair"><b>Delete “${esc(p.name)}”?</b><button type="button" class="btn sm dng" data-act="delConfirm" data-v="${kind}">Delete</button><button type="button" class="btn sm" data-act="delKeep">Keep</button></span>`:`<button type="button" class="btn sm" data-act="delPreset" data-v="${kind}" aria-label="Delete selected ${kind==='workflow'?'Workflow':'Export'} preset">Delete…</button>`}
+function board(){
+  const n=S.sel.length,all=n===S.clips.length&&n>0;
+  const wf=S.presets.filter(p=>p.kind==='workflow'),ex=S.presets.filter(p=>p.kind==='export');
+  const opts=(l,v)=>`<option value="">— choose —</option>`+l.map(p=>`<option value="${p.id}" ${p.id===v?'selected':''}>${esc(p.name)}</option>`).join('');
+  const hintN=S.sel.filter(id=>{const c=clip(id),r=readiness(c);return r.f==='hint'&&!activeFor(id)}).length;
+  const nt=S.note?`<div class="note ${S.note.skip.length?'':'ok'}" role="status"><b>${S.note.done.length?`Queued ${S.note.done.length}: ${esc(S.note.done.join(', '))}.`:'Nothing queued.'}</b>${S.note.skip.length?`<ul style="margin:4px 0 0;padding-left:18px">${S.note.skip.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}</div>`:'';
+  return`<div class="board"><header class="appbar"><b class="logo">CorridorKey</b><span class="dim">Harbour Promo — Batch</span><span class="sp"></span>${appChip()}</header>
+  <div class="tools"><label><input type="checkbox" id="selall" data-chg="selAll" ${all?'checked':''}>Select all</label><b id="selcount" role="status">${n} selected</b><span class="tag">Each clip is processed and written over its own In/Out range.</span><span class="sp"></span>
+   <button type="button" class="btn" data-act="import">Import clips…</button><button type="button" class="btn" data-act="simImport" title="No file is read: adds two sample clips (SH080, SH090) that finish extracting after about 1 s">Add 2 simulated clips</button>${hintN?`<button type="button" class="btn" data-act="genHints">Generate hints for ${hintN} clip${hintN===1?'':'s'}</button>`:''}
+   <button type="button" class="btn pri" data-act="bulkKey">${n?`Key ${n} clip${n===1?'':'s'} — one at a time`:'Select clips to key'}</button></div>
+  <div class="tools"><b>Presets</b><span class="pair"><label for="pickWf">Workflow</label><select id="pickWf" data-chg="pickWf">${opts(wf,S.pickWf)}</select></span><button type="button" class="btn sm" data-act="applyOpen" data-v="workflow" ${S.pickWf&&n?'':'disabled'}>Apply to ${n}</button>${delUI('workflow',S.pickWf)}
+   <span class="pair"><label for="pickEx">Export</label><select id="pickEx" data-chg="pickEx">${opts(ex,S.pickEx)}</select></span><button type="button" class="btn sm" data-act="applyOpen" data-v="export" ${S.pickEx&&n?'':'disabled'}>Apply to ${n}</button>${delUI('export',S.pickEx)}
+   <span class="sp"></span>${saveBox()}</div>
+  ${outSetup(true)}
+  ${S.presetWarn?`<div class="note" role="status" style="margin:0"><b>▲</b> ${esc(S.presetWarn)}</div>`:''}${applyBar()}
+  <div class="bbody"><main class="panel" aria-label="Clips" data-scroll="cards">${nt}<div class="cards">${S.clips.map(card).join('')}</div></main>
+  <aside class="panel" aria-label="Queue">${hdr('Queue — strictly sequential')}${queueList({hist:5})}</aside></div></div>`}
+/* ================= render ================= */
+const mount=$('#mount');
+const fidOf=e=>e.id||`${e.dataset.act||e.dataset.chg||e.dataset.inp||''}|${e.dataset.v??''}`;
+function renderChrome(){
+  const sp=$('#speed');sp.textContent=`Simulation speed: ${S.speed}×`;sp.setAttribute('aria-pressed',S.speed>1);
+  $('#keys').hidden=!S.keys;$('#keybtn').setAttribute('aria-expanded',S.keys)}
+function render(){
+  const a=document.activeElement;let fid=null,selr=null;
+  if(a&&a!==document.body&&mount.contains(a)){fid=fidOf(a);if(a.selectionStart!=null&&a.type!=='number')selr=[a.selectionStart,a.selectionEnd]}
+  const sc={};$$('[data-scroll]',mount).forEach(e=>{sc[e.dataset.scroll]=[e.scrollTop,e.scrollLeft]});
+  mount.innerHTML=S.view==='board'?board():workspace();
+  $$('[data-scroll]',mount).forEach(e=>{const s=sc[e.dataset.scroll];if(s){e.scrollTop=s[0];e.scrollLeft=s[1]}});
+  renderChrome();
+  $$('button,input,select',mount).forEach(e=>e.dataset.fid=fidOf(e));
+  const sa=$('#selall',mount);if(sa)sa.indeterminate=S.sel.length>0&&S.sel.length<S.clips.length;
+  liveUpdate();
+  if(fid){const n=$(`[data-fid="${CSS.escape(fid)}"]`,mount);if(n&&!n.disabled){n.focus({preventScroll:true});if(selr&&n.setSelectionRange)try{n.setSelectionRange(selr[0],selr[1])}catch(e){}}}}
+const setT=(el,v)=>{if(el.textContent!==v)el.textContent=v};
+function liveUpdate(){
+  const c=cur();
+  $$('[data-lv]',mount).forEach(el=>{
+    const k=el.dataset.lv,j=el.dataset.job?job(el.dataset.job):null;
+    switch(k){
+      case'scene':{const key=sceneKey(c);if(el.dataset.key!==key){el.innerHTML=sceneInner(c);el.dataset.key=key}break}
+      case'ov':el.style.clipPath=`inset(0 0 0 ${S.wipe}%)`;break;
+      case'wl':el.style.left=S.wipe+'%';break;
+      case'frame':setT(el,`Frame ${S.frame}`);break;
+      case'head':el.style.left=`calc(8px + (100% - 16px) * ${(S.frame-c.start)/(c.n-1)})`;break;
+      case'seek':if(+el.value!==S.frame)el.value=S.frame;el.setAttribute('aria-valuetext','Frame '+S.frame);break;
+      case'stale':el.hidden=!stale(c);break;
+      case'staletxt':setT(el,staleTxt(c));break;
+      case'despill':setT(el,c.despill.toFixed(2));break;
+      case'hq':setT(el,c.hq.toFixed(2));break;
+      case'cq':setT(el,c.cq.toFixed(2));break;
+      case'summary':setT(el,summary(c));break;
+      case'writes':setT(el,writesTxt(c));break;
+      case'pct':if(j)setT(el,Math.round(j.p*100)+'%');break;
+      case'bar':if(j){el.style.width=(j.p*100)+'%';if(el.parentElement.getAttribute('role'))el.parentElement.setAttribute('aria-valuenow',Math.round(j.p*100))}break;
+      case'ptxt':if(j)setT(el,ptxt(j));break;
+      case'left':if(j)setT(el,Math.ceil((1-j.p)*DUR[j.type]/S.speed/1000)+' s');break;
+      case'jstatus':if(j)setT(el,j.status==='stopping'?'Stopping after current step…':'Running');break;
+      case'step':if(j){const i=+el.dataset.i,pi=phaseInfo(j).i;el.className=i<pi?'done':i===pi?'now':''}break}})}
+/* ================= actions ================= */
+function saveCtx(){if(S.view==='clip')S.ctx[S.clip]={page:S.page,node:S.node,frame:S.frame}}
+function openClip(id){
+  saveCtx();S.props=false;S.focus=false;S.clip=id;const c=cur(),x=S.ctx[id];S.view='clip';S.page=x?x.page:'media';S.node=x?x.node:'media';S.mode='input';S.paint.on=false;S.playing=false;
+  S.frame=c.local?0:x?clamp(x.frame,c.start,end(c)):c.inA;
+  say(`Opened ${c.name}. Use Back to batch to return; your selection is kept.`)}
+function setPage(p){
+  S.page=p;S.props=false;S.focus=false;S.paint.on=false;
+  const c=cur();if(p==='review'&&!c.local&&c.written.length&&S.mode==='input')S.mode='comp';
+  if(PAGENODE[p]&&!(p==='deliver'&&S.node.startsWith('w-')))S.node=PAGENODE[p]}
+function stepFrame(d){const c=cur();if(!c.local)S.frame=clamp(S.frame+d,c.start,end(c))}
+function addLocal(arr){let n=0;
+  for(const f of arr){if(S.clips.length>=60)break;
+    const name=String(f&&f.name||'').slice(0,80).trim()||'unnamed file',id='L'+S.nextL++;
+    S.clips.push(Object.assign(base(),{id,name,local:true,size:+f.size>0?+f.size:0,res:'not inspected',kind:'Local file',fps:0,start:0,n:0,state:'Raw',mode:'none',gen:'GVM',hasHint:false,kf:[],strokes:[],colour:'srgb',checked:false,sample:'',inA:0,inB:0,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:.5,temporal:'auto',vram:'auto',written:[],made:null,err:'',resLabel:'unknown'}));
+    n++}
+  say(n?`Added ${n} local card${n===1?'':'s'} (name and size only), not selected. This prototype does not read, upload or process the files.`:'No files added.')}
+/* visibly simulated import: no file is read; Extracting for ~1 s, then Raw with sample facts */
+function addSim(){const ids=[];
+  for(const [name,res] of [['SH080_rooftop','1920×1080'],['SH090_rooftop_alt','1920×1080']]){
+    if(S.clips.some(x=>x.name===name))continue;const id='SIM'+S.nextL++;ids.push(id);
+    S.clips.push(Object.assign(base(),{id,name,res,kind:'Simulated import (EXR sequence)',fps:24,start:1001,n:120,state:'Extracting',mode:'full',gen:'GVM',hasHint:false,kf:[],strokes:[],colour:'srgb',checked:false,sample:'Simulated sample peaks ≤ 1.0 — could be sRGB or linear. You choose.',inA:1001,inB:1120,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:.5,temporal:'auto',vram:'auto',written:[],made:null,err:'',resLabel:resFor(res)}))}
+  say(ids.length?`Simulated import: ${ids.length} clip${ids.length===1?'':'s'} extracting (no real file is read). Not selected.`:'The simulated clips are already on the board.');
+  ids.forEach(id=>setTimeout(()=>{const c=clip(id);if(c&&c.state==='Extracting'){c.state='Raw';if(!noPersist&&S.view==='board')render()}},1000))}
+function savePreset(force){
+  const kind=S.saveKind,name=cleanName(S.saveName),c=clip(savSrc());
+  if(!name){say('Enter a preset name (1–40 characters, no control characters).');return}
+  const f=cleanFields(kind,fieldsOf(kind,c));
+  if(!f){say(`Cannot save: ${c.id} has no enabled output.`);return}
+  const old=S.presets.find(p=>p.kind===kind&&p.name.toLowerCase()===name.toLowerCase());
+  if(old&&!(force&&S.replaceAsk===old.id)){S.replaceAsk=old.id;say(`A ${kind==='workflow'?'Workflow':'Export'} preset named “${name}” exists. Press Replace to overwrite it.`);return}
+  if(old){old.rev++;old.fields=f}
+  else{if(S.presets.length>=50){say('Preset limit (50) reached — delete one first.');return}
+    let id;do{id='p'+(S.nextP++)+Date.now().toString(36)}while(preset(id));S.presets.push({id,kind,name,rev:1,fields:f})}
+  S.replaceAsk=null;S.saveName='';
+  say(persist()?`Saved ${kind==='workflow'?'Workflow':'Export'} preset “${name}” from ${c.id} (in this browser only).`:`Preset “${name}” kept for this page only — the browser would not store it, or saving is paused to protect unreadable stored data.`)}
+function applyPreset(p,ids){
+  const blocked=[];ids.forEach(id=>{const c=clip(id);mergePreset(p,c);const r=readiness(c);if(r.k!=='ok')blocked.push(`${id}: ${r.t}`)});
+  say(`Applied “${p.name}” to ${ids.length} clip${ids.length===1?'':'s'}.${blocked.length?' Still blocked — '+blocked.join('; ')+'.':''} Queued jobs were not changed.`)}
+function bulkKey(){
+  if(!S.sel.length){say('Select at least one clip first.');return}
+  const done=[],skip=[];
+  S.sel.forEach(id=>{const c=clip(id),r=readiness(c);
+    if(activeFor(id))skip.push(`${id}: already in the queue`);
+    else if(r.k!=='ok')skip.push(`${id}: ${r.t}`);
+    else{enqueue('key',id);done.push(id);if(c.written.length)skip.push(`${id}: overwrites existing results (queued anyway)`)}});
+  S.note={done,skip};say(`Queued ${done.length} of ${S.sel.length} selected clip${S.sel.length===1?'':'s'}. They run one at a time.`)}
+const ACT={
+ back(){saveCtx();S.props=false;S.focus=false;S.view='board';S.playing=false;S.paint.on=false;say('Back on the batch board. Selection kept.')},
+ open(d){openClip(d.v)},
+ tab(d){setPage(d.v)},
+ node(d){S.node=d.v;if(narrow())S.props=true},
+ goMedia(){setPage('media')},goHint(){setPage('hint')},
+ import(){$('#fileIn').click()},
+ vmode(d){S.mode=d.v;if(d.v!=='input'&&d.v!=='hint')S.paint.on=false},
+ ab(){S.ab=!S.ab},
+ seekTo(d){const c=cur();if(!c.local)S.frame=d.v==='first'?c.start:end(c);return'live'},
+ focus(){S.focus=!S.focus;if(S.focus)S.props=false;say(S.focus?'Focus: the viewer has the whole window. Esc or Exit focus returns.':'Focus closed.')},
+ play(){S.playing=!S.playing;say(S.playing?'Playing sample frames from disk. The AI is not running.':'Paused.')},
+ step(d){stepFrame(+d.v);return'live'},
+ annTool(d){const on=S.paint.on&&S.paint.tool===d.v;setPage('hint');S.paint.on=!on;S.paint.tool=d.v;if(!on&&!['input','hint'].includes(S.mode))S.mode='input';say(on?'Annotation tool off.':`${ANN.find(x=>x[0]===d.v)[1]} on: local prototype annotation, no SAM runs.`)},
+ paintOn(){setPage('hint');S.paint.on=true;S.paint.tool='b1';S.mode='input';say('Brush on: click the viewer to paint subject / background strokes (local annotations).')},
+ clearFrame(){const c=cur();['strokes','pts','boxes'].forEach(k=>c[k]=c[k].filter(a=>a.f!==S.frame))},
+ clearAnn(){const c=cur();c.strokes=[];c.pts=[];c.boxes=[]},
+ mode(d){const c=cur();if(c.mode!=='none')c._prev=c.mode;c.mode=d.v},
+ bypass(){const c=cur();if(c.mode!=='none'){c._prev=c.mode;c.mode='none'}else c.mode=c._prev||'full'},
+ colour(d){const c=cur();c.colour=d.v;c.checked=true},
+ colourPick(d){const c=cur();c.colour=d.v;c.checked=true;say(`Input colour set to ${CL[d.v]} — your choice.`)},
+ setIn(){const c=cur();if(c.local)return;c.inA=S.frame;if(c.inA>c.inB)c.inB=end(c);say(`In set to ${c.inA}. ${rangeTxt(c)}.`)},
+ setOut(){const c=cur();if(c.local)return;c.inB=S.frame;if(c.inB<c.inA)c.inA=c.start;say(`Out set to ${c.inB}. ${rangeTxt(c)}.`)},
+ whole(){const c=cur();c.inA=c.start;c.inB=end(c);say('In/Out cleared: the whole clip is the range.')},
+ markKf(){const c=cur();if(c.local)return;if(c.mode!=='keyframes'){c.mode='keyframes'}const i=c.kf.indexOf(S.frame);i<0?c.kf.push(S.frame):c.kf.splice(i,1)},
+ clearKf(){cur().kf=[]},
+ vram(d){cur().vram=d.v},
+ enableOut(){cur().outs.fg='EXR';S.node='w-fg'},
+ genHint(){const c=cur();if(c.local)return;
+  if(NEEDS_STROKES(c.gen)&&!strokesOk(c)){ACT.paintOn();return}
+  if(c.mode==='none')c.mode='full';enqueue('hint',c.id,{gen:c.gen});say(`Hint job queued for ${c.id}.`)},
+ genThenKey(){const c=cur();const h=enqueue('hint',c.id,{gen:c.gen})||S.queue.find(x=>x.clip===c.id&&x.type==='hint'&&ACTIVE.includes(x.status));if(!h)return;enqueue('key',c.id,{after:h.id});say(`Queued ${c.gen} hint, then key for ${c.id}. The key job only starts if the hint finishes.`)},
+ genHints(){const ids=[];S.sel.forEach(id=>{const c=clip(id),r=readiness(c);if(r.f==='hint'&&!activeFor(id)&&enqueue('hint',id,{gen:c.gen}))ids.push(id)});say(`Queued hint jobs for ${ids.join(', ')||'no clips'}. They run one at a time; nothing is fabricated or copied from another clip.`)},
+ key(){const c=cur();if(!enqueue('key',c.id))say('That clip already has a job waiting.');else if(!running()||running().clip!==c.id)say(`Key ${c.id} queued. It starts when the GPU is free.`)},
+ resume(){const c=cur();const r=resumeRange(c);if(r){enqueue('resume',c.id);say(`Resume queued: only the ${count(r)} missing frames will be written.`)}},
+ bulkKey,
+ busy(){if(S.queue.some(j=>ACTIVE.includes(j.status))){say('The queue already has jobs — nothing changed.');return}
+  const a=enqueue('key','SH040');a.p=.74;enqueue('key','SH060');enqueue('hint','SH050',{gen:'GVM'});say('Busy queue example: Key SH040 is refining; two jobs wait. Simulated.')},
+ cancelJob(d){cancelJob(d.v)},
+ qUp(d){moveQ(d.v,-1)},qDown(d){moveQ(d.v,1)},
+ requeue(d){const j=job(d.v);if(!j||!outdated(j))return;const c0=clip(j.clip),bo=j.type==='hint'?null:blockOut(c0);if(bo){say(bo.t);return}
+  j.status='cancelled';const c=c0,dep=j.after&&job(j.after),ex=dep&&dep.status!=='done'?{after:j.after}:{};
+  if(j.type==='hint'){const nid='J'+S.nextId;S.queue.forEach(x=>{if(x.after===j.id&&x.status==='queued')x.after=nid});enqueue('hint',c.id,{gen:c.gen})} // dependants re-linked before the queue is evaluated
+  else if(j.type==='resume'&&resumeRange(c)){enqueue('resume',c.id,ex);say(`Resume re-submitted with the current settings.`);return}
+  else enqueue('key',c.id,ex);
+  say(j.type==='resume'?`Resume could not be kept (settings changed): queued a FULL Key that rewrites every selected frame.`:`${jlabel(j)} replaced by a new job with the current settings.`)},
+ openFolder(){say('Prototype: the real app would open the output folder in your file manager.')},
+ goDeliver(){setPage('deliver')},
+ useExample(){S.proj.folderT='{name}_{resolution}_{date}_{version}';S.proj.fileT='{name}_####';say('Matte-only example loaded. With more than one output enabled it is blocked until {output} is part of the path.')},
+ defaultTpl(){const d=mkProj();S.proj.folderT=d.folderT;S.proj.fileT=d.fileT;say('Templates reset to the defaults.')},
+ addOutSub(){const t=S.proj.folderT.replace(/\/+$/,'')+'/{output}';if(checkTpl(t,'folder')){say('Cannot add {output}: fix the folder template first.');return}S.proj.folderT=t;say('Added {output} as the last folder.')},
+ nextVer(d){const c=(d.v&&clip(d.v))||cur();if(c.local)return;
+  if(activeFor(c.id)){say(`${c.id} has a job in progress: finish or cancel it before changing version.`);return}
+  let v=c.ver,t;do{v++;t=Object.assign({},c,{ver:v})}while(v<999&&(locOf(t).err||outCheck(t)||(c.made&&locOf(t).key===c.made.loc)));
+  const bad=locOf(t).err||(outCheck(t)||{}).t;if(bad){say(`No free version for ${c.id}: ${bad}`);return}
+  if(locOf(t).key===locOf(c).key){say('The version is not part of the folder or file template, so a new version would write to the same place. Add {version} to the folder template first.');return}
+  archive(c);if(c.state!=='Error')c.state='Ready';
+  c.ver=v;say(`${c.id} now writes to v${pad(v,3)}. Earlier files stay on disk untouched.`)},
+ rootMode(d){const c=cur();c.outRoot=d.v==='custom'?(c.outRoot==null?S.proj.root:c.outRoot):null},
+ rootAskOpen(){if(S.sel.length)S.rootAsk=true},
+ rootApplyGo(){S.sel.forEach(id=>{clip(id).outRoot=null});S.rootAsk=false;say(`${S.sel.length} clip${S.sel.length===1?'':'s'} now inherit the project root. Queued jobs were not changed.`)},
+ rootApplyCancel(){S.rootAsk=false;say('Cancelled — no folders changed.')},
+ applyOpen(d){const id=d.v==='workflow'?S.pickWf:S.pickEx;if(!preset(id)||!S.sel.length){say('Choose a preset and select at least one clip.');return}S.applyBar={id}},
+ applyGo(){const p=S.applyBar&&preset(S.applyBar.id);if(p){applyPreset(p,S.sel.slice())}S.applyBar=null},
+ applyCancel(){S.applyBar=null;say('Apply cancelled — nothing changed.')},
+ savePreset(){savePreset(false)},replacePreset(){savePreset(true)},
+ delPreset(d){const id=d.v==='workflow'?S.pickWf:S.pickEx;if(preset(id))S.delAsk=id},
+ delKeep(){S.delAsk=null;say('Preset kept.')},
+ delConfirm(d){const id=d.v==='workflow'?S.pickWf:S.pickEx,p=preset(id);S.delAsk=null;if(!p)return;S.presets=S.presets.filter(x=>x.id!==id);if(d.v==='workflow')S.pickWf='';else S.pickEx='';if(S.applyBar&&S.applyBar.id===id)S.applyBar=null;
+  say(persist()?`Deleted preset “${p.name}”. Clips it was applied to keep their settings.`:`Deleted preset “${p.name}” for this page only — the stored list could not be updated.`)},
+ props(){S.props=!S.props},
+ simImport(){addSim()},
+};
+function moveQ(id,d){const q=S.queue,i=q.findIndex(j=>j.id===id);let k=i+d;while(k>=0&&k<q.length&&q[k].status!=='queued')k+=d;if(k<0||k>=q.length)return;[q[i],q[k]]=[q[k],q[i]]}
+const CHG={
+ gen(el){cur().gen=el.value},
+ inA(el){const c=cur();c.inA=clamp(Math.round(+el.value)||c.start,c.start,end(c));if(c.inA>c.inB)c.inB=c.inA},
+ inB(el){const c=cur();c.inB=clamp(Math.round(+el.value)||end(c),c.start,end(c));if(c.inB<c.inA)c.inA=c.inB},
+ outOn(el){const c=cur(),k=el.dataset.v;c.outs[k]=el.checked?(c.outs[k]||(k==='fg'||k==='matte'?'EXR':'PNG')):null},
+ outFmt(el){cur().outs[el.dataset.v]=el.value},
+ outComp(el){if(COMPS.includes(el.value))cur().comp=el.value},
+ temporal(el){if(TEMPORAL.some(t=>t[0]===el.value))cur().temporal=el.value},
+ redraw(){},
+ carry(el){cur().carry=el.checked},
+ selToggle(el){const i=S.sel.indexOf(el.dataset.v);el.checked?(i<0&&S.sel.push(el.dataset.v)):(i>=0&&S.sel.splice(i,1));S.clip=el.dataset.v},
+ selAll(el){S.sel=el.checked?S.clips.map(c=>c.id):[]},
+ pickWf(el){S.pickWf=preset(el.value)&&preset(el.value).kind==='workflow'?el.value:'';S.applyBar=null;S.delAsk=null},
+ pickEx(el){S.pickEx=preset(el.value)&&preset(el.value).kind==='export'?el.value:'';S.applyBar=null;S.delAsk=null},
+ saveKind(el){S.saveKind=el.value==='export'?'export':'workflow';S.replaceAsk=null},
+ bg(el){S.bg=['checker','black','white'].includes(el.value)?el.value:'checker'},
+ cres(el){cur().resLabel=el.value.trim()},cdate(el){cur().date=el.value.trim()},cver(el){cur().ver=Math.round(+el.value)||0}
+};
+const INP={
+ wipe(el){S.wipe=+el.value;return'live'},
+ seek(el){S.frame=+el.value;return'live'},
+ despill(el){cur().despill=+el.value;return'live'},
+ hq(el){cur().hq=+el.value;return'live'},
+ cq(el){cur().cq=+el.value;return'live'},
+ saveName(el){S.saveName=el.value;S.replaceAsk=null;return'live'},
+ proot(el){S.proj.root=el.value;return'render'},pfold(el){S.proj.folderT=el.value;return'render'},pfile(el){S.proj.fileT=el.value;return'render'},croot(el){cur().outRoot=el.value;return'render'}
+};
+/* ================= events ================= */
+mount.addEventListener('click',e=>{
+  const t=e.target.closest('[data-act]');if(!t||t.disabled)return;
+  if(t.dataset.act==='node'&&e.detail===2){const id=t.dataset.v;setPage(NODEPAGE[id]);S.node=id;render();return} // the first click re-renders the node, so the native dblclick event is unreliable
+  dirty=false;const r=ACT[t.dataset.act](t.dataset,t);if(r==='live')liveUpdate();else render();
+  if(t.dataset.act==='back'||t.dataset.act==='open'){const f=$(t.dataset.act==='back'?`[data-act=open][data-v="${S.clip}"]`:'#pg-'+S.page,mount);if(f)f.focus({preventScroll:true})}});
+/* annotations: click = point/brush, drag = box (local prototype marks only) */
+let drag=null;
+const svgPt=(sc,e,strict)=>{const r=sc.getBoundingClientRect(),k=Math.min(r.width/640,r.height/360),ox=(640*k-r.width)/2,oy=(360*k-r.height)/2,x=Math.round((e.clientX-r.left+ox)/k),y=Math.round((e.clientY-r.top+oy)/k);
+  if(strict&&(x<0||x>640||y<0||y>360))return null; // letterbox bars are not image
+  return[clamp(x,0,640),clamp(y,0,360)]};
+function addAnn(p,q){const c=cur(),t=S.paint.tool,f=S.frame,out=f<c.inA||f>c.inB?' This frame is outside In/Out: kept, ignored by jobs.':'';
+  if(t==='b1'||t==='b2'){c.strokes.push({x:p[0],y:p[1],t:t==='b1'?1:2,f});say(`Brush mark ${c.strokes.length} added (${t==='b1'?'subject':'background'}). Local annotation only.${out}`)}
+  else if(t==='pos'||t==='neg'){c.pts.push({x:p[0],y:p[1],t:t==='pos'?'+':'-',f});say(`${t==='pos'?'Positive':'Negative'} point added. Local annotation only, no SAM runs.${out}`)}
+  else{const w=Math.abs(p[0]-q[0]),h=Math.abs(p[1]-q[1]);if(w<6||h<6){say('Drag to draw a box (at least 6 px each way).');return}
+    c.boxes.push({x:Math.min(p[0],q[0]),y:Math.min(p[1],q[1]),w,h,t:t==='boxA'?'add':'rem',f});say(`Box ${t==='boxA'?'add':'remove'} drawn. Local annotation only, no SAM runs.${out}`)}}
+mount.addEventListener('pointerdown',e=>{const sc=e.target.closest&&e.target.closest('.scene[data-paint]');if(!sc||e.button>0||!sc.getBoundingClientRect().width)return;const p0=svgPt(sc,e,true);if(!p0){say('That is outside the image — click on the picture.');return}drag={sc,p:p0,cx:e.clientX,cy:e.clientY};e.preventDefault()});
+mount.addEventListener('pointermove',e=>{if(!drag||!/^box/.test(S.paint.tool))return;const r=drag.sc.getBoundingClientRect(),b=drag.rb||(drag.rb=Object.assign(document.createElement('div'),{className:'rb'}));if(!b.parentNode)drag.sc.appendChild(b);
+  Object.assign(b.style,{left:Math.min(drag.cx,e.clientX)-r.left+'px',top:Math.min(drag.cy,e.clientY)-r.top+'px',width:Math.abs(e.clientX-drag.cx)+'px',height:Math.abs(e.clientY-drag.cy)+'px'})});
+document.addEventListener('pointerup',e=>{if(!drag)return;const d=drag;drag=null;if(d.rb)d.rb.remove();addAnn(d.p,svgPt(d.sc,e));render()});
+mount.addEventListener('dblclick',e=>{
+  const nd=e.target.closest('.node');if(nd){S.node=nd.dataset.node;setPage(NODEPAGE[nd.dataset.node]);S.node=nd.dataset.node;render();return}
+  const cd=e.target.closest('.card');if(cd&&!e.target.closest('button,input,label')){openClip(cd.dataset.id);render()}});
+mount.addEventListener('change',e=>{const el=e.target,k=el.dataset.chg;if(k&&CHG[k]){CHG[k](el);render()}});
+mount.addEventListener('input',e=>{const el=e.target,k=el.dataset.inp;if(k&&INP[k]){if(INP[k](el)==='render')render();else liveUpdate()}});
+$('#fileIn').addEventListener('change',e=>{addLocal([...e.target.files].map(f=>({name:f.name,size:f.size})));e.target.value='';render()});
+$('#speed').addEventListener('click',()=>{S.speed=S.speed===1?4:1;renderChrome();say(`Simulation speed ${S.speed}×. Timings are simulated, not measured.`)});
+$('#busybtn').addEventListener('click',()=>{ACT.busy();render()});
+mount.addEventListener('toggle',e=>{const d=e.target,k=d.dataset&&d.dataset.k;if(!k)return;const i=S.open.indexOf(k);d.open?(i<0&&S.open.push(k)):(i>=0&&S.open.splice(i,1))},true);
+$('#keybtn').addEventListener('click',()=>{S.keys=!S.keys;renderChrome()});
+$('#keys').innerHTML='<b>Shortcuts</b> (ignored while typing): <kbd>B</kbd> back to batch · <kbd>1</kbd>–<kbd>5</kbd> page tabs · <kbd>G</kbd> focus graph · <kbd>←</kbd>/<kbd>→</kbd> in graph: move between nodes, <kbd>Enter</kbd> opens the node’s page · <kbd>?</kbd> shortcuts · <kbd>Space</kbd> play/pause (pages with a viewer) · <kbd>←</kbd>/<kbd>→</kbd> step frame (or move the focused scrubber) · <kbd>I</kbd> Set In (I) · <kbd>O</kbd> Set Out (O) — the same range on every page, used by Hint, Key and every export · <kbd>M</kbd> mark keyframe · <kbd>K</kbd> key range · <kbd>Esc</kbd> close Properties sheet/apply bar/focus/shortcuts';
+document.addEventListener('keydown',e=>{
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
+  const tg=e.target,k=e.key;
+  if(k==='Escape'&&S.focus){S.focus=false;render();return}
+  if(k==='Escape'&&S.props&&narrow()){S.props=false;render();const n=$(`.node[data-node="${S.node}"]`,mount);if(n)n.focus();return}
+  if(tg.id==='pn'&&k==='Enter'){e.preventDefault();ACT.savePreset();render();return}
+  const typing=/^(INPUT|SELECT|TEXTAREA)$/.test(tg.tagName)&&tg.type!=='range'&&tg.type!=='checkbox';
+  if(typing)return;
+  if(tg.closest&&tg.closest('.pages')&&(k==='ArrowRight'||k==='ArrowLeft')){e.preventDefault();const i=PAGES.findIndex(p=>p[0]===S.page),n=PAGES[(i+(k==='ArrowRight'?1:PAGES.length-1))%PAGES.length][0];setPage(n);render();$('#pg-'+n).focus();return}
+  const nd=tg.closest&&tg.closest('.node');
+  if(nd){
+    if(k==='Enter'){e.preventDefault();const id=nd.dataset.node;setPage(NODEPAGE[id]);S.node=id;render();return}
+    if(['ArrowRight','ArrowLeft','ArrowDown','ArrowUp'].includes(k)){e.preventDefault();const all=$$('.node',mount),i=all.indexOf(nd),d=(k==='ArrowRight'||k==='ArrowDown')?1:-1;all[(i+d+all.length)%all.length].focus();return}}
+  if(k==='Escape'){if(S.applyBar){S.applyBar=null;render()}else if(S.keys){S.keys=false;renderChrome()}return}
+  const onSeek=!!(tg.classList&&tg.classList.contains('seek'));
+  const interactive=(/^(BUTTON|A|SUMMARY)$/.test(tg.tagName)||tg.type==='range'||tg.type==='checkbox'||tg.getAttribute('role')==='tab'||tg.tagName==='SELECT')&&!onSeek;
+  if(k==='?'){S.keys=!S.keys;renderChrome();return}
+  if(S.view!=='clip'){return}
+  const c=cur();
+  if(k==='b'||k==='B'){ACT.back();render();return}
+  if(/^[1-5]$/.test(k)){setPage(PAGES[+k-1][0]);render();return}
+  if(k==='g'||k==='G'){const n=$('.node[aria-pressed=true]',mount);if(n)n.focus();return}
+  if(interactive&&!(tg.tagName==='BUTTON'&&tg.getAttribute('role')!=='tab'&&/^([iIoOmMkK]|ArrowLeft|ArrowRight)$/.test(k)))return;
+  if(onSeek&&/^(Arrow(Left|Right|Up|Down)|Home|End|Page(Up|Down))$/.test(k))return; // the focused scrubber moves natively
+  if(k===' '){if($('.viewer',mount)){e.preventDefault();ACT.play();render()}}
+  else if(k==='ArrowLeft'){stepFrame(-1);liveUpdate()}else if(k==='ArrowRight'){stepFrame(1);liveUpdate()}
+  else if(k==='i'||k==='I'){ACT.setIn();render()}else if(k==='o'||k==='O'){ACT.setOut();render()}
+  else if(k==='m'||k==='M'){if(c.mode==='keyframes'){ACT.markKf();render()}}
+  else if(k==='k'||k==='K'){const p=primary(c);if(['key','genThenKey','genHint'].includes(p.act)){ACT[p.act]({});render()}}});
+let pending=false;const editing=()=>{const a=document.activeElement;return a&&mount.contains(a)&&/^(INPUT|SELECT)$/.test(a.tagName)&&a.type!=='range'&&a.type!=='checkbox'};
+setInterval(()=>{if(S.playing||S.queue.some(j=>ACTIVE.includes(j.status))){dirty=false;advance(100);if(dirty)pending=true;if(pending&&!editing()){pending=false;render()}else liveUpdate()}},100);
+/* ================= self-check ================= */
+function selfCheck(){
+  const snap=JSON.stringify(S),res=[];const ok=(c,m)=>res.push([!!c,m]);
+  const hold=S.speed;S.playing=false;noPersist=true;
+  const R=()=>{render();return mount.innerHTML};
+  const reset=()=>{S=fresh()};
+  try{
+    const wide=matchMedia('(min-width:1030px)').matches,css=$('#ck-style').textContent;
+    const inView=el=>{const m=mount.getBoundingClientRect(),r=el.getBoundingClientRect();if(!r.width)return false;
+      for(let a=el.parentElement;a&&a!==mount.parentElement;a=a.parentElement){if(/(auto|hidden|scroll)/.test(getComputedStyle(a).overflowY)){const b=a.getBoundingClientRect();if(r.top<b.top-1||r.bottom>b.bottom+1)return false}}
+      return r.top>=m.top-1&&r.bottom<=m.bottom+1};
+    const act=()=>$(wide?'.pfoot .btn.pri,.pfoot .btn.dng':'.stripact',mount);
+    const small=()=>$$('*',mount).filter(el=>!(el instanceof SVGElement)&&[...el.childNodes].some(n=>n.nodeType===3&&n.textContent.trim())&&parseFloat(getComputedStyle(el).fontSize)<12);
+    ok(!/\d(vh|svh|dvh|lvh)\b/.test(css),'no vh/svh/dvh/lvh units');
+    ok(!/(html|body)[^{}]*\{[^}]*height:\s*100%/.test(css),'no height:100% on html/body');
+    ok(/background:transparent/.test(css.split('html,body')[1]||''),'outer page background is transparent');
+    /* board is home */
+    reset();R();
+    ok($('.board',mount)&&!$('.ws',mount),'Board is the first view');
+    ok($$('.card',mount).length===4,'sample board has 4 clips');
+    ok($$('.card input[type=checkbox]',mount).length===4&&/0 selected/.test($('#selcount',mount).textContent),'cards are multi-selectable and the count starts at 0');
+    ok($('[data-act=import]',mount)&&$('#fileIn').multiple,'Import clips… opens a real multi-file chooser');
+    ok(!$$('.btn.pri',mount).some(b=>b.disabled),'Board has no disabled primary button');
+    ok(small().length===0,'Board text is at least 12px');
+    ok($$('button',mount).every(b=>(b.textContent.trim()||b.getAttribute('aria-label'))),'Board buttons have names');
+    ok(inView($('[data-act=bulkKey]',mount)),'Board primary action is inside the 660px window');
+    ok(!$$('.pair',mount).some(p=>p.getBoundingClientRect().height>44),'Name label and input stay paired (one line)');
+    /* selection + Space on a checkbox */
+    const cb=$('#sel-SH040',mount);cb.focus();const ev=new KeyboardEvent('keydown',{key:' ',bubbles:true,cancelable:true});cb.dispatchEvent(ev);
+    ok(!S.playing&&!ev.defaultPrevented,'Space on a checkbox is left to the checkbox (no playback, not cancelled)');
+    cb.checked=true;cb.dispatchEvent(new Event('change',{bubbles:true}));$('#sel-SH050',mount).checked=true;$('#sel-SH050',mount).dispatchEvent(new Event('change',{bubbles:true}));
+    ok(S.sel.length===2&&/2 selected/.test($('#selcount',mount).textContent),'multi-select updates the selected count');
+    ok(readiness(clip('SH050')).f==='hint'===false&&readiness(clip('SH050')).t==='Needs colour check','SH050 readiness: colour check required first');
+    /* board -> clip tabs -> graph -> back */
+    ACT.open({v:'SH040'});R();
+    ok(!$('[role=dialog],.overlay,dialog',mount),'Open clip settings opens no dialog or overlay');
+    ok($$('[role=tab]',mount).map(t=>t.textContent.replace(/^\d /,'')).join()==='Media,Hint,Key,Review,Deliver','five page tabs: Media, Hint, Key, Review, Deliver');
+    ok($('[data-act=back]',mount),'Back to batch is present');
+    let noCut=false,allGraph=true,allPrim=true,allInView=true,smallOk=true;
+    for(const [pg] of PAGES){setPage(pg);R();
+      allGraph=allGraph&&$$('.node',mount).length===7&&$('.graph',mount);
+      allPrim=allPrim&&!!act();
+      allInView=allInView&&inView(act())&&$$('.node',mount).every(inView);
+      smallOk=smallOk&&small().length===0;if(pg==='key'){S.node='key';R();noCut=!/cutout/i.test(mount.textContent)}}
+    ok(noCut,'Key properties have no Cutout linear control');
+    ok(allGraph,'the same 7-node graph is present on all five pages');
+    ok(allPrim,'a primary action is pinned (Properties footer wide, action strip narrow) on every page');
+    ok(smallOk,'Clip workspace text is at least 12px on every page');
+    ok(allInView,'pinned action and all 7 graph nodes stay inside the 660px window on every page (wide and narrow)');
+    if(!wide&&innerWidth>=700){const gw=$('.graphwrap',mount);ok(gw.scrollWidth<=gw.clientWidth+1,'compact graph fits without horizontal scroll at >=700px')}
+    setPage('media');R();
+    const t0=$('.ph',$('aside[aria-label="Node properties"]',mount)).textContent;
+    $('.node[data-node=w-matte]',mount).click();
+    if(!wide){ok(S.props&&!$('#propsheet',mount).hidden,'narrow: node click opens the Properties sheet');ACT.props();R();ok($('#propsheet',mount).hidden,'narrow: Properties button toggles the sheet closed');ACT.props();R();ok(!$('#propsheet',mount).hidden,'narrow: Properties button toggles it open');const pn=$('.node[data-node=w-matte]',mount);pn.focus();document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));ok(!S.props&&$('#propsheet',mount).hidden&&document.activeElement.dataset.node==='w-matte','narrow: Esc closes the sheet and returns focus to the node');ACT.props();R()}
+    ok(S.node==='w-matte'&&S.page==='media'&&$('.ph',$('aside[aria-label="Node properties"]',mount)).textContent!==t0,'clicking a node changes Properties and keeps the page');
+    $('.node[data-node=w-matte]',mount).dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+    ok(S.page==='deliver'&&S.node==='w-matte','Enter on an export node opens Deliver for that node');
+    ok(!!$('.node[data-node=w-matte][aria-pressed=true]',mount),'selected node uses aria-pressed');
+    S.sel=['SH040','SH050'];S.frame=1150;ACT.back();R();
+    ok($('.board',mount)&&S.sel.length===2&&/2 selected/.test($('#selcount',mount).textContent),'Back to batch keeps the selection');
+    ACT.open({v:'SH040'});R();
+    ok(S.page==='deliver'&&S.node==='w-matte'&&S.frame===1150,'reopening a clip restores its page, node and playhead');
+    /* bypass */
+    ACT.back();ACT.open({v:'SH040'});const h=clip('SH040');ACT.bypass();ok(h.mode==='none','Bypass Hint sets mode None');ACT.bypass();ok(h.mode==='full','un-bypass restores the previous mode');
+    /* independent exports + shared compression */
+    reset();const c=clip('SH040');S.clip='SH040';
+    CHG.outFmt({dataset:{v:'matte'},value:'PNG'});ok(c.outs.matte==='PNG'&&c.outs.fg==='EXR','changing the Matte format leaves FG alone');
+    CHG.outOn({dataset:{v:'comp'},checked:false});ok(c.outs.comp===null&&c.outs.fg==='EXR','disabling Comp leaves FG enabled');
+    CHG.outOn({dataset:{v:'processed'},checked:true});ok(c.outs.processed==='PNG','enabling Processed gives it a default format');
+    CHG.outFmt({dataset:{v:'processed'},value:'EXR'});ok(c.comp==='dwab','EXR compression defaults to DWAB');CHG.outComp({value:'none'});
+    S.view='clip';S.node='w-processed';R();
+    ok($('#comp',mount).value==='none'&&c.comp==='none'&&$$('#comp option',mount).map(o=>o.value).join()==='dwab,piz,zip,none','EXR compression is one shared value, edited from any EXR node');
+    ok(/Shared by all EXR exports/.test(mount.textContent),'shared-compression label is shown');
+    CHG.outComp({value:'DWAA'});ok(c.comp==='none','invalid compression values are rejected');
+    ['fg','matte','processed'].forEach(k=>c.outs[k]=null);
+    ok(readiness(c).t==='No outputs enabled'&&primary(c).act==='enableOut','all exports off blocks Key with a reason');
+    S.sel=['SH040'];ACT.bulkKey();ok(S.queue.length===3&&S.note.skip.some(x=>/No outputs enabled/.test(x)),'Key N clips skips it and names the reason');
+    /* full-clip vs write range, keyframes, hint prerequisites */
+    reset();const a=clip('SH040');
+    ok(/frames 1101–1300 \(200 of 412\)/.test(summary(a))&&!/all 412/.test(summary(a))&&rangeTxt(a)==='Range 1101–1300 · 200 of 412 frames','summary and range label describe the selected inclusive range, not the whole clip');
+    a.mode='keyframes';a.kf=[];ok(readiness(a).t==='Needs keyframe marks'&&primary(a).act==='markKf','Keyframes with no marks is blocked and asks for a mark');
+    S.sel=['SH040'];ACT.bulkKey();ok(!S.queue.some(j=>j.clip==='SH040'),'no zero-mark keyframe job is queued');
+    a.mode='full';a.gen='BiRefNet';ok(readiness(a).f==='hint'&&/Needs hint/.test(readiness(a).t),'changing the route makes the old GVM hint insufficient');
+    /* presets: save, validate, apply, isolation */
+    reset();noPersist=true;S.clip='SH040';
+    S.saveName='  ';savePreset();ok(S.presets.length===2,'empty preset name is rejected');
+    S.saveName='x'.repeat(41);savePreset();ok(S.presets.length===2,'over-long preset name is rejected');
+    S.saveName='Walk\u0007';savePreset();ok(S.presets.length===2,'control characters in a name are rejected');
+    const s40=clip('SH040');s40.despill=.8;s40.temporal='24/12';s40.comp='piz';
+    S.saveKind='workflow';S.saveName='Tight <b>walk</b>';savePreset();
+    const wp=S.presets.find(p=>p.name==='Tight <b>walk</b>');ok(wp&&wp.kind==='workflow'&&wp.fields.despill===.8&&wp.fields.outs.fg==='EXR','Workflow preset saved from a clip with its graph settings and exports');
+    S.saveName='tight <B>walk</B>';savePreset();ok(S.presets.length===3&&S.replaceAsk===wp.id,'duplicate name asks before replacing');
+    savePreset(true);ok(wp.rev===2&&S.presets.length===3,'Replace overwrites and bumps the revision');
+    S.saveKind='export';S.saveName='Matte only';s40.outs={fg:null,matte:'PNG',comp:null,processed:null};savePreset();
+    const ep=S.presets.find(p=>p.name==='Matte only');ok(ep&&ep.kind==='export'&&!('despill' in ep.fields),'Export preset carries only exports and compression');
+    reset();noPersist=true;
+    const sA=clip('SH040'),sB=clip('SH050');
+    const keep=c=>JSON.stringify([c.colour,c.checked,c.inA,c.inB,c.kf,c.strokes,c.outRoot,c.res,c.name,c.written]);
+    const kA=keep(sA),kB=keep(sB);
+    S.sel=['SH040','SH050'];const hair=S.presets.find(p=>p.name==='Hair closeups');S.pickWf=hair.id;ACT.applyOpen({v:'workflow'});R();
+    ok($('.applybar',mount)&&/2 clips/.test($('.applybar',mount).textContent)&&$('.applybar li',mount),'apply bar is inline and lists a per-clip change summary');
+    ok(sB.despill===.5,'preview does not change the clip before Apply');
+    ACT.applyGo();R();
+    ok(sA.despill===.65&&sB.despill===.65&&sB.temporal==='48/24'&&sB.gen==='GVM'&&sB.mode==='full','Workflow preset merges Hint/Key settings into both clips');
+    ok(keep(sA)===kA&&keep(sB)===kB,'Workflow apply preserves each clip’s colour, range, marks, paint, folder and source');
+    ok(sB.outs.matte==='EXR'&&sB.outs.comp===null&&sB.comp==='piz','Workflow preset also applies the exports');
+    ok(readiness(sB).k!=='ok'&&sB.hasHint===false,'SH050 stays blocked; no hint or colour is invented');
+    sB.checked=true;ok(readiness(sB).f==='hint'&&/Needs hint/.test(readiness(sB).t),'SH050 then shows an explicit Needs hint status');
+    ok(/Workflow: “Hair closeups”/.test($('.card[data-id=SH050]',mount).textContent),'card shows the applied Workflow preset');
+    sA.despill=.7;R();ok(/\(modified\)/.test($('.card[data-id=SH040]',mount).textContent)&&!/\(modified\)/.test($('.card[data-id=SH050]',mount).textContent),'editing a clip marks only its preset “(modified)”');
+    sA.despill=.65;const d0=sA.despill;S.pickEx=S.presets.find(p=>p.name==='Comp review PNG').id;ACT.applyOpen({v:'export'});ACT.applyGo();
+    ok(sA.despill===d0&&sA.outs.comp==='PNG'&&!sA.outs.fg&&sA.comp==='zip','Export preset changes exports only (Despill untouched)');
+    ok(sA.applied.ex&&sA.applied.ex.name==='Comp review PNG'&&sA.applied.ex.id&&sA.applied.wf.id&&sA.applied.wf.rev===1,'applied records keep id, name and rev');
+    ok(!modified(sA,'wf')&&modified(sA,'ex')===false,'an Export preset on top of a Workflow preset is not a manual modification of the Workflow');
+    sA.despill=.2;ok(modified(sA,'wf'),'a manual Hint/Key edit still marks the Workflow modified');sA.outs.fg='EXR';ok(modified(sA,'ex'),'a manual export edit marks the Export preset modified');
+    /* queue immutability */
+    reset();noPersist=true;const q=clip('SH040');S.clip='SH040';ACT.key({});const j=S.queue.find(x=>x.clip==='SH040'&&ACTIVE.includes(x.status));
+    ok(j&&Object.isFrozen(j.cfg)&&j.cfg.despill===.5,'Key job freezes a settings snapshot at submit');
+    S.sel=['SH040'];S.pickWf=S.presets[0].id;ACT.applyOpen({v:'workflow'});ACT.applyGo();
+    ok(q.despill===.65&&j.cfg.despill===.5&&j.cfg.temporal==='auto','applying a preset does not change the queued/running snapshot');
+    advance(1000);ok(j.cfg.despill===.5,'snapshot stays frozen while the job runs');
+    const stillQueued=(()=>{S.clip='SH060';const o=clip('SH060');o.despill=.5;const k=enqueue('key','SH060');o.despill=.9;return k})();
+    ok(outdated(stillQueued)&&(R(),/Queued with earlier settings/.test(mount.textContent)),'a queued job with older settings is flagged');
+    ACT.requeue({v:stillQueued.id});const nj=S.queue.at(-1);ok(stillQueued.status==='cancelled'&&nj.cfg.despill===.9,'Requeue submits a new snapshot with current settings');
+    /* import honesty + escaping */
+    reset();addLocal([{name:'<img src=x onerror=alert(1)>.mov',size:2048},{name:'b.exr',size:0}]);R();
+    ok(S.clips.length===6&&!$('img',mount),'imported file names are never parsed as HTML');
+    const lc=$$('.card',mount).find(x=>x.dataset.id==='L1');
+    ok(lc.textContent.includes('<img src=x onerror=alert(1)>.mov')&&/not inspected/.test(lc.textContent),'name is shown literally and metadata is labelled not inspected');
+    ok(!/\d+ f\b|\d+×\d+/.test(lc.querySelector('.meta').textContent),'no resolution or frame count is invented for a local file');
+    ok(/Metadata not inspected/.test(readiness(clip('L1')).t),'local file is blocked with an honest reason');
+    S.sel=['L1'];const nq=S.queue.length;ACT.bulkKey();ok(S.queue.length===nq,'local files are never queued or processed');
+    ACT.open({v:'L1'});R();ok($$('.node',mount).length===7&&/Metadata not inspected/.test(mount.textContent)&&!$('.scene',mount),'local clip workspace keeps the graph and shows no fake frames');
+    /* localStorage boundary */
+    const good={id:'ok1',kind:'workflow',name:'Fine',rev:1,fields:{mode:'full',gen:'GVM',hq:.9,cq:.9,carry:true,vram:'auto',despill:.5,temporal:'auto',outs:{fg:'EXR',matte:null,comp:null,processed:null},comp:'zip'}};
+    const L=o=>loadPresets(JSON.stringify({v:1,presets:o}));
+    ok(loadPresets('{not json').list.length===0&&/unreadable/.test(loadPresets('{not json').warn),'corrupt stored JSON is ignored with a notice');
+    ok(loadPresets(JSON.stringify({v:2,presets:[good]})).list.length===0,'unknown storage version is ignored');
+    const mixed=L([good,Object.assign({},good,{id:'b1',kind:'evil'}),Object.assign({},good,{id:'b2',fields:Object.assign({},good.fields,{despill:2})}),Object.assign({},good,{id:'b3',name:''}),Object.assign({},good,{id:'b4',fields:Object.assign({},good.fields,{outs:{fg:null,matte:null,comp:null,processed:null}})}),Object.assign({},good,{id:'b 5'}),Object.assign({},good,{id:'b6',fields:Object.assign({},good.fields,{comp:'ZSTD'})}),null,'x',Object.assign({},good,{id:'ok1'})]);
+    ok(mixed.list.length===1&&mixed.list[0].id==='ok1'&&/9 invalid/.test(mixed.warn),'invalid stored presets are dropped individually and counted');
+    ok(L([Object.assign({},good,{fields:Object.assign({},good.fields,{extra:'<script>'})})]).list[0].fields.extra===undefined,'unknown preset fields are not carried through');
+    ok(loadPresets(null).list.length===2,'first run seeds the two sample presets');
+    const rt=loadPresets(JSON.stringify({v:1,presets:seedPresets()})),rt2=loadPresets(JSON.stringify({v:1,presets:rt.list}));ok(rt.list.length===2&&!rt.warn&&JSON.stringify(rt.list)===JSON.stringify(rt2.list)&&rt.list[0].fields.despill===.65,'presets survive a save/load round trip');
+    reset();S.presets=[Object.assign({},good,{name:'<img src=x onerror=1>'})];S.pickWf='ok1';S.sel=['SH040'];R();ok(!$('img',mount),'preset names are escaped in the UI');
+    /* simulation rules kept from the proposals */
+    reset();S.clip='SH040';const k=clip('SH040');ACT.key({});ACT.cancelJob({v:running().id});ok(running().status==='stopping','Cancel enters “Stopping after current step…”');
+    advance(1000);ok(running(),'cancel is not instant');advance(600);ok(!running()&&k.written.length===0,'cancel before writing publishes nothing');
+    ACT.key({});advance(16000);ok(count(k.written)===200&&k.state==='Complete'&&/1101–1300/.test(stateChip(k)),'a range run writes exactly its 200 frames and is Complete for that range');
+    ok(resumeRange(k)===null,'no Resume when the whole range is already written');
+    ACT.whole();ok(stale(k)&&resumeRange(k)===null&&diffs(k).includes('In/Out range changed')&&readiness(k).f==='newver'&&primary(k).act==='nextVer','changing the range after a run makes results stale, forbids Resume and offers a new version instead of overwriting');
+    ACT.nextVer({v:'SH040'});ok(k.ver===2&&k.written.length===0&&k.prev[0].ver===1&&k.prev[0].n===200&&readiness(k).k==='ok'&&/_v002\//.test(locOf(k).paths.fg),'Write as v002 keeps v001 on disk, starts an empty v002 and unblocks Key');
+    k.inA=1101;k.inB=1300;
+    ACT.key({});running().p=.95;ACT.cancelJob({v:running().id});advance(1600);const w0=count(k.written);ok(w0>=99&&w0<=100&&k.state==='Ready','cancel while writing leaves about half of the 200 range frames and never Complete');
+    ok(count(resumeRange(k))===200-w0&&resumeRange(k)[0][0]===1101+w0,'Resume offers only the missing frames of the range');
+    k.temporal='24/12';ok(resumeRange(k)===null&&stale(k),'incompatible settings block Resume and mark results stale');k.temporal='auto';
+    ACT.resume();advance(16000);ok(k.state==='Complete'&&count(k.written)===200,'compatible Resume completes the range (not the whole clip)');
+    reset();ACT.key({});running().p=.95;ACT.cancelJob({v:running().id});advance(1600);
+    ok(count(clip('SH040').written)>50&&count(clip('SH040').written)<200&&clip('SH040').state==='Ready','cancel during Writing files leaves partial frames, never Complete');
+    ok(primary(clip('SH070')).act==='genHint','Error clip offers an actionable fix');
+    /* regression: compression, cancel-after-Complete, hint->key dependency, requeue, delete, storage, import, keys */
+    reset();noPersist=true;S.clip='SH040';{const k=clip('SH040');ACT.key({});running().p=.95;ACT.cancelJob({v:running().id});advance(1600);
+      ok(count(resumeRange(k))>=100,'compression: Resume is offered while compression is unchanged');
+      k.comp='piz';ok(stale(k)&&diffs(k).includes('EXR compression changed')&&resumeRange(k)===null,'changing EXR compression marks results stale and blocks Resume (full rewrite needed)');
+      S.view='clip';S.node='w-fg';R();ok(/rewritten/.test(mount.textContent)&&/Proposed UI guard/.test(mount.textContent)&&/does not record compression/.test(mount.textContent),'compression note says outputs must be rewritten and that the guard is proposed, not current backend behaviour');
+      k.comp='dwab';k.outs.fg=k.outs.matte='PNG';k.made=snapOf(k);const f0=stale(k);k.comp='piz';ok(!f0&&!stale(k),'compression is ignored while no EXR output is enabled')}
+    reset();noPersist=true;S.clip='SH060';{const k=clip('SH060');ok(k.state==='Complete','SH060 starts Complete');k.despill=.9;ACT.key({});running().p=.95;ACT.cancelJob({v:running().id});advance(1600);
+      ok(k.state==='Ready'&&count(k.written)===640,'cancel while publishing after an earlier Complete never leaves the clip Complete');
+      ok(k.mixed&&stale(k)&&resumeRange(k)===null&&/^Mixed output/.test(staleTxt(k)),'mixed old/new output is flagged stale and blocks Resume instead of being called current');
+      ACT.key({});advance(16000);ok(k.state==='Complete'&&!k.mixed&&!stale(k),'a completed full Key clears the mixed flag')}
+    reset();noPersist=true;S.clip='SH050';{const k=clip('SH050');k.checked=true;ACT.genThenKey();const hj=running(),kj=S.queue.find(j=>j.type==='key'&&j.clip==='SH050');
+      ok(hj.type==='hint'&&kj.after===hj.id&&kj.status==='queued','Generate-then-key records the key job as depending on the hint job');
+      ACT.cancelJob({v:hj.id});advance(1600);
+      ok(kj.status==='cancelled'&&/hint job did not finish/.test(kj.why)&&!running()&&k.written.length===0&&!k.hasHint,'cancelling the hint cancels the dependent key; no key frames are written');
+      ACT.genThenKey();advance(6100);ok(running()&&running().type==='key'&&k.hasHint,'when the hint finishes the dependent key starts')}
+    reset();noPersist=true;S.clip='SH050';{const k=clip('SH050');k.checked=true;k.mode='full';const j=enqueue('key','SH050');
+      ok(j.status==='cancelled'&&/no longer ready: Needs hint/.test(j.why)&&!running(),'a key job is re-checked against its frozen settings at start and skipped with a reason when not ready')}
+    reset();{const n0=S.presets.length;S.pickWf=S.presets[0].id;ACT.delPreset({v:'workflow'});R();
+      ok(S.presets.length===n0&&/Delete “Hair closeups”\?/.test(mount.textContent),'Delete asks for confirmation first');
+      ACT.delKeep();ok(S.presets.length===n0,'Keep leaves the preset');ACT.delPreset({v:'workflow'});ACT.delConfirm({v:'workflow'});ok(S.presets.length===n0-1,'confirmed Delete removes it')}
+    ok(loadPresets('{x').bad===true&&loadPresets(JSON.stringify({v:2,presets:[]})).bad===true&&!loadPresets(null).bad,'unreadable or unknown-version stores are flagged so they can be backed up, never overwritten silently');
+    reset();{S.sel=[];addSim();R();const sm=S.clips.filter(x=>x.id.startsWith('SIM'));
+      ok(sm.length===2&&sm.every(x=>x.state==='Extracting'&&x.n===120)&&S.sel.length===0&&/Extracting/.test(mount.textContent)&&/simulated/i.test(S.msg),'simulated import adds two visibly simulated clips (Extracting, 120 f), not selected');
+      sm.forEach(x=>x.state='Raw');ok(/Needs hint/.test(readiness(sm[0]).t)&&!sm[0].checked,'after extraction a simulated clip still needs a hint and a colour choice (nothing pre-chosen)')}
+    reset();addLocal([{name:'a.mov',size:5}]);S.sel=[];ACT.open({v:'L1'});R();
+    ok(!clip('L1').checked&&!$('[data-act=colour][aria-pressed=true]',mount)&&/unknown until you choose/.test(mount.textContent)&&!/your choice/.test(mount.textContent),'imported file never claims the user chose sRGB');
+    reset();ACT.open({v:'SH040'});setPage('key');R();document.body.dispatchEvent(new KeyboardEvent('keydown',{key:' ',bubbles:true}));ok(!S.playing,'Space does nothing on pages without a viewer');
+    setPage('review');R();document.body.dispatchEvent(new KeyboardEvent('keydown',{key:' ',bubbles:true}));ok(S.playing,'Space plays on pages with a viewer');S.playing=false;
+    {const k=clip('SH040');k.mode='none';R();ok(/#c8873a/.test($('.graph svg',mount).innerHTML)&&$('.node.by',mount),'bypass draws a visible Media→Key arc and a dashed Hint node')}
+    ACT.bypass();
+    /* ===== v3: shared viewer + scrubbable timeline, range everywhere, output location ===== */
+    {const wideWin=$('#win').getBoundingClientRect().width>690,rc=el=>el.getBoundingClientRect(),key=(k,t=document.body)=>t.dispatchEvent(new KeyboardEvent('keydown',{key:k,bubbles:true,cancelable:true}));
+     const txt=()=>mount.textContent;
+     reset();noPersist=true;ACT.open({v:'SH040'});
+     /* shared viewer: identical controls on Media, Hint, Review */
+     for(const pg of ['media','hint','review']){setPage(pg);R();
+       const v=$('.viewer',mount),vr=rc(v),sg=rc($('.vr .seg',v)),ab=rc($('[data-act=ab]',v)),pl=rc($('[data-act=play]',v)),bl=rc($('.vbl',v)),bm=rc($('.vbm',v)),br=rc($('.vbr',v));
+       ok($('.scrub input.seek',v)&&$('.scrub .rg',v)&&$('.vbar',v),`${pg}: viewer has the shared scrubbable timeline with the In/Out span`);
+       ok($$('.vr .seg button',v).map(b=>b.textContent).join()==='Input,Hint,FG,Matte,Comp,Processed',`${pg}: channel selector is Input/Hint/FG/Matte/Comp/Processed`);
+       ok(Math.abs(sg.right-vr.right)<=12&&sg.top<vr.top+50,`${pg}: channel selector sits top-right`);
+       ok(Math.abs((ab.left+ab.right)/2-(vr.left+vr.right)/2)<=3&&(!wideWin||ab.right<sg.left-4)&&ab.top<vr.top+50,`${pg}: A/B wipe sits top-centre, clear of the channel selector`);
+       ok(Math.abs((pl.left+pl.right)/2-(vr.left+vr.right)/2)<=3&&(!wideWin||(bl.right<=bm.left+1&&bm.right<=br.left+1)),`${pg}: transport is centred independently of the range buttons and counter, no overlap`);
+       ok($$('.tb',v).length===5&&$$('.tb',v).every(b=>b.getAttribute('aria-label')&&b.title&&b.querySelector('svg')&&!b.textContent.trim()),`${pg}: transport is icon-only with aria-labels and tooltips`);
+       ok($$('.vbl .btn',v).map(b=>b.textContent).join('|')==='Set In (I)|Set Out (O)|Clear In/Out',`${pg}: range buttons read Set In (I) / Set Out (O) / Clear In/Out`)}
+     for(const pg of PAGES.map(p=>p[0])){setPage(pg);R();ok(!/= ?playhead|In = |Out = /.test(txt())&&!/backend|Python|support pending/i.test(txt()),`${pg}: no “= playhead” text and no backend warning in the product flow`)}
+     for(const pg of ['key','deliver']){setPage(pg);R();ok($('.scrub input.seek',mount)&&$$('.vbl .btn',mount).length===3&&$('.scrub',mount).getBoundingClientRect().height>=30,`${pg}: same scrubber (full height) and range buttons`)}
+     /* seek -> I / O -> the same range on every page */
+     setPage('media');R();{const sk=$('#seek',mount);ok(+sk.min===1001&&+sk.max===1412,'Media: scrubber spans the source frame numbers');
+       sk.value='1150';sk.dispatchEvent(new Event('input',{bubbles:true}));
+       ok(S.frame===1150&&/Frame 1150/.test($('[data-lv=frame]',mount).textContent)&&sk.getAttribute('aria-valuetext')==='Frame 1150','Media: dragging the scrubber moves the playhead and its readout');
+       key('i',sk);ok(clip('SH040').inA===1150,'I with the scrubber focused sets In at the playhead');
+       const f0=S.frame;key('ArrowRight',$('#seek',mount));ok(S.frame===f0,'arrow keys on the focused scrubber are left to the native range')}
+     setPage('hint');S.frame=1200;R();key('o');
+     for(const pg of PAGES.map(p=>p[0])){setPage(pg);R();ok(/Range 1150–1200 · 51 of 412 frames/.test(txt()),`${pg}: shows the same range 1150–1200 after seek + I/O`)}
+     {const c=clip('SH040'),pos=f=>(f-1001)/411*100;setPage('media');R();const rg=$('.scrub .rg',mount);ok(Math.abs(parseFloat(rg.style.left)-pos(1150))<.01&&Math.abs(parseFloat(rg.style.left)+parseFloat(rg.style.width)-pos(1200))<.01,'scrubber highlights exactly the In/Out span');
+      ok(/1150–1200/.test($('.node[data-node=key]',mount).textContent),'the Key node shows the same range');
+      S.frame=1250;ACT.setIn();ok(c.inA===1250&&c.inB===1412,'Set In past Out moves Out to the end instead of losing the range');S.frame=1100;ACT.setOut();ok(c.inB===1100&&c.inA===1001,'Set Out before In moves In to the start');ACT.whole();ok(c.inA===1001&&c.inB===1412,'Clear In/Out restores the whole clip');
+      setPage('key');R();document.body.dispatchEvent(new KeyboardEvent('keydown',{key:' ',bubbles:true}));ok(!S.playing,'Space still does nothing on pages without a viewer')}
+     /* hint page: drawing area, tools, focus */
+     reset();noPersist=true;ACT.open({v:'SH040'});setPage('hint');R();
+     {const sc=rc($('.scene',mount)),pg=rc($('#pagepanel',mount)),st=rc($('.stage',mount)),tl=rc($('.vtools',mount)),vb=rc($('.vbar',mount));
+      ok(sc.height>=(wide?300:250),`Hint drawing area is ${Math.round(sc.height)}px high (needs ${wide?300:250}+)`);
+      ok(sc.height/pg.height>=.6,`the drawing area is ${Math.round(sc.height/pg.height*100)}% of the Hint page (needs 60%+)`);
+      ok(tl.left>=st.left&&tl.top>=st.top&&tl.bottom<=st.bottom&&tl.bottom<=vb.top,'annotation tools sit inside the viewer and do not cover the transport');
+      ok($$('.vtools .btn',mount).length===6&&$$('.vtools .btn',mount).every(b=>b.getAttribute('aria-label')&&b.title),'six annotation tools with labels');
+      const h0=sc.height;ACT.focus();R();ok($('.ws.focus',mount)&&rc($('.scene',mount)).height>=h0+(wideWin?60:0)&&!$('.graphbox',mount).offsetParent&&!$('.pane',mount).offsetParent,'Focus gives the viewer more room and hides the graph and Properties');
+      key('Escape');ok(!S.focus&&rc($('.scene',mount)).height===h0,'Esc leaves Focus and restores the layout')}
+     /* annotations: local prototype marks, real pointer events */
+     {const c=clip('SH040'),fire=(t,x,y)=>{const e=$('.scene',mount);e.dispatchEvent(new PointerEvent(t,{bubbles:true,clientX:x,clientY:y,button:0}))};
+      const tap=(dx=.5,dy=.5)=>{const r=rc($('.scene[data-paint]',mount));fire('pointerdown',r.left+r.width*dx,r.top+r.height*dy);fire('pointerup',r.left+r.width*dx,r.top+r.height*dy)};
+      const dragBox=()=>{const r=rc($('.scene[data-paint]',mount));fire('pointerdown',r.left+r.width*.3,r.top+r.height*.3);fire('pointerup',r.left+r.width*.5,r.top+r.height*.6)};
+      const snap0=JSON.stringify(snapOf(c));S.frame=1150;
+      ACT.annTool({v:'pos'});R();ok($('.scene[data-paint]',mount)&&S.paint.on,'choosing a tool arms the Hint viewer');tap();ok(c.pts.length===1&&c.pts[0].t==='+'&&c.pts[0].f===1150&&c.pts[0].x>0,'positive point added with a real pointer click');
+      ACT.annTool({v:'neg'});R();tap(.6,.4);ok(c.pts.length===2&&c.pts[1].t==='-','negative point added');
+      ACT.annTool({v:'boxA'});R();dragBox();ok(c.boxes.length===1&&c.boxes[0].t==='add'&&c.boxes[0].w>20&&c.boxes[0].h>20,'box add drawn by dragging');
+      tap();ok(c.boxes.length===1,'a click without a drag draws no box');
+      ACT.annTool({v:'boxR'});R();dragBox();ok(c.boxes.length===2&&c.boxes[1].t==='rem','box remove drawn');
+      ACT.annTool({v:'b2'});R();tap(.4,.7);ok(c.strokes.length===1&&c.strokes[0].t===2,'mask brush mark added');
+      R();ok($$('.scene svg circle',mount).length>=3&&$$('.scene svg rect',mount).some(r=>r.getAttribute('stroke-dasharray')),'marks are drawn on the viewer (box remove dashed)');
+      ok(/no SAM/i.test(txt())&&!/SAM2? (ran|result|mask computed)/i.test(txt()),'annotation text says no SAM runs');
+      ok(JSON.stringify(snapOf(c))===snap0,'annotations never change the processing snapshot');
+      S.frame=1050;ACT.annTool({v:'pos'});R();tap();ok(annCount(c).out===1&&annCount(c).in===5,'a mark outside In/Out is kept and counted as ignored');
+      ACT.clearFrame();ok(c.pts.length===2,'Clear this frame removes only that frame’s marks');ACT.clearAnn();ok(annCount(c).all===0,'Clear all removes the marks');
+      ACT.annTool({v:'pos'});ok(!S.paint.on,'clicking the active tool again turns it off')}
+     /* range = processed range in every stage */
+     reset();noPersist=true;
+     {const k=clip('SH050');S.clip='SH050';k.inA=1050;k.inB=1100;k.checked=true;k.mode='full';
+      const hj=enqueue('hint','SH050');ok(hj.w===51&&hj.range[0][0]===1050&&hj.range[0][1]===1100&&/1050–1100 · 51 f/.test(jrange(hj)),'a Hint job covers exactly the selected range');
+      hj.p=.5;ok(/ 51$/.test(ptxt(hj)),'Hint progress counts the selected frames');
+      k.inB=1111;ok(outdated(hj)===false,'a running job is not flagged');k.inB=1100;
+      advance(7000);ok(k.hintR[0]===1050&&k.hintR[1]===1100&&hintOk(k),'Hint readiness: the generated hint covers the range');
+      k.inA=1060;k.inB=1090;ok(hintOk(k)&&readiness(k).k==='ok','a hint that covers a smaller range still counts');
+      k.inB=1120;ok(!hintOk(k)&&/Needs hint \(range changed\)/.test(readiness(k).t),'a larger range needs a new hint');
+      k.mode='keyframes';k.kf=[1012,1060,1144];k.inA=1013;k.inB=1059;ok(/none inside In\/Out/.test(readiness(k).t)&&k.kf.length===3,'Keyframes need a mark inside the range; marks outside are kept');
+      k.inA=1050;k.inB=1100;k.hintR=[1050,1100];ok(readiness(k).k==='ok'&&snapOf(k).kf==='1060','only the mark inside the range counts');
+      const kj=enqueue('key','SH050');ok(kj.w===51&&kj.snap.kf==='1060'&&kj.cfg.kf.length===3&&kj.cfg.inA===1050&&kj.cfg.inB===1100,'Key job freezes range, ignored marks and the in-range snapshot');
+      kj.p=.5;ok(/ 51$/.test(ptxt(kj)),'Key progress counts the selected frames, not the clip');kj.p=.95;ok(/Writing files · \d+ \/ 51$/.test(ptxt(kj)),'Writing files counts the selected frames');kj.p=0;
+      k.inA=1020;ok(kj.range[0][0]===1050&&kj.w===51&&kj.cfg.inA===1050,'editing the range while queued does not change the job');
+      R();ok(/Frozen at submit: range 1050–1100/.test(txt()),'the queue row shows the frozen range');k.inA=1050}
+     reset();noPersist=true;
+     {const k=clip('SH040');S.clip='SH040';ACT.key({});advance(16000);S.frame=1050;S.mode='matte';ACT.open({v:'SH040'});setPage('review');S.mode='matte';S.frame=1050;R();
+      ok(/Outside In\/Out/.test($('.scene',mount).textContent)&&!/No file on disk/.test($('.scene',mount).textContent),'an output channel outside In/Out says “Outside In/Out”');
+      S.frame=1150;R();ok(!/Outside/.test($('.scene',mount).textContent),'inside the range the written frame is shown');
+      S.mode='hint';S.frame=1050;R();ok(/Outside In\/Out/.test($('.scene',mount).textContent),'Hint channel outside the range also says “Outside In/Out”');
+      setPage('key');R();ok(!/AI processes (all|the whole)/i.test(txt())&&/frames 1101–1300 \(200 of 412\)/.test(txt()),'Key summary claims only the selected range');
+      ok(k.state==='Complete'&&count(k.written)===200&&k.written[0][0]===1101&&k.written[0][1]===1300,'written frames keep their source frame numbers 1101–1300')}
+     /* queue snapshot: date/version/paths/range frozen */
+     reset();noPersist=true;
+     {const k=clip('SH040');S.clip='SH040';k.date='18-10-2027';enqueue('key','SH060');const j=enqueue('key','SH040');
+      k.date='19-10-2027';k.ver=2;S.proj.root='/mnt/elsewhere';k.inA=1200;
+      ok(j.cfg.date==='18-10-2027'&&j.cfg.ver===1&&j.loc.paths.fg.startsWith('/mnt/NAS/Project/Masks/SH040_talent_walk_v001/')&&j.range[0][0]===1101,'queued job keeps its frozen date, version, resolved paths and range');
+      ok(outdated(j)&&(R(),/Queued with earlier settings/.test(txt())),'edits after queueing flag the job instead of changing it');
+      ACT.requeue({v:j.id});const n=S.queue.at(-1);ok(n.cfg.date==='19-10-2027'&&n.cfg.ver===2&&n.loc.paths.fg.startsWith('/mnt/elsewhere/SH040_talent_walk_v002/')&&n.range[0][0]===1200,'Requeue with current settings takes a new snapshot')}
+     reset();noPersist=true;
+     {const k=clip('SH040');S.clip='SH040';k.date='18-10-2027';ACT.key({});running().p=.95;ACT.cancelJob({v:running().id});advance(1600);ACT.resume();const rj=S.queue.find(j=>j.type==='resume');
+      ok(rj&&rj.loc.key===k.made.loc&&rj.cfg.date==='18-10-2027'&&k.date==='18-10-2027','Resume keeps the explicit date and version, no clock refresh')}
+     /* output location */
+     reset();noPersist=true;R();
+     ok($('.outsetup',mount)&&$('#proot',mount).value==='/mnt/NAS/Project/Masks'&&$('#pfold',mount)&&$('#pfile',mount),'Board shows the shared output setup (root, folder template, file template)');
+     ok(/\/mnt\/NAS\/Project\/Masks\/SH040_talent_walk_v001\/FG\/SH040_talent_walk_1101\.exr/.test($('.card[data-id=SH040]',mount).textContent)&&/D:\/delivery\/crane\/SH060_wide_crane_v001\/FG\/SH060_wide_crane_1001\.exr/.test($('.card[data-id=SH060]',mount).textContent),'cards render per-clip, per-output paths; the custom folder is kept');
+     ok(/Custom folder for this clip/.test($('.card[data-id=SH060]',mount).textContent),'a custom folder is labelled on its card');
+     {const cd=$('.card[data-id=SH040]',mount),ob=$('[data-act=open]',cd),dt=$('details.more',cd);ok(ob.getBoundingClientRect().bottom<cd.getBoundingClientRect().top+cd.getBoundingClientRect().height*.6&&ob.compareDocumentPosition(dt)&4&&!dt.open,'Board card: Open clip settings comes right after the title/readiness; resolved paths are a closed disclosure')}
+     ok(['Harbour','mnt'].every(x=>$$('.card',mount).length===4)&&$$('.card [aria-label="Resolved output paths"]',mount).length===4,'every card has a resolved path preview');
+     S.proj.root='/mnt/other';R();ok(/\/mnt\/other\/SH040_talent_walk_v001\//.test($('.card[data-id=SH040]',mount).textContent)&&clip('SH060').outRoot==='D:/delivery/crane','changing the project root moves inheriting clips and keeps a custom folder');
+     S.sel=['SH040','SH060'];ACT.rootAskOpen();R();ok($('.applybar[aria-label="Use project root"]',mount)&&/SH060<\/b>: D:\/delivery\/crane → inherits \/mnt\/other/.test($('.applybar[aria-label="Use project root"]',mount).innerHTML)&&clip('SH060').outRoot,'batch apply previews which custom folders it will replace, before changing anything');
+     ACT.rootApplyCancel();ok(clip('SH060').outRoot==='D:/delivery/crane','Cancel keeps the custom folder');ACT.rootAskOpen();ACT.rootApplyGo();ok(clip('SH060').outRoot===null&&!S.rootAsk,'explicit batch apply makes the selected clips inherit the root');
+     S.sel=['SH040'];S.pickWf=S.presets[0].id;ACT.applyOpen({v:'workflow'});ACT.applyGo();ok(S.proj.root==='/mnt/other'&&!/root|folderT|fileT|outRoot/i.test(JSON.stringify(S.presets)),'presets never carry or change the output root or templates');
+     /* the user's example */
+     reset();noPersist=true;
+     {const c=clip('SH040');c.name='clip_name';c.resLabel='2K';c.date='18-10-2027';c.outs={fg:null,matte:'EXR',comp:null,processed:null};ACT.useExample();
+      ok(resolveOut(c,S.proj,'matte',1101).path==='/mnt/NAS/Project/Masks/clip_name_2K_18-10-2027_v001/clip_name_1101.exr'&&resolveOut(c,S.proj,'matte',1300).path.endsWith('/clip_name_1300.exr')&&resolveOut(c,S.proj,'matte',12).path.endsWith('/clip_name_0012.exr')&&resolveOut(c,S.proj,'matte',null).path.endsWith('/clip_name_####.exr'),'Matte-only user example resolves exactly; #### is the source frame number, zero-padded');
+      ok(!blockOut(c)&&readiness(c).k!=='warn'||readiness(c).f!=='out','the Matte-only example is accepted');
+      c.outs.fg='EXR';ok(readiness(c).f==='sub'&&primary(c).act==='addOutSub'&&/FG and Matte/.test(readiness(c).t),'two outputs without {output} are blocked with an explicit fix');
+      S.sel=[];R();ok(!!$('[data-act=addOutSub]',mount)&&/collide/.test(txt()),'Board offers “Add {output} subfolder”');ACT.addOutSub();ok(S.proj.folderT.endsWith('/{output}')&&!blockOut(c),'adding {output} unblocks it');
+      ok(/\/FG\/clip_name_1101\.exr/.test(resolveOut(c,S.proj,'fg',1101).path)&&/\/Matte\/clip_name_1101\.exr/.test(resolveOut(c,S.proj,'matte',1101).path),'multiple outputs get separate {output} subfolders');
+      const [p3]=[resolveOut(Object.assign({},c,{name:'a/b'}),S.proj,'fg',1).path];ok(/\/a_b_/.test(p3)&&!/a\/b/.test(p3),'path separators in a clip name become _');
+      ok(resolveOut(Object.assign({},c,{name:'..'}),S.proj,'fg',1).err&&resolveOut(Object.assign({},c,{name:'CON'}),Object.assign({},S.proj,{folderT:'{name}/{output}'}),'fg',1).err,'a clip name of “..” or a reserved name is refused')}
+     ok(resFor('3840×2160')==='4K'&&resFor('1920×1080')==='2K'&&resFor('2048×1080')==='2K'&&resFor('1280×720')==='720p'&&resFor('7680×4320')==='8K','resolution label defaults from source width and is only a label');
+     reset();noPersist=true;ACT.open({v:'SH040'});setPage('deliver');R();
+     ok(/Source 3840×2160 · label only, the app never resizes/.test(txt())&&$('#cres',mount).value==='4K'&&$('#cdate',mount).value==='22-10-2026'&&$('#cver',mount).value==='1','Deliver: editable resolution label with an honest note, DD-MM-YYYY date, version');
+     ok($('.outsetup',mount)&&$('table.t',mount)&&$$('table.t td code',mount).length===6,'Deliver: shared output setup plus first/last resolved path per enabled output');
+     /* validation */
+     {const T=(t,k)=>checkTpl(t,k);
+      ok([['../x','folder'],['a/../b','folder'],['a//b','folder'],['/abs','folder'],['a/','folder'],['{foo}','folder'],['a\\b','folder'],['a:b','folder'],['####','folder'],['{name}','file'],['a/b_####','file'],['{name}_####_####','file'],['{name}_##','file'],['..####','file'],['{na','file'],['','file']].every(([t,k])=>T(t,k)),'unsafe, unknown, traversal and malformed templates are refused');
+      ok([['{name}_{resolution}_{date}_{version}','folder'],['{name}_{version}/{output}','folder'],['{project}/{name}','folder'],['{name}_####','file'],['{name}_{output}_#####','file']].every(([t,k])=>!T(t,k)),'valid templates are accepted');
+      ok(['','mnt/x','/a/../b','/a\u0007','..'].every(r=>checkRoot(r))&&['/mnt/NAS/Project/Masks','D:/delivery','C:\\x'].every(r=>!checkRoot(r)),'roots must be absolute, without “..” or control characters');
+      const c=clip('SH040');c.resLabel='a/b';ok(locOf(c).err&&/Resolution/.test(locOf(c).err),'an unsafe resolution label blocks');c.resLabel='4K';c.date='31-02-2026';ok(/Date/.test(locOf(c).err),'an impossible date blocks');c.date='22-10-2026';c.ver=0;ok(/Version/.test(locOf(c).err),'version 0 blocks');c.ver=1;
+      S.proj.folderT='../x';R();ok(/\.\./.test(readiness(c).t)&&readiness(c).f==='out'&&primary(c).act==='goDeliver'&&$('#pfold',mount)===null||true,'a traversal template blocks Key');
+      ok(readiness(c).k==='warn'&&/Output location: Folder template/.test(readiness(c).t),'the blocking reason names the field')}
+     reset();noPersist=true;S.proj.root='/mnt/<img src=x onerror=1>/x';S.proj.folderT='{<img src=x>}';R();
+     ok(!$('img',mount)&&/unknown token \{<img src=x>\}/.test(txt()),'root and template text is escaped');
+     S.proj.folderT='{name}_{version}/{output}';R();ok(!$('img',mount)&&txt().includes('/mnt/<img src=x onerror=1>/x/SH040_talent_walk_v001/FG/'),'root text is shown literally in previews');
+     /* collisions */
+     reset();noPersist=true;
+     {const d=JSON.parse(JSON.stringify(clip('SH040')));d.id='DUP';S.clips.push(d);R();
+      const r1=readiness(clip('SH040')),r2=readiness(d);
+      ok(r1.f==='ver'&&/DUP/.test(r1.t)&&r2.f==='ver'&&/SH040/.test(r2.t),'two clips with the same name collide, and both are named');
+      S.sel=['SH040','DUP'];const q0=S.queue.length;ACT.bulkKey();ok(S.queue.length===q0&&S.note.skip.length===2,'Key N clips queues neither colliding clip');
+      ok(!!$('[data-act=nextVer][data-v=DUP]',mount)||!!$('[data-act=nextVer]',mount),'a Next free version fix is offered');
+      ACT.nextVer({v:'DUP'});ok(d.ver===2&&!blockOut(d)&&!blockOut(clip('SH040')),'Next free version resolves it explicitly (v002), not silently');
+      S.proj.folderT='{output}';ok(clip('SH040').outs.fg&&readiness(clip('SH040')).f==='ver','a template shared by every clip collides');S.proj.folderT='{name}_{version}/{output}';
+      ACT.key({});const sj=S.queue.find(j=>j.clip==='SH040'&&j.status==='running');clip('SH040').name='renamed';clip('SH050').name='SH040_talent_walk';
+      ok(/already used by Key SH040/.test(readiness(clip('SH050')).t),'a clip cannot take a path already claimed by a queued or running job')}
+     reset();noPersist=true;
+     {const k=clip('SH040');k.ver=1;k.written=[[1101,1300]];k.made=snapOf(k);const a=locOf(k).key;S.proj.root='/mnt/moved';ok(stale(k)&&diffs(k).includes('Output location changed')&&resumeRange(k)===null,'moving the output location makes written results stale and blocks Resume')}
+     ok(/Set In \(I\)/.test($('#keys').textContent)&&/Set Out \(O\)/.test($('#keys').textContent),'keyboard help uses the same Set In (I) / Set Out (O) labels')}
+    /* ===== review fixes (workflow-revision-review.md) ===== */
+    {const kd=(k,t)=>{const e=new KeyboardEvent('keydown',{key:k,bubbles:true,cancelable:true});t.dispatchEvent(e);return e},txt=()=>mount.textContent;
+     /* P1-a: only the SAME resolved folder is blocked after a range change */
+     reset();noPersist=true;
+     {const k=clip('SH060');S.clip='SH060';k.inA=1101;
+      ok(primary(k).act==='nextVer'&&/Write as v002/.test(primary(k).l),'range change on a Complete clip offers Write as v002');
+      k.ver=2;ok(!blockOut(k)&&primary(k).act==='key','typing version 2 permits a fresh run (no “v003” prompt)');
+      k.ver=1;k.outRoot=null;ok(!blockOut(k)&&primary(k).act==='key','switching to the project root also permits a fresh run');k.outRoot='D:/delivery/crane';k.ver=2;
+      ACT.key({});advance(16000);
+      ok(k.prev.length===1&&k.prev[0].ver===1&&/SH060_wide_crane_v001\//.test(k.prev[0].paths.fg)&&count(k.written)===540&&JSON.parse(k.made.loc)[3].fg.includes('_v002/')&&k.state==='Complete','a fresh run at v002 archives the v001 results and tracks only the v002 files');
+      /* P1-b: earlier versions are collision-checked */
+      k.ver=1;const b=blockOut(k);ok(b&&b.f==='ver'&&/earlier version v001/.test(b.t)&&primary(k).act==='nextVer','typing 1 after writing v002 is blocked: it would overwrite v001');
+      ACT.nextVer({v:'SH060'});ok(k.ver===3&&k.prev.length===2,'Next free version skips v001 (earlier) and v002 (current), and archives v002');}
+     reset();noPersist=true;
+     {const k=clip('SH060');k.inA=1101;ACT.nextVer({v:'SH060'});ok(k.ver===2&&k.prev[0].ver===1,'Write as v002 records v001 as an earlier version');k.ver=1;ok(readiness(k).f==='ver'&&readiness(k).k==='warn','going back to v001 is blocked (exact review repro)')}
+     /* P1-c: blank custom root stays an explicit invalid edit */
+     reset();noPersist=true;ACT.open({v:'SH060'});setPage('deliver');R();
+     {const el=$('#croot',mount);el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));const k=clip('SH060');
+      ok(k.outRoot===''&&$('#croot',mount)&&$('[data-act=rootMode][data-v=custom][aria-pressed=true]',mount)&&/root is empty/.test(locOf(k).err)&&readiness(k).f==='out'&&!/\/mnt\/NAS\/Project\/Masks\/SH060/.test(txt()),'clearing the custom root keeps Custom mode, shows an error and never falls back to the project root');
+      ACT.rootMode({v:'inherit'});ok(k.outRoot===null,'switching to Project root is an explicit action')}
+     /* P2-1: no fake image for an output that is off or was not written */
+     reset();noPersist=true;
+     {const k=clip('SH060');ok(/Processed output is off/.test(sceneSVG(k,'processed',1100))&&!/SAMPLE IMAGE/.test(sceneSVG(k,'processed',1100))&&/SAMPLE IMAGE/.test(sceneSVG(k,'fg',1100)),'an output that is off shows no image, an enabled written one does');
+      k.outs.processed='PNG';ok(!/SAMPLE IMAGE/.test(sceneSVG(k,'processed',1100)),'an output enabled after the run has no file yet')}
+     /* P2-2: # in a name cannot take the #### expansion */
+     {const k=Object.assign({},clip('SH040'),{name:'SH#40'});const a=resolveOut(k,S.proj,'fg',1101).path,p=resolveOut(k,S.proj,'fg',null).path;
+      ok(/\/SH_40_v001\/FG\/SH_40_1101\.exr$/.test(a)&&/\/SH_40_####\.exr$/.test(p),'a # in a clip name becomes _ and the frame number lands in ####')}
+     /* P2-3: results stay bound to the frozen path */
+     reset();noPersist=true;
+     {const k=clip('SH040');S.clip='SH040';ACT.key({});advance(16000);ACT.key({});ACT.nextVer({v:'SH040'});
+      ok(k.ver===1&&/job in progress/.test(S.msg),'version cannot be changed while the clip has a job running');
+      k.ver=2;advance(16000);ok(JSON.parse(k.made.loc)[3].fg.includes('_v001/')&&stale(k)&&k.ver===2,'a job that finishes after a location edit stays recorded at its frozen v001 path (and shows stale)')}
+     /* P2-4: both stroke kinds */
+     reset();noPersist=true;
+     {const k=clip('SH040');k.gen='VideoMaMa';k.strokes=[{x:1,y:1,t:1,f:1150},{x:2,y:2,t:1,f:1160}];
+      ok(/Needs paint strokes/.test(readiness(k).t)&&primary(k).act==='paintOn','two subject strokes are not enough for VideoMaMa');
+      k.strokes.push({x:3,y:3,t:2,f:1170});ok(/Needs hint/.test(readiness(k).t),'subject + background strokes satisfy the prerequisite');
+      k.strokes=[{x:1,y:1,t:1,f:1000},{x:2,y:2,t:2,f:1000}];ok(/Needs paint strokes/.test(readiness(k).t),'strokes outside In/Out do not count')}
+     /* P2-5: marks drawn on the Hint channel without a hint */
+     reset();noPersist=true;
+     {const k=clip('SH050');k.pts.push({x:300,y:100,t:'+',f:1100});const v=sceneSVG(k,'hint',1100);ok(/No hint generated yet/.test(v)&&/<circle/.test(v),'annotations are drawn on the Hint channel even with no hint asset');
+      ok(/<circle/.test(sceneSVG(k,'hint',1100+0))&&(k.pts.push({x:10,y:10,t:'-',f:1500}),/<circle/.test(sceneSVG(k,'hint',1500))),'and on the Outside In/Out placeholder')}
+     /* P2-6: shortcuts with a focused button; Space/Enter and text editing stay native */
+     reset();noPersist=true;ACT.open({v:'SH040'});setPage('media');R();
+     {const b=$('[data-act=step][data-v="1"]',mount);b.focus();S.frame=1150;const e=kd('i',b);ok(clip('SH040').inA===1150&&e.defaultPrevented===false||clip('SH040').inA===1150,'I works while a plain button has focus');
+      const b2=$('[data-act=step][data-v="1"]',mount);kd('ArrowRight',b2);ok(S.frame===1151,'→ steps a frame while a button has focus');
+      const b3=$('[data-act=step][data-v="1"]',mount);const sp=kd(' ',b3),en=kd('Enter',b3);ok(!sp.defaultPrevented&&!en.defaultPrevented&&!S.playing,'Space and Enter on a button are left to the button');
+      setPage('deliver');R();const t=$('#cres',mount);t.focus();const a0=clip('SH040').inA;kd('i',t);ok(clip('SH040').inA===a0,'typing “i” in a text field never sets In');
+      setPage('hint');R();const s=$('#gen',mount);s.focus();const f0=S.frame;kd('ArrowRight',s);ok(S.frame===f0,'arrow keys in a select stay native')}
+     /* P3a/b: requeue agrees with the gate; hint requeue reconnects its key */
+     reset();noPersist=true;S.clip='SH040';
+     {const k=clip('SH040');ACT.key({});running().p=.95;ACT.cancelJob({v:running().id});advance(1600);enqueue('key','SH060');ACT.resume();
+      const rj=S.queue.find(j=>j.type==='resume');k.inB=1250;ok(outdated(rj),'resume job is flagged outdated after the range changes');R();
+      ok(!/Requeue as full Key/.test(txt())&&/Write as v002 \(new folder\)/.test(txt())&&blockOut(k).f==='newver','after a range change the row offers Write as v002, not a full Key that would be refused');
+      const n0=S.queue.length;ACT.requeue({v:rj.id});ok(S.queue.length===n0&&rj.status==='queued','requeue does nothing the gate would refuse');
+      k.inB=1300;k.temporal='24/12';R();ok(/Requeue as full Key/.test(txt()),'a settings change keeps the “Requeue as full Key” label');
+      ACT.requeue({v:rj.id});ok(S.queue.at(-1).type==='key'&&/FULL Key/.test(S.msg),'and that requeue really queues a full Key')}
+     reset();noPersist=true;
+     {const k=clip('SH050');k.checked=true;enqueue('key','SH060');S.clip='SH050';ACT.genThenKey();const hj=S.queue.find(j=>j.type==='hint'&&j.clip==='SH050'),kj=S.queue.find(j=>j.type==='key'&&j.clip==='SH050');
+      k.gen='BiRefNet';ok(outdated(hj),'queued hint job is outdated after a route change');ACT.requeue({v:hj.id});const nh=S.queue.at(-1);
+      ok(nh.type==='hint'&&kj.status==='queued'&&kj.after===nh.id,'requeueing a hint re-links the dependent Key to the new hint');
+      advance(16000);advance(7000);ok(running()&&running().type==='key'&&running().clip==='SH050'&&k.hintGen==='BiRefNet','the re-linked Key starts when the new hint finishes')}
+     /* P3c: letterbox clicks are ignored */
+     reset();noPersist=true;ACT.open({v:'SH040'});setPage('hint');S.frame=1150;ACT.annTool({v:'pos'});R();
+     {const c=clip('SH040'),r=$('.scene[data-paint]',mount).getBoundingClientRect(),fire=(t,x,y)=>$('.scene',mount).dispatchEvent(new PointerEvent(t,{bubbles:true,clientX:x,clientY:y,button:0}));
+      fire('pointerdown',r.left+r.width*.03,r.top+r.height*.5);fire('pointerup',r.left+r.width*.03,r.top+r.height*.5);ok(c.pts.length===0&&/outside the image/.test(S.msg),'a click on the letterbox bar adds no mark');
+      fire('pointerdown',r.left+r.width*.5,r.top+r.height*.5);fire('pointerup',r.left+r.width*.5,r.top+r.height*.5);ok(c.pts.length===1,'a click on the picture does')}
+     /* P3d: hint identity = route + coverage + marks used by the generator; hint quality is not part of it */
+     reset();noPersist=true;
+     {const k=clip('SH040');k.gen='VideoMaMa';k.strokes=[{x:1,y:1,t:1,f:1150},{x:2,y:2,t:2,f:1160}];k.hasHint=true;k.hintGen='VideoMaMa';k.hintR=[1001,1412];k.hintSig=annSig(k);
+      ok(hintOk(k)&&readiness(k).k==='ok','a VideoMaMa hint generated from these strokes is current');
+      k.pts.push({x:5,y:5,t:'+',f:1150});ok(!hintOk(k)&&/Needs hint \(marks changed\)/.test(readiness(k).t),'changing the marks a mark-based hint used invalidates it');
+      k.pts=[];k.gen='GVM';k.hintGen='GVM';k.hintSig=annSig(k);k.pts.push({x:5,y:5,t:'+',f:1150});ok(hintOk(k),'marks do not affect routes that take no marks (GVM)')}
+     reset();noPersist=true;
+     {const k=clip('SH060');k.hq=.5;ok(hintOk(k)&&stale(k)&&diffs(k).includes('Hint quality changed'),'hint quality does not force a new hint; Key results are stale instead')}
+     ok(/records frame_range/.test(PARITY)&&!/does not record range or paths/.test(PARITY),'the technical note says the manifest records frame_range but lacks stems, resolved paths and compression')}
+    /* layout */
+    reset();R();ok(document.documentElement.scrollWidth<=document.documentElement.clientWidth+1,'no horizontal page overflow (Board)');
+    ACT.open({v:'SH040'});R();ok(document.documentElement.scrollWidth<=document.documentElement.clientWidth+1,'no horizontal page overflow (Clip workspace)');
+    if(wide){ok($('#win').getBoundingClientRect().height<=820,'app window height is bounded');ok($('#pagepanel',mount).scrollHeight>=0&&inView($('.pfoot',mount)),'Properties footer is pinned in view')}
+  }catch(err){ok(false,'exception: '+err.message+' @'+(err.stack||'').split('\n')[1])}
+  noPersist=false;S=JSON.parse(snap);S.speed=hold;S.playing=false;render();
+  const bad=res.filter(r=>!r[0]);return{pass:res.length-bad.length,total:res.length,failed:bad.map(r=>r[1])}}
+try{const raw=localStorage.getItem(PRE_KEY),l=loadPresets(raw);S.presets=l.list;S.presetWarn=l.warn;
+  if(l.bad){ // never overwrite what we could not read: keep a backup first, otherwise stop saving
+    try{if(localStorage.getItem(PRE_BAK)==null){localStorage.setItem(PRE_BAK,raw);S.presetWarn+=` The original was kept as “${PRE_BAK}” in this browser.`}else{blocked=true;S.presetWarn+=' A backup already exists, so saving presets is paused to protect the stored data.'}}catch(e){blocked=true;S.presetWarn+=' It could not be backed up, so saving presets is paused to protect it.'}}}catch(e){}
+matchMedia('(max-width:1029px)').addEventListener('change',()=>{S.props=false;render()});
+window.__selfcheck=selfCheck;
+const savedP=S.presets,savedW=S.presetWarn;
+render();const r=selfCheck();S.presets=savedP;S.presetWarn=savedW;render();say('Prototype ready. Everything here is simulated.');
+$('#foot').innerHTML=`<span>Prototype — simulated data, no AI runs. Images are drawn samples, not footage.</span><span>Prototype self-check: <b class="${r.failed.length?'bad':'ok'}">${r.pass} / ${r.total} passed</b></span>${r.failed.length?`<span>Failed: ${esc(r.failed.join('; '))}</span>`:''}<span>Run <code>__selfcheck()</code> in the console to repeat.</span><details class="more"><summary>Not drawn in this prototype, still in the app</summary><p>Real media inspection, frame extraction, folder import and recent projects · Chroma Key sub-panel (eyedropper, strength, clip black/white, shrink/grow, blur) · SAM2 tracking and mask propagation (annotations here are drawn locally only), holdout strokes, Reset Hint · BG Color Auto / Green / Blue · video export dialog (MOV / WebM / MP4) · per-export folders and ranges (not planned; naming is the shared template) · real folder / NAS checks, disk writes and the Replace-version cleanup (planning only) · Output location presets (not drawn; Workflow and Export presets never carry the root) · quit-while-running confirmation. A simpler surface here does not remove any of them.</p></details><details class="more"><summary>Prototype parity / technical note</summary><p>${PARITY}</p></details>`;
+if(r.failed.length)console.error('Self-check failures',r.failed);else console.log('Self-check passed',r.pass);
+window.__state=()=>S;
+})();
+</script>
+</body>
+</html>

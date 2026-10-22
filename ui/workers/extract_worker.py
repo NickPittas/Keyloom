@@ -19,7 +19,7 @@ from PySide6.QtCore import QThread, Signal
 
 from backend.ffmpeg_tools import (
     require_ffmpeg_install, probe_video, extract_frames,
-    write_video_metadata, build_exr_vf,
+    write_video_metadata, build_video_metadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,26 +192,7 @@ class ExtractWorker(QThread):
                 return
 
             # Write metadata sidecar (for stitching back later)
-            metadata = {
-                "source_path": job.video_path,
-                "fps": info.get("fps", 24.0),
-                "width": info.get("width", 0),
-                "height": info.get("height", 0),
-                "frame_count": extracted,
-                "codec": info.get("codec", "unknown"),
-                "duration": info.get("duration", 0),
-                "exr_vf": build_exr_vf(info),
-                "source_probe": {
-                    "frame_count": info.get("frame_count", 0),
-                    "pix_fmt": info.get("pix_fmt", ""),
-                    "color_space": info.get("color_space", ""),
-                    "color_primaries": info.get("color_primaries", ""),
-                    "color_transfer": info.get("color_transfer", ""),
-                    "color_range": info.get("color_range", ""),
-                    "chroma_location": info.get("chroma_location", ""),
-                    "bits_per_raw_sample": info.get("bits_per_raw_sample", 0),
-                },
-            }
+            metadata = build_video_metadata(job.video_path, info, extracted)
             write_video_metadata(job.clip_root, metadata)
 
             logger.info(f"Extraction complete: {job.clip_name} ({extracted} frames)")

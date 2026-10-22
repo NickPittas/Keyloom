@@ -1027,3 +1027,14 @@ def test_stitch_exr_to_prores4444_without_apply_trc(tmp_path):
          "-of", "csv=p=0", str(out)], capture_output=True, text=True, check=True)
     codec, pix_fmt = probe.stdout.strip().split(",")
     assert codec == "prores" and pix_fmt.startswith("yuva444")
+
+
+def test_build_video_metadata_matches_sidecar_contract(tmp_path):
+    info = {"fps": 25.0, "width": 64, "height": 36, "frame_count": 5, "codec": "h264", "duration": 0.2,
+            "pix_fmt": "yuv420p", "color_space": "bt709", "color_range": "tv", "color_transfer": "bt709"}
+    md = ffmpeg_tools.build_video_metadata("/x/a.mp4", info, 5)
+    assert md["frame_count"] == 5 and md["fps"] == 25.0 and md["source_probe"]["color_transfer"] == "bt709"
+    assert md["exr_vf"] == ffmpeg_tools.build_exr_vf(info)
+    ffmpeg_tools.write_video_metadata(str(tmp_path), md)
+    assert ffmpeg_tools.read_video_metadata(str(tmp_path)) == md
+    assert not (tmp_path / ".video_metadata.json.tmp").exists()

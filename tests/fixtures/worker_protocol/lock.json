@@ -1,0 +1,31 @@
+{
+  "description": "Schema 1 of <manifest_dir>/.corridorkey_job.lock (JSON, created O_CREAT|O_EXCL|O_NOFOLLOW). Liveness is the file MTIME (utime every heartbeat_interval_s); 'heartbeat' is only the creation time. Proof of death (same host only): pid absent, OR /proc/<pid>/stat starttime != proc_start_ticks, OR boot_id != current boot_id. A stale mtime alone never proves death. Null fields mean 'unknown': treat as unprovable. 'platform' is sys.platform: on 'linux' proc_start_ticks is /proc/<pid>/stat field 22; on 'win32' it is the process creation FILETIME (100 ns units since 1601) and boot_id is null, so on Windows only 'pid gone' or 'creation time differs' prove death. Same-host proof only; a different host proves nothing.",
+  "required_keys": [
+    "schema",
+    "job_id",
+    "clip_id",
+    "host",
+    "platform",
+    "pid",
+    "boot_id",
+    "proc_start_ticks",
+    "worker_rev",
+    "started",
+    "heartbeat",
+    "heartbeat_interval_s"
+  ],
+  "example": {
+    "schema": 1,
+    "job_id": "job-key-new",
+    "clip_id": "proj-9f2c/clips/clip_name",
+    "host": "render2",
+    "pid": 4242,
+    "proc_start_ticks": 123456789,
+    "worker_rev": "unknown",
+    "started": 1792000000.5,
+    "heartbeat": 1792000000.5,
+    "heartbeat_interval_s": 10.0,
+    "platform": "linux",
+    "boot_id": "b5f1c0de-0000-4000-8000-000000000000"
+  }
+}

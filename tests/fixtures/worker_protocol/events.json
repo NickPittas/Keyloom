@@ -1,0 +1,28 @@
+{
+  "description": "Worker -> app events, one JSON object per line on stdout. Field sets are exact.",
+  "events": [
+    {"v":1,"event":"hello","protocol":1,"worker_rev":"unknown","engine":"corridorkey-v2","host":"render2","platform":"linux",
+     "gpu":{"index":0,"name":"NVIDIA GeForce RTX 4090","vram_gb":24.0},
+     "models":{"corridorkey_v2":{"path":"/models/weights/corridorkey_v2.safetensors","bytes":123,"sha256":"abababababababababababababababababababababababababababababababab"}},
+     "capabilities":{"key":true,"generate_hint":false,"publish_modes":["final"]}},
+    {"v":1,"event":"accepted","job_id":"job-key-new"},
+    {"v":1,"event":"rejected","job_id":"job-bad-paths","code":"paths","message":"outputs.matte: bad, duplicate or out-of-folder path"},
+    {"v":1,"event":"rejected","job_id":null,"code":"protocol","message":"not JSON"},
+    {"v":1,"event":"status","job_id":"job-key-new","message":"Loading model..."},
+    {"v":1,"event":"progress","job_id":"job-key-new","phase":"publish","done":1,"total":3},
+    {"v":1,"event":"warning","job_id":"job-key-new","message":"example warning"},
+    {"v":1,"event":"profile","job_id":"job-key-new","hann_chunk":80,"hann_stride":40,"low_vram":false},
+    {"v":1,"event":"published","job_id":"job-key-new","stems":["shot_1003"]},
+    {"v":1,"event":"done","job_id":"job-key-new","outcome":"complete","message":null,"error_kind":null,
+     "manifest":"/mnt/NAS/Project/Masks/clip_name_2K_18-10-2027_v001/.corridorkey_manifest.json",
+     "published":3,"skipped":0,"expected":3,"manifest_complete":true},
+    {"v":1,"event":"done","job_id":"job-key-new","outcome":"cancelled","message":"Cancelled; published frames were kept.","error_kind":null,
+     "manifest":null,"published":0,"skipped":0,"expected":3,"manifest_complete":false}
+  ],
+  "rejected_codes": ["busy","protocol","invalid","paths","exists","range","hint"],
+  "error_kinds": ["oom","input","disk","engine","internal"],
+  "commands": [
+    {"v":1,"cmd":"cancel","job_id":"job-key-new"},
+    {"v":1,"cmd":"shutdown"}
+  ]
+}

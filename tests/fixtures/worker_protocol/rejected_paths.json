@@ -1,0 +1,9 @@
+{
+  "description": "A traversal path must be refused before any write",
+  "expect": {"parse":"rejected","code":"paths"},
+  "message": {"v": 1, "cmd": "key", "job": {
+    "job_id": "job-bad-paths", "clip_id": "proj-9f2c/clips/clip_name", "clip_root": "/mnt/NAS/Project/clip_name",
+    "range": {"in_point":2,"out_point":4,"in_stem":"shot_1003","out_stem":"shot_1005"}, "params": {"input_is_linear":false,"use_alpha_hint":false,"hint_quality":0.95,"carry_hint":true,"carry_hint_quality":0.95,"vram_profile":"auto","despill_strength":0.5,"cutout_linear":false,"hint_mode":"none","temporal_window":"auto"}, "output_config": {"fg_enabled":false,"fg_format":"exr","matte_enabled":true,"matte_format":"exr","comp_enabled":false,"comp_format":"png","processed_enabled":false,"processed_format":"exr","exr_compression":"dwab"}, "hint_keyframes_abs": null,
+    "outputs": {"matte":["/mnt/NAS/Project/Masks/clip_name_2K_18-10-2027_v001/clip_name_1003.exr","/mnt/NAS/Project/Masks/clip_name_2K_18-10-2027_v001/../../escape/clip_name_1004.exr","/mnt/NAS/Project/Masks/clip_name_2K_18-10-2027_v001/clip_name_1005.exr"]}, "manifest_dir": "/mnt/NAS/Project/Masks/clip_name_2K_18-10-2027_v001", "mode": "new", "publish": "final",
+    "path_map": [], "require": {"protocol":1,"models":{"corridorkey_v2":null}}}}
+}

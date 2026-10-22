@@ -123,10 +123,14 @@ class InferenceMixin:
         from ..ffmpeg_tools.discovery import find_ffmpeg
         return find_ffmpeg() or "ffmpeg"
 
-    def _v2_check_disk(self, clip: ClipEntry, cfg, root: str) -> None:
-        """Fail early if scratch EXRs (assumed uncompressed float32) cannot fit."""
-        dims = clip.input_asset.get_dimensions()
-        count = clip.input_asset.frame_count
+    def _v2_check_disk(self, clip: ClipEntry, cfg, root: str, count=None, dims=None) -> None:
+        """Fail early if scratch EXRs (assumed uncompressed float32) cannot fit.
+
+        ``count``/``dims`` override the whole-clip probe (range jobs must not read frames
+        outside their range).
+        """
+        dims = dims or clip.input_asset.get_dimensions()
+        count = count or clip.input_asset.frame_count
         if not dims or not count:
             return
         channels = sum(_PRODUCT_CHANNELS[p] for p in self._v2_required_products(cfg))

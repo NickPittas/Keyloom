@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CorridorKey UI proposals — prototype gallery</title>
+<style>
+:root{color-scheme:dark;--bg0:#1c1c1c;--bg1:#262626;--bg2:#303030;--bg3:#3a3a3a;--line:#141414;--soft:#454545;--text:#d4d4d4;--dim:#b3b3b3;--accent:#c8873a;--ink:#17120a;--selbg:#4a3a24;--selfg:#f2dcb8;--run:#8fb0dc;--ok:#a3c28f;--warn:#d8bc6c;--err:#ec9a8f;--viewer:#121212}
+*{box-sizing:border-box}
+html,body{margin:0;background:transparent}
+body{font:13px/1.45 Inter,"Segoe UI",system-ui,sans-serif;color:var(--text);font-variant-numeric:tabular-nums}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+[hidden]{display:none!important}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.dim{color:var(--dim)}.sp{flex:1}
+.gal{max-width:1680px;margin:0 auto;display:grid;grid-template-columns:minmax(0,1fr);gap:4px}.gal>*{min-width:0}
+/* gallery chrome */
+.tabs{display:flex;flex-wrap:wrap;gap:2px;background:var(--bg0);border:1px solid var(--line);padding:3px}
+.tab{min-height:30px;padding:3px 10px;background:var(--bg1);border:1px solid var(--line);border-radius:3px;text-align:left}
+.tab:hover{background:var(--bg3)}
+.tab[aria-selected=true]{background:var(--selbg);border-color:var(--accent);color:var(--selfg);font-weight:600}
+.tab .star{color:var(--warn)}
+.info{background:var(--bg1);border:1px solid var(--line);padding:6px 12px;display:grid;gap:2px 12px;grid-template-columns:minmax(0,1fr) auto}
+.info h2{margin:0;font-size:16px}
+.info p{margin:0}
+.info .proto{grid-column:1/-1;font-size:12px;color:var(--dim)}
+.info .sl{grid-column:2;grid-row:1/3;align-self:start;text-align:right;max-width:330px}
+.info .sl small{display:block;margin-top:4px;color:var(--dim);font-size:12px}
+.keys{background:var(--bg1);border:1px solid var(--line);padding:6px 12px;font-size:12px;color:var(--dim)}
+kbd{background:var(--bg2);border:1px solid var(--soft);border-radius:2px;padding:0 4px;font:12px ui-monospace,monospace;color:var(--text)}
+.foot{background:var(--bg0);border:1px solid var(--line);padding:5px 10px;font-size:12px;color:var(--dim);display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center}
+.foot details{flex-basis:100%}
+.foot b.ok{color:var(--ok)}.foot b.bad{color:var(--err)}
+/* app window */
+.win{container:win/inline-size;background:var(--bg1);border:1px solid var(--line);position:relative}
+.statusbar{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;padding:5px 10px;background:var(--bg0);border-top:1px solid var(--line);font-size:12px}
+.statusbar #msg{flex:1;min-width:200px}
+.appbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:6px 10px;background:var(--bg2);border-bottom:1px solid var(--line);min-height:40px}
+.appbar .logo{letter-spacing:.02em}
+.gpu{font-size:12px;color:var(--dim)}
+.panel{background:var(--bg1);min-width:0}
+.ph{display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--bg2);border-bottom:1px solid var(--line);font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);font-weight:600;min-height:30px}
+.ph .btn{text-transform:none;letter-spacing:0}
+.sec{padding:8px 10px;border-bottom:1px solid var(--line)}
+.sec h3{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+.opt{text-transform:none;letter-spacing:0;font-weight:400;border:1px solid var(--soft);border-radius:8px;padding:0 6px;margin-left:4px}
+.help{margin:3px 0;font-size:12px;color:var(--dim)}
+.help.strong{color:var(--text)}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin:4px 0}
+.row label{color:var(--dim);min-width:0}
+input[type=number],select{background:var(--bg0);border:1px solid var(--soft);border-radius:3px;min-height:28px;padding:2px 6px}
+input[type=number]{width:84px}
+input[type=range]{accent-color:var(--accent);min-height:24px;width:100%;min-width:90px}
+input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;margin:0 4px 0 0;vertical-align:-3px}
+/* buttons */
+.btn{min-height:28px;padding:3px 10px;background:var(--bg2);border:1px solid var(--soft);border-radius:3px}
+.btn:hover:not(:disabled){background:var(--bg3)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--ink);font-weight:600}
+.btn.pri:hover:not(:disabled){background:#d8964a}
+.btn.dng{border-color:var(--err);color:var(--err)}
+.more{margin:4px 0;font-size:12px;color:var(--dim)}.more summary{cursor:pointer;color:var(--dim)}.more summary:hover{color:var(--text)}.more p{margin:4px 0}
+.pane{display:flex;flex-direction:column;min-width:0}.pbody{min-width:0}.pfoot{padding:8px 10px;border-top:1px solid var(--line);background:var(--bg2)}
+.btn.big{min-height:36px;padding:6px 14px}
+.btn.sm{min-height:28px;padding:1px 8px;font-size:12px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn[aria-pressed=true],.btn[aria-current=true]{background:var(--selbg);border-color:var(--accent);color:var(--selfg)}
+.seg{display:inline-flex;flex-wrap:wrap;border:1px solid var(--soft);border-radius:3px;overflow:hidden}
+.seg button{min-height:28px;padding:2px 10px;background:var(--bg2);border:0;border-right:1px solid var(--soft)}
+.seg button:last-child{border-right:0}
+.seg button:hover{background:var(--bg3)}
+.seg button[aria-pressed=true]{background:var(--selbg);color:var(--selfg);font-weight:600;box-shadow:inset 0 -2px var(--accent)}
+.run-actions{display:grid;gap:6px}
+.run-actions .help{margin:0}
+/* chips / notes */
+.clipbtn[aria-current=true] .chip{color:var(--selfg)}
+.chip{display:inline-block;font-size:12px;padding:0 7px;border:1px solid currentColor;border-radius:9px;white-space:nowrap}
+.c-ok{color:var(--ok)}.c-run{color:var(--run)}.c-warn{color:var(--warn)}.c-err{color:var(--err)}.c-dim{color:var(--dim)}
+.tag{font-size:12px;color:var(--dim)}
+.note{border-left:3px solid var(--warn);background:#2e2a1f;padding:6px 10px;margin:6px 10px;font-size:12px}
+.note.err{border-color:var(--err);background:#33231f}.note.info{border-color:var(--run);background:#212832}.note.ok{border-color:var(--ok);background:#242c20}
+.note .row{margin:6px 0 0}
+.panel>.note:first-child{margin-top:10px}
+/* viewer */
+.viewer{background:var(--bg0)}
+.vhead,.vfoot{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:5px 10px;background:var(--bg1)}
+.vhead{border-bottom:1px solid var(--line)}
+.vfoot{border-top:1px solid var(--line)}
+.scene{position:relative;height:280px;background:var(--viewer);overflow:hidden}
+.scene[data-paint]{cursor:crosshair;outline:2px dashed var(--accent);outline-offset:-2px}
+.scene svg{position:absolute;inset:0;width:100%;height:100%;display:block}
+.scene .ov{position:absolute;inset:0;pointer-events:none}
+.scene .wl{position:absolute;top:0;bottom:0;width:2px;background:#fff;pointer-events:none}
+.viewer.compact .scene{height:230px}
+.wipe{display:flex;align-items:center;gap:8px;min-width:170px;flex:1;max-width:320px}
+/* timeline */
+.tl{padding:4px 10px 6px;background:var(--bg1);border-top:1px solid var(--line)}
+.tl-row{display:grid;grid-template-columns:96px minmax(0,1fr);align-items:center;gap:8px;margin:1px 0}
+.tl-row>span{font-size:12px;color:var(--dim)}
+.tl-tracks{position:relative}
+.lane{position:relative;height:22px;margin:0 8px;background:var(--bg0);border:1px solid var(--line);overflow:hidden}
+.lane .b{position:absolute;top:0;bottom:0;font-size:12px;line-height:20px;padding:0 4px;white-space:nowrap;overflow:hidden}
+.b.ai{background:#33404f;left:0;right:0;color:#d6dfeb}
+.b.plan{border:1px dashed var(--accent);background:rgba(200,135,58,.18);color:#f0d9b5}
+.b.wr{background:rgba(143,174,125,.55);color:#10150d}
+.tick{position:absolute;top:3px;width:10px;height:10px;margin-left:-5px;background:var(--warn);transform:rotate(45deg)}
+.head{position:absolute;top:-3px;bottom:-3px;width:2px;background:#fff;pointer-events:none;z-index:2}
+.tl-legend{font-size:12px;color:var(--dim);margin:2px 0}
+.tl .row{margin:3px 0 0}
+/* progress */
+.bar{height:8px;background:var(--bg0);border:1px solid var(--line)}
+.bar i{display:block;height:100%;background:var(--run);width:0}
+.steps{display:flex;flex-wrap:wrap;gap:2px;list-style:none;margin:0 0 6px;padding:0}
+.steps li{flex:1;min-width:84px;text-align:center;font-size:12px;padding:3px 4px;background:var(--bg0);border:1px solid var(--line);color:var(--dim)}
+.steps li.done{color:var(--ok)}.steps li.done::before{content:"✓ "}
+.steps li.now{color:var(--run);border-color:var(--run);font-weight:600}.steps li.now::before{content:"▶ "}
+.jobs{list-style:none;margin:0;padding:0}
+.job{padding:8px 10px;border-bottom:1px solid var(--line)}
+.job .row{margin:0 0 4px}
+.job.s-done,.job.s-cancelled,.job.s-failed{opacity:.8}
+/* clip list/cards */
+.clips{list-style:none;margin:0;padding:0}
+.clips li+li{border-top:1px solid var(--line)}
+.clipbtn{display:grid;gap:2px;width:100%;text-align:left;padding:8px 10px;background:transparent;border:0;border-left:3px solid transparent;min-height:44px}
+.clipbtn:hover{background:var(--bg3)}
+.clipbtn[aria-current=true]{background:var(--selbg);border-left-color:var(--accent);color:var(--selfg)}
+.clipbtn small{color:var(--dim);font-size:12px}
+.clipbtn[aria-current=true] small{color:#d9c39f}
+/* ====== layouts ====== */
+.l1,.l2,.l3,.l4,.l5,.l6,.l7,.l8{display:grid;gap:1px;background:var(--line);min-width:0}
+.ga-bar{grid-area:bar}.ga-clips{grid-area:clips}.ga-view{grid-area:view}.ga-insp{grid-area:insp}.ga-job{grid-area:job}.ga-side{grid-area:side}.ga-main{grid-area:main}.ga-rail{grid-area:rail}.ga-q{grid-area:q}.ga-tool{grid-area:tool}.ga-grid{grid-area:grid}.ga-pages{grid-area:pages}.ga-strip{grid-area:strip}.ga-ticket{grid-area:ticket}.ga-lanes{grid-area:lanes}.ga-graph{grid-area:graph}.ga-props{grid-area:props}
+.l1{grid-template-columns:210px minmax(0,1fr) 310px;grid-template-areas:"bar bar bar" "clips view insp" "job job job"}
+.l2{grid-template-columns:200px minmax(0,1fr) minmax(0,1fr);grid-template-areas:"bar bar bar" "rail main side"}
+.l2.big{grid-template-areas:"bar bar bar" "rail main main"}
+.l3{grid-template-columns:minmax(0,1fr) 330px;grid-template-areas:"bar bar" "tool q" "grid q"}
+.l4{grid-template-columns:minmax(0,1fr);grid-template-areas:"bar" "pages" "main" "strip"}
+.l5{grid-template-columns:minmax(0,1fr);grid-template-areas:"bar" "view"}
+.l6{grid-template-columns:minmax(0,1fr) 360px;grid-template-areas:"bar bar" "ticket side"}
+.l7{grid-template-columns:minmax(0,1fr) 340px;grid-template-areas:"bar bar" "view side" "lanes lanes" "insp insp"}
+.l8{grid-template-columns:minmax(0,1fr) 330px;grid-template-areas:"bar bar" "view props" "graph props" "q q"}
+.l5,.l3{position:relative}
+.rail ol{list-style:none;margin:0;padding:6px;display:grid;gap:2px}
+.rail button{width:100%;text-align:left;min-height:36px;padding:4px 8px;background:transparent;border:1px solid transparent;border-radius:3px;display:flex;gap:8px;align-items:center}
+.rail button:hover{background:var(--bg3)}
+.rail button[aria-current=step]{background:var(--selbg);border-color:var(--accent);color:var(--selfg);font-weight:600}
+.rail .n{display:inline-grid;place-items:center;width:22px;height:22px;border:1px solid currentColor;border-radius:50%;font-size:12px}
+.rail .done .n{color:var(--ok)}.rail .warnstep .n{color:var(--warn)}
+.stepfoot{display:flex;flex-wrap:wrap;gap:8px;padding:10px;border-top:1px solid var(--line);background:var(--bg2)}
+.stepbody{padding:8px 10px}
+.stepbody h2{margin:0 0 6px;font-size:16px}
+.range-diagram{margin:8px 0;padding:8px;background:var(--bg0);border:1px solid var(--line)}
+.range-diagram .lane{margin:4px 0}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;padding:10px}
+.card{background:var(--bg2);border:1px solid var(--soft);border-radius:3px;display:grid;gap:6px;padding:8px;align-content:start}
+.card[data-sel=true]{border-color:var(--accent)}
+.card .thumb{height:130px;position:relative;background:var(--viewer);overflow:hidden}
+.card .thumb svg{position:absolute;inset:0;width:100%;height:100%}
+.card h3{margin:0;font-size:13px;overflow-wrap:anywhere}
+.card .meta{font-size:12px;color:var(--dim)}
+.tools{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;padding:8px 10px;background:var(--bg1)}
+.overlay{position:absolute;inset:0;background:rgba(10,10,10,.8);z-index:5;padding:10px}
+.ovbox{position:sticky;top:8px;max-width:1000px;margin:0 auto;background:var(--bg1);border:1px solid var(--soft);display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr)}
+.ovbox>.ph{grid-column:1/-1}
+.pages{display:flex;flex-wrap:wrap;gap:2px;padding:4px;background:var(--bg0)}
+.pages button{min-height:34px;padding:4px 18px;background:var(--bg1);border:1px solid var(--line);border-radius:3px}
+.pages button:hover{background:var(--bg3)}
+.pages button[aria-selected=true]{background:var(--selbg);border-color:var(--accent);color:var(--selfg);font-weight:600}
+.cols2{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:1px;background:var(--line)}
+.cols2>*{background:var(--bg1);min-width:0}
+.cols3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--line)}
+.cols3>*{background:var(--bg1);min-width:0}
+.strip{display:flex;gap:4px;padding:6px;overflow-x:auto;background:var(--bg0)}
+.strip .clipbtn{min-width:190px;background:var(--bg1);border:1px solid var(--line);border-left:3px solid transparent}
+.strip .clipbtn[aria-current=true]{background:var(--selbg);border-color:var(--accent)}
+table.t{border-collapse:collapse;width:100%}
+table.t th,table.t td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+table.t th{background:var(--bg2);font-size:12px;color:var(--dim);font-weight:600}
+.scroll{overflow-x:auto}
+.scroll:focus-visible{outline-offset:-2px}
+.chips{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
+.drawer{position:absolute;top:41px;right:0;bottom:0;width:350px;background:var(--bg1);border-left:2px solid var(--accent);overflow:hidden;z-index:4;display:flex;flex-direction:column}
+.drawer .pbody{flex:1;min-height:0;overflow:auto}
+.l5 .banner{position:relative}
+.ticket{background:var(--bg2);margin:10px;border:1px solid var(--soft);border-top:3px solid var(--accent);font-family:ui-monospace,"SF Mono",Menlo,monospace}
+.ticket h2{margin:0;padding:10px 12px;font-size:15px;border-bottom:1px dashed var(--soft);display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.ticket .sec{border-bottom:1px dashed var(--soft)}
+.ticket dl{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;margin:0}
+.ticket dt{color:var(--dim)}.ticket dd{margin:0}
+.ticket .sentence{padding:8px 12px;font-size:13px;line-height:1.45;background:var(--bg0);margin:8px 10px;border-left:3px solid var(--accent)}
+.thumbs{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;padding:0 10px 10px}
+.thumbs div{position:relative;aspect-ratio:16/9;background:var(--viewer)}
+.thumbs svg{position:absolute;inset:0;width:100%;height:100%}
+.lanes .lane{height:24px;margin:0}
+.lanerow{display:grid;grid-template-columns:78px minmax(0,1fr);gap:8px;align-items:center;margin:2px 0}
+.lanerow>span{font-size:12px;color:var(--dim)}
+.lanetrack{position:relative;height:24px;background:var(--bg0);border:1px solid var(--line)}
+.lanetrack .seg1{position:absolute;top:0;bottom:0;border-right:2px solid var(--bg1);overflow:hidden;font-size:12px;line-height:22px;padding:0 3px;white-space:nowrap}
+.lanetrack button.seg1{background:#2f3a47;border:0;border-right:2px solid var(--bg1);color:var(--text);text-align:left;min-height:0}
+.lanetrack button.seg1[aria-current=true]{background:var(--selbg);color:var(--selfg);box-shadow:inset 0 0 0 2px var(--accent)}
+.lanetrack .hint-full{background:rgba(130,163,207,.35)}
+.lanetrack .hint-none{background:repeating-linear-gradient(45deg,#2a2a2a 0 6px,#222 6px 12px);color:var(--dim)}
+.lanetrack .wr{background:rgba(143,174,125,.55)}
+.lanetrack .plan{border:1px dashed var(--accent);background:rgba(200,135,58,.18)}
+.lanetrack .flag{color:var(--warn)}.lanetrack .flag.err{color:var(--err)}
+.lanes .head{top:-2px;bottom:-2px}
+.graphwrap{overflow-x:auto;padding:6px 10px;background:var(--bg0)}
+.graph{position:relative;width:770px;height:196px}
+.graph svg{position:absolute;inset:0}
+.node{position:absolute;height:42px;padding:2px 8px;background:var(--bg2);border:1px solid var(--soft);border-left:5px solid #6b7480;border-radius:3px;text-align:left;display:grid;align-content:center;line-height:1.25}
+.node small{font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node[aria-pressed=true]{border-color:var(--accent);background:var(--selbg);color:var(--selfg)}
+.node[aria-pressed=true] small{color:#d9c39f}
+.node.off{opacity:.6;border-left-color:#555}
+.node.by{border-style:dashed}
+.sentence-box{margin:6px 10px}
+/* ====== desktop: the app window has a fixed height; panels scroll inside it, primary actions stay in footers ====== */
+@media (min-width:1030px){
+  .win{height:660px;display:flex;flex-direction:column}
+  #mount{flex:1;min-height:0;display:grid}
+  #mount>div{min-height:0;height:100%}
+  .l1,.l2,.l3,.l4,.l5,.l6,.l7,.l8{grid-template-rows:auto minmax(0,1fr)}
+  .l1{grid-template-rows:auto minmax(0,1fr) auto}
+  .l3{grid-template-rows:auto auto minmax(0,1fr)}
+  .l4{grid-template-rows:auto auto minmax(0,1fr) auto}
+  .l7{grid-template-rows:auto minmax(0,1fr) auto minmax(0,.95fr)}
+  .l8{grid-template-rows:auto minmax(0,1fr) auto auto}
+  :is(.l1,.l2,.l3,.l4,.l5,.l6,.l7,.l8)>.panel,.l7>.ga-insp{display:flex;flex-direction:column;min-height:0;overflow:auto}
+  .ga-bar{min-height:0}
+  .pbody{flex:1;min-height:0;overflow:auto}.pfoot,.stepfoot,.ph{flex:none}
+  .viewer.fill{flex:1;min-height:0;display:flex;flex-direction:column}
+  .viewer.fill .scene{flex:1;min-height:120px;height:auto}
+  .viewer.fill .vhead,.viewer.fill .vfoot{flex:none}
+  .ga-bar>.appbar{min-height:36px;padding:4px 10px}
+  .l3{position:relative}
+  .overlay{overflow:auto}
+  .ovbox{height:100%;grid-template-rows:auto minmax(0,1fr)}
+  .ovbox>div:not(.ph){min-height:0;overflow:auto}
+  .cols2.fillc,.cols3.fillc{flex:1;min-height:0}
+  .cols2.fillc>*,.cols3.fillc>*{min-height:0;overflow:auto}
+  .ga-job .jobs,.l8 .ga-q .jobs{max-height:120px;overflow:auto}
+  .drawer{top:38px}
+  .l2.big .scene{height:300px}
+  .l6 .ticket{flex:1;min-height:0;display:flex;flex-direction:column}
+  .l6 .ticket>h2{flex:none}
+  .l6 .ticket>.pbody{flex:1;min-height:0;overflow:auto}
+  .l2 .scene,.l6 .scene{height:220px}
+}
+/* ====== responsive (container of the app window) ====== */
+@container win (max-width:1000px){
+  .l1{grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-areas:"bar bar" "view view" "clips insp" "job job"}
+  .l2,.l2.big{grid-template-columns:minmax(0,1fr);grid-template-areas:"bar" "rail" "main" "side"}
+  .rail ol{grid-auto-flow:column;grid-auto-columns:minmax(120px,1fr);overflow-x:auto}
+  .l3{grid-template-columns:minmax(0,1fr);grid-template-areas:"bar" "tool" "grid" "q"}
+  .l6,.l7,.l8{grid-template-columns:minmax(0,1fr)}
+  .l6{grid-template-areas:"bar" "ticket" "side"}
+  .l7{grid-template-areas:"bar" "view" "side" "lanes" "insp"}
+  .l8{grid-template-areas:"bar" "view" "props" "graph" "q"}
+  .cols3{grid-template-columns:minmax(0,1fr)}
+  .cols2{grid-template-columns:minmax(0,1fr)}
+  .drawer{position:static;width:auto;border-left:0;border-top:2px solid var(--accent)}
+  .ovbox{grid-template-columns:minmax(0,1fr)}
+}
+@container win (max-width:640px){
+  .l1{grid-template-columns:minmax(0,1fr);grid-template-areas:"bar" "view" "clips" "insp" "job"}
+  .btn,.seg button,.tab,input[type=number],select,.pages button{min-height:40px}
+  .btn.sm{min-height:36px}
+  .clipbtn{min-height:48px}
+  .tl-row{grid-template-columns:70px minmax(0,1fr)}
+  .thumbs{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .steps li{min-width:70px}
+  .cards{grid-template-columns:minmax(0,1fr)}
+  .scene{height:220px}
+}
+@media (max-width:760px){.info{grid-template-columns:minmax(0,1fr)}.info .sl{grid-column:1;grid-row:auto;text-align:left}.tab{min-height:40px}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="gal" id="gal">
+  <div class="tabs" role="tablist" aria-label="Design proposals" id="tabs"></div>
+  <section class="info" id="info" aria-live="off"></section>
+  <div class="keys" id="keys" hidden></div>
+  <div id="panel" role="tabpanel">
+    <div class="win" id="win">
+      <div id="mount"></div>
+      <div class="statusbar">
+        <span id="msg" role="status" aria-live="polite">Prototype ready. Everything here is simulated.</span>
+        <span class="gpu">RTX 4090 · VRAM 17.8 / 24.0 GiB <i>(sample)</i></span>
+        <button type="button" class="btn sm" id="busybtn" title="Load a sample queue: one running job and two waiting">Show busy queue example</button>
+        <button type="button" class="btn sm" id="speed" aria-pressed="false" title="Make simulated jobs finish faster">Simulation speed: 1×</button>
+        <button type="button" class="btn sm" id="keybtn" aria-expanded="false">Keyboard shortcuts</button>
+      </div>
+    </div>
+  </div>
+  <div class="foot" id="foot"><span>Self-check running…</span></div>
+</div>
+<script>
+(()=>{'use strict';
+/* ================= data ================= */
+const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const PH=[['rvm','Motion prep',.12],['vfm','Feature pass',.2],['stage1','Coarse matte',.25],['stage2','Refine',.33],['publish','Writing files',.10]];
+const GENS=['GVM','BiRefNet','VideoMaMa','MatAnyone2','Chroma Key','Import Alpha'];
+const NEEDS_STROKES=g=>g==='VideoMaMa'||g==='MatAnyone2';
+const TEMPORAL=[['auto','Auto'],['80/40','80 / 40'],['48/24','48 / 24'],['24/12','24 / 12'],['8/4','8 / 4'],['1/1','1 / 1 (no overlap)']];
+const CL={srgb:'sRGB',linear:'Linear'};
+const OUTK=['fg','matte','comp','processed'];
+const OLBL={fg:'FG',matte:'Matte',comp:'Comp',processed:'Processed'};
+const MODES=[['input','Input'],['hint','Hint'],['fg','FG'],['matte','Matte'],['comp','Comp'],['processed','Processed']];
+const DUR={key:15000,resume:15000,hint:6000};
+const ST={Extracting:['◔','run'],Raw:['○','dim'],Masked:['◐','run'],Ready:['●','ok'],Complete:['✓','ok'],Error:['✕','err']};
+
+const mkClips=()=>mkRaw().map(c=>Object.assign({hq:.95,carry:true,cq:.95},c,{made:c.made?Object.assign(snapOf(Object.assign({hq:.95,carry:true,cq:.95},c)),c.made):null}));
+const mkRaw=()=>[
+ {id:'SH040',name:'SH040_talent_walk',res:'3840×2160',kind:'EXR sequence',fps:24,start:1001,n:412,state:'Ready',mode:'full',gen:'GVM',hasHint:true,kf:[],strokes:[],colour:'linear',checked:true,sample:'',inA:1101,inB:1300,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:0.5,temporal:'auto',vram:'auto',written:[],made:null,err:''},
+ {id:'SH050',name:'SH050_closeup_hair',res:'1920×1080',kind:'PNG sequence',fps:24,start:1001,n:168,state:'Raw',mode:'none',gen:'GVM',hasHint:false,kf:[1012,1060,1144],strokes:[],colour:'srgb',checked:false,sample:'Sampled peaks ≤ 1.0 in frames 1001/1084/1168 — could be sRGB or linear. Check before keying.',inA:1001,inB:1168,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:0.5,temporal:'auto',vram:'auto',written:[],made:null,err:''},
+ {id:'SH060',name:'SH060_wide_crane',res:'3840×2160',kind:'MOV, frames extracted',fps:24,start:1001,n:640,state:'Complete',mode:'full',gen:'GVM',hasHint:true,kf:[],strokes:[],colour:'srgb',checked:true,sample:'',inA:1001,inB:1640,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:0.65,temporal:'auto',vram:'auto',written:[[1001,1640]],made:{despill:0.5,colour:'srgb',mode:'full'},err:''},
+ {id:'SH070',name:'SH070_insert_hands',res:'2048×1080',kind:'EXR sequence',fps:24,start:1001,n:96,state:'Error',mode:'full',gen:'GVM',hasHint:true,kf:[],strokes:[],colour:'srgb',checked:true,sample:'',inA:1001,inB:1096,outs:{fg:'EXR',matte:'EXR',comp:'PNG',processed:null},despill:0.5,temporal:'auto',vram:'auto',written:[],made:null,err:'Hint has 94 frames, clip has 96 — regenerate hint'}
+];
+const fresh=()=>({open:[],design:0,clip:'SH040',sel:['SH040'],frame:1101,playing:false,mode:'input',ab:false,wipe:50,bg:'checker',paint:{on:false,tool:1},speed:1,adv:false,step:0,page:'media',drawer:false,node:'key',overlay:null,qOpen:false,keys:false,shortlist:[],msg:'Prototype ready. Everything here is simulated.',nextId:1,
+ clips:mkClips(),
+ queue:[{id:'J0a',type:'key',clip:'SH060',status:'done',p:1,w:640},{id:'J0b',type:'hint',gen:'BiRefNet',clip:'SH070',status:'cancelled',p:.3},{id:'J0c',type:'key',clip:'SH070',status:'failed',p:.45}]});
+let S=fresh();
+const clip=id=>S.clips.find(c=>c.id===id),cur=()=>clip(S.clip);
+const end=c=>c.start+c.n-1;
+/* frame ranges */
+const merge=r=>{r=r.map(x=>[...x]).sort((a,b)=>a[0]-b[0]);const o=[];for(const x of r){const l=o[o.length-1];if(l&&x[0]<=l[1]+1)l[1]=Math.max(l[1],x[1]);else o.push(x)}return o};
+const count=r=>r.reduce((s,x)=>s+x[1]-x[0]+1,0);
+const firstN=(r,n)=>{const o=[];for(const x of r){if(n<=0)break;const k=Math.min(n,x[1]-x[0]+1);o.push([x[0],x[0]+k-1]);n-=k}return o};
+const covers=(r,f)=>r.some(x=>f>=x[0]&&f<=x[1]);
+const missing=(r,a,b)=>{const o=[];let p=a;for(const x of merge(r)){if(x[1]<a)continue;if(x[0]>b)break;if(x[0]>p)o.push([p,x[0]-1]);p=Math.max(p,x[1]+1)}if(p<=b)o.push([p,b]);return o};
+const nWrite=c=>c.inB-c.inA+1;
+const isWhole=c=>c.inA<=c.start&&c.inB>=end(c);
+/* staleness */
+function outKey(c){return OUTK.map(k=>k+':'+(c.outs[k]||'-')).join(' ')}
+function snapOf(c){return{despill:c.despill,colour:c.colour,mode:c.mode,temporal:c.temporal,vram:c.vram,gen:c.mode==='none'?'':c.gen,hq:c.mode==='none'?0:c.hq,carry:c.carry,cq:c.carry?c.cq:0,outs:outKey(c),kf:c.mode==='keyframes'?[...c.kf].sort((a,b)=>a-b).join(','):''}}
+const SNAPLBL={temporal:'Temporal window',vram:'VRAM profile',gen:'Hint generator',hq:'Hint quality',carry:'Carry hint',cq:'Carry quality',outs:'Outputs / formats',kf:'Keyframe marks'};
+/* one rule drives both the stale banner and whether Resume is allowed (backend needs identical settings) */
+const diffs=c=>{const d=[];if(!c.made)return d;const n=snapOf(c);if(c.made.despill!==n.despill)d.push(`Despill ${c.made.despill.toFixed(2)} → ${c.despill.toFixed(2)}`);if(c.made.colour!==n.colour)d.push(`Input colour ${CL[c.made.colour]} → ${CL[c.colour]}`);if(c.made.mode!==n.mode)d.push('Hint mode changed');
+  for(const k in SNAPLBL)if(c.made[k]!==n[k])d.push(SNAPLBL[k]+' changed');return d};
+const stale=c=>c.written.length>0&&diffs(c).length>0;
+const staleTxt=c=>stale(c)?`Settings changed since last run (${diffs(c).join('; ')}) — re-key to update. Results on disk were made with Despill ${c.made.despill.toFixed(2)} and ${CL[c.made.colour]} input.`:'';
+/* jobs */
+const job=id=>S.queue.find(j=>j.id===id);
+const ACTIVE=['queued','running','stopping'];
+const running=()=>S.queue.find(j=>j.status==='running'||j.status==='stopping');
+const activeFor=cid=>S.queue.find(j=>j.clip===cid&&ACTIVE.includes(j.status));
+const jlabel=j=>(j.type==='key'?'Key ':j.type==='resume'?'Resume ':j.gen+' hint ')+j.clip;
+function say(m){S.msg=m;const e=$('#msg');if(e)e.textContent=m}
+function enqueue(type,cid,extra={}){
+  const c=clip(cid);if(S.queue.some(j=>j.clip===cid&&j.type===type&&ACTIVE.includes(j.status)))return null;
+  const j=Object.assign({id:'J'+S.nextId++,type,clip:cid,status:'queued',p:0},extra);
+  if(type!=='hint'){j.snap=snapOf(c);j.range=type==='resume'?missing(c.written,c.inA,c.inB):[[c.inA,c.inB]];j.w=count(j.range)}
+  S.queue.push(j);startNext();return j}
+function startNext(){if(running())return;const j=S.queue.find(x=>x.status==='queued');if(j){j.status='running';j.p=0;say(`${jlabel(j)} started. One GPU job runs at a time.`)}}
+function finish(j,st){
+  j.status=st;const c=clip(j.clip);
+  if(st==='done'){
+    if(j.type==='hint'){c.hasHint=true;c.gen=j.gen;if(c.mode==='none')c.mode='full';c.err='';c.state='Ready';say(`${jlabel(j)} finished (simulated). Hint ready.`)}
+    else{c.written=merge(j.type==='resume'?c.written.concat(j.range):j.range);c.made=Object.assign({},j.snap);c.state=count(c.written)>=c.n?'Complete':'Ready';
+      say(c.state==='Complete'?`${jlabel(j)} finished (simulated). Clip is Complete.`:`${jlabel(j)} finished (simulated). ${count(c.written)} of ${c.n} frames written — not Complete until every frame is written.`)}
+  }else{let note='';
+    if(j.type!=='hint'){const {list,i,frac}=phaseInfo(j),n=Math.floor(frac*j.w);
+      if(list[i][0]==='publish'&&n>0){c.written=merge(c.written.concat(firstN(j.range,n)));c.made=Object.assign({},j.snap);c.state=count(c.written)>=c.n?'Complete':'Ready';note=`${jlabel(j)} stopped while writing: ${n} of ${j.w} frames were written. The clip is not Complete.`}}
+    say(note||`${jlabel(j)} cancelled before any file was written. Nothing is marked Complete.`)}
+  dirty=true;startNext()}
+function cancelJob(id){const j=job(id);if(!j)return;
+  if(j.status==='queued'){j.status='cancelled';say(`${jlabel(j)} removed from the queue.`)}
+  else if(j.status==='running'){j.status='stopping';j.stopLeft=1500;say('Stopping after current step…')}}
+let dirty=false,noPersist=false;
+function advance(ms){
+  const j=running();
+  if(j){if(j.status==='stopping'){j.stopLeft-=ms;if(j.stopLeft<=0)finish(j,'cancelled')}
+    else{j.p+=ms/(DUR[j.type]/S.speed);if(j.p>=1){j.p=1;finish(j,'done')}}}
+  else{const before=S.queue.some(x=>x.status==='running');startNext();if(!before&&running())dirty=true}
+  if(S.playing){const c=cur();S.frame=S.frame>=end(c)?c.start:S.frame+1}}
+function phaseInfo(j){const list=j.type==='hint'?[['gen','Generating hint',1]]:PH;let acc=0,i=0;for(;i<list.length-1;i++){if(j.p<acc+list[i][2])break;acc+=list[i][2]}
+  return{list,i,frac:clamp((j.p-acc)/list[i][2],0,1)}}
+function ptxt(j){const c=clip(j.clip),{list,i,frac}=phaseInfo(j);const key=list[i][0];
+  if(key==='publish')return`Writing files · ${Math.round(frac*j.w)} / ${j.w}`;
+  return`${list[i][1]} · frame ${Math.round(frac*c.n)} / ${c.n}`}
+/* ================= small view helpers ================= */
+const seg=(label,opts,val,act)=>`<div class="seg" role="group" aria-label="${label}">${opts.map(([v,l])=>`<button type="button" data-act="${act}" data-v="${v}" aria-pressed="${v===val}">${l}</button>`).join('')}</div>`;
+const stateChip=c=>{const [i,k]=ST[c.state];return`<span class="chip c-${k}"><span aria-hidden="true">${i}</span> ${c.state}${c.state==='Ready'&&c.written.length?' · partial':''}</span>`};
+const hintTxt=c=>c.mode==='none'?'Hint: none':`Hint: ${c.gen} · ${c.mode==='full'?'Full':'Keyframes'}${c.hasHint?'':' · not generated'}`;
+const outList=c=>OUTK.filter(k=>c.outs[k]).map(k=>[k,c.outs[k]]);
+const writesTxt=c=>`Writes ${nWrite(c)} of ${c.n} frames (${c.inA}–${c.inB}) · AI processes all ${c.n}`;
+function summary(c){
+  const outs=outList(c).map(([k,f])=>`${OLBL[k]} (${f})`).join(', ')||'nothing — enable at least one output';
+  const h=c.mode==='none'?'without a hint':c.mode==='full'?`using the ${c.gen} hint${c.hasHint?'':' (still to be generated)'}`:`using the ${c.gen} hint with ${c.kf.length} marked keyframes${c.hasHint?'':' (still to be generated)'}`;
+  return`AI will process all ${c.n} frames of ${c.name} ${h}, reading the input as ${CL[c.colour]}, then write ${outs} for frames ${c.inA}–${c.inB} (${nWrite(c)} of ${c.n}).`}
+function primary(c){
+  const j=activeFor(c.id);
+  if(j)return{l:j.status==='stopping'?'Stopping after current step…':j.status==='queued'?`Cancel queued ${jlabel(j)}`:`Cancel ${jlabel(j)}`,act:'cancelJob',v:j.id,cls:'dng',dis:j.status==='stopping',sub:'Cancel is graceful: the GPU finishes its current step first.'};
+  if(c.state==='Error'&&c.err)return{l:'Regenerate hint',act:'genHint',sub:'Queues a hint job. Keying stays blocked until the hint matches the clip.'};
+  if(!outList(c).length)return{l:'Enable an output (FG) to continue',act:'enableOut',sub:'Nothing would be written. Pick at least one of FG, Matte, Comp, Processed.'};
+  if(c.mode==='keyframes'&&!c.kf.length)return{l:'Mark at least one keyframe (M)',act:'markKf',sub:'Keyframes mode needs marks on the frames that should get a hint. Marks the current playhead frame.'};
+  if(c.mode!=='none'&&!c.hasHint)return{l:`Generate ${c.gen} hint, then key clip`,act:'genThenKey',sub:'Queues the hint job, then the key job. Choose “None” in Hint to key without one.'};
+  return{l:`Key clip — AI processes all ${c.n} frames`,act:'key',sub:`Writes only ${c.inA}–${c.inB}. Jobs run one at a time on the GPU.`}}
+const resumeRange=c=>{if(!c.written.length||stale(c)||c.state==='Error')return null;const m=missing(c.written,c.inA,c.inB);return m.length?m:null};
+function runBtns(c){const p=primary(c),r=resumeRange(c);
+  return`<div class="run-actions"><button type="button" class="btn ${p.cls==='dng'?'dng':'pri'} big" data-act="${p.act}" data-v="${p.v||''}" ${p.dis?'disabled':''}>${p.l}</button>${r&&!activeFor(c.id)?`<button type="button" class="btn" data-act="resume">Resume — AI processes all ${c.n} again, writes only ${count(r)} missing frames</button>`:''}<p class="help">${p.sub}</p></div>`}
+/* ================= sample scene (drawn, not footage) ================= */
+let uid=0;
+function sceneSVG(c,mode,frame,o={}){
+  const have=mode==='input'||(mode==='hint'?c.hasHint:covers(c.written,frame));
+  if(!have)return`<svg viewBox="0 0 640 360" role="img" aria-label="No file on disk"><rect width="640" height="360" fill="#121212"/><text x="320" y="168" text-anchor="middle" fill="#cfcfcf" font-size="17">${mode==='hint'?'No hint generated yet':'No file on disk for frame '+frame}</text><text x="320" y="196" text-anchor="middle" fill="#a3a3a3" font-size="13">${mode==='hint'?'Generate a hint, or choose “None”.':'Results exist only for written frames. Key the clip first.'}</text></svg>`;
+  const id='k'+(uid++),t=frame-c.start,fx=150+((t*3)%340),lg=Math.sin(t/3)*14;
+  const fig=(fill,blur)=>`<g transform="translate(${fx} 0)" fill="${fill}" stroke="${fill}"${blur?` filter="url(#${id}b)"`:''}><circle cx="0" cy="84" r="22" stroke="none"/><path d="M-30 116 Q0 106 30 116 L36 222 H-36 Z" stroke="none"/><path d="M-14 222 L${-14-lg} 322 M14 222 L${14+lg} 322" stroke-width="17" stroke-linecap="round" fill="none"/><path d="M-30 124 L-44 196 M30 124 L44 196" stroke-width="12" stroke-linecap="round" fill="none"/></g>`;
+  const chk=`<pattern id="${id}c" width="32" height="32" patternUnits="userSpaceOnUse"><rect width="32" height="32" fill="#7d7d7d"/><rect width="16" height="16" fill="#5e5e5e"/><rect x="16" y="16" width="16" height="16" fill="#5e5e5e"/></pattern>`;
+  let bg,f;
+  if(mode==='input'){bg='<rect width="640" height="360" fill="#7f8488"/><rect y="300" width="640" height="60" fill="#5c6165"/><rect x="40" y="30" width="170" height="220" fill="#898e92"/>';f=fig('#2d3136')}
+  else if(mode==='hint'){bg='<rect width="640" height="360" fill="#000"/>';f=fig('#fff',true)}
+  else if(mode==='matte'){bg='<rect width="640" height="360" fill="#000"/>';f=fig('#fff')}
+  else if(mode==='fg'){bg='<rect width="640" height="360" fill="#000"/>';f=fig('#555c63')}
+  else if(mode==='comp'&&S.bg!=='checker'){bg=`<rect width="640" height="360" fill="${S.bg==='black'?'#000':'#fff'}"/>`;f=fig('#2d3136')}
+  else{bg=`<rect width="640" height="360" fill="url(#${id}c)"/>`;f=fig('#2d3136')}
+  let ex='';
+  if(o.strokes!==false&&(mode==='input'||mode==='hint'))ex+=c.strokes.map(s=>`<circle cx="${s.x}" cy="${s.y}" r="8" fill="${s.t===1?'#8fae7d':'#d37466'}" stroke="#fff" stroke-width="1.5"/>`).join('');
+  if(c.kf.includes(frame)&&c.mode==='keyframes')ex+='<text x="12" y="26" fill="#cdb061" font-size="15">◆ marked keyframe</text>';
+  return`<svg viewBox="0 0 640 360" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Sample frame ${frame}, ${mode} view (drawn sample, not footage)"><defs>${chk}<filter id="${id}b"><feGaussianBlur stdDeviation="6"/></filter></defs>${bg}${f}${ex}<rect x="520" y="336" width="116" height="20" fill="#000" opacity=".6"/><text x="578" y="350" text-anchor="middle" fill="#cfcfcf" font-size="12">SAMPLE IMAGE</text></svg>`}
+const thumb=(c,f)=>sceneSVG(c,'input',f,{strokes:false}).replace('<svg ','<svg aria-hidden="true" ').replace(/ role="img" aria-label="[^"]*"/,'');
+const sceneKey=c=>[c.id,S.frame,S.mode,S.ab,S.bg,c.strokes.length,c.hasHint,count(c.written),c.mode].join('|');
+function sceneInner(c){
+  if(S.ab&&S.mode!=='input')return`${sceneSVG(c,'input',S.frame)}<div class="ov" data-lv="ov" style="clip-path:inset(0 0 0 ${S.wipe}%)">${sceneSVG(c,S.mode,S.frame)}</div><div class="wl" data-lv="wl" style="left:${S.wipe}%"></div>`;
+  return sceneSVG(c,S.mode,S.frame)}
+const sceneBox=c=>`<div class="scene" data-lv="scene" data-key="${sceneKey(c)}" ${S.paint.on?'data-paint':''}>${sceneInner(c)}</div>`;
+function viewer(o={}){
+  const c=cur(),exp=o.modes||MODES;if(!exp.some(x=>x[0]===S.mode))S.mode=exp[0][0];
+  const m=S.mode;
+  const lab=m==='input'?'Source frames — sample image':m==='hint'?'Hint on disk — sample image':'Viewing results on disk — playback never runs the AI';
+  return`<div class="viewer ${o.cls||''}${o.fill?' fill':''}"><div class="vhead"><span class="tag">${lab}</span><span class="chip c-warn" data-lv="stale" ${stale(c)?'':'hidden'}>▲ Stale — re-key to update</span><span class="sp"></span>
+   <button type="button" class="btn sm" data-act="ab" aria-pressed="${S.ab}" title="Wipe between Input (A) and the selected view (B)">A/B wipe</button>
+   ${m==='comp'?`<span class="tag">Backdrop</span>${seg('Comp backdrop',[['checker','Checker'],['black','Black'],['white','White']],S.bg,'bg')}`:''}
+   ${S.ab&&m!=='input'?`<label class="wipe"><span class="tag">Wipe</span><input type="range" id="wipe" min="0" max="100" value="${S.wipe}" data-inp="wipe" aria-label="Wipe position"></label>`:''}</div>
+   ${sceneBox(c)}
+   <div class="vfoot"><button type="button" class="btn sm" data-act="step" data-v="-1" aria-label="Previous frame">◀ Frame</button>
+    <button type="button" class="btn sm" data-act="play" aria-pressed="${S.playing}">${S.playing?'⏸ Pause':'▶ Play'}</button>
+    <button type="button" class="btn sm" data-act="step" data-v="1" aria-label="Next frame">Frame ▶</button>
+    <span data-lv="frame"></span><span class="tag">of ${c.start}–${end(c)} · sample frames</span><span class="sp"></span>
+    ${seg('Viewer content',exp,m,'vmode')}</div>
+   ${o.paint?paintBar(c):''}</div>`}
+function paintBar(c){return`<div class="vfoot" style="border-top:1px solid var(--line)"><button type="button" class="btn sm" data-act="paintToggle" aria-pressed="${S.paint.on}">Paint hint strokes</button>${seg('Stroke type',[[1,'1 Subject'],[2,'2 Background']],S.paint.tool,'paintTool')}<span class="tag">${c.strokes.length} strokes${S.paint.on?' · click the image to add':''}</span><button type="button" class="btn sm" data-act="clearStrokes" ${c.strokes.length?'':'disabled'}>Clear strokes</button></div>`}
+function timeline(o={}){const c=cur(),pos=f=>(f-c.start)/(c.n-1)*100;
+  const wr=c.written.map(r=>`<div class="b wr" style="left:${pos(r[0])}%;width:${Math.max(.5,pos(r[1])-pos(r[0]))}%"></div>`).join('');
+  const kf=c.mode==='keyframes'?c.kf.map(f=>`<span class="tick" style="left:${pos(f)}%" title="Keyframe ${f}"></span>`).join(''):'';
+  return`<div class="tl" aria-label="Timeline">
+  <div class="tl-row"><span>AI processes</span><div class="tl-tracks"><div class="lane"><div class="b ai">All ${c.n} frames — always the whole clip</div></div></div></div>
+  <div class="tl-row"><span>Writes</span><div class="tl-tracks"><div class="lane"><div class="b plan" style="left:${pos(c.inA)}%;width:${Math.max(1,pos(c.inB)-pos(c.inA))}%">${c.inA}–${c.inB}</div>${wr}</div></div></div>
+  ${c.mode==='keyframes'?`<div class="tl-row"><span>Hint keyframes</span><div class="tl-tracks"><div class="lane">${kf}</div></div></div>`:''}
+  <div class="tl-row"><span>Playhead</span><div class="tl-tracks"><input type="range" id="seek" min="${c.start}" max="${end(c)}" value="${S.frame}" data-lv="seek" data-inp="seek" aria-label="Playhead frame"><div class="head" data-lv="head"></div></div></div>
+  <div class="tl-legend">Dashed = frames that will be written · green = already written on disk${c.mode==='keyframes'?' · ◆ marked hint keyframes':''}</div>
+  ${o.marks===false?'':`<div class="row"><button type="button" class="btn sm" data-act="setIn">Set In = playhead (I)</button><button type="button" class="btn sm" data-act="setOut">Set Out = playhead (O)</button>${c.mode==='keyframes'?`<button type="button" class="btn sm" data-act="markKf">${c.kf.includes(S.frame)?'Unmark keyframe':'Mark keyframe here (M)'}</button>`:''}</div>`}</div>`}
+/* inspector sections */
+const more=(k,t,body)=>`<details class="more" data-k="${k}" ${S.open.includes(k)?'open':''}><summary>${t}</summary>${body}</details>`;
+const pane=(head,body,foot='',cls='')=>`<div class="pane ${cls}">${head}<div class="pbody">${body}</div>${foot?`<div class="pfoot">${foot}</div>`:''}</div>`;
+function banners(c){return`${c.err&&c.state==='Error'?`<div class="note err" role="alert"><b>✕ Error:</b> ${c.err}</div>`:''}<div class="note" data-lv="stale" ${stale(c)?'':'hidden'}><b>▲ Stale results.</b> <span data-lv="staletxt">${staleTxt(c)}</span></div>`}
+function secHint(c){
+  const hs=c.hasHint?`✓ Hint ready: ${c.gen}${c.mode==='keyframes'?' (keyframes)':' · full clip'}`:'No hint generated yet';
+  const g=c.gen,act=activeFor(c.id);
+  const gb=g==='Import Alpha'?['Import alpha…','genHint']:NEEDS_STROKES(g)&&c.strokes.length<2?['Paint strokes first','paintOn']:['Generate hint','genHint'];
+  return`<section class="sec"><h3>Hint <span class="opt">optional</span></h3>
+  ${seg('Hint mode',[['none','None'],['full','Full AlphaHint'],['keyframes','Keyframes']],c.mode,'mode')}
+  <p class="help">${c.mode==='none'?'No hint: the AI keys the clip by itself. A good first try.':c.mode==='full'?'Full AlphaHint: one hint matte for every frame.':'Keyframes: hints on marked frames only; a partial AlphaHint is allowed.'}</p>
+  ${c.mode==='none'?'':`<div class="row"><label for="gen">Generator</label><select id="gen" data-chg="gen">${GENS.map(x=>`<option ${x===g?'selected':''}>${x}</option>`).join('')}</select></div>
+   <div class="row"><span>${hs}</span><button type="button" class="btn sm" data-act="${gb[1]}" ${act&&act.type==='hint'?'disabled':''}>${act&&act.type==='hint'?'Hint job queued':gb[0]}</button></div>
+   <div class="row"><label for="hq">Hint quality</label><input type="range" id="hq" min="0" max="1" step="0.05" value="${c.hq}" data-inp="hq" data-chg="despillEnd" aria-describedby="hqv" style="flex:1" title="How much the AI trusts the external hint"><b id="hqv" data-lv="hq">${c.hq.toFixed(2)}</b></div>
+   ${NEEDS_STROKES(g)?`<p class="help">${g} needs paint strokes on the viewer: 1 = subject, 2 = background. Strokes painted: <b>${c.strokes.length}</b>.</p>`:''}
+   ${c.mode==='keyframes'?`<p class="help">Marked keyframes: <b>${c.kf.length}</b>${c.kf.length?' ('+[...c.kf].sort((a,b)=>a-b).join(', ')+')':''}. Mark them at the playhead.</p><div class="row"><button type="button" class="btn sm" data-act="markKf">${c.kf.includes(S.frame)?'Unmark keyframe':'Mark keyframe here (M)'}</button><button type="button" class="btn sm" data-act="clearKf" ${c.kf.length?'':'disabled'}>Clear keyframes</button></div>`:''}`}
+  </section>`}
+function secInput(c){
+  const o=c.colour==='srgb'?'linear':'srgb';
+  return`<section class="sec"><h3>Input colour</h3>${seg('Input colour',[['srgb','sRGB'],['linear','Linear']],c.colour,'colour')}
+  ${c.sample&&!c.checked?`<div class="note" style="margin:8px 0 0"><b>▲ Check before keying.</b> ${c.sample}<div class="row"><button type="button" class="btn sm" data-act="colourPick" data-v="${c.colour}">Keep ${CL[c.colour]}</button><button type="button" class="btn sm" data-act="colourPick" data-v="${o}">Switch to ${CL[o]}</button></div></div>`
+   :`<p class="help">${c.checked?`✓ Confirmed as ${CL[c.colour]} — your choice; never switched automatically.`:'Not confirmed yet.'}</p>${more('colour','What changing it does','<p>Changing it does not rewrite existing outputs; it marks them stale.</p>')}`}</section>`}
+function secOutput(c){
+  return`<section class="sec"><h3>Output</h3>
+  <div class="row"><label for="inA">Write frames</label><input type="number" id="inA" min="${c.start}" max="${end(c)}" value="${c.inA}" data-chg="inA" aria-label="First frame to write"><span aria-hidden="true">–</span><input type="number" id="inB" min="${c.start}" max="${end(c)}" value="${c.inB}" data-chg="inB" aria-label="Last frame to write"></div>
+  <div class="row"><button type="button" class="btn sm" data-act="setIn">In = playhead</button><button type="button" class="btn sm" data-act="setOut">Out = playhead</button><button type="button" class="btn sm" data-act="whole">Whole clip</button></div>
+  <p class="help strong" data-lv="writes">${writesTxt(c)}</p>
+  ${more('range','How In / Out works','<p>In/Out only limits which frames are written. The clip is Complete only when every frame is written; separate range runs do not add up unless you Resume.</p>')}
+  ${OUTK.map(k=>`<div class="row"><label><input type="checkbox" id="o-${k}" data-chg="outOn" data-v="${k}" ${c.outs[k]?'checked':''}>${OLBL[k]}</label><select id="f-${k}" data-chg="outFmt" data-v="${k}" aria-label="${OLBL[k]} format" ${c.outs[k]?'':'disabled'}>${['EXR','PNG'].map(f=>`<option ${c.outs[k]===f?'selected':''}>${f}</option>`).join('')}</select></div>`).join('')}
+  <div class="row"><button type="button" class="btn sm" data-act="openFolder">Open output folder</button></div>
+  ${more('tech','Technical details','<p>Run notes are written to <code>.corridorkey_manifest.json</code> next to the outputs.</p>')}</section>`}
+function secAdv(c,forceOpen){const open=S.adv||forceOpen;
+  return`<section class="sec"><h3>Advanced</h3><button type="button" class="btn sm" data-act="adv" aria-expanded="${open}" ${forceOpen?'hidden':''}>${open?'▾ Hide advanced':'▸ Show advanced'}</button>
+  ${open?`<div class="row"><label for="temporal">Temporal window</label><select id="temporal" data-chg="temporal">${TEMPORAL.map(([v,l])=>`<option value="${v}" ${v===c.temporal?'selected':''}>${l}</option>`).join('')}</select></div>
+   <p class="help">${c.temporal==='auto'?'Auto currently picks 48 / 24 — estimated peak ~18.2 GiB (sample figure).':'The real app shows its own peak-VRAM estimate for this window (not simulated here).'}</p>
+   <div class="row"><label>VRAM profile</label>${seg('VRAM profile',[['auto','Auto'],['low','Low']],c.vram,'vram')}</div>
+   <div class="row"><label for="despill">Despill</label><input type="range" id="despill" min="0" max="1" step="0.05" value="${c.despill}" data-inp="despill" data-chg="despillEnd" aria-describedby="dsv" style="flex:1"><b id="dsv" data-lv="despill">${c.despill.toFixed(2)}</b></div>
+   <div class="row"><label><input type="checkbox" id="carry" data-chg="carry" ${c.carry?'checked':''}>Carry hint</label>${c.carry?`<label for="cq">Quality</label><input type="range" id="cq" min="0" max="1" step="0.05" value="${c.cq}" data-inp="cq" data-chg="despillEnd" aria-describedby="cqv" style="flex:1"><b id="cqv" data-lv="cq">${c.cq.toFixed(2)}</b>`:''}</div>
+   ${more('carry','What is “carry”?','<p>Reuses the model’s own predictions where overlapping windows share frames. It applies in every hint mode, including None.</p>')}`:''}</section>`}
+const summaryBlock=c=>`<section class="sec"><h3>What will happen</h3><p style="margin:0" data-lv="summary">${summary(c)}</p></section>`;
+/* queue */
+function phaseUI(j){const {list}=phaseInfo(j);
+  return`<ol class="steps" aria-label="Phases">${list.map((p,i)=>`<li data-lv="step" data-job="${j.id}" data-i="${i}">${p[1]}</li>`).join('')}</ol>
+  <div class="row"><span data-lv="ptxt" data-job="${j.id}"></span><span class="sp"></span><span><b data-lv="pct" data-job="${j.id}"></b> overall</span></div>
+  <div class="bar" role="progressbar" aria-label="Overall progress" aria-valuemin="0" aria-valuemax="100"><i data-lv="bar" data-job="${j.id}"></i></div>
+  <p class="help"><span data-lv="jstatus" data-job="${j.id}"></span> · ≈ <span data-lv="left" data-job="${j.id}"></span> left (simulated timing)</p>`}
+const JST={queued:['◷','Queued','dim'],running:['▶','Running','run'],stopping:['■','Stopping…','warn'],done:['✓','Done','ok'],cancelled:['–','Cancelled','dim'],failed:['✕','Failed','err']};
+function queueList(o={}){
+  const run=S.queue.filter(j=>j.status==='running'||j.status==='stopping'),qd=S.queue.filter(j=>j.status==='queued'),hist=S.queue.filter(j=>!ACTIVE.includes(j.status)).reverse().slice(0,o.hist??4);
+  const row=(j,qi)=>{const [i,l,k]=JST[j.status];
+    return`<li class="job s-${j.status}"><div class="row"><span class="chip c-${k}"><span aria-hidden="true">${i}</span> ${l}</span><b>${jlabel(j)}</b><span class="sp"></span>
+     ${j.status==='queued'?`<button type="button" class="btn sm" data-act="qUp" data-v="${j.id}" aria-label="Move ${jlabel(j)} earlier" ${qi===0?'disabled':''}>↑</button><button type="button" class="btn sm" data-act="qDown" data-v="${j.id}" aria-label="Move ${jlabel(j)} later" ${qi===qd.length-1?'disabled':''}>↓</button>`:''}
+     ${ACTIVE.includes(j.status)?`<button type="button" class="btn sm dng" data-act="cancelJob" data-v="${j.id}" ${j.status==='stopping'?'disabled':''} aria-label="Cancel ${jlabel(j)}">${j.status==='stopping'?'Stopping…':'Cancel'}</button>`:''}</div>
+     ${j.status==='running'||j.status==='stopping'?phaseUI(j):''}</li>`};
+  const items=run.map(j=>row(j)).concat(qd.map((j,i)=>row(j,i)),hist.map(j=>row(j)));
+  return`<ul class="jobs" aria-label="Job queue">${items.join('')||'<li class="job dim">Queue is empty.</li>'}</ul><p class="help" style="padding:0 10px 8px;margin:0">One GPU job at a time. Playback never uses the queue.</p>`}
+const queueSummary=()=>{const r=S.queue.filter(j=>j.status==='running'||j.status==='stopping').length,q=S.queue.filter(j=>j.status==='queued').length;return`Queue: ${r} running · ${q} waiting`};
+const appbar=(extra='')=>`<header class="appbar"><b class="logo">CorridorKey</b><span class="dim">Harbour Promo</span>${extra}<span class="sp"></span><span class="chip c-${running()?'run':'dim'}">${queueSummary()}</span></header>`;
+const hdr=(t,x='')=>`<div class="ph"><span>${t}</span><span class="sp"></span>${x}</div>`;
+const clipBtn=(c,o={})=>`<button type="button" class="clipbtn" data-act="clip" data-v="${c.id}" aria-current="${S.clip===c.id}"><b>${c.name}</b><span>${stateChip(c)} ${o.hint?`<small>${hintTxt(c)}</small>`:''}</span><small>${c.res} · ${c.n} f · ${c.start}–${end(c)}</small></button>`;
+const clipList=()=>`<ul class="clips">${S.clips.map(c=>`<li>${clipBtn(c,{hint:true})}</li>`).join('')}</ul>`;
+function jobbar(){const j=running();
+  return`<div class="tools">${j?`<span class="chip c-run">▶ ${jlabel(j)}</span><span data-lv="ptxt" data-job="${j.id}"></span><b data-lv="pct" data-job="${j.id}"></b><div class="bar" style="width:140px"><i data-lv="bar" data-job="${j.id}"></i></div><button type="button" class="btn sm dng" data-act="cancelJob" data-v="${j.id}" ${j.status==='stopping'?'disabled':''}>${j.status==='stopping'?'Stopping after current step…':'Cancel'}</button>`:'<span class="dim">No job running.</span>'}<span class="sp"></span><span class="dim">${queueSummary()}</span><button type="button" class="btn sm" data-act="qOpen" aria-expanded="${S.qOpen}">${S.qOpen?'Hide queue':'Show queue'}</button></div>${S.qOpen?queueList():''}`}
+/* ================= designs ================= */
+function d1(){const c=cur();return`<div class="l1">
+ <div class="ga-bar">${appbar()}</div>
+ <nav class="panel ga-clips" aria-label="Clips">${hdr('Clips')}${clipList()}</nav>
+ <main class="panel ga-view">${viewer({paint:true,fill:true})}${timeline()}</main>
+ <aside class="panel pane ga-insp" aria-label="Inspector">${hdr('Inspector — '+c.id,stateChip(c))}<div class="pbody">${banners(c)}${secHint(c)}${secInput(c)}${secOutput(c)}${secAdv(c)}${summaryBlock(c)}</div><div class="pfoot">${runBtns(c)}</div></aside>
+ <footer class="panel ga-job">${jobbar()}</footer></div>`}
+const STEPS=['Import','Hint (optional)','Check colour','Output','Key','Review'];
+function d2(){const c=cur(),s=S.step;
+  const okS=[true,c.mode==='none'||c.hasHint,c.checked,outList(c).length>0,c.written.length>0,false];
+  const done=i=>i<s&&okS[i],warn=i=>i<s&&!okS[i];
+  const rail=`<nav class="panel rail ga-rail" aria-label="Steps"><ol>${STEPS.map((n,i)=>`<li><button type="button" class="${done(i)?'done':warn(i)?'warnstep':''}" data-act="step6" data-v="${i}" ${i===s?'aria-current="step"':''}><span class="n" aria-hidden="true">${done(i)?'✓':warn(i)?'▲':i+1}</span>${n}${warn(i)?'<span class="sr"> — needs attention</span>':''}</button></li>`).join('')}</ol></nav>`;
+  let body='';
+  if(s===0)body=`<div class="stepbody"><h2>1 · Choose a clip</h2><p class="help">Importing happens in the real app (drag and drop or Open). Pick one of the sample clips to continue.</p></div><ul class="clips">${S.clips.map(x=>`<li>${clipBtn(x)}</li>`).join('')}</ul>`;
+  else if(s===1)body=`<div class="stepbody"><h2>2 · Hint — optional</h2><p class="help">Most clips can be tried with no hint first. You can always add one later.</p></div>${secHint(c)}<div class="stepbody"><button type="button" class="btn" data-act="skipHint">Skip — key without hint</button></div>`;
+  else if(s===2)body=`<div class="stepbody"><h2>3 · Check input colour</h2><p class="help">Tell the AI how to read the pixels. This is the setting most often wrong, so it gets its own step.</p></div>${secInput(c)}`;
+  else if(s===3)body=`<div class="stepbody"><h2>4 · Choose what to write</h2>${rangeDiagram(c)}</div>${secOutput(c)}`;
+  else if(s===4)body=`<div class="stepbody"><h2>5 · Key</h2><p data-lv="summary" style="margin:0 0 8px">${summary(c)}</p>${banners(c)}</div><div class="sec">${runBtns(c)}</div>${queueList({hist:2})}<div class="sec">${secAdv(c).replace('<section class="sec">','<div>').replace('</section>','</div>')}</div>`;
+  else body=`<div class="stepbody"><h2>6 · Review</h2><p class="help">You are looking at files already on disk. Scrubbing never starts the AI.</p>${banners(c)}</div>${timeline({marks:false})}<div class="stepbody row"><button type="button" class="btn pri" data-act="openFolder">Open output folder</button><button type="button" class="btn" data-act="step6" data-v="0">Key another clip</button></div>`;
+  const foot=`<div class="stepfoot"><button type="button" class="btn" data-act="stepNav" data-v="-1" ${s===0?'disabled':''}>← Back</button><span class="sp"></span>${s<5?`<button type="button" class="btn pri" data-act="stepNav" data-v="1">Next: ${STEPS[s+1]} →</button>`:''}</div>`;
+  const big=s===5;
+  return`<div class="l2${big?' big':''}">
+  <div class="ga-bar">${appbar(`<span class="dim">Step ${s+1} of 6 — ${STEPS[s]}</span>`)}</div>${rail}
+  <main class="panel ga-main"><div class="pbody">${big?`<div class="cols2"><div>${viewer()}</div><div>${body}</div></div>`:body}</div>${foot}</main>
+  ${big?'':`<aside class="panel ga-side" aria-label="Preview">${hdr('Preview — '+c.id,stateChip(c))}${viewer({cls:'compact',paint:s===1,modes:[['input','Input'],['hint','Hint']]})}${s===4?'':`<div class="sec"><p class="help" style="margin:0">${writesTxt(c)}</p></div>`}</aside>`}</div>`}
+function rangeDiagram(c){const pos=f=>(f-c.start)/(c.n-1)*100;
+  return`<div class="range-diagram" role="img" aria-label="${writesTxt(c)}"><div class="tag">AI processes (always everything)</div><div class="lane"><div class="b ai">All ${c.n} frames</div></div><div class="tag">Files written (your In/Out)</div><div class="lane"><div class="b plan" style="left:${pos(c.inA)}%;width:${Math.max(1,pos(c.inB)-pos(c.inA))}%">${nWrite(c)}</div></div><p class="help" style="margin:4px 0 0">Setting a shorter range makes fewer files, not a faster AI pass.</p></div>`}
+function d3(){const sel=S.sel,n=sel.length;
+  const cards=S.clips.map(c=>{const on=sel.includes(c.id),j=activeFor(c.id);
+   return`<article class="card" data-sel="${on}"><div class="thumb">${thumb(c,c.inA)}</div><h3><label><input type="checkbox" data-chg="selToggle" data-v="${c.id}" id="sel-${c.id}" ${on?'checked':''}>${c.name}</label></h3>
+   <div>${stateChip(c)} <span class="chip c-dim">${hintTxt(c)}</span> ${stale(c)?'<span class="chip c-warn">▲ stale</span>':''} ${!c.checked&&c.sample?'<span class="chip c-warn">▲ check colour</span>':''}</div>
+   <div class="meta">${c.res} · ${c.n} f · writes ${c.inA}–${c.inB} · ${CL[c.colour]}</div>
+   <div class="meta">Outputs: ${outList(c).map(([k,f])=>OLBL[k]+' '+f).join(', ')||'none'}</div>
+   ${c.state==='Error'?`<div class="note err" style="margin:0">${c.err}</div>`:''}
+   <div class="row" style="margin:0"><button type="button" class="btn sm" data-act="open" data-v="${c.id}">Open viewer &amp; settings</button>${j?`<button type="button" class="btn sm dng" data-act="cancelJob" data-v="${j.id}" ${j.status==='stopping'?'disabled':''}>Cancel</button>`:`<button type="button" class="btn sm" data-act="cardKey" data-v="${c.id}">${c.state==='Error'?'Regenerate hint':'Add to queue'}</button>`}</div></article>`}).join('');
+  const ov=S.overlay?(()=>{const c=clip(S.overlay);return`<div class="overlay"><div class="ovbox" role="dialog" aria-modal="true" aria-label="Clip viewer and settings">${hdr(c.name,`<button type="button" class="btn sm" data-act="closeOv" id="closeov">Close (Esc)</button>`)}<div>${viewer({paint:true})}${timeline()}</div>${pane('',banners(c)+secHint(c)+secInput(c)+secOutput(c),runBtns(c))}</div></div>`})():'';
+  return`<div class="l3"><div class="ga-bar">${appbar()}</div>
+  <div class="panel ga-tool" ${S.overlay?'inert':''}><div class="tools"><b>${n} selected</b><button type="button" class="btn sm" data-act="selAll">${n===S.clips.length?'Clear selection':'Select all'}</button><span class="tag">AI always processes the whole clip; In/Out only limits files written.</span><span class="sp"></span>
+   <button type="button" class="btn sm" data-act="bulkApply" ${n<2?'disabled':''} title="Copy outputs, Despill and temporal window from the focused clip">Copy outputs &amp; advanced from ${S.clip}</button>
+   <button type="button" class="btn pri" data-act="bulkQueue" ${n?'':'disabled'}>Key ${n} clip${n===1?'':'s'} — one at a time</button></div></div>
+  <main class="panel ga-grid" ${S.overlay?'inert':''}><div class="cards">${cards}</div></main>
+  <aside class="panel ga-q" aria-label="Queue" ${S.overlay?'inert':''}>${hdr('Queue — strictly sequential')}${queueList({hist:5})}</aside>${ov}</div>`}
+const PAGES=[['media','Media'],['hint','Hint'],['key','Key'],['review','Review'],['deliver','Deliver']];
+function d4(){const c=cur(),p=S.page;let main='';
+  if(p==='media')main=`<div class="scroll" tabindex="0" role="region" aria-label="Clip table (scrollable)"><table class="t"><thead><tr><th>Clip</th><th>State</th><th>Size</th><th>Frames</th><th>Source</th><th>Colour</th></tr></thead><tbody>${S.clips.map(x=>`<tr><td><button type="button" class="btn sm" data-act="clip" data-v="${x.id}" aria-current="${S.clip===x.id}">${x.name}</button></td><td>${stateChip(x)}</td><td>${x.res}</td><td>${x.n} (${x.start}–${end(x)})</td><td>${x.kind}</td><td>${CL[x.colour]}</td></tr>`).join('')}</tbody></table></div><div class="stepbody"><p class="help">Pick a clip here or in the strip below, then go to <b>Hint</b> or <b>Key</b>.</p></div>`;
+  else if(p==='hint')main=`<div class="cols2 fillc"><div class="pane">${viewer({paint:true,fill:true,modes:[['input','Input'],['hint','Hint']]})}${timeline()}</div>${pane(hdr('Hint — optional'),banners(c)+secHint(c))}</div>`;
+  else if(p==='key')main=`<div class="cols2 fillc">${pane(hdr('AI processing','<span class="tag">Runs on the GPU, one job at a time</span>'),banners(c)+secInput(c)+secAdv(c)+summaryBlock(c)+'<p class="help" style="padding:0 10px">Frame range and outputs are set on <b>Deliver</b>.</p>',runBtns(c))}${pane(hdr('Queue'),queueList())}</div>`;
+  else if(p==='review')main=`${hdr('Playback of files on disk','<span class="tag">The AI is not involved on this page</span>')}${banners(c)}${viewer({fill:true})}${timeline({marks:false})}`;
+  else main=`<div class="cols2 fillc">${pane(hdr('Deliver'),secOutput(c))}${pane(hdr('Current plan'),`<div class="stepbody"><p style="margin:0" data-lv="summary">${summary(c)}</p></div>${banners(c)}`,runBtns(c))}</div>`;
+  return`<div class="l4"><div class="ga-bar">${appbar(`<span class="dim">${c.name}</span>`)}</div>
+  <div class="ga-pages pages" role="tablist" aria-label="Pages">${PAGES.map(([v,l])=>`<button type="button" role="tab" data-act="page" data-v="${v}" aria-selected="${p===v}" id="pg-${v}">${l}</button>`).join('')}</div>
+  <main class="panel ga-main" role="tabpanel" aria-labelledby="pg-${p}">${main}</main>
+  <nav class="ga-strip strip" aria-label="Clip strip">${S.clips.map(x=>clipBtn(x)).join('')}</nav></div>`}
+function d5(){const c=cur();
+  return`<div class="l5"><div class="ga-bar">${appbar(`<span class="dim">${c.name}</span> ${stateChip(c)}`)}</div>
+  <main class="panel ga-view">${banners(c)}
+  <div class="tools"><span class="dim">Clip</span><select id="rclip" data-chg="clipSel" aria-label="Clip">${S.clips.map(x=>`<option value="${x.id}" ${x.id===c.id?'selected':''}>${x.name}</option>`).join('')}</select><span class="sp"></span>
+   <button type="button" class="btn pri" data-act="drawer" aria-expanded="${S.drawer}">${S.drawer?'Close Key panel':c.written.length?'Re-key…':'Key clip…'}</button></div>
+  ${viewer({fill:true})}${timeline({marks:false})}<div class="sec"><div class="row"><span class="chip c-${running()?'run':'dim'}">${queueSummary()}</span>${running()?`<span data-lv="ptxt" data-job="${running().id}"></span><b data-lv="pct" data-job="${running().id}"></b>`:''}${activeFor(c.id)?`<button type="button" class="btn sm dng" data-act="cancelJob" data-v="${activeFor(c.id).id}" ${activeFor(c.id).status==='stopping'?'disabled':''}>Cancel</button>`:''}</div></div></main>
+  ${S.drawer?`<aside class="drawer" aria-label="Re-key panel">${hdr((c.written.length?'Re-key ':'Key ')+c.id,'<button type="button" class="btn sm" data-act="drawer">Close</button>')}<div class="pbody"><p class="help" style="padding:6px 10px;margin:0">Changing settings does not update the viewer. Key again to make new results.</p>${secHint(c)}${secInput(c)}${secOutput(c)}${secAdv(c)}${summaryBlock(c)}${queueList({hist:2})}</div><div class="pfoot">${runBtns(c)}</div></aside>`:''}</div>`}
+function d6(){const c=cur(),pf=[0,.25,.5,.75,1].map(f=>Math.round(c.start+f*(c.n-1)));
+  return`<div class="l6"><div class="ga-bar">${appbar()}</div>
+  <main class="panel ga-ticket"><div class="ticket"><h2>JOB TICKET <span class="sp"></span><label class="row" style="margin:0;font-family:inherit"><span class="dim">Clip</span><select id="tclip" data-chg="clipSel" aria-label="Clip for this ticket">${S.clips.map(x=>`<option value="${x.id}" ${x.id===c.id?'selected':''}>${x.name}</option>`).join('')}</select></label></h2>
+   <div class="pbody">${banners(c)}
+   <section class="sec"><h3>1 · Source</h3><dl><dt>Clip</dt><dd>${c.name}</dd><dt>Size</dt><dd>${c.res} · ${c.kind}</dd><dt>Frames</dt><dd>${c.n} (${c.start}–${end(c)}) at ${c.fps} fps</dd><dt>State</dt><dd>${stateChip(c)}</dd></dl></section>
+   <div class="ticket-sec">${secHint(c).replace(/<h3>/,'<h3>2 · ')}</div>${secInput(c).replace(/<h3>/,'<h3>3 · ')}${secOutput(c).replace(/<h3>/,'<h3>4 · ')}${secAdv(c).replace(/<h3>/,'<h3>5 · ')}</div>
+   <div class="pfoot"><div class="sentence" data-lv="summary" style="margin:0 0 8px">${summary(c)}</div>${runBtns(c)}</div></div></main>
+  <aside class="panel ga-side" aria-label="Preview and queue">${hdr('Preview — sample thumbnails')}<div class="thumbs" style="padding-top:10px">${pf.map(f=>`<div>${thumb(c,f)}</div>`).join('')}</div>${viewer({cls:'compact',paint:true,modes:[['input','Input'],['hint','Hint'],['matte','Matte'],['comp','Comp']]})}${hdr('Queue')}${queueList({hist:3})}</aside></div>`}
+function d7(){const c=cur(),tot=S.clips.reduce((s,x)=>s+x.n,0);let off=0;const offs={};S.clips.forEach(x=>{offs[x.id]=off;off+=x.n});
+  const L=x=>offs[x.id]/tot*100,W=x=>x.n/tot*100,fp=(x,f)=>(offs[x.id]+(f-x.start))/tot*100;
+  const src=S.clips.map(x=>`<button type="button" class="seg1" style="left:${L(x)}%;width:${W(x)}%" data-act="clip" data-v="${x.id}" aria-current="${S.clip===x.id}" aria-label="${x.name}, ${x.state}, ${x.n} frames">${x.id}</button>`).join('');
+  const hint=S.clips.map(x=>x.mode==='none'?`<span class="seg1 hint-none" style="left:${L(x)}%;width:${W(x)}%">no hint</span>`:`<span class="seg1 hint-full" style="left:${L(x)}%;width:${W(x)}%">${x.hasHint?x.gen:'not generated'}</span>${x.mode==='keyframes'?x.kf.map(f=>`<span class="tick" style="left:${fp(x,f)}%;top:9px" title="${x.id} keyframe ${f}"></span>`).join(''):''}`).join('');
+  const wr=S.clips.map(x=>`<span class="seg1 plan" style="left:${fp(x,x.inA)}%;width:${(x.inB-x.inA+1)/tot*100}%"></span>`+x.written.map(r=>`<span class="seg1 wr" style="left:${fp(x,r[0])}%;width:${(r[1]-r[0]+1)/tot*100}%"></span>`).join('')).join('');
+  const flags=S.clips.map(x=>`<span class="seg1 flag ${x.state==='Error'?'err':''}" style="left:${L(x)}%;width:${W(x)}%">${x.state==='Error'?'✕ Error':stale(x)?'▲ Stale':!x.checked&&x.sample?'▲ Colour':''}</span>`).join('');
+  return`<div class="l7"><div class="ga-bar">${appbar()}</div>
+  <main class="panel ga-view">${banners(c)}${viewer({modes:MODES,fill:true})}</main>
+  <aside class="panel pane ga-side" aria-label="Queue">${hdr('Queue')}<div class="pbody">${queueList({hist:3})}</div><div class="pfoot">${runBtns(c)}</div></aside>
+  <section class="panel ga-lanes" aria-label="Timeline lanes"><div class="ph">Clips laid end-to-end <span class="tag" style="text-transform:none;letter-spacing:0">(layout only — no editing or sequence output)</span></div><div class="stepbody lanes"><div style="position:relative">
+   <div class="lanerow"><span>Source</span><div class="lanetrack">${src}</div></div><div class="lanerow"><span>Hint</span><div class="lanetrack">${hint}</div></div>
+   <div class="lanerow"><span>Written</span><div class="lanetrack">${wr}</div></div><div class="lanerow"><span>Status</span><div class="lanetrack">${flags}</div></div>
+   <div style="position:absolute;left:86px;right:0;top:0;bottom:0;pointer-events:none"><div class="head" data-lv="head7" style="top:0;bottom:0"></div></div></div>
+   ${more('lanes','How to read the lanes','<p>Dashed = frames to write for each clip · green = written. A gap inside a clip is where Resume would fill in. The AI always processes each clip’s whole length.</p>')}</div></section>
+  <section class="ga-insp"><div class="cols3 fillc">${pane(hdr('Hint &amp; input — '+c.id),secHint(c)+secInput(c))}${pane(hdr('Output'),secOutput(c))}${pane(hdr('Advanced'),secAdv(c)+summaryBlock(c))}</div></section></div>`}
+function d8(){const c=cur(),n=S.node,by=c.mode==='none';
+  const wy={fg:0,matte:48,comp:96,processed:144};
+  const sub={read:`${c.id} · ${c.n} f · ${CL[c.colour]}`,hint:by?'Bypassed — no hint':`${c.gen} · ${c.mode==='full'?'Full':'Keyframes'}${c.hasHint?'':' (todo)'}`,key:`whole clip · ${c.n} f`};
+  const node=(k,x,y,w,t,s,cls='')=>`<button type="button" class="node ${cls}" style="left:${x}px;top:${y}px;width:${w}px" data-act="node" data-v="${k}" aria-pressed="${n===k}"><b>${t}</b><small>${s}</small></button>`;
+  const link=(x1,y1,x2,y2,d)=>`<path d="M${x1} ${y1} C${x1+((x2-x1)/2)} ${y1} ${x2-((x2-x1)/2)} ${y2} ${x2} ${y2}" fill="none" stroke="${d?'#555':'#8a8a8a'}" stroke-width="2" ${d?'stroke-dasharray="5 4"':''}/>`;
+  const links=link(160,99,210,99,by)+link(360,99,410,99,by)+(by?link(160,99,410,99,false):'')+OUTK.map(k=>link(560,99,610,wy[k]+21,!c.outs[k])).join('');
+  const nodes=node('read',10,78,150,'Read',sub.read)+node('hint',210,78,150,'Hint',sub.hint,by?'by':'')+node('key',410,78,150,'CorridorKey 2.0',sub.key)+OUTK.map(k=>node('w-'+k,610,wy[k],150,'Write '+OLBL[k],c.outs[k]?`${c.outs[k]} · ${c.inA}–${c.inB}`:'Off',c.outs[k]?'':'off')).join('');
+  let props='';
+  if(n==='read')props=`${hdr('Properties — Read')}<div class="pbody"><div class="sec"><dl style="margin:0;display:grid;grid-template-columns:auto 1fr;gap:2px 12px"><dt class="dim">Clip</dt><dd style="margin:0">${c.name}</dd><dt class="dim">Size</dt><dd style="margin:0">${c.res}</dd><dt class="dim">Frames</dt><dd style="margin:0">${c.n} (${c.start}–${end(c)})</dd><dt class="dim">State</dt><dd style="margin:0">${stateChip(c)}</dd></dl></div>${secInput(c)}<div class="sec"><div class="chips">${S.clips.map(x=>`<button type="button" class="btn sm" data-act="clip" data-v="${x.id}" aria-current="${S.clip===x.id}">${x.id}</button>`).join('')}</div></div></div>`;
+  else if(n==='hint')props=`${hdr('Properties — Hint')}<div class="pbody"><div class="sec"><button type="button" class="btn" data-act="bypass" aria-pressed="${by}">${by?'Bypassed (click to enable)':'Bypass hint'}</button><p class="help">Bypass = Hint mode “None”: the AI keys the clip by itself.</p></div>${secHint(c)}</div>`;
+  else if(n==='key')props=`${hdr('Properties — CorridorKey 2.0')}<div class="pbody">${banners(c)}${secAdv(c,true)}${summaryBlock(c)}</div><div class="pfoot">${runBtns(c)}</div>`;
+  else props=`${hdr('Properties — Write '+OLBL[n.slice(2)])}<div class="pbody">${secOutput(c)}</div>`;
+  return`<div class="l8"><div class="ga-bar">${appbar('<span class="chip c-dim">Expert view</span>')}</div>
+  <main class="panel ga-view">${viewer({paint:true,fill:true})}</main>
+  <section class="panel ga-graph" aria-label="Node graph"><div class="ph">Node graph — fixed pipeline <span class="tag" style="text-transform:none;letter-spacing:0">(you can select, bypass Hint and toggle outputs; wiring is not editable)</span></div><div class="graphwrap" tabindex="0" role="region" aria-label="Node graph (scrollable)"><div class="graph"><svg width="770" height="196" aria-hidden="true">${links}</svg>${nodes}</div></div></section>
+  <aside class="panel pane ga-props" aria-label="Properties">${props}</aside>
+  <footer class="panel ga-q">${jobbar()}</footer></div>`}
+/* ================= registry ================= */
+const DESIGNS=[
+ {id:'P1',name:'Shot Station',render:d1,best:'One hero shot at a time, and people coming from today’s app.',trade:'Dense; the queue is secondary and batch work means scrolling.',r:[3,2,3,3,'Low','High']},
+ {id:'P2',name:'Guided Stepper',render:d2,best:'First-time and occasional users — the colour check cannot be missed.',trade:'Slow for repeat work and awkward for many clips.',r:[4,1,2,4,'Med','Med']},
+ {id:'P3',name:'Batch Board',render:d3,best:'Many shots in one session; clear status overview.',trade:'The viewer is second-class and tuning needs an extra click.',r:[3,4,1,2,'Med','Med']},
+ {id:'P4',name:'Page Tabs',render:d4,best:'A clean split between “AI processing” and “reviewing files”.',trade:'More navigation; “where is that setting?” risk.',r:[3,3,4,3,'High','Med']},
+ {id:'P5',name:'Review Room',render:d5,best:'Judging mattes — results fill the screen.',trade:'First run feels hidden; weak for batch; hint painting is cramped.',r:[2,1,4,2,'Med','Med']},
+ {id:'P6',name:'Job Ticket',render:d6,best:'Knowing exactly what will happen; clear validation.',trade:'Least visual; feels like admin software.',r:[4,2,1,4,'Low','High']},
+ {id:'P7',name:'Timeline Lanes',render:d7,best:'Coverage, resume gaps and hint keyframes at a glance.',trade:'Implies edit semantics the app lacks; heavier to build.',r:[2,3,3,4,'High','Low']},
+ {id:'P8',name:'Node Graph',render:d8,best:'Compositors who think in nodes — an optional expert view.',trade:'Wrong default for normal users; hints at flexibility that is not there.',r:[1,2,2,2,'High','Low']}
+];
+const dname=i=>`${DESIGNS[i].id} ${DESIGNS[i].name}`;
+function compare(){
+  const dots=n=>`<span aria-hidden="true">${'●'.repeat(n)}<span class="dim">${'○'.repeat(4-n)}</span></span><span class="sr"> ${n} of 4</span>`;
+  const sl=S.shortlist.map(i=>dname(i));
+  return`<div class="stepbody"><h2 style="margin:0 0 6px">Compare the eight directions</h2><p class="help" style="margin:0 0 8px">Ratings are the planner’s opinion, not measurements. More dots is better; build cost and fit are Low / Med / High.</p></div>
+  <div class="scroll" tabindex="0" role="region" aria-label="Comparison table (scrollable)"><table class="t"><caption class="sr">Comparison of the eight designs</caption><thead><tr><th scope="col">Design</th><th scope="col">Ordinary user</th><th scope="col">Batch</th><th scope="col">Review</th><th scope="col">Range / whole-clip clarity</th><th scope="col">Build cost</th><th scope="col">Fit to current code</th><th scope="col">Actions</th></tr></thead><tbody>
+  ${DESIGNS.map((d,i)=>`<tr><th scope="row"><b>${d.id} ${d.name}</b><br><span class="dim">Best for: ${d.best}</span></th>${d.r.slice(0,4).map(v=>`<td>${dots(v)}</td>`).join('')}<td>${d.r[4]}</td><td>${d.r[5]}</td><td><button type="button" class="btn sm" data-act="design" data-v="${i}">Open ${d.id}</button> <button type="button" class="btn sm" data-act="shortlist" data-v="${i}" aria-pressed="${S.shortlist.includes(i)}">${S.shortlist.includes(i)?'★ Shortlisted':'☆ Shortlist'}</button></td></tr>`).join('')}</tbody></table></div>
+  <div class="sec"><h3>Your shortlist (marked on this page only)</h3><p style="margin:0" id="slsum">${sl.length?sl.join(' · '):'Nothing marked yet.'}</p><p class="help">Nothing is sent anywhere. Tell the assistant the names above in chat to record your choice.</p>
+  <p class="help" style="margin-bottom:0">Planner’s starting point, not a decision: P1 Shot Station (safe evolution), P4 Page Tabs (cleanest AI-vs-review split), P3 Batch Board if most work is multi-shot.</p></div>`}
+/* ================= render ================= */
+const mount=$('#mount');
+const fidOf=e=>e.id||`${e.dataset.act||e.dataset.chg||e.dataset.inp||''}|${e.dataset.v??''}`;
+function renderChrome(){
+  const tabs=$('#tabs');
+  tabs.innerHTML=DESIGNS.map((d,i)=>`<button type="button" class="tab" role="tab" id="tab-${i}" data-tab="${i}" aria-selected="${S.design===i}" aria-controls="panel" tabindex="${S.design===i?0:-1}">${d.id} ${d.name}${S.shortlist.includes(i)?' <span class="star" aria-label="shortlisted">★</span>':''}</button>`).join('')+`<button type="button" class="tab" role="tab" id="tab-8" data-tab="8" aria-selected="${S.design===8}" aria-controls="panel" tabindex="${S.design===8?0:-1}">Compare &amp; shortlist</button>`;
+  const info=$('#info');
+  if(S.design===8)info.innerHTML=`<div><h2>Compare &amp; shortlist</h2><p><b>Use this to decide:</b> open any design from the table, then mark the ones you like.</p></div>`;
+  else{const d=DESIGNS[S.design],on=S.shortlist.includes(S.design);
+    info.innerHTML=`<div><h2>${d.id} · ${d.name}</h2><p><b>Best for:</b> ${d.best}</p><p><b>Tradeoff:</b> ${d.trade}</p></div><div class="sl"><button type="button" class="btn ${on?'':'pri'}" data-act="shortlist" data-v="${S.design}" aria-pressed="${on}" id="slbtn">${on?'★ On my shortlist (click to remove)':'☆ Add to my shortlist'}</button><small>Marks it on this page only. Nothing is sent — tell the assistant “${dname(S.design)}” in chat.</small></div>`}
+  $('#panel').setAttribute('aria-labelledby','tab-'+S.design);
+  $('#keys').hidden=!S.keys;$('#keybtn').setAttribute('aria-expanded',S.keys);
+  const sp=$('#speed');sp.textContent=`Simulation speed: ${S.speed}×`;sp.setAttribute('aria-pressed',S.speed>1)}
+function render(){
+  const a=document.activeElement;let fid=null,selr=null;
+  if(a&&a!==document.body&&(mount.contains(a)||$('#info').contains(a))){fid=fidOf(a);if(a.selectionStart!=null&&a.type!=='number')selr=[a.selectionStart,a.selectionEnd]}
+  mount.innerHTML=S.design===8?compare():DESIGNS[S.design].render();
+  renderChrome();
+  $$('button,input,select',mount).forEach(e=>e.dataset.fid=fidOf(e));
+  $$('button,input,select',$('#info')).forEach(e=>e.dataset.fid=fidOf(e));
+  liveUpdate();
+  if(fid){const n=$(`[data-fid="${CSS.escape(fid)}"]`,mount)||$(`[data-fid="${CSS.escape(fid)}"]`,$('#info'));if(n&&!n.disabled)n.focus({preventScroll:true})}
+  if(S.overlay&&!fid){const b=$('#closeov');if(b)b.focus({preventScroll:true})}}
+const setT=(el,v)=>{if(el.textContent!==v)el.textContent=v};
+function liveUpdate(){
+  const c=cur();
+  $$('[data-lv]',mount).forEach(el=>{
+    const k=el.dataset.lv,j=el.dataset.job?job(el.dataset.job):null;
+    switch(k){
+      case'scene':{const key=sceneKey(c);if(el.dataset.key!==key){el.innerHTML=sceneInner(c);el.dataset.key=key}break}
+      case'ov':el.style.clipPath=`inset(0 0 0 ${S.wipe}%)`;break;
+      case'wl':el.style.left=S.wipe+'%';break;
+      case'frame':setT(el,`Frame ${S.frame}`);break;
+      case'head':el.style.left=`calc(8px + (100% - 16px) * ${(S.frame-c.start)/(c.n-1)})`;break;
+      case'head7':{const tot=S.clips.reduce((s,x)=>s+x.n,0);let off=0;for(const x of S.clips){if(x.id===c.id)break;off+=x.n}el.style.left=`${(off+S.frame-c.start)/tot*100}%`;break}
+      case'seek':if(+el.value!==S.frame)el.value=S.frame;break;
+      case'stale':el.hidden=!stale(c);break;
+      case'staletxt':setT(el,staleTxt(c));break;
+      case'despill':setT(el,c.despill.toFixed(2));break;
+      case'hq':setT(el,c.hq.toFixed(2));break;
+      case'cq':setT(el,c.cq.toFixed(2));break;
+      case'summary':setT(el,summary(c));break;
+      case'writes':setT(el,writesTxt(c));break;
+      case'pct':if(j)setT(el,Math.round(j.p*100)+'%');break;
+      case'bar':if(j){el.style.width=(j.p*100)+'%';if(el.parentElement.getAttribute('role'))el.parentElement.setAttribute('aria-valuenow',Math.round(j.p*100))}break;
+      case'ptxt':if(j)setT(el,ptxt(j));break;
+      case'left':if(j)setT(el,Math.ceil((1-j.p)*DUR[j.type]/S.speed/1000)+' s');break;
+      case'jstatus':if(j)setT(el,j.status==='stopping'?'Stopping after current step…':'Running');break;
+      case'step':if(j){const i=+el.dataset.i,pi=phaseInfo(j).i;el.className=i<pi?'done':i===pi?'now':''}break}})}
+/* ================= actions ================= */
+const ACT={
+ design(d){S.design=+d.v;S.overlay=null},
+ shortlist(d){const i=+d.v,k=S.shortlist.indexOf(i);k<0?S.shortlist.push(i):S.shortlist.splice(k,1);S.shortlist.sort();if(!noPersist)try{localStorage.setItem('ck-shortlist',JSON.stringify(S.shortlist))}catch(e){}
+  say(k<0?`${dname(i)} marked on this page only. Nothing was sent — tell the assistant the name in chat.`:`${dname(i)} removed from your shortlist.`)},
+ clip(d){selectClip(d.v)},
+ vmode(d){S.mode=d.v;if(d.v!=='input'&&d.v!=='hint')S.paint.on=false},
+ ab(){S.ab=!S.ab},bg(d){S.bg=d.v},
+ play(){S.playing=!S.playing;say(S.playing?'Playing sample frames from disk. The AI is not running.':'Paused.')},
+ step(d){stepFrame(+d.v);return'live'},
+ paintToggle(){S.paint.on=!S.paint.on;if(S.paint.on&&!['input','hint'].includes(S.mode))S.mode='input'},
+ paintOn(){S.paint.on=true;S.mode='input';say('Paint mode on: click the viewer to add subject (1) and background (2) strokes.')},
+ paintTool(d){S.paint.tool=+d.v},
+ clearStrokes(){cur().strokes=[]},
+ mode(d){const c=cur();if(c.mode!=='none')c._prev=c.mode;c.mode=d.v},
+ bypass(){const c=cur();if(c.mode!=='none'){c._prev=c.mode;c.mode='none'}else c.mode=c._prev||'full'},
+ colour(d){const c=cur();c.colour=d.v;c.checked=true},
+ colourPick(d){const c=cur();c.colour=d.v;c.checked=true;say(`Input colour set to ${CL[d.v]} — your choice.`)},
+ setIn(){const c=cur();c.inA=Math.min(S.frame,c.inB);return},
+ setOut(){const c=cur();c.inB=Math.max(S.frame,c.inA)},
+ whole(){const c=cur();c.inA=c.start;c.inB=end(c)},
+ markKf(){const c=cur(),i=c.kf.indexOf(S.frame);i<0?c.kf.push(S.frame):c.kf.splice(i,1)},
+ clearKf(){cur().kf=[]},
+ adv(){S.adv=!S.adv},vram(d){cur().vram=d.v},
+ enableOut(){cur().outs.fg='EXR'},
+ genHint(){const c=cur();
+  if(c.gen==='Import Alpha'){c.hasHint=true;c.err='';if(c.state==='Error'||c.state==='Raw')c.state='Ready';if(c.mode==='none')c.mode='full';say('Prototype: file picker not shown; a sample alpha was attached.');return}
+  if(NEEDS_STROKES(c.gen)&&c.strokes.length<2){ACT.paintOn();return}
+  if(c.mode==='none')c.mode='full';enqueue('hint',c.id,{gen:c.gen});say(`Hint job queued for ${c.id}.`)},
+ genThenKey(){const c=cur();if(NEEDS_STROKES(c.gen)&&c.strokes.length<2){ACT.paintOn();return}enqueue('hint',c.id,{gen:c.gen});enqueue('key',c.id);say(`Queued ${c.gen} hint, then key for ${c.id}. They run one at a time.`)},
+ key(){const c=cur();if(!enqueue('key',c.id))say('That clip already has a job waiting.');else if(!running()||running().clip!==c.id)say(`Key ${c.id} queued. It starts when the GPU is free.`)},
+ resume(){const c=cur();enqueue('resume',c.id);say(`Resume queued: only the ${count(resumeRange(c)||[])} missing frames will be written.`)},
+ busy(){if(S.queue.some(j=>ACTIVE.includes(j.status))){say('The queue already has jobs — nothing changed.');return}
+  const a=enqueue('key','SH040');a.p=.74;enqueue('key','SH050');enqueue('hint','SH070',{gen:'BiRefNet'});say('Busy queue example: Key SH040 is refining; two jobs wait. Simulated.')},
+ cancelJob(d){cancelJob(d.v)},
+ qUp(d){moveQ(d.v,-1)},qDown(d){moveQ(d.v,1)},qOpen(){S.qOpen=!S.qOpen},
+ openFolder(){say(`Prototype: the real app would open …/clips/${cur().name}/ in your file manager.`)},
+ step6(d){S.step=+d.v;if(+d.v===0)S.mode='input'},
+ stepNav(d){S.step=clamp(S.step+ +d.v,0,5);if(S.step===5&&cur().written.length)S.mode='comp'},
+ skipHint(){const c=cur();c.mode='none';S.step=2;say('Hint skipped — the AI will key the clip without one.')},
+ page(d){S.page=d.v;if(d.v==='review'&&cur().written.length)S.mode='comp'},
+ drawer(){S.drawer=!S.drawer},
+ node(d){S.node=d.v},
+ open(d){S.clip=d.v;const c=cur();S.frame=c.inA;S.overlay=d.v;S.mode='input'},
+ closeOv(){S.overlay=null;S.paint.on=false},
+ selAll(){S.sel=S.sel.length===S.clips.length?[]:S.clips.map(c=>c.id)},
+ cardKey(d){const c=clip(d.v);if(c.state==='Error'){S.clip=c.id;ACT.genHint()}else queueClip(c)},
+ bulkQueue(){const names=[];S.sel.forEach(id=>{const c=clip(id);if(queueClip(c,true))names.push(id)});say(`Queued ${names.length} clip${names.length===1?'':'s'}: ${names.join(', ')||'none'}. They run one at a time.`)},
+ bulkApply(){const s=cur();S.sel.forEach(id=>{if(id===s.id)return;const c=clip(id);c.outs=Object.assign({},s.outs);c.despill=s.despill;c.temporal=s.temporal;c.vram=s.vram});say(`Copied outputs and advanced settings from ${s.id} to ${S.sel.length-1} other clip(s). Frame ranges were left alone.`)}
+};
+function queueClip(c,quiet){
+  if(activeFor(c.id)){if(!quiet)say(`${c.id} already has a job waiting.`);return false}
+  if(c.state==='Error'){say(`${c.id} skipped: ${c.err}`);return false}
+  if(!outList(c).length){say(`${c.id} skipped: no outputs enabled.`);return false}
+  if(c.mode!=='none'&&!c.hasHint){if(NEEDS_STROKES(c.gen)&&c.strokes.length<2){say(`${c.id} skipped: ${c.gen} needs paint strokes first.`);return false}enqueue('hint',c.id,{gen:c.gen})}
+  enqueue('key',c.id);if(!quiet)say(`Key ${c.id} queued.`);return true}
+function moveQ(id,d){const q=S.queue,i=q.findIndex(j=>j.id===id);let k=i+d;while(k>=0&&k<q.length&&q[k].status!=='queued')k+=d;if(k<0||k>=q.length)return;[q[i],q[k]]=[q[k],q[i]]}
+function selectClip(id){S.clip=id;if(!S.sel.includes(id)&&S.design!==2)S.sel=[id];const c=cur();S.frame=clamp(S.frame,c.start,end(c));if(S.frame<c.inA||S.frame>c.inB)S.frame=c.inA;S.paint.on=false}
+function stepFrame(d){const c=cur();S.frame=clamp(S.frame+d,c.start,end(c))}
+const CHG={
+ gen(el){cur().gen=el.value},
+ inA(el){const c=cur();c.inA=clamp(Math.round(+el.value)||c.start,c.start,end(c));if(c.inA>c.inB)c.inB=c.inA},
+ inB(el){const c=cur();c.inB=clamp(Math.round(+el.value)||end(c),c.start,end(c));if(c.inB<c.inA)c.inA=c.inB},
+ outOn(el){cur().outs[el.dataset.v]=el.checked?(cur().outs[el.dataset.v]||(el.dataset.v==='fg'||el.dataset.v==='matte'?'EXR':'PNG')):null},
+ outFmt(el){cur().outs[el.dataset.v]=el.value},
+ temporal(el){cur().temporal=el.value},
+ despillEnd(){},
+ carry(el){cur().carry=el.checked},
+ selToggle(el){const i=S.sel.indexOf(el.dataset.v);el.checked?(i<0&&S.sel.push(el.dataset.v)):(i>=0&&S.sel.splice(i,1));S.clip=el.dataset.v},
+ clipSel(el){selectClip(el.value)}
+};
+const INP={
+ wipe(el){S.wipe=+el.value;return'live'},
+ seek(el){S.frame=+el.value;return'live'},
+ despill(el){cur().despill=+el.value;return'live'},
+ hq(el){cur().hq=+el.value;return'live'},
+ cq(el){cur().cq=+el.value;return'live'}
+};
+/* ================= events ================= */
+mount.addEventListener('click',e=>{
+  const sc=e.target.closest('.scene[data-paint]');
+  if(sc&&!e.target.closest('button')){const r=sc.getBoundingClientRect(),c=cur();
+    if(r.width){const w=r.width,h=r.height,k=Math.min(w/640,h/360),ox=(640*k-w)/2,oy=(360*k-h)/2;
+      c.strokes.push({x:Math.round((e.clientX-r.left+ox)/k),y:Math.round((e.clientY-r.top+oy)/k),t:S.paint.tool});say(`Stroke ${c.strokes.length} added (${S.paint.tool===1?'subject':'background'}).`);liveUpdate();$$('.vfoot .tag',mount).forEach(t=>{if(/strokes/.test(t.textContent))t.textContent=`${c.strokes.length} strokes · click the image to add`})}
+    return}
+  const t=e.target.closest('[data-act]');if(!t||t.disabled)return;
+  dirty=false;const r=ACT[t.dataset.act](t.dataset,t);if(r==='live')liveUpdate();else render()});
+$('#info').addEventListener('click',e=>{const t=e.target.closest('[data-act]');if(t){ACT[t.dataset.act](t.dataset,t);render()}});
+mount.addEventListener('change',e=>{const el=e.target,k=el.dataset.chg;if(k&&CHG[k]){CHG[k](el);render()}});
+mount.addEventListener('input',e=>{const el=e.target,k=el.dataset.inp;if(k&&INP[k]){INP[k](el);liveUpdate()}});
+$('#tabs').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){S.design=+b.dataset.tab;S.overlay=null;render();$('#tab-'+S.design).focus()}});
+$('#tabs').addEventListener('keydown',e=>{
+  const n=9,i=S.design;let k=null;
+  if(e.key==='ArrowRight')k=(i+1)%n;else if(e.key==='ArrowLeft')k=(i+n-1)%n;else if(e.key==='Home')k=0;else if(e.key==='End')k=n-1;
+  if(k!=null){e.preventDefault();S.design=k;S.overlay=null;render();$('#tab-'+k).focus()}});
+$('#speed').addEventListener('click',()=>{S.speed=S.speed===1?4:1;renderChrome();say(`Simulation speed ${S.speed}×. Timings are simulated, not measured.`)});
+$('#busybtn').addEventListener('click',()=>{ACT.busy();render()});
+mount.addEventListener('toggle',e=>{const d=e.target,k=d.dataset&&d.dataset.k;if(!k)return;const i=S.open.indexOf(k);d.open?(i<0&&S.open.push(k)):(i>=0&&S.open.splice(i,1))},true);
+$('#keybtn').addEventListener('click',()=>{S.keys=!S.keys;renderChrome()});
+$('#keys').innerHTML='<b>Shortcuts</b> (ignored while typing): <kbd>1</kbd>–<kbd>8</kbd> design · <kbd>C</kbd> compare · <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> step frame · <kbd>I</kbd>/<kbd>O</kbd> set In/Out · <kbd>M</kbd> mark keyframe · <kbd>K</kbd> key clip (queue) · <kbd>Esc</kbd> close viewer/panel';
+document.addEventListener('keydown',e=>{
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
+  const tg=e.target,typing=/^(INPUT|SELECT|TEXTAREA)$/.test(tg.tagName)&&tg.type!=='range'&&tg.type!=='checkbox';
+  if(typing)return;
+  const interactive=/^(BUTTON|A|SUMMARY)$/.test(tg.tagName)||tg.type==='range'||tg.type==='checkbox'||tg.getAttribute('role')==='tab'||tg.tagName==='SELECT';
+  const c=cur(),k=e.key;
+  if(tg.closest&&tg.closest('.pages')&&(k==='ArrowRight'||k==='ArrowLeft')){e.preventDefault();const i=PAGES.findIndex(p=>p[0]===S.page),n=PAGES[(i+(k==='ArrowRight'?1:PAGES.length-1))%PAGES.length][0];ACT.page({v:n});render();$('#pg-'+n).focus();return}
+  if(/^[1-8]$/.test(k)){S.design=+k-1;S.overlay=null;render();return}
+  if(k==='c'||k==='C'){S.design=8;render();return}
+  if(k==='Escape'){if(S.overlay){ACT.closeOv();render()}else if(S.drawer){S.drawer=false;render()}return}
+  if(S.design===8||interactive)return;
+  if(k===' '){e.preventDefault();ACT.play();render()}
+  else if(k==='ArrowLeft'){stepFrame(-1);liveUpdate()}else if(k==='ArrowRight'){stepFrame(1);liveUpdate()}
+  else if(k==='i'||k==='I'){ACT.setIn();render()}else if(k==='o'||k==='O'){ACT.setOut();render()}
+  else if((k==='m'||k==='M')&&c.mode==='keyframes'){ACT.markKf();render()}
+  else if(k==='k'||k==='K'){const p=primary(c);if(p.act==='key'||p.act==='genThenKey'||p.act==='genHint'){ACT[p.act]({});render()}}});
+let pending=false;const editing=()=>{const a=document.activeElement;return a&&mount.contains(a)&&/^(INPUT|SELECT)$/.test(a.tagName)&&a.type!=='range'&&a.type!=='checkbox'};
+setInterval(()=>{if(S.playing||S.queue.some(j=>ACTIVE.includes(j.status))){dirty=false;advance(100);if(dirty)pending=true;if(pending&&!editing()){pending=false;render()}else liveUpdate()}},100);
+/* ================= self-check ================= */
+function selfCheck(){
+  const snap=JSON.stringify(S),res=[];const ok=(c,m)=>res.push([!!c,m]);
+  const hold=S.speed;S.playing=false;noPersist=true;
+  try{
+    ok(DESIGNS.length===8,'eight designs registered');
+    ok($$('#tabs [role=tab]').length===9,'eight design tabs plus Compare are named, keyboard-reachable controls');
+    const wide=matchMedia('(min-width:1030px)').matches;
+    const visibleText=root=>{const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);let t='',n;while(n=w.nextNode()){const p=n.parentElement;if(p&&!p.closest('details:not([open])')||p&&p.tagName==='SUMMARY')t+=n.textContent}return t};
+    const inView=el=>{const m=mount.getBoundingClientRect(),r=el.getBoundingClientRect();if(!r.width)return false;
+      for(let a=el.parentElement;a&&a!==mount.parentElement;a=a.parentElement){if(/(auto|hidden|scroll)/.test(getComputedStyle(a).overflowY)){const b=a.getBoundingClientRect();if(r.top<b.top-1||r.bottom>b.bottom+1)return false}}
+      return r.top>=m.top-1&&r.bottom<=m.bottom+1};
+    const sigs=new Set(),css=$('style').textContent;
+    ok(!/\d(vh|svh|dvh|lvh)\b/.test(css),'no vh/svh/dvh/lvh units');
+    ok(!/(html|body)[^{}]*\{[^}]*height:\s*100%/.test(css),'no height:100% on html/body');
+    DESIGNS.forEach((d,i)=>{S=JSON.parse(snap);S.design=i;S.playing=false;S.step=4;S.page='key';render();const h=mount.innerHTML,txt=mount.textContent;
+      sigs.add(h.replace(/\d+/g,'').slice(0,4000));
+      ok($('.appbar',mount),`${d.id} has app header`);
+      ok($$('[data-act],[data-chg]',mount).length>8,`${d.id} has interactive controls`);
+      ok(/Key clip|Key \d+ clip|Re-key|Generate|hint, then key|Regenerate|Cancel/.test(txt),`${d.id} shows a working primary action`);
+      ok(/all 412|All 412|whole clip/i.test(txt),`${d.id} states the whole clip is processed`);
+      ok(/queue|Queue/.test(txt),`${d.id} shows the queue`);
+      ok(!$$('.btn.pri',mount).some(b=>b.disabled),`${d.id} has no disabled primary button`);
+      ok($$('button',mount).every(b=>(b.textContent.trim()||b.getAttribute('aria-label'))),`${d.id} buttons have names`);
+      const small=$$('*',mount).filter(el=>!(el instanceof SVGElement)&&[...el.childNodes].some(n=>n.nodeType===3&&n.textContent.trim())&&parseFloat(getComputedStyle(el).fontSize)<12);
+      ok(small.length===0,`${d.id} text is at least 12px${small.length?' (e.g. '+small[0].className+')':''}`);
+      ok(!/Cutout linear|manifest\.json/.test(visibleText(mount)),`${d.id} hides implementation noise (Cutout linear, manifest file)`);
+      if(wide){const pr=$$('.btn.pri,.btn.dng',mount)[0],pl=$('[data-act=play]',mount);
+        ok(pr&&inView(pr),`${d.id} primary action is inside the desktop app bounds`);
+        if(pl)ok(inView(pl),`${d.id} playback controls are inside the desktop app bounds`)}});
+    if(wide){S=JSON.parse(snap);S.design=3;S.page='review';S.playing=false;render();ok(inView($('[data-act=play]',mount)),'P4 Review playback controls are inside the desktop app bounds');
+      S=JSON.parse(snap);S.design=0;render();const wr=$('#win').getBoundingClientRect();ok(wr.height<=700,'app window height is bounded (no giant page)')}
+    ok(sigs.size===8,'all eight layouts have distinct markup');
+    /* simulation */
+    S=JSON.parse(snap);S.design=0;S.speed=1;
+    const c=clip('SH040');ACT.key({});ok(running()&&running().clip==='SH040','Key queues and starts');
+    ACT.cancelJob({v:running().id});ok(running().status==='stopping','Cancel enters “Stopping after current step…”');
+    advance(1000);ok(running(),'cancel is not instant');advance(600);ok(!running()&&S.queue.at(-1).status==='cancelled','job ends Cancelled after the step');ok(c.written.length===0,'cancelled run publishes nothing');
+    ACT.key({});advance(100);ACT.key({});
+    S.clip='SH050';ACT.key({});
+    ok(S.queue.filter(j=>j.status==='running').length===1,'only one job runs at a time');
+    S.queue.forEach(j=>{if(ACTIVE.includes(j.status))j.status='cancelled'});
+    S.clip='SH040';ACT.key({});advance(16000);
+    ok(count(c.written)===200&&c.state==='Ready','partial range writes 200 frames and stays Ready (not Complete)');
+    ok(resumeRange(c)===null,'no resume offered when In/Out is already written');
+    ACT.whole();ok(resumeRange(c)&&count(resumeRange(c))===212,'Resume offers the 212 missing frames');
+    ACT.resume();advance(16000);ok(c.state==='Complete'&&count(c.written)===412,'Resume completes the clip');
+    ok(!stale(c),'fresh results are not stale');c.despill=0.8;ok(stale(c)&&/re-key/.test(staleTxt(c)),'changing Despill marks results stale');
+    ok(stale(clip('SH060')),'SH060 sample is stale (Despill 0.50 → 0.65)');
+    S.clip='SH050';const s5=clip('SH050');ok(!s5.checked&&s5.colour==='srgb','SH050 colour not auto-switched');ACT.colourPick({v:'srgb'});ok(s5.checked,'colour choice is user-driven');
+    ok(primary(clip('SH070')).act==='genHint','Error clip offers an actionable fix');
+    ok(/all 412 frames/.test(summary(c)),'summary says AI processes all frames');
+    /* review round fixes */
+    S=JSON.parse(snap);S.design=0;ACT.key({});running().p=.95;ACT.cancelJob({v:running().id});advance(1600);
+    ok(count(clip('SH040').written)>50&&count(clip('SH040').written)<200&&clip('SH040').state==='Ready'&&/not Complete/.test(S.msg),'cancel during Writing files leaves partial frames, never Complete');
+    S=JSON.parse(snap);const c6=clip('SH060');c6.written=[[1001,1100]];c6.despill=0.5;
+    ok(resumeRange(c6),'Resume offered when settings match the earlier run');c6.temporal='24/12';
+    ok(!resumeRange(c6)&&stale(c6)&&/Temporal/.test(staleTxt(c6)),'changing the temporal window blocks Resume and marks results stale');
+    c6.temporal='auto';c6.outs.matte='PNG';ok(!resumeRange(c6),'changing an output format blocks Resume');
+    const c4=clip('SH040');c4.mode='keyframes';c4.kf=[];ok(primary(c4).act==='markKf','Keyframes with no marks asks for a keyframe first');
+    S.design=1;S.step=5;S.clip='SH050';render();ok($('.rail .warnstep',mount),'P2 flags the unchecked colour step instead of ticking it');
+    S.design=0;S.clip='SH040';render();const cb=$('#o-fg',mount);cb.focus();cb.dispatchEvent(new KeyboardEvent('keydown',{key:' ',bubbles:true,cancelable:true}));ok(!S.playing,'Space on a focused checkbox does not start playback');
+    S=JSON.parse(snap);ok(S.queue.some(j=>j.status==='failed'),'a failed job is in the sample history');
+    S.design=0;ACT.shortlist({v:'3'});ok(S.shortlist.includes(3)&&/Nothing was sent/.test(S.msg),'shortlist marks locally and says nothing was sent');
+    S.design=3;render();ok(/Page Tabs/.test($('#info').textContent),'shortlist button renders in the info row');
+  }catch(err){ok(false,'exception: '+err.message)}
+  noPersist=false;S=JSON.parse(snap);S.speed=hold;S.playing=false;
+  const bad=res.filter(r=>!r[0]);return{pass:res.length-bad.length,total:res.length,failed:bad.map(r=>r[1])}}
+try{const sv=JSON.parse(localStorage.getItem('ck-shortlist')||'[]');if(Array.isArray(sv))S.shortlist=sv.filter(i=>Number.isInteger(i)&&i>=0&&i<8)}catch(e){}
+window.__selfcheck=selfCheck;
+const saved=S.shortlist.slice();
+render();const r=selfCheck();S.shortlist=saved;render();say(S.msg);
+$('#foot').innerHTML=`<span>Prototype — simulated data, no AI runs. Images are drawn samples, not footage.</span><span>Prototype self-check: <b class="${r.failed.length?'bad':'ok'}">${r.pass} / ${r.total} passed</b></span>${r.failed.length?`<span>Failed: ${r.failed.join('; ')}</span>`:''}<span>Run <code>__selfcheck()</code> in the console to repeat.</span><details class="more"><summary>Not drawn in this prototype, still in the app</summary><p>Import, frame extraction and recent projects · Chroma Key panel (eyedropper, strength, clip black/white, shrink/grow, blur, live preview) · SAM2 tracking, holdout strokes, Reset Hint · BG Color Auto / Green / Blue · EXR compression, custom output folder, source copy/reference · stitch / video export jobs · quit-while-running confirmation. A simpler surface here does not remove any of them.</p></details>`;
+if(r.failed.length)console.error('Self-check failures',r.failed);else console.log('Self-check passed',r.pass);
+window.__state=()=>S;
+})();
+</script>
+</body>
+</html>

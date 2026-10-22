@@ -1,0 +1,5 @@
+{
+  "description": "Key set of .corridorkey_manifest.json version 3 as written by the worker. 'hint_keyframes' is present only in keyframes mode. exr_pixel_type is always 'float32'; exr_lossy is true for dwab (values above 65504 are clipped, precision is reduced). 'files' is relative to the manifest folder and ordered like source_stems.",
+  "required_keys": ["version","engine","clip_id","job_id","enabled_outputs","formats","exr_compression","exr_pixel_type","exr_lossy","params","range","frame_range","source_stems","files","effective_profile","worker","complete","alpha_convention"],
+  "optional_keys": ["hint_keyframes"]
+}

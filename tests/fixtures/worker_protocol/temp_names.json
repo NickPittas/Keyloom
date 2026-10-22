@@ -1,0 +1,21 @@
+{
+  "description": "Exact names of every temporary/aux file the worker creates. Anything starting with '.ck-' in an output folder is a worker temp file; output file names never start with '.'. The worker removes ONLY temp files it created itself in this job (exclusive create); a same-named pre-existing file is never touched and makes the job fail/reject.",
+  "job_id_charset": "[A-Za-z0-9._-]{1,64}",
+  "patterns": {
+    "output_tmp": "^\\.ck-(?P<job_id>[A-Za-z0-9._-]{1,64})-(?P<final_sha1_12>[0-9a-f]{12})\\.(exr|png)$",
+    "probe": "^\\.ck-probe-(?P<job_id>[A-Za-z0-9._-]{1,64})-(a|b)$",
+    "manifest_tmp": "^\\.corridorkey_manifest\\.json\\.tmp\\.(?P<job_id>[A-Za-z0-9._-]{1,64})$",
+    "settings_tmp": "^corridorkey_v2_settings\\.txt\\.tmp\\.(?P<job_id>[A-Za-z0-9._-]{1,64})$"
+  },
+  "locations": {
+    "output_tmp": "same folder as the final file; <final_sha1_12> = first 12 hex of sha1(utf-8 of the final path string as sent, normalised to the worker OS)",
+    "probe": "every distinct output folder, before inference",
+    "manifest_tmp": "manifest folder",
+    "settings_tmp": "manifest folder"
+  },
+  "fixed_names": {
+    "manifest": ".corridorkey_manifest.json",
+    "lock": ".corridorkey_job.lock",
+    "settings": "corridorkey_v2_settings.txt"
+  }
+}

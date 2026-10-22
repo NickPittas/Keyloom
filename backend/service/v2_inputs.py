@@ -34,6 +34,15 @@ _RUNTIME_EXTS = {".exr", ".png", ".jpg", ".jpeg"}
 _HINT_RE = re.compile(r"^(?P<prefix>.*)_alphahint_(?P<n>\d+)$", re.IGNORECASE)
 _NO_HINT_MSG = "This clip has no AlphaHint. Generate one or turn off 'Use AlphaHint'."
 _DEFAULT_FPS = 24.0
+_RANGE_VIDEO_HINT_MSG = (
+    "Range keying needs the AlphaHint as an image sequence, not a video: decoding a video "
+    "hint would read frames outside In/Out. Extract the AlphaHint to frames or regenerate it "
+    "for this range.")
+_UNSET = object()  # "probe the input asset" (whole-clip behaviour); range mode always passes dims
+
+
+def _dims(clip, want):
+    return clip.input_asset.get_dimensions() if want is _UNSET else want
 
 
 class V2InputError(CorridorKeyError):
@@ -51,6 +60,7 @@ class V2PreparedInput:
     initial_hint_path: str | None = None       # single-mark reference matte file
     initial_hint_index: int = 0                # absolute source index of that mark
     hint_frame_indices: tuple[int, ...] | None = None  # sparse marks (absolute, sorted)
+    range_offset: int = 0      # frame_range start: absolute index = relative index + range_offset
 
 
 # --------------------------------------------------------------------- helpers
@@ -207,7 +217,7 @@ def _pick(cands: list[str]) -> str | None:
     return uniq[0] if uniq else None
 
 
-def _match_by_ordinal(files: list[str], total: int) -> list[str | None]:
+def _match_by_ordinal(files: list[str], total: int, offset: int = 0) -> list[str | None]:
     """Legacy ``<prefix>_alphaHint_<n>`` names whose prefix is not a frame stem: n == index."""
     parsed = {}
     for f in files:
@@ -217,7 +227,7 @@ def _match_by_ordinal(files: list[str], total: int) -> list[str | None]:
         parsed[int(m.group("n"))] = f
     if len(parsed) != len(files):
         return [None] * total
-    return [parsed.get(i) for i in range(total)]
+    return [parsed.get(offset + i) for i in range(total)]
 
 
 def _image_size(path: str) -> tuple[int, int] | None:
@@ -290,7 +300,7 @@ def _prepare_hint(clip, input_stems: list[str], staging: Path, check_cancel) -> 
 
 
 def _resolve_selected(files: list[str], source_stems: list[str],
-                      indices: list[int]) -> dict[int, str]:
+                      indices: list[int], offset: int = 0) -> dict[int, str]:
     """Selected-frame lookup with the dense policies (exact stem, verified legacy ordinal).
 
     Only the selected frames must resolve; unselected files are ignored.
@@ -307,7 +317,7 @@ def _resolve_selected(files: list[str], source_stems: list[str],
     for k in indices:
         stem = source_stems[k]
         try:
-            found = _pick(by_stem.get(stem.lower(), [])) if exact_any else _pick(ordinal.get(k, []))
+            found = _pick(by_stem.get(stem.lower(), [])) if exact_any else _pick(ordinal.get(k + offset, []))
         except V2InputError as exc:
             raise V2InputError(f"AlphaHint for keyframe {k} (frame '{stem}'): {exc}") from None
         if found is None:
@@ -341,7 +351,8 @@ def _write_matte(img, want, label: str, dst: str) -> None:
         raise V2InputError(f"Could not write staged AlphaHint '{dst}'.")
 
 
-def _prepare_keyframe_hint(clip, stems: list[str], staging: Path, check_cancel):
+def _prepare_keyframe_hint(clip, stems: list[str], staging: Path, check_cancel,
+                           rng=None, want=_UNSET):
     marks, err = clip.hint_keyframes, clip.hint_keyframes_error
     if err:
         raise V2InputError(f"Keyframes are unusable: {err}")
@@ -355,6 +366,12 @@ def _prepare_keyframe_hint(clip, stems: list[str], staging: Path, check_cancel):
     if len(set(raw)) != len(raw):
         dup = sorted({k for k in raw if raw.count(k) > 1})
         raise V2InputError(f"Keyframes contain duplicate frame indices {dup}.")
+    off = 0
+    if rng is not None:  # marks outside In/Out are ignored (they stay in the sidecar)
+        off = rng[0]
+        raw = [k - off for k in raw if rng[0] <= k <= rng[1]]
+        if not raw:
+            raise V2InputError("Needs keyframe marks (none inside In/Out)")
     idx = sorted(raw)
     if idx[0] < 0 or idx[-1] >= len(stems):
         bad = idx[0] if idx[0] < 0 else idx[-1]
@@ -363,7 +380,9 @@ def _prepare_keyframe_hint(clip, stems: list[str], staging: Path, check_cancel):
     asset = clip.alpha_asset
     if asset is None:
         raise V2InputError(_NO_HINT_MSG)
-    want = clip.input_asset.get_dimensions()
+    if rng is not None and asset.asset_type == "video":
+        raise V2InputError(_RANGE_VIDEO_HINT_MSG)
+    want = _dims(clip, want)
     dst = staging / "hint"
     shutil.rmtree(dst, ignore_errors=True)
     os.makedirs(dst, exist_ok=True)
@@ -388,7 +407,7 @@ def _prepare_keyframe_hint(clip, stems: list[str], staging: Path, check_cancel):
         finally:
             cap.release()
     else:
-        chosen = _resolve_selected(asset.get_frame_files(), stems, idx)
+        chosen = _resolve_selected(asset.get_frame_files(), stems, idx, off)
         for k in idx:
             if check_cancel is not None:
                 check_cancel()
@@ -414,11 +433,90 @@ def _prepare_sequence(clip, staging: Path, check_cancel) -> tuple[str, list[str]
     return str(dst), stems, True
 
 
+def _prepare_hint_range(clip, stems: list[str], offset: int, want, staging: Path,
+                        check_cancel) -> str:
+    """Dense hint for frames ``offset..offset+len(stems)-1`` only, staged as ``{i:06d}``."""
+    asset = clip.alpha_asset
+    if asset is None:
+        raise V2InputError(_NO_HINT_MSG)
+    if asset.asset_type == "video":
+        raise V2InputError(_RANGE_VIDEO_HINT_MSG)
+    dst = staging / "hint"
+    shutil.rmtree(dst, ignore_errors=True)
+    os.makedirs(dst, exist_ok=True)
+    files = asset.get_frame_files()
+    _check_duplicate_stems(files, "AlphaHint")
+    by_stem = _hint_by_stem(files)
+    ordered = [_pick(by_stem.get(s.lower(), [])) for s in stems]
+    if all(o is None for o in ordered):
+        ordered = _match_by_ordinal(files, len(stems), offset)
+    missing = [s for s, o in zip(stems, ordered) if o is None]
+    if missing:
+        raise V2InputError(
+            f"AlphaHint is missing {len(missing)} of {len(stems)} frames in the range "
+            f"(e.g. {', '.join(missing[:5])}) — regenerate the AlphaHint for this range.")
+    if len(set(ordered)) != len(ordered):
+        raise V2InputError("AlphaHint has ambiguous names for frames in the range.")
+    resize = False
+    for f in ordered:  # only in-range hint headers are read
+        resize |= _check_hint_dims(want, os.path.join(asset.path, f))
+    if resize:
+        for i, f in enumerate(ordered):
+            if check_cancel is not None:
+                check_cancel()
+            _write_matte(imread_unicode(os.path.join(asset.path, f), cv2.IMREAD_UNCHANGED),
+                         want, f"frame '{f}'", str(dst / f"{i:06d}.png"))
+    else:
+        _stage_files([os.path.join(asset.path, f) for f in ordered], str(dst), check_cancel)
+    return str(dst)
+
+
+def range_dimensions(clip, frame_range: tuple[int, int]) -> tuple[int, int]:
+    """(width, height) from the FIRST FRAME OF THE RANGE; never touches out-of-range frames."""
+    asset = clip.input_asset
+    files = asset.get_frame_files() if asset is not None and asset.asset_type == "sequence" else []
+    a, b = frame_range
+    if not 0 <= a <= b < len(files):
+        raise V2InputError(f"Range {a}-{b} is outside the clip (0-{len(files) - 1}).")
+    size = _image_size(os.path.join(asset.path, files[a]))
+    if size is None:
+        raise V2InputError(f"Could not read frame '{files[a]}'.")
+    return size
+
+
+def _prepare_range(clip, mode: str, staging: Path, check_cancel, rng) -> V2PreparedInput:
+    asset = clip.input_asset
+    if asset.asset_type != "sequence":
+        raise V2InputError("Range keying needs an image sequence; re-import or extract this clip")
+    if mode != "none" and clip.alpha_asset is not None and clip.alpha_asset.asset_type == "video":
+        raise V2InputError(_RANGE_VIDEO_HINT_MSG)  # before any file is read or staged
+    a, b = rng
+    ez = asset.get_frame_files()
+    if not ez:
+        raise V2InputError("The input image sequence has no frames.")
+    _check_duplicate_stems(ez, "Input")
+    want = range_dimensions(clip, rng)
+    files = ez[a:b + 1]
+    stems = [_stem(f) for f in files]
+    dst = staging / "input"
+    _stage_files([os.path.join(asset.path, f) for f in files], str(dst), check_cancel)  # always
+    common = (str(dst), stems, len(stems), _DEFAULT_FPS, True)
+    if mode == "keyframes":
+        kf = _prepare_keyframe_hint(clip, stems, staging, check_cancel, rng, want)
+        return V2PreparedInput(*common, kf.hint_path, kf.initial_hint_path,
+                               kf.initial_hint_index, kf.hint_frame_indices, a)
+    hint = _prepare_hint_range(clip, stems, a, want, staging, check_cancel) if mode == "full" else None
+    return V2PreparedInput(*common, hint, range_offset=a)
+
+
 def prepare_v2_inputs(clip, *, use_alpha_hint: bool, staging_dir: str | Path,
-                      check_cancel=None, hint_mode: str | None = None) -> V2PreparedInput:
+                      check_cancel=None, hint_mode: str | None = None,
+                      frame_range: tuple[int, int] | None = None) -> V2PreparedInput:
     """Resolve input (and optional dense/sparse hint) paths for ``run_inference``.
 
     ``hint_mode`` (none/full/keyframes) wins when given; otherwise ``use_alpha_hint``.
+    ``frame_range=(a, b)`` (inclusive, absolute) stages and exposes ONLY those frames; hint
+    frames are matched by stem and keyframes are filtered/rebased to the range.
     """
     mode = hint_mode if hint_mode is not None else ("full" if use_alpha_hint else "none")
     if mode not in ("none", "full", "keyframes"):
@@ -430,6 +528,8 @@ def prepare_v2_inputs(clip, *, use_alpha_hint: bool, staging_dir: str | Path,
     created = [staging / "input", staging / "hint"]
     pre_existing = [p.exists() for p in created]
     try:
+        if frame_range is not None:
+            return _prepare_range(clip, mode, staging, check_cancel, tuple(frame_range))
         if asset.asset_type == "video":
             count = asset.frame_count or _video_frame_count(asset.path)
             path, stems, staged = asset.path, [f"{i:05d}" for i in range(count)], False

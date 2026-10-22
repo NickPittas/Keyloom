@@ -34,6 +34,7 @@ from .extraction import (
     extract_frames,
 )
 from .metadata import (
+    build_video_metadata,
     read_video_metadata,
     write_video_metadata,
 )
@@ -63,5 +64,6 @@ __all__ = [
     "stitch_video",
     # metadata
     "write_video_metadata",
+    "build_video_metadata",
     "read_video_metadata",
 ]
