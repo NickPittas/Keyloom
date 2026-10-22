@@ -15,6 +15,7 @@ Verified AlphaHint frame naming (the only patterns accepted):
 from __future__ import annotations
 
 import logging
+import numbers
 import os
 import re
 import shutil
@@ -262,12 +263,17 @@ def _resolve_selected(files: list[str], source_stems: list[str],
     """
     by_stem = _hint_by_stem(files)
     exact_any = any(s.lower() in by_stem for s in source_stems)
-    ordinal = {} if exact_any else dict(enumerate(_match_by_ordinal(files, len(source_stems))))
+    ordinal: dict[int, list[str]] = {}
+    if not exact_any:  # sparse: ignore non-matching extras; only selected duplicates are ambiguous
+        for f in files:
+            m = _HINT_RE.match(_stem(f))
+            if m:
+                ordinal.setdefault(int(m.group("n")), []).append(f)
     out: dict[int, str] = {}
     for k in indices:
         stem = source_stems[k]
         try:
-            found = _pick(by_stem.get(stem.lower(), [])) if exact_any else ordinal.get(k)
+            found = _pick(by_stem.get(stem.lower(), [])) if exact_any else _pick(ordinal.get(k, []))
         except V2InputError as exc:
             raise V2InputError(f"AlphaHint for keyframe {k} (frame '{stem}'): {exc}") from None
         if found is None:
@@ -308,10 +314,15 @@ def _prepare_keyframe_hint(clip, stems: list[str], staging: Path, check_cancel):
         raise V2InputError(f"Keyframes are unusable: {err}")
     if not marks:
         raise V2InputError("Keyframes mode needs at least one marked frame.")
-    try:
-        idx = sorted({int(k) for k in marks})
-    except (TypeError, ValueError):
-        raise V2InputError("Keyframes contain non-integer frame indices.") from None
+    raw = list(marks)
+    for k in raw:
+        if isinstance(k, bool) or not isinstance(k, numbers.Integral):
+            raise V2InputError(f"Keyframes contain non-integer frame index {k!r}.")
+    raw = [int(k) for k in raw]
+    if len(set(raw)) != len(raw):
+        dup = sorted({k for k in raw if raw.count(k) > 1})
+        raise V2InputError(f"Keyframes contain duplicate frame indices {dup}.")
+    idx = sorted(raw)
     if idx[0] < 0 or idx[-1] >= len(stems):
         bad = idx[0] if idx[0] < 0 else idx[-1]
         raise V2InputError(

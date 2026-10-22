@@ -219,3 +219,33 @@ def test_explicit_mode_wins_over_bool(tmp_path):
     with pytest.raises(V2InputError, match="Unknown hint mode"):
         prepare_v2_inputs(c, use_alpha_hint=True, hint_mode="bogus",
                           staging_dir=tmp_path / "s")
+
+
+def test_unselected_ordinal_dup_and_junk_do_not_block(tmp_path, monkeypatch):
+    import backend.service.v2_inputs as mod
+    hints = {"zz_alphaHint_00001.png": _g(2), "zz_alphaHint_00003.png": _g(4),
+             "zz_alphaHint_00002.png": _g(9), "zz_alphaHint_00002.jpg": _g(8),
+             "notes.png": _g(1)}
+    c = _clip(tmp_path, hints=hints, marks=(1, 3))
+    read = []
+    real = mod.imread_unicode
+    monkeypatch.setattr(mod, "imread_unicode",
+                        lambda p, *a, **k: (read.append(os.path.basename(p)), real(p, *a, **k))[1])
+    p = _prep(c, tmp_path)
+    assert int(_read(os.path.join(p.hint_path, "000003.png"))[0, 0]) == 4
+    assert sorted(read) == ["zz_alphaHint_00001.png", "zz_alphaHint_00003.png"]
+
+
+def test_selected_ordinal_duplicate_rejected(tmp_path):
+    hints = {"zz_alphaHint_00001.png": _g(2), "zz_alphaHint_00001.jpg": _g(3)}
+    c = _clip(tmp_path, hints=hints, marks=(1,))
+    with pytest.raises(V2InputError, match=r"keyframe 1.*f_0001.*zz_alphaHint_00001"):
+        _prep(c, tmp_path)
+
+
+@pytest.mark.parametrize("marks", [(True,), (1.9,), ("1",), (1, 1), (1, 1.0), (1, True)])
+def test_non_int_or_duplicate_marks_write_nothing(tmp_path, marks):
+    c = _clip(tmp_path, hints={"f_0001.png": _g(1)}, marks=marks)
+    with pytest.raises(V2InputError):
+        _prep(c, tmp_path)
+    assert not (tmp_path / "stage" / "hint").exists()
