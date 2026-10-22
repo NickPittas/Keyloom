@@ -8,7 +8,7 @@ import pytest
 
 from backend import ClipEntry, ClipState
 from backend.clip_state import MASK_TRACK_MANIFEST
-from backend.hint_assets import clear_hint_assets
+from backend.hint_assets import clear_hint_assets, has_hint_assets
 
 
 def _touch(path, text="x"):
@@ -189,7 +189,7 @@ def test_complete_outputs_resolve_complete_after_clear(tmp_path):
 
 def test_has_hint_assets(tmp_path):
     from backend.clip_state import ClipEntry
-    from backend.hint_assets import clear_hint_assets, has_hint_assets
+    from backend.hint_assets import clear_hint_assets, has_hint_assets, has_hint_assets
     root = tmp_path / "clip"
     (root / "Frames").mkdir(parents=True)
     clip = ClipEntry(name="clip", root_path=str(root))
@@ -197,4 +197,18 @@ def test_has_hint_assets(tmp_path):
     (root / "AlphaHint").mkdir()
     assert has_hint_assets(clip)
     clear_hint_assets(clip)
+    assert not has_hint_assets(clip)
+
+
+def test_keyframe_sidecar_opt_in_and_counted(tmp_path):
+    from backend.hint_keyframes import KEYFRAMES_FILENAME
+    clip = _clip(tmp_path)
+    root = clip.root_path
+    side = os.path.join(root, KEYFRAMES_FILENAME)
+    _touch(side, "{}")
+    clear_hint_assets(clip)
+    assert os.path.exists(side)  # default never touches marks
+    assert has_hint_assets(clip)  # sidecar counts
+    clear_hint_assets(clip, clear_alpha=False, clear_masks=False, clear_keyframes=True)
+    assert not os.path.exists(side)
     assert not has_hint_assets(clip)

@@ -50,9 +50,10 @@ class IOTrayActionsMixin:
         return False
 
     def _clear_hints(self, clip: ClipEntry, failures: list[str], *,
-                     alpha: bool, masks: bool) -> None:
+                     alpha: bool, masks: bool, keyframes: bool = False) -> None:
         try:
-            clear_hint_assets(clip, clear_alpha=alpha, clear_masks=masks)
+            clear_hint_assets(clip, clear_alpha=alpha, clear_masks=masks,
+                              clear_keyframes=keyframes)
         except OSError as e:
             logger.warning("Hint clear failed for %s: %s", clip.name, e)
             failures.append(f"{clip.name}: {e}")
@@ -350,7 +351,7 @@ class IOTrayActionsMixin:
         failures: list[str] = []
         for clip in clips:
             # Hints (masks + alpha)
-            self._clear_hints(clip, failures, alpha=True, masks=True)
+            self._clear_hints(clip, failures, alpha=True, masks=True, keyframes=True)
             clip.mask_asset = None
             clip.alpha_asset = None
 
@@ -378,7 +379,8 @@ class IOTrayActionsMixin:
         confirm = QMessageBox.question(
             self, self.tr("Clear Alpha"),
             self.tr("Delete AlphaHint for %d clip(s)?\n%s\n\n"
-                    "This will remove all generated alpha hint frames from disk.") % (len(clips), names),
+                    "This will remove all generated alpha hint frames and any "
+                    "marked hint keyframes from disk.") % (len(clips), names),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if confirm != QMessageBox.Yes:
@@ -388,7 +390,7 @@ class IOTrayActionsMixin:
 
         failures: list[str] = []
         for clip in clips:
-            self._clear_hints(clip, failures, alpha=True, masks=False)
+            self._clear_hints(clip, failures, alpha=True, masks=False, keyframes=True)
             clip.alpha_asset = None
             clip.find_assets()  # re-scan disk, updates alpha_asset and state
             self._model.update_clip_state(clip.name, clip.state)

@@ -13,6 +13,7 @@ import os
 import shutil
 
 from .clip_state import MASK_TRACK_MANIFEST, ClipEntry
+from .hint_keyframes import KEYFRAMES_FILENAME
 from .project import is_video_file
 
 ALPHA_NAME = "AlphaHint"
@@ -52,10 +53,14 @@ def _clear_named(root: str, real_root: str, name: str, removed: list[str]) -> No
 
 def clear_hint_assets(
     clip: ClipEntry, *, clear_alpha: bool = True, clear_masks: bool = True,
+    clear_keyframes: bool = False,
 ) -> list[str]:
     """Delete the clip's alpha and/or mask hint assets; return removed paths.
 
     Idempotent (missing assets are fine). Raises OSError on any failure.
+    ``clear_keyframes`` also deletes the sparse-keyframe sidecar. It is opt-in
+    (never cleared by a plain replacement/mask clear); Reset Hint and tray
+    Clear Alpha / Clear All pass True. It is removed last.
     Does not rescan the clip; callers should call ``clip.find_assets()``.
     """
     root = clip.root_path
@@ -66,6 +71,8 @@ def clear_hint_assets(
     if clear_masks:
         _clear_named(root, real_root, MASK_NAME, removed)
         _remove(os.path.join(root, MASK_TRACK_MANIFEST), real_root, removed)
+    if clear_keyframes:
+        _remove(os.path.join(root, KEYFRAMES_FILENAME), real_root, removed)
     return removed
 
 
@@ -77,4 +84,7 @@ def has_hint_assets(clip: ClipEntry) -> bool:
             return True
         if any(is_video_file(p) for p in glob.glob(os.path.join(root, f"{name}.*"))):
             return True
-    return os.path.lexists(os.path.join(root, MASK_TRACK_MANIFEST))
+    return (
+        os.path.lexists(os.path.join(root, MASK_TRACK_MANIFEST))
+        or os.path.lexists(os.path.join(root, KEYFRAMES_FILENAME))
+    )

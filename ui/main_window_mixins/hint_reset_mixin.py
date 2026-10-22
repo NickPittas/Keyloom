@@ -87,6 +87,7 @@ class HintResetMixin:
         box.setWindowTitle(_tr("Reset Hint"))
         box.setText(_tr("Delete AlphaHint and SAM masks for '%s'?") % clip.name)
         box.setInformativeText(_tr(
+            "Marked hint keyframes are cleared too. "
             "Keyed outputs, holdout strokes and settings are kept. "
             "Annotations are kept unless you tick the box below. "
             "If the clip already has complete outputs it stays Complete."
@@ -115,7 +116,9 @@ class HintResetMixin:
 
         error = None
         try:
-            clear_hint_assets(clip)
+            clear_hint_assets(clip, clear_keyframes=True)
+            clip.hint_keyframes = ()
+            clip.hint_keyframes_error = None
         except OSError as e:
             error = e
             logger.warning("Reset hint failed for %s: %s", clip.name, e)
@@ -184,6 +187,9 @@ class HintResetMixin:
         self._update_annotation_info()
         self._refresh_button_state()
         self._refresh_hint_tools()
+        keyframe_refresh = getattr(self, "_refresh_hint_keyframe_tools", None)
+        if callable(keyframe_refresh):
+            keyframe_refresh()
 
     # ── Shared guard for alpha generators ──
 

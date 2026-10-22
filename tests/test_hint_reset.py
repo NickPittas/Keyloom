@@ -321,7 +321,7 @@ def test_refused_if_became_busy_during_dialog(tmp_path):
 def test_deletion_error_warns_and_does_not_claim_success(tmp_path, monkeypatch):
     clip = _make_clip(tmp_path)
 
-    def boom(c):
+    def boom(c, **k):
         raise OSError("denied")
 
     monkeypatch.setattr(hint_reset_mixin, "clear_hint_assets", boom)
@@ -389,3 +389,53 @@ def test_clear_annotations_refused_when_busy(tmp_path):
     h._on_clear_annotations()
     assert os.path.exists(os.path.join(clip.root_path, "VideoMamaMaskHint"))
     assert h.shared.has_annotations()
+
+
+def _mark(clip, idx=(1,)):
+    from backend.hint_keyframes import save_hint_keyframes
+    stems = [f"frame_{i:05d}" for i in range(3)]
+    save_hint_keyframes(clip.root_path, list(idx), stems)
+    clip.find_assets()
+    assert clip.hint_keyframes == tuple(idx)
+
+
+def test_reset_clears_marks_sidecar_and_memory_no_resurrection(tmp_path):
+    from backend.hint_keyframes import KEYFRAMES_FILENAME
+    clip = _make_clip(tmp_path)
+    _mark(clip)
+    h = _Host(clip)
+    h._on_reset_hint()
+    assert not os.path.exists(os.path.join(clip.root_path, KEYFRAMES_FILENAME))
+    assert clip.hint_keyframes == () and clip.hint_keyframes_error is None
+    clip.find_assets()
+    assert clip.hint_keyframes == ()
+    assert os.path.exists(os.path.join(clip.root_path, "holdout_strokes.json"))
+
+
+def test_sidecar_only_reset_enabled_and_works(tmp_path):
+    from backend.hint_keyframes import KEYFRAMES_FILENAME
+    clip = _make_clip(tmp_path, alpha=False, mask=False)
+    _mark(clip)
+    h = _Host(clip)
+    h._refresh_hint_button_state()
+    assert h._param_panel.reset is True
+    h._on_reset_hint()
+    assert not os.path.exists(os.path.join(clip.root_path, KEYFRAMES_FILENAME))
+    assert clip.hint_keyframes == ()
+
+
+def test_cancel_keeps_marks(tmp_path):
+    clip = _make_clip(tmp_path)
+    _mark(clip)
+    _FakeBox.choice = "cancel"
+    _Host(clip)._on_reset_hint()
+    assert clip.hint_keyframes == (1,)
+
+
+def test_replacement_keeps_marks(tmp_path):
+    from backend.hint_assets import clear_hint_assets
+    clip = _make_clip(tmp_path)
+    _mark(clip)
+    clear_hint_assets(clip, clear_alpha=True, clear_masks=False)
+    clip.find_assets()
+    assert clip.hint_keyframes == (1,)

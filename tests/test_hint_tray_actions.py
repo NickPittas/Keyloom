@@ -185,3 +185,20 @@ def test_guard_rechecked_after_confirmation(tmp_path, monkeypatch):
     assert box.questions == 3 and box.infos == 3
     assert os.path.isdir(os.path.join(root, "AlphaHint"))
     assert os.path.isdir(os.path.join(root, "VideoMamaMaskHint"))
+
+
+def _mark(root):
+    from backend.hint_keyframes import KEYFRAMES_FILENAME
+    p = os.path.join(root, KEYFRAMES_FILENAME)
+    _touch(p, "{}")
+    return p
+
+
+def test_clear_alpha_and_all_clear_marks_mask_clear_keeps(tmp_path, monkeypatch):
+    _patch(monkeypatch, _Box())
+    for fn, gone in (("_clear_mask_batch", False), ("_clear_alpha_batch", True),
+                     ("_clear_all_batch", True)):
+        clip, root = _clip(tmp_path / fn)
+        side = _mark(root)
+        getattr(_Tray(), fn)([clip])
+        assert os.path.exists(side) is (not gone), fn
