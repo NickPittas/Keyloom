@@ -45,7 +45,9 @@ emit({
     "host": cfg.get("host", "fakehost"),
     "gpu": None if cfg.get("no_gpu") else {"index": cfg.get("gpu", gpu), "name": "Fake GPU", "vram_gb": cfg.get("vram", 24.0)},
     "models": {"corridorkey_v2": {"path": "/m/ck.safetensors", "bytes": 1, "sha256": cfg.get("sha")}},
-    "capabilities": {"key": True, "generate_hint": False, "publish_modes": ["final"]},
+    "capabilities": {"key": True, "generate_hint": True, "publish_modes": ["final"], "key_modes": cfg.get("key_modes", ["new", "resume", "replace"]),
+                     "birefnet_variants": cfg.get("variants", ["Matting"]), "sam_models": cfg.get("sam", ["small", "base_plus", "large"]),
+                     "tasks": cfg.get("tasks", {k: True for k in ("gvm", "birefnet", "chroma", "sam_preview", "sam_track", "matanyone2", "videomama", "export_video", "prepare_source", "import_hint")})},
 })
 
 
@@ -65,7 +67,7 @@ def run(job):
     jid, p = job["job_id"], job["params"]
     mode = p.get("fake", "ok")
     files = [path for paths in job["outputs"].values() for path in paths]
-    log({"event": "job", "job_id": jid, "mode": mode, "first": files[0], "clip_root": job["clip_root"],
+    log({"event": "job", "job_id": jid, "mode": mode, "key_mode": job.get("mode"), "first": files[0], "clip_root": job["clip_root"],
          "require": job["require"], "path_map": job["path_map"], "manifest_dir": job["manifest_dir"]})
     if mode == "reject":
         return emit({"event": "rejected", "job_id": jid, "code": "exists", "message": "nope"})
@@ -128,11 +130,81 @@ def run(job):
           "expected": len(files), "manifest_complete": mode != "fail"})
 
 
+def run_task(job):
+    jid, p, kind = job["job_id"], job["params"], job["kind"]
+    mode = p.get("fake", "ok")
+    log({"event": "task", "job_id": jid, "kind": kind, "mode": mode, "params": p, "staging": job["staging_dir"],
+         "publish": job["publish_dir"], "range": job["range"]})
+    if mode == "reject":
+        return emit({"event": "rejected", "job_id": jid, "code": "model_missing", "message": "no model"})
+    emit({"event": "accepted", "job_id": jid})
+    if mode == "crash":
+        os._exit(3)
+    done = {"event": "done", "job_id": jid, "outcome": "complete", "message": None, "error_kind": None,
+            "manifest": None, "published": 0, "skipped": 0, "expected": 0, "manifest_complete": False, "kind": kind}
+    if mode == "hold":
+        emit({"event": "progress", "job_id": jid, "phase": "track", "done": 0, "total": 2})
+        while not cancelled(jid, 0.05):
+            pass
+        done["outcome"] = "cancelled"
+        return emit(done)
+    if mode == "fail":
+        done.update(outcome="failed", message="boom", error_kind="engine")
+        return emit(done)
+    if job["staging_dir"]:
+        os.makedirs(job["staging_dir"], exist_ok=True)
+    emit({"event": "progress", "job_id": jid, "phase": "generate", "done": 1, "total": 2})
+    if kind == "sam_preview":
+        mp = os.path.join(job["staging_dir"], "preview-%s.png" % jid)
+        open(mp, "wb").write(png())
+        emit({"event": "preview", "job_id": jid, "frame_stem": p.get("frame_stem", ""), "width": 1, "height": 1,
+              "mask_png": mp, "score": 0.9})
+        done["result"] = {"published": 0, "expected": 0, "hint_dir": None, "complete": True, "outputs": None}
+    elif kind == "export_video":
+        done["result"] = {"published": 1, "expected": 1, "hint_dir": None, "complete": True, "outputs": [p["dest"]]}
+    elif kind in ("prepare_source", "import_hint"):
+        done["result"] = {"published": 1, "expected": 1, "hint_dir": None, "complete": True, "outputs": None}
+    else:
+        os.makedirs(job["publish_dir"], exist_ok=True)
+        open(os.path.join(job["publish_dir"], job["range"]["in_stem"] + ".png"), "wb").write(png())
+        done["result"] = {"published": 1, "expected": 1, "hint_dir": job["publish_dir"], "complete": True, "outputs": None}
+        done["published"] = done["expected"] = 1
+    emit({"event": "progress", "job_id": jid, "phase": "generate", "done": 2, "total": 2})
+    emit(done)
+
+
+def lock_cmd(c):
+    rid, root = c["request_id"], c["clip_root"]
+    path = os.path.join(root, ".corridorkey_hint.lock")
+    info = None
+    if os.path.lexists(path):
+        d = json.load(open(path))
+        dead = cfg.get("lock_dead", True)
+        info = {"path": path, "readable": True, "problem": None, "job_id": d.get("job_id"), "host": d.get("host", "h"),
+                "pid": d.get("pid", 1), "same_host": True, "local_dead": dead, "safe_to_clear": dead}
+    log({"event": "lock_cmd", "cmd": c["cmd"], "expect": c.get("expect"), "reason": c.get("reason")})
+    if c["cmd"] == "inspect_hint_lock":
+        return emit({"event": "hint_lock", "request_id": rid, "clip_root": root, "lock": info})
+    e = c.get("expect") or {}
+    if info is None or any(info[k] != e.get(k) for k in ("job_id", "host", "pid")):
+        return emit({"event": "hint_lock_refused", "request_id": rid, "clip_root": root, "code": "mismatch", "message": "different writer", "lock": info})
+    if info["local_dead"] is False:
+        return emit({"event": "hint_lock_refused", "request_id": rid, "clip_root": root, "code": "alive", "message": "still running", "lock": info})
+    os.remove(path)
+    emit({"event": "hint_lock_cleared", "request_id": rid, "clip_root": root, "recovered": [], "warning": None})
+
+
 while True:
     c = cmds.get()
     if c is None or c.get("cmd") == "shutdown":
         break
     if c.get("cmd") == "key":
         run(c["job"])
+        if eof:
+            break
+    if c.get("cmd") in ("inspect_hint_lock", "clear_hint_lock"):
+        lock_cmd(c)
+    if c.get("cmd") == "task":
+        run_task(c["job"])
         if eof:
             break

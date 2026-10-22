@@ -329,6 +329,9 @@ pub struct Inputs<'a> {
     pub range: (usize, usize),
     /// Reference digest of the model (`None` = unknown; the scheduler decides what that means).
     pub digest: Option<&'a str>,
+    /// A queued hint step produces the hint this job reads: skip the hint-exists checks (the Key job still
+    /// depends on that step, and the worker validates coverage at dispatch).
+    pub pending_hint: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,6 +341,10 @@ pub enum Intent {
     Resume,
     /// Same settings, next free `{version}`.
     NewVersion,
+    /// Replace the files of the existing app-owned result (same clip, range, outputs, formats and file map;
+    /// parameters, hint mode, compression and window may change). The worker swaps per file and keeps the
+    /// old files until the new ones are verified.
+    Replace,
 }
 
 #[derive(Clone, Debug)]
@@ -360,6 +367,12 @@ pub struct Existing {
     pub resume: bool,
     /// Next free version when the templates have `{version}`; `None` = cannot write a new version.
     pub next_version: Option<u32>,
+    /// Replace is possible for this result.
+    pub replace: bool,
+    /// Why not (the output identity differs, not an app-owned manifest...). `None` while `replace`.
+    pub replace_why: Option<String>,
+    /// Number of files Replace would overwrite.
+    pub replace_files: usize,
 }
 
 fn abs(p: &Path) -> PathBuf {
@@ -478,6 +491,66 @@ pub fn resume_problem(m: &Value, job: &KeyJob) -> Option<String> {
     checks.into_iter().find(|c| !c.0).map(|c| c.1.to_string())
 }
 
+/// Why `manifest` cannot be REPLACED by `job` (`None` = it can). Replace keeps the output identity: same
+/// app-owned v3 result, clip, range, source stems, enabled outputs, formats and exact file map. Settings
+/// (params, hint mode, EXR compression, temporal window) may differ.
+pub fn replace_problem(m: &Value, job: &KeyJob, range_stems: &[String]) -> Option<String> {
+    if m.get("version").and_then(Value::as_u64) != Some(3)
+        || m.get("engine").and_then(Value::as_str) != Some("corridorkey-v2")
+    {
+        return Some("the existing result is not an app-owned v3 result".into());
+    }
+    if m.get("clip_id").and_then(Value::as_str) != Some(&job.clip_id) {
+        return Some("the existing result belongs to another clip".into());
+    }
+    if m.get("range") != serde_json::to_value(&job.range).ok().as_ref() {
+        return Some("In/Out differs from the existing result: write a new version".into());
+    }
+    if let Some(st) = m.get("source_stems").and_then(Value::as_array) {
+        let st: Vec<&str> = st.iter().filter_map(Value::as_str).collect();
+        if st != range_stems.iter().map(String::as_str).collect::<Vec<_>>() {
+            return Some("the source frames differ from the existing result".into());
+        }
+    }
+    let cfg: OutputCfg = serde_json::from_value(job.output_config.clone()).unwrap_or_default();
+    let formats = json!({"fg": cfg.fg_format, "matte": cfg.matte_format, "comp": cfg.comp_format, "processed": cfg.processed_format});
+    let mut enabled: Vec<&str> = job.outputs.keys().map(String::as_str).collect();
+    enabled.sort();
+    let mut have: Vec<&str> = m
+        .get("enabled_outputs")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    have.sort();
+    if have != enabled {
+        return Some("the enabled outputs differ from the existing result".into());
+    }
+    if m.get("formats") != Some(&formats) {
+        return Some("the output formats differ from the existing result".into());
+    }
+    let files: BTreeMap<&String, Vec<String>> = job
+        .outputs
+        .iter()
+        .map(|(k, v)| {
+            (
+                k,
+                v.iter()
+                    .map(|p| {
+                        p.strip_prefix(&job.manifest_dir)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    if m.get("files").is_none_or(|f| *f != json!(files)) {
+        return Some("the output file names or folders differ from the existing result".into());
+    }
+    None
+}
+
 fn read_manifest_value(dir: &Path) -> Option<Value> {
     let p = dir.join(MANIFEST_NAME);
     std::fs::symlink_metadata(&p).ok()?;
@@ -522,7 +595,10 @@ pub fn plan(i: &Inputs, intent: Intent) -> Result<Plan, Blocked> {
     }
     // Hint readiness, by stem (the legacy ordinal rule stays as a fallback).
     let mut marks = None;
-    if i.params.hint_mode != "none" && list_images(&clip.root.join("AlphaHint")).is_empty() {
+    if i.params.hint_mode != "none"
+        && !i.pending_hint
+        && list_images(&clip.root.join("AlphaHint")).is_empty()
+    {
         let has_video = std::fs::read_dir(clip.root.join("AlphaHint"))
             .map(|d| {
                 d.flatten()
@@ -534,6 +610,7 @@ pub fn plan(i: &Inputs, intent: Intent) -> Result<Plan, Blocked> {
         }
     }
     match i.params.hint_mode.as_str() {
+        "full" if i.pending_hint => {}
         "full" => {
             let have: std::collections::BTreeSet<String> =
                 list_images(&clip.root.join("AlphaHint"))
@@ -551,7 +628,7 @@ pub fn plan(i: &Inputs, intent: Intent) -> Result<Plan, Blocked> {
             }
         }
         "keyframes" => {
-            if clip.alpha_frames == 0 {
+            if clip.alpha_frames == 0 && !i.pending_hint {
                 reasons.push("Needs hint: this clip has no AlphaHint".into());
             }
             let inside: Vec<usize> = clip
@@ -709,7 +786,7 @@ pub fn plan(i: &Inputs, intent: Intent) -> Result<Plan, Blocked> {
             }
             n
         };
-        if sel_intent != Intent::Resume {
+        if sel_intent != Intent::Resume && sel_intent != Intent::Replace {
             let probe = build(
                 i,
                 &clip_id,
@@ -723,6 +800,19 @@ pub fn plan(i: &Inputs, intent: Intent) -> Result<Plan, Blocked> {
                 && resume_json
                     .as_ref()
                     .is_some_and(|m| resume_problem(m, &probe).is_none());
+            let rprobe = build(
+                i,
+                &clip_id,
+                range.clone(),
+                marks.clone(),
+                outputs.clone(),
+                mdir.clone(),
+                JobMode::Replace,
+            );
+            let replace_why = match resume_json.as_ref() {
+                Some(m) => replace_problem(m, &rprobe, range_stems),
+                None => Some("the existing manifest is unreadable".into()),
+            };
             let reason = format!(
                 "A previous result{} already exists in {}",
                 if complete { " (complete)" } else { "" },
@@ -734,13 +824,22 @@ pub fn plan(i: &Inputs, intent: Intent) -> Result<Plan, Blocked> {
                     reason,
                     resume,
                     next_version: next,
+                    replace: replace_why.is_none(),
+                    replace_files: rprobe.outputs.values().map(Vec::len).sum(),
+                    replace_why,
                 }),
                 ..Default::default()
             });
         }
-        mode = JobMode::Resume;
+        mode = if sel_intent == Intent::Replace {
+            JobMode::Replace
+        } else {
+            JobMode::Resume
+        };
     } else if sel_intent == Intent::Resume {
         return blocked("Nothing to resume: no previous result in the output folder");
+    } else if sel_intent == Intent::Replace {
+        return blocked("Nothing to replace: no previous result in the output folder");
     }
     let job = build(i, &clip_id, range, marks, outputs, mdir, mode);
     if mode == JobMode::Resume {
@@ -754,6 +853,19 @@ pub fn plan(i: &Inputs, intent: Intent) -> Result<Plan, Blocked> {
             })
         {
             return blocked(format!("Cannot resume: {why}. Write as a new version."));
+        }
+    }
+    if mode == JobMode::Replace {
+        if let Some(why) = resume_json
+            .as_ref()
+            .and_then(|m| replace_problem(m, &job, range_stems))
+            .or_else(|| {
+                resume_json
+                    .is_none()
+                    .then(|| "the existing manifest is unreadable".into())
+            })
+        {
+            return blocked(format!("Cannot replace: {why}."));
         }
     }
     job.validate().map_err(|e| Blocked {
@@ -778,7 +890,11 @@ pub fn plan(i: &Inputs, intent: Intent) -> Result<Plan, Blocked> {
         stems.len(),
         names.join(", "),
         job.manifest_dir.display(),
-        if mode == JobMode::Resume { " (resuming a previous run)" } else { "" }
+        match mode {
+            JobMode::Resume => " (resuming a previous run)",
+            JobMode::Replace => " (replacing the files of the existing result)",
+            JobMode::New => "",
+        }
     );
     Ok(Plan {
         clip_id_is_new: clip.clip_id.is_none(),

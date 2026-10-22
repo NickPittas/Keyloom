@@ -1,10 +1,10 @@
-//! App shell: Board → clip workspace (Media · Hint · Key · Review · Deliver), node graph, Properties.
-//! Everything is read-only with respect to project data. Nothing here starts, simulates or implies AI work.
+//! Import clips, key them, review results, and deliver exports in the native app.
 use super::ai::AiUi;
 use super::graph;
 use super::import::{CardState, Dest, ImportUi};
 use super::picker::{rfd_backend, Backend, PickKind, Picker};
 use super::settings::Page as SettingsPage;
+use super::theme;
 use super::viewer::{Viewer, DIM, WARN};
 use crate::contracts::*;
 use crate::decode::exr_header_summary;
@@ -18,13 +18,16 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
-pub const BANNER: &str = "Native preview · AI keying runs in a worker process (GPU and remote machines not yet validated) · Import saves a new project; In/Out and colour changes stay in memory and are NOT saved";
+pub const BANNER: &str = "Import > Hint > Key > Review > Deliver | In/Out, colour and hint settings are saved in the project";
+mod hint;
+mod media;
+mod ws;
 const GRAPH_DEFAULT: f32 = 220.0;
 const GRAPH_MIN: f32 = 120.0;
+/// Hint page bar: actions, tools and brush rows stay visible without scrolling.
+const HINT_TOOLS_H: f32 = 132.0;
 const GRAPH_HEADER: f32 = 32.0;
 const MIN_VIEWER: f32 = 300.0;
-const HINT_NOT_INTEGRATED: &str =
-    "Hint generation is not integrated in this build. Generate hints in the Qt app.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -96,13 +99,13 @@ impl Node {
     }
 }
 
-/// Closing the window while workers exist.
+/// Closing the window while AI workers or the model helper are active.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CloseState {
     None,
-    /// Jobs are running: the user chooses (window close was cancelled).
+    /// Work is running: the user chooses (window close was cancelled).
     Prompt,
-    /// Graceful stop requested; the window stays open and keeps updating until every worker has exited.
+    /// Graceful stop requested; the window stays open until workers and any model helper have exited.
     Stopping,
 }
 
@@ -169,27 +172,38 @@ pub struct App {
     held_pick: Option<(PickKind, Vec<PathBuf>)>,
     /// "Open clip settings" button rectangles from the last Board frame: top bar, then per-card (layout tests).
     open_rects: Vec<(Option<usize>, egui::Rect)>,
-    /// Global preferences page; replaces the Board/workspace while open, which stay untouched underneath.
+    /// Settings and Models pages replace the Board/workspace while open, which stay untouched underneath.
     settings: SettingsPage,
     settings_open: bool,
+    models: super::models::Page,
+    models_open: bool,
     settings_rect: Option<egui::Rect>,
     /// The Settings button was clicked this frame; handled once the screen has finished drawing.
     settings_requested: bool,
     settings_back_rect: Option<egui::Rect>,
+    models_back_rect: Option<egui::Rect>,
     /// A clip an import asked to open while the page was showing.
     pending_open: Option<String>,
     ai: AiUi,
     close: CloseState,
-    /// The user chose Quit anyway, or every worker has stopped: a close request now goes through.
+    /// The user chose Quit anyway, or all graceful work has stopped: a close request now goes through.
     close_force: bool,
     close_rects: Vec<egui::Rect>,
     /// Output-location editor for the open project (Deliver tab).
     loc_note: Option<String>,
+    /// (range, linear) whose save failed: not retried every frame, shown in the notice instead.
+    persist_failed: Option<(Option<(usize, usize)>, bool)>,
+    hint: hint::State,
+    ws: ws::WsState,
+    media: media::MediaState,
+    last_ctx: Option<egui::Context>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, opts: AppOptions) -> Self {
-        Self::with_ctx(&cc.egui_ctx, opts)
+        let mut app = Self::with_ctx(&cc.egui_ctx, opts);
+        app.models.start_background(&cc.egui_ctx);
+        app
     }
 
     /// Window-free constructor (tests drive the same `frame` the window does).
@@ -205,6 +219,10 @@ impl App {
         ));
         ctx.set_zoom_factor(settings.saved().interface.ui_scale);
         let settings_saved = settings.saved().clone();
+        let models = super::models::Page::new(opts.repo.as_deref());
+        // Runtime resolution (descriptor / CK_REPO / checkout discovery) happens once here; import
+        // and AI launching re-resolve on demand, never from a build-time path.
+        let launch = crate::runtime::launch(opts.repo.as_deref());
         let mut app = App {
             path_input: opts
                 .project
@@ -243,7 +261,7 @@ impl App {
             imp: ImportUi::new(
                 opts.data_dir
                     .clone()
-                    .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")),
+                    .or_else(|| crate::runtime::default_data_dir(&launch)),
                 opts.repo.clone(),
             ),
             pending_reload: None,
@@ -258,15 +276,23 @@ impl App {
             open_rects: vec![],
             settings,
             settings_open: false,
+            models,
+            models_open: false,
             settings_rect: None,
             settings_requested: false,
             settings_back_rect: None,
+            models_back_rect: None,
             pending_open: None,
             ai: AiUi::new(&settings_saved, opts.repo.as_deref()),
             close: CloseState::None,
             close_force: false,
             close_rects: vec![],
             loc_note: None,
+            persist_failed: None,
+            hint: Default::default(),
+            ws: Default::default(),
+            media: Default::default(),
+            last_ctx: None,
         };
         if opts.project.is_some() {
             app.load(ctx);
@@ -446,6 +472,12 @@ impl App {
             return;
         }
         let pressed = |k: Key| ctx.input(|i| i.key_pressed(k) && !i.modifiers.command);
+        if self.models_open {
+            if pressed(Key::Escape) {
+                self.close_models();
+            }
+            return;
+        }
         if self.settings_open {
             // The page owns the keyboard: no workspace shortcuts, Esc = Cancel.
             if pressed(Key::Escape) {
@@ -708,6 +740,7 @@ impl App {
                     ui.set_width(queue_w);
                     ui.label(RichText::new("Queue").strong());
                     self.ai.queue_ui(ui);
+                    self.ai.history_ui(ui);
                 });
             }
         });
@@ -801,7 +834,13 @@ impl App {
                     });
                 });
             // Resizable graph panel; its max keeps the viewer at least MIN_VIEWER px tall (Hint image stays large).
-            let max_h = (ui.available_height() - 34.0 - 26.0 - 78.0 - MIN_VIEWER).max(GRAPH_MIN);
+            let tools_h = match (self.tab, narrow) {
+                (Tab::Hint, false) => HINT_TOOLS_H,
+                // Narrow: the viewer keeps its height; the action row is first, the rest scrolls.
+                (Tab::Hint, true) => 100.0,
+                _ => 78.0,
+            };
+            let max_h = (ui.available_height() - 34.0 - 26.0 - tools_h - MIN_VIEWER).max(GRAPH_MIN);
             if self.graph_collapsed {
                 Panel::bottom("graph_collapsed")
                     .exact_size(GRAPH_HEADER)
@@ -818,11 +857,13 @@ impl App {
                         self.graph(ui, h);
                     });
             }
-            Panel::bottom("pagetools").exact_size(78.0).show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| self.page_tools(ui));
-            });
+            Panel::bottom("pagetools")
+                .exact_size(tools_h)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| self.page_tools(ui));
+                });
             if !narrow || self.props_sheet {
                 Panel::right("props")
                     .default_size(310.0)
@@ -934,6 +975,13 @@ impl App {
         let (Some(clip), Some(v)) = (self.clip().cloned(), self.viewer.as_ref()) else {
             return;
         };
+        let (v_linear, v_len, v_range, v_range_text) =
+            (v.linear, v.index.len(), v.range, v.range_text());
+        let v_view_frames: Vec<(View, usize)> =
+            [View::Fg, View::Matte, View::Comp, View::Processed]
+                .into_iter()
+                .map(|w| (w, v.index.view_frames(w)))
+                .collect();
         match self.tab {
             Tab::Media => {
                 ui.label(format!(
@@ -956,38 +1004,30 @@ impl App {
                         Source::Missing => "no source found".into(),
                     }
                 ));
-                ui.label(format!("Input colour: {} ({}). Change it in Properties > Media (display only, unsaved).", if v.linear { "Linear" } else { "sRGB" }, color_origin_text(&clip)));
+                if matches!(clip.source, Source::Missing) || clip.error.is_some() {
+                    if ui.button("Relink missing footage…").on_hover_text("Choose the folder the image sequence now lives in; its frames must match the stored identity").clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.request_pick(&ctx, PickKind::Relink);
+                    }
+                }
+                ui.label(format!("Input colour: {} ({}). Change it in Properties > Media (saved in the project).", if v_linear { "Linear" } else { "sRGB" }, color_origin_text(&clip)));
             }
             Tab::Hint => {
-                ui.label(format!(
-                    "AlphaHint: {} frames · VideoMaMa mask hint: {} frames · keyframe marks: {}",
-                    clip.alpha_frames,
-                    clip.mask_frames,
-                    if clip.keyframes.is_empty() {
-                        "none".into()
-                    } else {
-                        format!("{:?}", clip.keyframes)
-                    }
-                ));
-                ui.add_enabled(false, egui::Button::new("Generate hint"))
-                    .on_disabled_hover_text(HINT_NOT_INTEGRATED);
-                ui.label(RichText::new("Hint routes, paint, SAM points and keyframe marks need the worker (not integrated).").color(DIM).size(12.0));
+                self.hint_tools(ui, &clip);
             }
             Tab::Key => {
-                let n = v.range.map_or(v.index.len(), |r| r.1 - r.0 + 1);
+                let n = v_range.map_or(v_len, |r| r.1 - r.0 + 1);
                 ui.label(format!(
                     "Key will process {} of {} frames. {}",
-                    n,
-                    v.index.len(),
-                    v.range_text()
+                    n, v_len, v_range_text
                 ));
                 ui.label(RichText::new("Set options in Properties, then press Key clip (summary, blockers and target are in the Properties footer).").color(DIM).size(12.0));
             }
             Tab::Review => {
                 ui.label("Playback of files already on disk. Missing frames show “No file on disk”; frames outside In/Out show “Outside In/Out”.");
-                let line: Vec<String> = [View::Fg, View::Matte, View::Comp, View::Processed]
-                    .into_iter()
-                    .map(|w| format!("{} {}/{}", w.label(), v.index.view_frames(w), v.index.len()))
+                let line: Vec<String> = v_view_frames
+                    .iter()
+                    .map(|(w, n)| format!("{} {}/{}", w.label(), n, v_len))
                     .collect();
                 ui.label(line.join("  ·  "));
             }
@@ -998,12 +1038,14 @@ impl App {
                         .as_ref()
                         .map_or("unknown".into(), |p| p.display().to_string())
                 ));
+                ui.label(RichText::new("Video export, presets and the output location are in Properties (right), export first.").color(DIM).size(12.0));
                 ui.label(RichText::new(format!("Resolved from: {} · Legacy layout <output>/FG|Matte|Comp|Processed/<stem>.<ext>", clip.output_dir_note)).color(DIM).size(12.0));
             }
         }
     }
 
     fn properties(&mut self, ui: &mut Ui) {
+        let range_frames_now = self.ai_open_range().ok().map(|(a, b)| b - a + 1);
         let (clip, session_o, node) = {
             let (Some(p), Some(c)) = (self.project.as_ref(), self.clip()) else {
                 return;
@@ -1012,12 +1054,22 @@ impl App {
         };
         ui.heading(format!("Properties: {}", node.title()));
         // Pinned footer first so it keeps its space.
-        Panel::bottom("props_footer")
-            .show_separator_line(true)
-            .show(ui, |ui| {
-                self.key_footer(ui, &clip);
-            });
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| match node {
+        // The Key footer (summary, target, Key button) belongs to the Key page only; Media, Hint, Review and Deliver
+        // need the panel's height for their own controls.
+        if self.tab == Tab::Key {
+            Panel::bottom("props_footer")
+                .show_separator_line(true)
+                .show(ui, |ui| {
+                    self.key_footer(ui, &clip);
+                });
+        }
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            // Deliver: the video export is the primary action, first and always visible, whichever node is selected.
+            if self.tab == Tab::Deliver {
+                self.export_ui(ui, &clip);
+                ui.separator();
+            }
+            match node {
             Node::Media => {
                 let v = self.viewer.as_mut().unwrap();
                 kv(ui, "Source", &match &clip.source {
@@ -1041,28 +1093,33 @@ impl App {
                 }
                 ui.label(RichText::new(format!("Stored: {} ({})", if stored { "Linear" } else { "sRGB" }, color_origin_text(&clip))).color(DIM).size(12.0));
                 if v.linear != stored {
-                    ui.colored_label(WARN, "Display only · unsaved · not written to the project");
+                    ui.colored_label(WARN, "Saving the new colour interpretation…");
                 }
+                self.media_props(ui, &clip);
             }
             Node::Hint => {
                 kv(ui, "Hint frames", &clip.alpha_frames.to_string());
                 kv(ui, "Mask hint frames", &clip.mask_frames.to_string());
                 kv(ui, "Keyframe marks", &if clip.keyframes.is_empty() { "none".into() } else { format!("{:?}", clip.keyframes) });
                 ui.separator();
+                self.hint_props(ui, &clip);
+                ui.separator();
                 if let Some(p) = &self.project {
                     self.ai.hint_controls(ui, &clip, p, self.settings.saved());
                 }
-                ui.label(RichText::new("Hint generation is not integrated; these options choose how an existing hint is used.").color(DIM).size(12.0));
             }
             Node::Key => {
                 if let Some(p) = &self.project {
                     let lin = self.viewer.as_ref().is_some_and(|v| v.linear);
+                    let range_frames = range_frames_now;
                     let st = self.settings.saved();
-                    self.ai.key_controls(ui, &clip, p, st, lin);
+                    self.ai.key_controls(ui, &clip, p, st, lin, range_frames);
                     ui.separator();
                     ui.label(RichText::new("Outputs").strong());
                     self.ai.output_controls(ui, &clip, p, st, None);
                 }
+                ui.separator();
+                self.preset_ui(ui, &clip, false);
                 if let Some(m) = &clip.manifest {
                     ui.separator();
                     ui.label(RichText::new("Last run (manifest)").strong());
@@ -1114,6 +1171,7 @@ impl App {
                     ui.separator();
                     self.location_preview(ui, &clip);
                 }
+            }
             }
         });
     }
@@ -1287,6 +1345,62 @@ impl App {
         }
     }
 
+    /// In/Out and input colour are saved as soon as they change (same keys the Qt app reads). A failed save
+    /// leaves the edit visible as unsaved and is reported once per distinct value, never silently dropped.
+    fn persist_media(&mut self) {
+        let (Some(i), Some(p), Some(v)) = (self.open, self.project.as_mut(), self.viewer.as_mut())
+        else {
+            return;
+        };
+        if !v.range_dirty() && v.linear == v.linear_stored {
+            return;
+        }
+        let sig = (v.range, v.linear);
+        if self.persist_failed == Some(sig) {
+            return;
+        }
+        let clip = p.clips[i].clone();
+        let mut err = None;
+        if v.range_dirty() {
+            // Timeline indices -> indices into the clip's own source frames.
+            let at = |t: usize| {
+                v.index
+                    .stems
+                    .get(t)
+                    .and_then(|s| clip.input_files.iter().position(|f| &f.0 == s))
+            };
+            let src = match v.range {
+                None => Ok(None),
+                Some((a, b)) => match (at(a), at(b)) {
+                    (Some(a), Some(b)) => Ok(Some((a, b))),
+                    _ => Err("an In/Out edge is not a source frame".to_string()),
+                },
+            };
+            let stems: Vec<String> = clip.input_files.iter().map(|f| f.0.clone()).collect();
+            match src.and_then(|r| crate::persist::save_range(&clip, r, &stems).map(|()| r)) {
+                Ok(r) => {
+                    v.range_stored = v.range;
+                    p.clips[i].in_out = r;
+                }
+                Err(e) => err = Some(format!("In/Out not saved: {e}")),
+            }
+        }
+        if v.linear != v.linear_stored {
+            match crate::persist::save_colour(&p.root, &clip.name, v.linear) {
+                Ok(()) => {
+                    v.linear_stored = v.linear;
+                    p.clips[i].input_is_linear = v.linear;
+                    p.clips[i].color_origin = crate::project::ColorOrigin::SessionOverride;
+                }
+                Err(e) => err = Some(format!("Colour not saved: {e}")),
+            }
+        }
+        self.persist_failed = err.as_ref().map(|_| sig);
+        if err.is_some() {
+            self.ai.notice = err;
+        }
+    }
+
     /// Poll the scheduler; re-read the LOCAL manifest of any clip a job published to or finished.
     fn ai_tick(&mut self, ctx: &egui::Context) {
         for r in self.ai.tick() {
@@ -1297,15 +1411,18 @@ impl App {
         }
     }
 
-    /// A window close with workers alive never just kills them: the close is cancelled and the user chooses; a
-    /// graceful stop keeps the window open and updating until every worker has exited.
+    /// Active work cancels the close request; graceful stop keeps the window updating until it exits.
     fn close_tick(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_force {
-            let (jobs, alive) = (self.ai.running_jobs(), self.ai.workers_alive());
-            if jobs || alive {
+            let (jobs, alive, models) = (
+                self.ai.running_jobs(),
+                self.ai.workers_alive(),
+                self.models.busy(),
+            );
+            if jobs || alive || models {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 if self.close == CloseState::None {
-                    if jobs {
+                    if jobs || models {
                         self.close = CloseState::Prompt;
                     } else {
                         self.ai.begin_stop(); // only idle workers: no question to ask
@@ -1314,7 +1431,7 @@ impl App {
                 }
             }
         }
-        if self.close == CloseState::Stopping && self.ai.all_stopped() {
+        if self.close == CloseState::Stopping && self.ai.all_stopped() && !self.models.busy() {
             self.close_force = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1328,15 +1445,20 @@ impl App {
         let mut next = self.close;
         let (mut stop, mut quit) = (false, false);
         let mut rects = vec![];
-        egui::Window::new("Workers are running")
+        egui::Window::new("Work is running")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| match self.close {
                 CloseState::Prompt => {
-                    ui.label("AI jobs are still running. Stopping cancels them gracefully: frames already written stay and a run can be resumed.");
+                    if self.ai.running_jobs() {
+                        ui.label("AI jobs are still running. Stopping them gracefully keeps frames already written so a run can be resumed.");
+                    }
+                    if self.models.busy() {
+                        ui.label(self.models.close_status());
+                    }
                     ui.horizontal_wrapped(|ui| {
-                        let a = ui.button("Stop workers, then quit");
+                        let a = ui.button("Stop work, then quit");
                         let b = ui.button("Keep working");
                         let c = ui.button("Quit anyway");
                         rects.extend([a.rect, b.rect, c.rect]);
@@ -1346,22 +1468,26 @@ impl App {
                         }
                         quit = c.clicked();
                     });
-                    ui.label(RichText::new("Quit anyway leaves the workers to end by themselves: running jobs may keep writing or be cancelled when their connection closes, and their folders stay locked until you resolve them.").color(DIM).size(12.0));
+                    ui.label(RichText::new("Quit anyway may leave workers or the model helper running; the UI will no longer show their final result.").color(DIM).size(12.0));
                 }
                 _ => {
                     let lines = self.ai.stopping_lines();
-                    ui.label(format!("Stopping workers… ({} target(s))", lines.len()));
+                    ui.label(format!("Stopping work… ({} target(s))", lines.len()));
                     for l in lines {
                         ui.label(RichText::new(l).color(DIM).size(12.0));
                     }
+                    if self.models.busy() { ui.label(self.models.close_status()); }
                     let c = ui.button("Quit anyway");
                     rects.push(c.rect);
                     quit = c.clicked();
-                    ui.label(RichText::new("The window closes by itself when every worker has exited. Quit anyway may leave a worker running and its folder locked.").color(DIM).size(12.0));
+                    ui.label(RichText::new("The window closes when workers and the helper have exited. Quit anyway may leave the helper running and hide its final result.").color(DIM).size(12.0));
                 }
             });
         self.close_rects = rects;
         if stop {
+            if self.models.busy() {
+                self.models.stop_for_close(ctx);
+            }
             self.ai.begin_stop();
             next = CloseState::Stopping;
         }
@@ -1604,14 +1730,36 @@ impl App {
                 .map(|f| f.path().to_path_buf())
                 .collect()
         });
-        // Settings has no import target: refuse, and say so (the notice shows once Settings is closed).
-        let dropped = if self.settings_open && !dropped.is_empty() {
-            self.imp
-                .notify("Dropped files were not imported: close Settings and drop them again.");
+        // Settings and Models have no import target: refuse, and show the notice after leaving the page.
+        let dropped = if (self.settings_open || self.models_open) && !dropped.is_empty() {
+            let page = if self.models_open {
+                "Models"
+            } else {
+                "Settings"
+            };
+            self.imp.notify(&format!(
+                "Dropped files were not imported: leave {page} and drop them again."
+            ));
             vec![]
         } else {
             dropped
         };
+        // Clip-level dialogs (relink, hint movie/sequence, export folder) answer inside the open clip.
+        if self.in_workspace()
+            && !self.settings_open
+            && matches!(
+                self.held_pick.as_ref().map(|h| h.0),
+                Some(
+                    PickKind::HintMovie
+                        | PickKind::ExportFolder
+                        | PickKind::Relink
+                        | PickKind::RelinkMovie
+                        | PickKind::HintSequence
+                )
+            )
+        {
+            self.apply_pick(ctx);
+        }
         if self.in_workspace() {
             // Never leave or replace the open clip for a drop.
             if !dropped.is_empty() {
@@ -1683,7 +1831,9 @@ impl App {
         if (dest && !self.imp.has_pending()) || (!dest && self.imp.busy()) {
             return false;
         }
-        let dir = (kind == PickKind::Location).then(|| self.imp.data_dir.clone());
+        let dir = (kind == PickKind::Location)
+            .then(|| self.imp.data_dir.clone())
+            .flatten();
         let c = ctx.clone();
         let started = self.picker.start(kind, dir, move || c.request_repaint());
         self.imp.hold |= started;
@@ -1700,7 +1850,10 @@ impl App {
     /// The one global Settings button, shown in the Board and the workspace header (not per clip).
     fn settings_button(&mut self, ui: &mut Ui) -> egui::Rect {
         let r = ui
-            .add_enabled(!self.settings_open, egui::Button::new("Settings"))
+            .add_enabled(
+                !self.settings_open && !self.models_open,
+                egui::Button::new("Settings"),
+            )
             .on_hover_text("Preferences: playback, interface, defaults");
         self.settings_rect = Some(r.rect);
         self.settings_requested |= r.clicked();
@@ -1717,6 +1870,9 @@ impl App {
     fn close_settings(&mut self) {
         self.settings.cancel();
         self.settings_open = false;
+    }
+    fn close_models(&mut self) {
+        self.models_open = false;
     }
     /// An import is probing, waiting for confirmation or running (tests).
     pub fn import_active(&self) -> bool {
@@ -1740,6 +1896,9 @@ impl App {
     }
     pub fn settings_back_rect(&self) -> Option<egui::Rect> {
         self.settings_back_rect
+    }
+    pub fn models_back_rect(&self) -> Option<egui::Rect> {
+        self.models_back_rect
     }
 
     /// True while a file dialog is open (tests).
@@ -1792,6 +1951,11 @@ impl App {
             PickKind::AddTo => {
                 self.imp.set_dest(ctx, Dest::Add(paths[0].clone()));
             }
+            PickKind::HintMovie => self.hint_picked(paths[0].clone(), true),
+            PickKind::ExportFolder => self.hint_picked(paths[0].clone(), false),
+            PickKind::Relink => self.relink_picked(ctx, paths[0].clone()),
+            PickKind::RelinkMovie => self.movie_picked(paths[0].clone()),
+            PickKind::HintSequence => self.sequence_picked(paths[0].clone()),
         }
     }
 
@@ -1836,20 +2000,66 @@ impl App {
     pub fn frame(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.import_tick(&ctx);
+        self.ai
+            .set_model_mutation_active(self.models.blocks_worker_launch());
         self.ai_tick(&ctx);
+        self.last_ctx = Some(ctx.clone());
+        self.persist_media();
+        self.hint_sync();
+        self.media_poll(&ctx);
+        self.workspace_sync();
+        self.ai
+            .queue_open(self.project.as_ref().map(|p| p.root.as_path()));
+        self.ai.queue_sync();
+        if let Some(f) = self.ai.tk.requeue.take() {
+            if let Some(i) = self
+                .project
+                .as_ref()
+                .and_then(|p| p.clips.iter().position(|c| c.folder == f))
+            {
+                self.selected = [i].into();
+                self.key_selected(&ctx);
+            }
+        }
+        self.models.set_asset_safety(
+            !self.ai.model_asset_mutation_safe(),
+            self.ai.workers_need_stop_for_model_change(),
+            self.ai.unresolved_model_fences(),
+        );
+        self.models.tick(&ctx);
+        self.ai
+            .set_model_mutation_active(self.models.blocks_worker_launch());
         self.close_tick(&ctx);
         self.keys(&ctx);
+        let mut open_models = false;
         Panel::top("banner").show(ui, |ui| {
             ui.label(
                 RichText::new(BANNER)
                     .color(Color32::from_rgb(225, 190, 110))
                     .size(12.5),
             );
+            if !self.models_open && self.models.startup_ui(ui) {
+                open_models = true;
+            }
         });
+        self.models_open |= open_models;
         if std::mem::take(&mut self.settings_requested) {
             self.open_settings();
         }
-        if self.settings_open {
+        if self.models_open {
+            Panel::top("models_nav").show(ui, |ui| {
+                let back = ui.button("‹ Back");
+                self.models_back_rect = Some(back.rect);
+                if back.clicked() {
+                    self.models_open = false;
+                }
+            });
+            if self.models_open {
+                if self.models.ui(ui) {
+                    self.ai.begin_stop();
+                }
+            }
+        } else if self.settings_open {
             Panel::top("settings_nav").show(ui, |ui| {
                 let back = ui.button("‹ Back");
                 self.settings_back_rect = Some(back.rect);
@@ -1863,6 +2073,9 @@ impl App {
                         ctx.set_zoom_factor(self.settings.saved().interface.ui_scale);
                         self.ai
                             .set_targets(self.settings.saved(), self.opts.repo.as_deref());
+                    }
+                    super::settings::Event::OpenModels => {
+                        self.models_open = true;
                     }
                     super::settings::Event::Closed => self.close_settings(),
                     super::settings::Event::None => {}
@@ -1943,6 +2156,51 @@ impl App {
 mod settings_handoff_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn settings_opens_models_without_discarding_its_draft() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions::default());
+        app.open_settings();
+        let original = app.settings.draft().playback.loop_default;
+        app.settings.draft_mut().playback.loop_default = !original;
+        let frame = |app: &mut App, events| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| app.frame(ui)).textures_delta.clear();
+        };
+        frame(&mut app, vec![]);
+        let pos = app.settings.models_rect().unwrap().center();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(app.models_open && app.settings_open);
+        assert!(app.settings.dirty());
+    }
 
     #[test]
     fn completed_import_open_request_waits_until_settings_close() {

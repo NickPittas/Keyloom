@@ -6,7 +6,7 @@ Batch Board → clip workspace (Media · Hint · Key · Review · Deliver) with 
 and one shared viewer (mode chips top-right, A/B wipe top-centre, icon transport centred, scrubbable timeline,
 Set In (I) / Set Out (O) / Clear In/Out on every page).
 
-**Import** (the only thing that writes project data): *Import clips…* (movies, multi-select), *Import folder…* (movies, plus image
+**Import**: *Import clips…* (movies, multi-select), *Import folder…* (movies, plus image
 sequences in the folder or its sub-folders) or drop files/folders on the window. File dialogs run on a worker thread (one at a time; the window never freezes) and a result picked while a clip is open or an import runs is held / refused, never applied under you. Drops need X11: under Wayland the app starts through XWayland when `$DISPLAY` has a live socket (`CK_WAYLAND=1` keeps native Wayland, where winit delivers no drops). A plan is shown first (name, destination,
 which clips are skipped and why); nothing is written until you press *Import*. The plan includes a **Destination** section that previews exactly where it writes:
 with no project open (drop or button) you must choose a folder (*New project in folder…*) or an existing project (*Add to another
@@ -19,9 +19,9 @@ Sequences are referenced in place (PNG/EXR only) and the source folder is never 
 `tools/ck_import.py`, which reuses `backend/project*.py` and `backend/ffmpeg_tools` (needs the repo `.venv` and FFmpeg; `CK_PYTHON` overrides
 the interpreter). Cancel stops after the current step; an unfinished movie keeps its source copy and its card offers
 *Resume extraction*. Frames are extracted into a hidden `.frames_importing` folder and renamed to `Frames/` only when complete,
-so partial frames never look playable. Companion AlphaHint/MaskHint videos are copied but **not** extracted here.
+so partial frames never look playable. Companion alpha/mask movies are copied at import; extracting them into hint frames is done from the Hint page (*Import alpha / mask movie*, through the worker's validated normalization).
 
-Settings writes a separate user preferences file. Project viewing is read-only; it **does not run, queue or simulate AI**. In/Out and input-colour edits stay in memory (not saved).
+Settings writes a separate user preferences file. **Key** runs in a real Python worker process (`backend.worker` over stdio) — inference runs outside the UI process: result files appear only when a worker publishes them and its manifest says so. The Key tab queues the open clip confined to its In/Out; the Board queues selected clips as a batch (each clip its stored In/Out, else the whole clip) after a per-clip review that never replaces existing results (skip / resume / write as *vNNN*). A queue panel tracks, cancels and stops jobs; one job runs at a time per worker target. A submission persists its options and result folder (`workflow`, `output_values` and `key_result` in `clip.json`). Saving a Deliver output location writes `project.json`. In/Out, input colour, hint settings, annotations and the workspace (open clip, page, view, frame, graph layout) are saved in the project (see *Saved state*); the queue history is saved and anything running at shutdown comes back as *held*, never restarted. An unknown output or hint lock found on disk requires explicit confirmation in the UI before release.
 
 ## Run
 
@@ -98,28 +98,41 @@ Loader tests build temporary projects at run time and prove the loader changes n
 - RAM preview: Play buffers the whole In/Out loop (A and B views, current colour reading) with a progress bar; with Loop off it buffers the remaining frames in the play direction. A range that cannot fit the cache budget says so (needed vs budget) and streams instead; changing view, A/B, colour reading, In/Out or Loop re-buffers. Failed and oversized frames report an error without endless buffering or preventing playback from stopping at the end.
 - Playback: timer at the clip's fps (24 with a visible "fps assumed" note when metadata is missing), forward/reverse,
   holds the last frame while a decode lags and counts dropped frames.
-- Set In / Set Out / Clear In/Out and the Input-colour radio work **in memory only**, shown as "edited in memory — NOT
-  saved to the project".
+- Set In / Set Out / Clear In/Out and the Input-colour radio are saved to the project as you edit (see *Saved state*).
 - `contracts.rs` holds the range identity (stems, inclusive indices) and the output-location token resolver; the
-  Deliver tab shows a *preview-only* resolver (the user's NAS example resolves exactly).
+  Deliver tab edits those templates and saves them to `project.json` — every new Key job of the project resolves
+  its output paths through them (default: the clip's own output folder, `{name}_{version}/{output}/{name}_####`).
+- Workers answer a `hello` with GPU, model SHA-256 and capabilities before any job; the first local worker's digest
+  is the trusted reference and a remote job runs only on a matching digest (unverified models need an explicit
+  opt-in). Outputs are published atomically with no-clobber; Cancel, *Resume* and *write as vNNN* come from the real
+  disk state.
 
 ## Settings
 
 The **Settings** button (Board, and the bottom bar of a clip workspace) opens a page for the decoded-frame RAM budget (0 = Auto, half the
-available RAM, 1–8 GB), decode workers (0 = Auto), default looping and UI scale; AI and mask defaults are saved but not used yet.
+available RAM, 1–8 GB), decode workers (0 = Auto), default looping and UI scale, plus the **AI worker targets** and the AI defaults that seed a new clip's Key options;
+mask defaults are saved but not used yet.
+A target is a local checkout (repo folder, optional Python, GPU index) or a remote worker launched over the system
+`ssh` (Linux; Windows selectable but flagged untested in-app), with per-target path-mapping rows; an empty list =
+one implicit local worker on GPU 0 found via `$CK_REPO` or near the program/working folder. All targets are assumed
+to see the same shared storage (no transfer copies); a remote job needs the local worker's verified model digest first.
 Preferences live in `$XDG_CONFIG_HOME/corridorkey-native/settings.json` (never in project data). UI scale applies on Apply; RAM, workers
 and looping apply to the next clip you open, and `--cache-mb` overrides the saved RAM budget. Back/Esc/Cancel discard unsaved edits.
 
-## Not implemented (deliberately)
+## Hint, Media, Deliver and recovery (implemented; Linux only so far)
 
-No AI/Key/Generate hint (button disabled with the reason), no queue, presets, JPEG/TIFF/DPX sequences (refused at import, not playable), Bypass Hint editing,
-saving graph layouts, native movie decode (movies are first extracted through FFmpeg), board
-thumbnails, or hint painting/SAM/keyframe marking. Output-location templates are not applied to anything.
-The Qt global output preference (QSettings) is not read; when a clip would fall to it the Board says so.
-Windows is not built or tested. Matte display intentionally differs from the Qt app (no 0.85 gamma lift).
-Playback speed for 3200×1800 frames is measured by `ck-bench`, not assumed; see its output for the actual gap.
+- **Hint page**: routes Import alpha / GVM / BiRefNet (all variants) / Chroma key / MatAnyone2 / VideoMaMa, Bypass (keeps settings and assets), SAM tracker model, SAM points / one box / paint on the Input frame (source-pixel coordinates), preview, track mask, sparse keyframe marks, a separate chroma holdout (`holdout_strokes.json`, not SAM paint), chroma colour pick. Generated hints are staged outside the clip and published by the worker, replacing only the frames of In/Out; the previous hint stays until the new set validates. Route availability comes from the worker's real model readiness.
+- **Media**: frame extraction, relink of a missing image sequence (stored In/Out and result stems must match) or movie (size, rate and frame count checked first; a partial match needs your confirmation), companion alpha/mask movie import, and companion alpha/mask **image-sequence** import (PNG/EXR, stems/size/In-Out coverage checked, existing hint frames never replaced; the clip's hint lock is held during the copy).
+- **Key**: one-off and batch review, hint steps chained ahead of Key (explicit prerequisites), *Temporal awareness* labels over the exact wire presets, **Replace** of an app-owned result (same files and range; confirmation required; needs a worker advertising `key_modes: replace`), New version and Resume as before.
+- **Deliver**: output location templates, workflow/export presets (field merge; never copies range, colour, prompts or locations), video export (MP4, alpha MOV ProRes 4444, alpha WebM; audio is not included; never overwrites a file).
+- **Saved state**: `clip.json` (`in_out_range` plus boundary stems, `ck_native` hint route/annotations), the session file (input colour), `project.json` (`ck_native.workspace`), `presets.json` beside the preferences, `.ck_queue.json` in the project. Unknown keys are preserved; unreadable files are set aside, not overwritten.
+- **Tasks run on the local worker only** (remote scheduling is deferred). One GPU job at a time, shared with Key.
 
-Current feedback validation and remaining checks: [feedback validation](../docs/design/rust-ui/feedback-validation.md).
-Earlier milestone evidence: [native validation](../docs/design/rust-ui/native-validation.md).
+## Not implemented / not accepted
+
+Windows: the native UI and the packaged installers are **not built or accepted**; the Windows worker over SSH passed only a synthetic local-disk smoke and its NAS access is unresolved. No board thumbnails; no JPEG/TIFF/DPX sequences (refused at import); native annotations are not shared with the Qt app's `annotations.json`; movie relink references the movie in place (not copied); remote task scheduling; audio retention in exports. Qt's global output preference (QSettings) is not read. Matte display intentionally differs from the Qt app (no 0.85 gamma lift). Playback speed on 3200x1800 frames is measured by `ck-bench`, not assumed. Use on production media, installers and the standalone gate remain unaccepted: [standalone release plan](../docs/design/rust-ui/standalone-release-plan.md).
+
+Evidence: [feedback validation](../docs/design/rust-ui/feedback-validation.md), [native validation](../docs/design/rust-ui/native-validation.md), [remote validation](../docs/design/rust-ui/remote-validation.md) (synthetic 256x256 clips only).
+
 At 700×660 the viewer is smaller than 280 px; use a taller window or Focus mode. The 728×900 and 1440×900 layouts were visually checked.
 Real OS shortcuts remain unverified; the automated keyboard checks inject egui events.

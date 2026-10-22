@@ -301,6 +301,36 @@ fn live_publication_appears_before_the_job_finishes() {
 }
 
 #[test]
+fn model_asset_changes_wait_for_idle_workers_to_exit() {
+    let e = env(
+        "model-mutation-gate",
+        &[("c", 1, matte_png())],
+        json!({"version": 2}),
+    );
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, None);
+    app.ai_mut().scheduler_mut().probe(Some("l0"));
+    pump(&ctx, &mut app, "idle worker ready", |a| {
+        matches!(
+            a.ai().scheduler().targets()[0].status,
+            ck::scheduler::TargetStatus::Ready
+        )
+    });
+    assert!(!app.ai().model_asset_mutation_safe());
+    assert!(app.ai().workers_need_stop_for_model_change());
+    app.ai_mut().begin_stop();
+    assert!(
+        !app.ai().model_asset_mutation_safe(),
+        "stop request is not observed process exit"
+    );
+    pump(&ctx, &mut app, "worker exit observed", |a| {
+        a.ai().all_stopped()
+    });
+    assert!(app.ai().model_asset_mutation_safe());
+    fs::remove_dir_all(e.base).unwrap();
+}
+
+#[test]
 fn batch_review_shows_paths_then_places_clips_and_offers_a_new_version_for_existing_results() {
     let mut blocked = matte_png();
     blocked["workflow"]["params"] = json!({"hint_mode": "full"}); // no AlphaHint on this clip
@@ -448,6 +478,7 @@ fn inputs<'a>(
         out,
         range,
         digest: None,
+        pending_hint: false,
     }
 }
 fn matte_only() -> OutputCfg {
@@ -1076,6 +1107,15 @@ fn a_lost_unproven_job_is_released_only_through_the_scheduler_confirm() {
         1,
         "it stays reachable"
     );
+    app.ai_mut().begin_stop();
+    pump(&ctx, &mut app, "all worker processes stopped", |a| {
+        a.ai().all_stopped()
+    });
+    assert!(app.ai().scheduler().needs_attention().len() == 1);
+    assert!(
+        !app.ai().model_asset_mutation_safe(),
+        "observed process exit alone does not clear an unresolved Lost fence"
+    );
     // The dedicated confirm keeps fence and proof coherent and does the cleanup.
     let rec = app
         .ai_mut()
@@ -1084,6 +1124,7 @@ fn a_lost_unproven_job_is_released_only_through_the_scheduler_confirm() {
         .expect("recovery runs");
     assert!(rec.lock_removed && !lock.exists(), "{rec:?}");
     assert_eq!(app.ai().lock_owner(&id), ck::ui::ai::LockOwner::Ended);
+    assert!(app.ai().model_asset_mutation_safe());
     fs::remove_dir_all(e.base).unwrap();
 }
 

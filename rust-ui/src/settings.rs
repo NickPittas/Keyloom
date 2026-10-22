@@ -12,6 +12,39 @@ pub const VRAM_PROFILES: [&str; 2] = ["auto", "low"];
 pub const HINT_MODES: [&str; 3] = ["none", "full", "keyframes"];
 /// Mirrors backend `VALID_TEMPORAL_WINDOWS`.
 pub const TEMPORAL_WINDOWS: [&str; 6] = ["auto", "80/40", "48/24", "24/12", "8/4", "1/1"];
+
+/// "Temporal awareness" wording for a wire value (the wire value itself never changes).
+pub fn temporal_label(w: &str) -> String {
+    match w {
+        "auto" => "Auto (engine picks from frame size and VRAM)".into(),
+        "1/1" => "Off: single frame (1/1)".into(),
+        other => match other.split_once('/') {
+            Some((c, s)) => format!("{c} frames (stride {s})"),
+            None => other.to_string(),
+        },
+    }
+}
+
+/// The frame window of a wire value (`None` = auto).
+pub fn temporal_chunk(w: &str) -> Option<usize> {
+    w.split_once('/')?.0.parse().ok()
+}
+
+/// One sentence on what the selection means for a job over `frames` frames.
+pub fn temporal_explain(w: &str, frames: Option<usize>) -> String {
+    let base = "Temporal awareness: how many neighbouring frames the key sees at once. More frames steadier edges and more memory; context never crosses In/Out.";
+    match (temporal_chunk(w), frames) {
+        (Some(c), Some(n)) if c > n => {
+            format!("{base} Your range has {n} frames, so the effective window is capped at {n}.")
+        }
+        (Some(1), _) => {
+            format!("{base} Off: every frame is keyed on its own (flicker is not smoothed).")
+        }
+        (Some(c), _) => format!("{base} Window {c} frames, advancing by half a window."),
+        (None, Some(n)) => format!("{base} Auto chooses for the {n}-frame range."),
+        (None, None) => base.to_string(),
+    }
+}
 /// (label, size, id) as in the Qt preferences dialog.
 pub const TRACKER_MODELS: [(&str, &str, &str); 3] = [
     ("Fast", "184 MB", "facebook/sam2.1-hiera-small"),
@@ -235,12 +268,46 @@ impl Settings {
     }
 }
 
-/// `$XDG_CONFIG_HOME` or `~/.config`, then `corridorkey-native/settings.json`.
+/// Platform settings location. Windows needs no `HOME`: Roaming AppData, then Local AppData; with
+/// neither the app runs with session-only settings. Unix: `$XDG_CONFIG_HOME` or `~/.config`.
 pub fn default_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    if cfg!(windows) {
+        windows_path(
+            std::env::var_os("APPDATA"),
+            std::env::var_os("LOCALAPPDATA"),
+        )
+    } else {
+        unix_path(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )
+    }
+}
+
+/// `%APPDATA%\corridorkey-native\settings.json`, else `%LOCALAPPDATA%\…`, else `None`.
+pub fn windows_path(
+    appdata: Option<std::ffi::OsString>,
+    local: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let base = appdata
+        .filter(|v| !v.is_empty())
+        .or_else(|| local.filter(|v| !v.is_empty()))?;
+    Some(
+        PathBuf::from(base)
+            .join("corridorkey-native")
+            .join("settings.json"),
+    )
+}
+
+/// `$XDG_CONFIG_HOME/corridorkey-native/settings.json`, else `~/.config/corridorkey-native/…`.
+pub fn unix_path(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let base = xdg
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join("corridorkey-native").join("settings.json"))
 }
 
@@ -377,6 +444,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn windows_settings_path_needs_no_home() {
+        let ad = std::ffi::OsString::from(r"C:\Users\u\AppData\Roaming");
+        let la = std::ffi::OsString::from(r"C:\Users\u\AppData\Local");
+        assert_eq!(
+            windows_path(Some(ad.clone()), Some(la.clone())),
+            Some(
+                PathBuf::from(r"C:\Users\u\AppData\Roaming")
+                    .join("corridorkey-native")
+                    .join("settings.json")
+            )
+        );
+        // No APPDATA and no HOME: LOCALAPPDATA still gives a settings location on Windows.
+        assert_eq!(
+            windows_path(None, Some(la.clone())),
+            Some(
+                PathBuf::from(r"C:\Users\u\AppData\Local")
+                    .join("corridorkey-native")
+                    .join("settings.json")
+            )
+        );
+        assert_eq!(windows_path(None, None), None);
+        assert_eq!(windows_path(Some(std::ffi::OsString::new()), None), None);
+    }
+
+    #[test]
+    fn unix_settings_path_prefers_xdg() {
+        let x = std::ffi::OsString::from("/xdg");
+        let h = std::ffi::OsString::from("/home/u");
+        assert_eq!(
+            unix_path(Some(x.clone()), Some(h.clone())),
+            Some(PathBuf::from("/xdg/corridorkey-native/settings.json"))
+        );
+        assert_eq!(
+            unix_path(None, Some(h.clone())),
+            Some(PathBuf::from(
+                "/home/u/.config/corridorkey-native/settings.json"
+            ))
+        );
+        assert_eq!(unix_path(None, None), None);
     }
 
     #[test]

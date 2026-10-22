@@ -63,7 +63,8 @@ pub enum CardState {
 }
 
 pub struct ImportUi {
-    pub data_dir: PathBuf,
+    /// Default location for new projects (`None` = no preset: the destination is chosen explicitly).
+    pub data_dir: Option<PathBuf>,
     repo: Option<PathBuf>,
     planning: Option<Planning>,
     pending: Option<Pending>,
@@ -88,7 +89,7 @@ fn default_name(src: &Sources) -> String {
 }
 
 impl ImportUi {
-    pub fn new(data_dir: PathBuf, repo: Option<PathBuf>) -> Self {
+    pub fn new(data_dir: Option<PathBuf>, repo: Option<PathBuf>) -> Self {
         ImportUi {
             data_dir,
             repo,
@@ -205,10 +206,14 @@ impl ImportUi {
         self.begin_with(ctx, project, src, None);
     }
 
-    /// QA (`--data-dir`/`--import`): with no open project the destination is preset to `<data-dir>/Projects`.
+    /// QA (`--data-dir`/`--import`): with no open project the destination is preset to `<data-dir>/Projects`
+    /// when a default location is known at all.
     pub fn begin_qa(&mut self, ctx: &egui::Context, project: Option<&Path>, src: Sources) {
-        let preset = Dest::NewIn(self.data_dir.join("Projects"));
-        self.begin_with(ctx, project, src, Some(preset));
+        let preset = self
+            .data_dir
+            .as_ref()
+            .map(|d| Dest::NewIn(d.join("Projects")));
+        self.begin_with(ctx, project, src, preset);
     }
 
     fn begin_with(

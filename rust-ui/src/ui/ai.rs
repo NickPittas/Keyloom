@@ -34,6 +34,8 @@ struct Tracked {
     job_id: String,
     folder: String,
     name: String,
+    /// Task kind label ("" = a Key job).
+    label: String,
 }
 
 /// What the host must do after `AiUi::tick`.
@@ -55,6 +57,8 @@ struct GateReq {
     out: OutputCfg,
     /// The single range snapshot this check (and the job it yields) is built from.
     range: Result<(usize, usize), String>,
+    /// Hint steps queued before Key (the plan assumes they provide the hint).
+    steps: Vec<crate::tasks::TaskJob>,
 }
 
 pub struct GateOut {
@@ -62,6 +66,7 @@ pub struct GateOut {
     main: Result<Plan, Blocked>,
     resume: Option<Plan>,
     newver: Option<Plan>,
+    replace: Option<Plan>,
 }
 
 fn run_gate(r: &GateReq) -> GateOut {
@@ -73,6 +78,7 @@ fn run_gate(r: &GateReq) -> GateOut {
         }),
         resume: None,
         newver: None,
+        replace: None,
     };
     let range = match &r.range {
         Ok(x) => *x,
@@ -86,15 +92,19 @@ fn run_gate(r: &GateReq) -> GateOut {
         out: &r.out,
         range,
         digest: None,
+        pending_hint: !r.steps.is_empty(),
     };
     let main = plan(&inp, Intent::New);
-    let (mut resume, mut newver) = (None, None);
+    let (mut resume, mut newver, mut replace) = (None, None, None);
     if let Err(Blocked {
         existing: Some(e), ..
     }) = &main
     {
         if e.resume {
             resume = plan(&inp, Intent::Resume).ok();
+        }
+        if e.replace {
+            replace = plan(&inp, Intent::Replace).ok();
         }
         if e.next_version.is_some() {
             newver = plan(&inp, Intent::NewVersion).ok();
@@ -105,6 +115,7 @@ fn run_gate(r: &GateReq) -> GateOut {
         main,
         resume,
         newver,
+        replace,
     }
 }
 
@@ -135,6 +146,8 @@ pub enum Choice {
     Queue,
     NewVersion,
     Resume,
+    /// Replace the files of the existing owned result (needs the batch's explicit confirmation).
+    Replace,
 }
 
 #[allow(clippy::large_enum_variant)] // a handful of short-lived review rows
@@ -144,11 +157,16 @@ enum RowState {
         reason: String,
         newver: Option<Plan>,
         resume: Option<Plan>,
+        replace: Option<Plan>,
+        /// Why Replace is unavailable (shown as the disabled reason).
+        replace_why: Option<String>,
     },
     Blocked(String),
 }
 
 struct BatchRow {
+    /// Hint-generation steps queued ahead of Key (each depends on the one before; Key on the last).
+    steps: Vec<crate::tasks::TaskJob>,
     clip: Clip,
     params: Params,
     out: OutputCfg,
@@ -163,6 +181,7 @@ impl BatchRow {
             (RowState::Ready(p), Choice::Queue) => Some(p),
             (RowState::Existing { newver, .. }, Choice::NewVersion) => newver.as_ref(),
             (RowState::Existing { resume, .. }, Choice::Resume) => resume.as_ref(),
+            (RowState::Existing { replace, .. }, Choice::Replace) => replace.as_ref(),
             _ => None,
         }
     }
@@ -170,11 +189,20 @@ impl BatchRow {
 
 /// The batch review: computed in the background, then confirmed by the user. The plans are the frozen jobs.
 struct Batch {
+    /// The user confirmed that rows set to Replace overwrite their owned result files.
+    confirm_replace: bool,
     rows: Vec<BatchRow>,
     pending: Option<Receiver<Vec<BatchRow>>>,
 }
 
+mod tasks;
+pub use tasks::{sig_of, PreviewResult, TaskDone};
+
 pub struct AiUi {
+    /// The Key panel's inline Replace confirmation is open.
+    replace_confirm: bool,
+    /// Task-side state (previews, finished results, held chains): see `tasks`.
+    pub tk: tasks::TaskState,
     sched: Scheduler,
     targets: Vec<Target>,
     /// Worker setup problems per target (`None` = no target at all), checked when targets change.
@@ -192,6 +220,8 @@ pub struct AiUi {
     lock_remove_temps: bool,
     /// Saved worker targets waiting for the running/unresolved jobs to finish (applied by `tick`).
     pending_targets: Option<Vec<Target>>,
+    /// Model assets are being installed or repaired; do not start workers against a changing tree.
+    model_mutation_active: bool,
     /// Screen rectangles from the last frame (click tests).
     pub key_rect: Option<egui::Rect>,
     pub batch_confirm_rect: Option<egui::Rect>,
@@ -206,42 +236,28 @@ fn trunc(s: &str) -> String {
     }
 }
 
-pub const NO_REPO: &str = "No worker is configured: no CorridorKey checkout (a folder with backend/worker) was found next to the program or in the working folder, and none is set. Add a local target with the repo folder in Settings > AI worker targets.";
+pub const NO_REPO: &str = "No worker is configured: no CorridorKey installation or checkout was found next to the program or in the working folder, and none is set. Add a local target in Settings > AI worker targets, or install/repair the packaged runtime.";
 
-/// A CorridorKey checkout found at run time: `$CK_REPO`, then the program's and the working folder's
-/// ancestors. `None` on a deployed binary without one: the user must configure a target.
-pub fn runtime_repo() -> Option<PathBuf> {
-    let ok = |p: &Path| p.join("backend/worker/__main__.py").is_file();
-    if let Some(p) = std::env::var_os("CK_REPO")
-        .map(PathBuf::from)
-        .filter(|p| ok(p))
-    {
-        return Some(p);
-    }
-    [std::env::current_exe().ok(), std::env::current_dir().ok()]
-        .into_iter()
-        .flatten()
-        .find_map(|start| {
-            start
-                .ancestors()
-                .take(6)
-                .find(|a| ok(a))
-                .map(Path::to_path_buf)
-        })
-}
-
-/// Saved targets, or one local GPU-0 worker on `repo` (explicit option or runtime discovery) when none are
-/// configured. No repo = no implicit target (see `NO_REPO`).
+/// Saved targets, or one local GPU-0 worker on `repo` (explicit option) or the resolved runtime —
+/// `CK_REPO`, then the install descriptor, then developer checkout discovery (`crate::runtime::launch`).
+/// Nothing found = no implicit target (see `NO_REPO`).
 pub fn effective_targets(st: &Settings, repo: Option<&Path>) -> Vec<Target> {
     if !st.ai_targets.is_empty() {
         return st.ai_targets.clone();
     }
-    let Some(repo) = repo.map(Path::to_path_buf).or_else(runtime_repo) else {
+    let l = crate::runtime::launch(repo);
+    let Some(repo) = l.repo else {
         return vec![];
     };
     vec![Target {
         id: "local-0".into(),
-        kind: TargetKind::Local { repo, python: None },
+        kind: TargetKind::Local {
+            repo,
+            // CK_PYTHON (user override) beats the descriptor's interpreter.
+            python: std::env::var_os("CK_PYTHON")
+                .map(PathBuf::from)
+                .or(l.python),
+        },
         gpu: 0,
         enabled: true,
         storage: Default::default(),
@@ -249,9 +265,18 @@ pub fn effective_targets(st: &Settings, repo: Option<&Path>) -> Vec<Target> {
     }]
 }
 
-fn setup_problems(targets: &[Target]) -> Vec<(Option<String>, String)> {
+fn setup_problems(
+    targets: &[Target],
+    runtime_problem: Option<&str>,
+) -> Vec<(Option<String>, String)> {
     let mut v = vec![];
-    if targets.iter().all(|t| !t.enabled) {
+    if let Some(p) = runtime_problem {
+        v.push((
+            None,
+            format!("The installed runtime descriptor is unusable: {p} Repair or reinstall the installation (or unset CK_INSTALL to use a developer checkout)."),
+        ));
+    }
+    if targets.iter().all(|t| !t.enabled) && v.is_empty() {
         v.push((
             None,
             if targets.is_empty() {
@@ -269,7 +294,11 @@ fn setup_problems(targets: &[Target]) -> Vec<(Option<String>, String)> {
             let why = if !repo.join("backend/worker/__main__.py").is_file() {
                 Some(format!("{}: {} is not a CorridorKey checkout (no backend/worker). Fix the repo folder in Settings > AI worker targets.", t.id, repo.display()))
             } else if !py.is_file() {
-                Some(format!("{}: no Python at {}. Create the repo's .venv or set Python in Settings > AI worker targets.", t.id, py.display()))
+                Some(if python.is_some() {
+                    format!("{}: the configured Python does not exist at {}. Fix Python in Settings > AI worker targets, or repair the installation.", t.id, py.display())
+                } else {
+                    format!("{}: no Python at {}. Create the repo's .venv or set Python in Settings > AI worker targets.", t.id, py.display())
+                })
             } else {
                 None
             };
@@ -284,6 +313,7 @@ fn setup_problems(targets: &[Target]) -> Vec<(Option<String>, String)> {
 impl AiUi {
     pub fn new(st: &Settings, repo: Option<&Path>) -> Self {
         let targets = effective_targets(st, repo);
+        let problem = crate::runtime::launch(repo).problem;
         let (sched, notice) = match Scheduler::new(targets.clone()) {
             Ok(s) => (s, None),
             Err(e) => (
@@ -292,8 +322,10 @@ impl AiUi {
             ),
         };
         Self {
+            replace_confirm: false,
+            tk: Default::default(),
             sched,
-            setup: setup_problems(&targets),
+            setup: setup_problems(&targets, problem.as_deref()),
             targets,
             drafts: BTreeMap::new(),
             tracked: vec![],
@@ -305,6 +337,7 @@ impl AiUi {
             batch: None,
             lock_remove_temps: false,
             pending_targets: None,
+            model_mutation_active: false,
             key_rect: None,
             batch_confirm_rect: None,
         }
@@ -319,16 +352,7 @@ impl AiUi {
     }
     /// A job is queued, starting or running, or a Lost writer is still fencing its folder.
     pub fn busy(&self) -> bool {
-        self.sched.snapshot().iter().any(|e| {
-            !e.state.is_terminal()
-                || matches!(
-                    e.state,
-                    JobState::Lost {
-                        writer_stopped: false,
-                        ..
-                    }
-                )
-        })
+        self.sched.busy()
     }
     pub fn job_ids(&self) -> Vec<String> {
         self.tracked.iter().map(|t| t.job_id.clone()).collect()
@@ -379,7 +403,7 @@ impl AiUi {
             Ok(mut s) => {
                 std::mem::swap(&mut self.sched, &mut s);
                 s.stop_all(); // the old workers are idle: they get EOF
-                self.setup = setup_problems(&t);
+                self.setup = setup_problems(&t, crate::runtime::launch(None).problem.as_deref());
                 self.targets = t;
                 self.tracked.clear();
                 self.notice = None;
@@ -405,9 +429,33 @@ impl AiUi {
                 SchedEvent::Published { job_id, .. } => (job_id, true),
                 // Only the end of a job needs a re-read besides publication.
                 SchedEvent::Changed(id)
-                    if self.sched.job(&id).is_some_and(|j| j.state.is_terminal()) =>
+                    if self.sched.state_of(&id).is_some_and(|s| s.is_terminal()) =>
                 {
+                    self.on_task_end(&id);
                     (id, false)
+                }
+                SchedEvent::Preview {
+                    job_id,
+                    frame_stem,
+                    width,
+                    height,
+                    mask_png,
+                    score,
+                } => {
+                    self.on_preview(job_id, frame_stem, width, height, mask_png, score);
+                    continue;
+                }
+                SchedEvent::HintLock {
+                    request_id,
+                    outcome,
+                } => {
+                    if let Some(folder) = self.on_lock_reply(request_id, outcome) {
+                        out.push(Refresh {
+                            folder,
+                            live: false,
+                        });
+                    }
+                    continue;
                 }
                 SchedEvent::Warning { job_id, message } => {
                     if let Some(t) = self.tracked.iter_mut().find(|t| t.job_id == job_id) {
@@ -470,13 +518,33 @@ impl AiUi {
         params: &Params,
         out: &OutputCfg,
     ) -> Result<String, String> {
+        self.submit_plan_after(clip, plan, params, out, vec![])
+    }
+
+    fn submit_plan_after(
+        &mut self,
+        clip: &Clip,
+        plan: Plan,
+        params: &Params,
+        out: &OutputCfg,
+        after: Vec<String>,
+    ) -> Result<String, String> {
+        if self.model_mutation_active {
+            return Err("Model installation or repair is active; wait for it to finish before starting Key work.".into());
+        }
+        if self.external_writer(&clip.root) {
+            return Err(
+                "a companion-sequence import is writing this clip's hints; wait for it to finish"
+                    .into(),
+            );
+        }
         commit(clip, &plan, params, out)?;
         let id = plan.job.job_id.clone();
         self.sched
             .submit(Submit {
                 job: plan.job,
                 placement: self.placement.clone(),
-                after: vec![],
+                after,
                 min_vram_gb: None,
             })
             .map_err(|e| format!("not queued: {e:?}"))?;
@@ -485,6 +553,7 @@ impl AiUi {
             job_id: id.clone(),
             folder: clip.folder.clone(),
             name: clip.display_name.clone(),
+            label: String::new(),
         });
         self.disk_gen += 1;
         Ok(id)
@@ -505,6 +574,7 @@ impl AiUi {
             Intent::New => g.main.as_ref().ok(),
             Intent::Resume => g.resume.as_ref(),
             Intent::NewVersion => g.newver.as_ref(),
+            Intent::Replace => g.replace.as_ref(),
         };
         let Some(plan) = plan else {
             return Err(match &g.main {
@@ -533,6 +603,12 @@ impl AiUi {
         st: &Settings,
         picks: &[usize],
     ) {
+        if self.model_mutation_active {
+            self.notice = Some(
+                "Model installation or repair is active; wait before starting a batch.".into(),
+            );
+            return;
+        }
         let mut reqs = vec![];
         for &i in picks {
             let Some(c) = project.clips.get(i) else {
@@ -548,6 +624,23 @@ impl AiUi {
             let d = self.draft(c, project, st);
             let (mut params, out) = (d.params.clone(), d.out.clone());
             params.input_is_linear = c.input_is_linear;
+            // Hint steps the saved route needs before Key (none when bypassed or already covering).
+            let (range, steps) = match range {
+                Ok(r) => match crate::hints::plan_steps(
+                    c,
+                    &crate::hints::HintCfg::load(c),
+                    &params.hint_mode,
+                    r,
+                    c.input_is_linear,
+                    false,
+                    &crate::hints::staging_root(&project.root, &c.root, &c.folder),
+                    new_id,
+                ) {
+                    Ok(s) => (Ok(r), s),
+                    Err(e) => (Err(e), vec![]),
+                },
+                e => (e, vec![]),
+            };
             reqs.push(GateReq {
                 sig: String::new(),
                 clip: c.clone(),
@@ -556,6 +649,7 @@ impl AiUi {
                 params,
                 out,
                 range,
+                steps,
             });
         }
         let (tx, rx) = channel();
@@ -579,6 +673,8 @@ impl AiUi {
                                         reason: e.reason,
                                         newver: g.newver,
                                         resume: g.resume,
+                                        replace: g.replace,
+                                        replace_why: e.replace_why,
                                     },
                                     c,
                                 )
@@ -587,6 +683,7 @@ impl AiUi {
                         },
                     };
                     BatchRow {
+                        steps: r.steps.clone(),
                         range: r.range.clone().unwrap_or((0, 0)),
                         clip: r.clip,
                         params: r.params,
@@ -600,6 +697,7 @@ impl AiUi {
             ctx.request_repaint();
         });
         self.batch = Some(Batch {
+            confirm_replace: false,
             rows: vec![],
             pending: Some(rx),
         });
@@ -735,15 +833,19 @@ impl AiUi {
         project: &Project,
         st: &Settings,
         linear: bool,
+        range_frames: Option<usize>,
     ) {
         let d = self.draft(clip, project, st);
         let p = &mut d.params;
-        ui.label(RichText::new("Temporal window").strong());
-        choice(
-            ui,
-            "temporal_window",
-            &mut p.temporal_window,
-            &TEMPORAL_WINDOWS,
+        ui.label(RichText::new("Temporal awareness (frames seen at once)").strong());
+        temporal_choice(ui, "temporal_window", &mut p.temporal_window);
+        ui.label(
+            RichText::new(crate::settings::temporal_explain(
+                &p.temporal_window,
+                range_frames,
+            ))
+            .color(DIM)
+            .size(12.0),
         );
         ui.label(RichText::new("VRAM profile (engine policy, not a cap)").strong());
         choice(ui, "vram_profile", &mut p.vram_profile, &VRAM_PROFILES);
@@ -861,6 +963,7 @@ impl AiUi {
                 params,
                 out,
                 range,
+                steps: vec![],
             };
             self.gate.want = Some((Instant::now(), req));
         }
@@ -1051,14 +1154,50 @@ impl AiUi {
                         }
                         if let Some(e) = &b.existing {
                             ui.colored_label(WARN, &e.reason);
-                            ui.label(RichText::new("Existing results are never replaced.").color(DIM).size(12.0));
+                            ui.label(RichText::new("Nothing is replaced unless you choose Replace and confirm it.").color(DIM).size(12.0));
+                            if self.replace_confirm && g.replace.is_some() {
+                                // Buttons first (always visible); the folder is already shown in the line above.
+                                ui.horizontal(|ui| {
+                                    if ui.button("Yes, replace").clicked() {
+                                        intent = Some(Intent::Replace);
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.replace_confirm = false;
+                                    }
+                                });
+                                ui.colored_label(WARN, format!("Replace {} owned file(s)? Old files stay until the new ones are verified; unknown files are never touched; cancel or failure keeps the previous result.", e.replace_files));
+                            }
                             ui.horizontal_wrapped(|ui| {
-                                if g.resume.is_some() && ui.button("Resume previous run").clicked() {
+                                if g.resume.is_some()
+                                    && ui.add_enabled(!self.model_mutation_active, egui::Button::new("Resume previous run")).clicked()
+                                {
                                     intent = Some(Intent::Resume);
+                                }
+                                // Replace: owned files only, explicit confirmation, disabled with its reason.
+                                let rep_ready = g.replace.as_ref().map(|p| self.sched.readiness(&self.placement, &p.job, None));
+                                let rep_block = match (&g.replace, &rep_ready) {
+                                    (None, _) => Some(e.replace_why.clone().unwrap_or_else(|| "Replace is not available for this result".into())),
+                                    (Some(_), Some(Readiness::Blocked(r))) => Some(r.join("; ")),
+                                    _ if self.model_mutation_active => Some("Model installation or repair is active".into()),
+                                    _ => None,
+                                };
+                                let label = format!("Replace result ({} files)", e.replace_files);
+                                match rep_block {
+                                    Some(why) => {
+                                        ui.add_enabled(false, egui::Button::new(label)).on_disabled_hover_text(why);
+                                    }
+                                    None => {
+                                        if ui.button(label).on_hover_text("Overwrites the files this result owns, with the settings above").clicked() {
+                                            self.replace_confirm = !self.replace_confirm;
+                                        }
+                                    }
                                 }
                                 match (e.next_version, &g.newver) {
                                     (Some(v), Some(_)) => {
-                                        if ui.button(format!("Write as v{v:03}")).on_hover_text("Same settings, next free version folder").clicked() {
+                                        if ui.add_enabled(
+                                            !self.model_mutation_active,
+                                            egui::Button::new(format!("Write as v{v:03}")),
+                                        ).on_hover_text("Same settings, next free version folder").clicked() {
                                             intent = Some(Intent::NewVersion);
                                         }
                                     }
@@ -1078,7 +1217,10 @@ impl AiUi {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Target");
                 self.placement_combo(ui);
-                if ui.button("Check workers").on_hover_text("Start the worker(s) now to see GPU and model identity").clicked() {
+                if ui.add_enabled(
+                    !self.model_mutation_active,
+                    egui::Button::new("Check workers"),
+                ).on_hover_text("Start the worker(s) now to see GPU and model identity; disabled during model installation or repair").clicked() {
                     self.sched.probe(None);
                 }
             });
@@ -1086,7 +1228,10 @@ impl AiUi {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(target_line(&t)).color(DIM).size(12.0));
                     let failed = matches!(t.status, TargetStatus::Down(_) | TargetStatus::Refused(_) | TargetStatus::Stopped);
-                    if failed && t.busy_with.is_none() && ui.small_button("Retry").on_hover_text("Forget this verdict and start the worker again").clicked() {
+                    if failed && t.busy_with.is_none() && ui.add_enabled(
+                        !self.model_mutation_active,
+                        egui::Button::new("Retry").small(),
+                    ).on_hover_text("Forget this verdict and start the worker again; disabled during model installation or repair").clicked() {
                         self.sched.reset_target(&t.id);
                     }
                 });
@@ -1103,34 +1248,42 @@ impl AiUi {
             self.unresolved_ui(ui);
             self.job_status(ui, &clip.folder);
         });
-        let (can, why) = match (&ready, &g) {
-            (_, None) => (false, "Checking the output folder…".to_string()),
-            _ if !setup.is_empty() => (false, "Worker setup needed (see above)".into()),
+        let (can, why) = if self.model_mutation_active {
             (
-                Some(Readiness::Ready {
-                    unverified,
-                    busy,
-                    target,
-                }),
-                _,
-            ) => {
-                let mut s = format!(
-                    "Runs on {target}{}",
-                    if *busy { " (busy: it will wait)" } else { "" }
-                );
-                if *unverified {
-                    s += " · model identity unverified";
-                }
-                (true, s)
-            }
-            (Some(Readiness::Pending(w)), _) => {
-                (true, format!("Worker not ready yet: {}", trunc(w)))
-            }
-            (Some(Readiness::Blocked(r)), _) => (
                 false,
-                format!("No target can run this job: {}", trunc(&r.join("; "))),
-            ),
-            _ => (false, "Fix the items above first".into()),
+                "Model installation or repair is active; Key workers are paused until it finishes."
+                    .into(),
+            )
+        } else {
+            match (&ready, &g) {
+                (_, None) => (false, "Checking the output folder…".to_string()),
+                _ if !setup.is_empty() => (false, "Worker setup needed (see above)".into()),
+                (
+                    Some(Readiness::Ready {
+                        unverified,
+                        busy,
+                        target,
+                    }),
+                    _,
+                ) => {
+                    let mut s = format!(
+                        "Runs on {target}{}",
+                        if *busy { " (busy: it will wait)" } else { "" }
+                    );
+                    if *unverified {
+                        s += " · model identity unverified";
+                    }
+                    (true, s)
+                }
+                (Some(Readiness::Pending(w)), _) => {
+                    (true, format!("Worker not ready yet: {}", trunc(w)))
+                }
+                (Some(Readiness::Blocked(r)), _) => (
+                    false,
+                    format!("No target can run this job: {}", trunc(&r.join("; "))),
+                ),
+                _ => (false, "Fix the items above first".into()),
+            }
         };
         ui.label(
             RichText::new(why)
@@ -1152,6 +1305,7 @@ impl AiUi {
             self.disk_gen += 1;
         }
         if let Some(i) = intent {
+            self.replace_confirm = false;
             self.notice = match self.submit_current(clip, i) {
                 Ok(_) => None,
                 Err(e) => Some(format!("Not queued: {}", trunc(&e))),
@@ -1169,7 +1323,7 @@ impl AiUi {
 
     fn job_row(&mut self, ui: &mut Ui, id: &str, with_name: bool) {
         let Some(e) = self.sched.job(id).cloned() else {
-            return;
+            return self.task_row(ui, id, with_name);
         };
         let name = self
             .tracked
@@ -1307,6 +1461,12 @@ impl AiUi {
             .needs_attention()
             .into_iter()
             .map(|e| e.job.job_id.clone())
+            .chain(
+                self.sched
+                    .task_attention()
+                    .into_iter()
+                    .map(|t| t.job.job_id.clone()),
+            )
             .collect()
     }
 
@@ -1331,7 +1491,7 @@ impl AiUi {
 
     /// Board queue: running/queued/unresolved jobs always, then the latest finished ones.
     pub fn queue_ui(&mut self, ui: &mut Ui) {
-        if self.tracked.is_empty() {
+        if self.tracked.is_empty() && self.tk.history.is_empty() {
             ui.label(RichText::new("No jobs").color(DIM));
         }
         let unresolved = self.unresolved();
@@ -1341,8 +1501,8 @@ impl AiUi {
             .rev()
             .filter(|t| {
                 self.sched
-                    .job(&t.job_id)
-                    .is_some_and(|e| !e.state.is_terminal())
+                    .state_of(&t.job_id)
+                    .is_some_and(|s| !s.is_terminal())
                     || unresolved.contains(&t.job_id)
             })
             .map(|t| t.job_id.clone())
@@ -1364,7 +1524,7 @@ impl AiUi {
     /// Board batch controls: "Key selected N clips" starts the review (nothing is queued yet).
     pub fn batch_ui(&mut self, ui: &mut Ui, project: &Project, st: &Settings, picks: &[usize]) {
         let r = ui.add_enabled(
-            !picks.is_empty() && self.batch.is_none(),
+            !picks.is_empty() && self.batch.is_none() && !self.model_mutation_active,
             egui::Button::new(format!(
                 "Key selected {} clip{}…",
                 picks.len(),
@@ -1429,6 +1589,8 @@ impl AiUi {
                             reason,
                             newver,
                             resume,
+                            replace,
+                            replace_why,
                         } => {
                             ui.colored_label(WARN, trunc(reason));
                             ui.selectable_value(&mut r.choice, Choice::Skip, "skip");
@@ -1443,17 +1605,41 @@ impl AiUi {
                             if resume.is_some() {
                                 ui.selectable_value(&mut r.choice, Choice::Resume, "resume");
                             }
+                            match replace {
+                                Some(p) => {
+                                    ui.selectable_value(
+                                        &mut r.choice,
+                                        Choice::Replace,
+                                        format!("replace {} owned files", p.job.outputs.values().map(Vec::len).sum::<usize>()),
+                                    );
+                                }
+                                None => {
+                                    ui.add_enabled(false, egui::Button::new("replace"))
+                                        .on_disabled_hover_text(replace_why.clone().unwrap_or_else(|| "Replace is not available for this result".into()));
+                                    if let Some(w) = replace_why {
+                                        ui.label(RichText::new(format!("replace unavailable: {}", trunc(w))).color(DIM).size(11.0));
+                                    }
+                                }
+                            }
                         }
                         RowState::Blocked(why) => {
                             ui.colored_label(BAD, format!("not queued: {}", trunc(why)));
                         }
                     }
                 });
+                if !r.steps.is_empty() && r.plan().is_some() {
+                    let chain: Vec<&str> = r.steps.iter().map(|s| s.kind.label()).collect();
+                    ui.label(
+                        RichText::new(format!("first: {} > Key", chain.join(" > ")))
+                            .color(DIM)
+                            .size(12.0),
+                    );
+                }
                 if let Some(p) = r.plan() {
                     let first = p.job.outputs.values().next().and_then(|v| v.first());
                     ui.label(
                         RichText::new(format!(
-                            "→ {}",
+                            "to {}",
                             first.map_or(String::new(), |f| f.display().to_string())
                         ))
                         .monospace()
@@ -1469,8 +1655,21 @@ impl AiUi {
                     .batch
                     .as_ref()
                     .map_or(0, |b| b.rows.iter().filter(|r| r.plan().is_some()).count());
+                let n_replace = self.batch.as_ref().map_or(0, |b| {
+                    b.rows.iter().filter(|r| r.choice == Choice::Replace && r.plan().is_some()).count()
+                });
+                let confirmed = n_replace == 0 || self.batch.as_ref().is_some_and(|b| b.confirm_replace);
+                if n_replace > 0 {
+                    if let Some(b) = self.batch.as_mut() {
+                        theme::checkbox(
+                            ui,
+                            &mut b.confirm_replace,
+                            format!("I confirm: replace the owned result files of {n_replace} clip(s). The worker keeps the old files until the new ones are verified; other files in those folders are untouched."),
+                        );
+                    }
+                }
                 let b = ui.add_enabled(
-                    n > 0,
+                    n > 0 && confirmed && !self.model_mutation_active,
                     egui::Button::new(format!(
                         "Queue {n} clip{} on {}",
                         if n == 1 { "" } else { "s" },
@@ -1482,7 +1681,7 @@ impl AiUi {
                 cancel = ui.button("Cancel").clicked();
             });
             ui.label(
-                RichText::new("Whole clips are distributed over the targets; nothing is replaced.")
+                RichText::new("Whole clips are distributed over the targets. Existing results are only replaced where you chose and confirmed it.")
                     .color(DIM)
                     .size(12.0),
             );
@@ -1492,7 +1691,16 @@ impl AiUi {
             let (mut queued, mut errs) = (0, vec![]);
             for r in rows {
                 if let Some(p) = r.plan().cloned() {
-                    match self.submit_plan(&r.clip, p, &r.params, &r.out) {
+                    let res = if r.steps.is_empty() {
+                        self.submit_plan(&r.clip, p, &r.params, &r.out)
+                    } else {
+                        self.submit_chain(
+                            &r.clip,
+                            r.steps.clone(),
+                            Some((p, r.params.clone(), r.out.clone())),
+                        )
+                    };
+                    match res {
                         Ok(_) => queued += 1,
                         Err(e) => errs.push(format!("{}: {}", r.clip.display_name, trunc(&e))),
                     }
@@ -1512,16 +1720,27 @@ impl AiUi {
 
     /// A job is queued, starting or running (not merely fenced).
     pub fn running_jobs(&self) -> bool {
-        self.sched.snapshot().iter().any(|e| !e.state.is_terminal())
+        self.sched.running()
+    }
+    pub fn set_model_mutation_active(&mut self, active: bool) {
+        self.model_mutation_active = active;
+    }
+    /// Model assets are safe to change only after observed worker exits and resolved job fences.
+    pub fn model_asset_mutation_safe(&self) -> bool {
+        self.sched.all_stopped()
+            && self.sched.needs_attention().is_empty()
+            && self.sched.task_attention().is_empty()
+            && !self.sched.running()
+    }
+    pub fn workers_need_stop_for_model_change(&self) -> bool {
+        self.running_jobs() || !self.sched.all_stopped()
+    }
+    pub fn unresolved_model_fences(&self) -> bool {
+        !self.unresolved().is_empty()
     }
     /// A worker process may be alive (starting, idle or stopping).
     pub fn workers_alive(&self) -> bool {
-        self.sched.targets().iter().any(|t| {
-            matches!(
-                t.status,
-                TargetStatus::Starting | TargetStatus::Ready | TargetStatus::Stopping
-            )
-        })
+        !self.sched.all_stopped()
     }
     /// Graceful stop of everything: queued jobs are cancelled, workers get EOF and finish their `done`.
     pub fn begin_stop(&mut self) {
@@ -1591,6 +1810,17 @@ fn notes(ui: &mut Ui, n: &[String]) {
     for t in n {
         ui.colored_label(WARN, t);
     }
+}
+
+/// The temporal-window combo with plain-language entries; the stored/wire value is the exact preset string.
+pub fn temporal_choice(ui: &mut Ui, id: &str, v: &mut String) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(crate::settings::temporal_label(v))
+        .show_ui(ui, |ui| {
+            for o in TEMPORAL_WINDOWS {
+                ui.selectable_value(v, o.to_string(), crate::settings::temporal_label(o));
+            }
+        });
 }
 
 fn choice(ui: &mut Ui, id: &str, v: &mut String, opts: &[&str]) {

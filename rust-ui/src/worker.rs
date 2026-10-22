@@ -33,6 +33,15 @@ pub struct Capabilities {
     pub key: bool,
     pub generate_hint: bool,
     pub publish_modes: Vec<String>,
+    /// Key job modes the worker supports (`new`, `resume`, `replace`). Empty = an older worker: new/resume only.
+    pub key_modes: Vec<String>,
+    /// Per task kind (`TaskKind::wire`): truthful readiness of that route on this worker.
+    pub tasks: BTreeMap<String, bool>,
+    /// Installed (verified) BiRefNet display variants and SAM tracker model ids.
+    pub birefnet_variants: Vec<String>,
+    pub sam_models: Vec<String>,
+    /// Why a family is unavailable (`gpu`, `ffmpeg`, `models`): shown, never guessed.
+    pub task_unavailable: BTreeMap<String, String>,
 }
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Hello {
@@ -74,6 +83,11 @@ pub struct Done {
     pub expected: u64,
     #[serde(default)]
     pub manifest_complete: bool,
+    /// Task jobs: `kind` and the worker's `result` object (published/expected/hint_dir/complete/outputs).
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub result: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -88,6 +102,31 @@ pub enum Event {
         job_id: Option<String>,
         code: String,
         message: String,
+        /// Set when the rejected command was a hint-lock request.
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    /// Answer to `inspect_hint_lock`: `lock` is the worker's facts (or null = no lock).
+    HintLock {
+        request_id: String,
+        clip_root: String,
+        lock: Option<Value>,
+    },
+    HintLockCleared {
+        request_id: String,
+        clip_root: String,
+        #[serde(default)]
+        recovered: Vec<String>,
+        #[serde(default)]
+        warning: Option<String>,
+    },
+    HintLockRefused {
+        request_id: String,
+        clip_root: String,
+        code: String,
+        message: String,
+        #[serde(default)]
+        lock: Option<Value>,
     },
     Status {
         job_id: String,
@@ -113,20 +152,34 @@ pub enum Event {
         hann_stride: u32,
         low_vram: bool,
     },
+    /// SAM preview result: a mask PNG under the job's `staging_dir`.
+    Preview {
+        job_id: String,
+        frame_stem: String,
+        width: u32,
+        height: u32,
+        mask_png: String,
+        #[serde(default)]
+        score: Option<f64>,
+    },
     Done(Done),
 }
 
 impl Event {
     pub fn job_id(&self) -> Option<&str> {
         match self {
-            Event::Hello(_) => None,
+            Event::Hello(_)
+            | Event::HintLock { .. }
+            | Event::HintLockCleared { .. }
+            | Event::HintLockRefused { .. } => None,
             Event::Rejected { job_id, .. } => job_id.as_deref(),
             Event::Accepted { job_id }
             | Event::Status { job_id, .. }
             | Event::Progress { job_id, .. }
             | Event::Warning { job_id, .. }
             | Event::Published { job_id, .. }
-            | Event::Profile { job_id, .. } => Some(job_id),
+            | Event::Profile { job_id, .. }
+            | Event::Preview { job_id, .. } => Some(job_id),
             Event::Done(d) => Some(&d.job_id),
         }
     }
@@ -142,8 +195,33 @@ pub fn parse_line(line: &str) -> Result<Event, String> {
     serde_json::from_value(v).map_err(|e| format!("bad event: {e}"))
 }
 
+/// `inspect_hint_lock` / `clear_hint_lock`: ownership-safe recovery of an orphaned hint lock, done by the
+/// worker (exact job/host/pid, liveness proof, `.prev` restore). Never unlinked from the UI side.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockCmd {
+    Inspect {
+        clip_root: PathBuf,
+    },
+    Clear {
+        clip_root: PathBuf,
+        job_id: String,
+        host: String,
+        pid: u64,
+        /// `observed_exit` (local exit proven) or `user_confirmed_orphan` (the user says it is gone).
+        reason: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockReq {
+    pub request_id: String,
+    pub cmd: LockCmd,
+}
+
 pub enum Cmd<'a> {
+    Lock(&'a LockReq),
     Key(&'a KeyJob),
+    Task(&'a crate::tasks::TaskJob),
     Cancel(&'a str),
     Shutdown,
 }
@@ -151,6 +229,12 @@ impl Cmd<'_> {
     pub fn line(&self) -> String {
         match self {
             Cmd::Key(j) => json!({"v":1,"cmd":"key","job":j}),
+            Cmd::Lock(r) => match &r.cmd {
+                LockCmd::Inspect { clip_root } => json!({"v":1,"cmd":"inspect_hint_lock","request_id":r.request_id,"clip_root":clip_root}),
+                LockCmd::Clear { clip_root, job_id, host, pid, reason } => json!({"v":1,"cmd":"clear_hint_lock","request_id":r.request_id,"clip_root":clip_root,
+                    "expect":{"job_id":job_id,"host":host,"pid":pid},"reason":reason}),
+            },
+            Cmd::Task(j) => json!({"v":1,"cmd":"task","job":j}),
             Cmd::Cancel(id) => json!({"v":1,"cmd":"cancel","job_id":id}),
             Cmd::Shutdown => json!({"v":1,"cmd":"shutdown"}),
         }
@@ -464,6 +548,11 @@ impl Target {
                 c.args(["-m", "backend.worker", "--gpu", &self.gpu.to_string()])
                     .current_dir(repo)
                     .env("PYTHONUNBUFFERED", "1");
+                // Installed runs: descriptor handed over, foreign Python variables removed.
+                crate::runtime::prepare_python_command(
+                    &mut c,
+                    crate::runtime::launch(None).install.as_ref(),
+                );
                 c
             }
             TargetKind::Ssh { ssh, .. } => {

@@ -12,7 +12,9 @@
 //!   run on local workers and, on remote workers, only if their digest equals the reference. Unknown digests
 //!   need the explicit `allow_unverified` opt-in and are flagged on the job.
 use crate::jobs::{JobError, KeyJob, Recovery, MANIFEST_NAME, PROTOCOL};
-use crate::worker::{Cmd, Done, Event, Hello, Msg, Outcome, Target, WorkerConn};
+use crate::tasks::{TaskJob, TaskKind};
+use crate::worker::{Cmd, Done, Event, Hello, LockCmd, LockReq, Msg, Outcome, Target, WorkerConn};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -79,7 +81,7 @@ impl JobState {
             JobState::Queued | JobState::Dispatching { .. } | JobState::Running { .. }
         )
     }
-    fn fences(&self) -> bool {
+    pub fn fences(&self) -> bool {
         !self.is_terminal()
             || matches!(
                 self,
@@ -250,6 +252,20 @@ pub enum SchedEvent {
         hann_stride: u32,
         low_vram: bool,
     },
+    /// Reply to a hint-lock request (`Scheduler::lock_request`).
+    HintLock {
+        request_id: String,
+        outcome: LockOutcome,
+    },
+    /// SAM preview mask for `frame_stem` (a PNG under the task's staging folder).
+    Preview {
+        job_id: String,
+        frame_stem: String,
+        width: u32,
+        height: u32,
+        mask_png: String,
+        score: Option<f64>,
+    },
 }
 
 /// Can this job run, per the current target knowledge? For the UI's Submit gate; call `probe` first.
@@ -276,7 +292,51 @@ pub struct Stalled {
 
 type Digests = BTreeMap<String, Option<String>>;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum LockOutcome {
+    /// The worker's facts about the lock (`None` = no lock): job_id, host, pid, same_host, local_dead,
+    /// safe_to_clear, readable, problem...
+    Inspected(Option<serde_json::Value>),
+    Cleared {
+        recovered: Vec<String>,
+        warning: Option<String>,
+    },
+    Refused {
+        code: String,
+        message: String,
+        lock: Option<serde_json::Value>,
+    },
+}
+
+struct LockEntry {
+    req: LockReq,
+    /// Slot the command was sent to (`None` = still waiting for an idle local worker).
+    slot: Option<usize>,
+}
+
+/// A queued/running non-Key job. Shares the slots (one GPU job per worker) with Key jobs.
+#[derive(Clone, Debug)]
+pub struct TaskEntry {
+    pub job: Arc<TaskJob>,
+    pub after: Vec<String>,
+    pub state: JobState,
+    pub cancel_requested: bool,
+    pub last_activity: Option<Instant>,
+}
+
+impl TaskEntry {
+    pub fn state_message(&self) -> Option<String> {
+        match &self.state {
+            JobState::Done { info, .. } if info.outcome == Outcome::Failed => info.message.clone(),
+            _ => None,
+        }
+    }
+}
+
 pub struct Scheduler {
+    locks: Vec<LockEntry>,
+    lock_seq: u64,
+    tasks: Vec<TaskEntry>,
     jobs: Vec<JobEntry>,
     slots: Vec<Slot>,
     /// Auto order: local targets first, then list order.
@@ -339,6 +399,9 @@ impl Scheduler {
             })
             .collect();
         Ok(Self {
+            locks: vec![],
+            lock_seq: 0,
+            tasks: vec![],
             jobs: vec![],
             slots,
             order,
@@ -361,7 +424,7 @@ impl Scheduler {
             }
         }
         for d in &s.after {
-            if !self.jobs.iter().any(|e| &e.job.job_id == d) {
+            if self.state_of(d).is_none() {
                 return Err(SubmitError::UnknownDependency(d.clone()));
             }
         }
@@ -372,6 +435,17 @@ impl Scheduler {
         {
             return Err(SubmitError::Collision {
                 with: e.job.job_id.clone(),
+            });
+        }
+        // A hint writer on the same clip may replace what Key reads: only a declared dependency may run with it.
+        if let Some(t) = self.tasks.iter().find(|t| {
+            t.state.fences()
+                && t.job.kind.writes_clip()
+                && t.job.clip_root == s.job.clip_root
+                && !s.after.contains(&t.job.job_id)
+        }) {
+            return Err(SubmitError::Collision {
+                with: t.job.job_id.clone(),
             });
         }
         self.jobs.push(JobEntry {
@@ -392,6 +466,241 @@ impl Scheduler {
 
     pub fn snapshot(&self) -> Vec<JobEntry> {
         self.jobs.clone()
+    }
+
+    /// Ask the idle local worker to inspect/clear a clip's hint lock. The answer arrives as
+    /// `SchedEvent::HintLock`; the request waits (starting or restarting the local worker if needed) and never
+    /// races a running job: the slot is held for it while it is outstanding.
+    pub fn lock_request(&mut self, cmd: LockCmd) -> Result<String, String> {
+        if !self
+            .slots
+            .iter()
+            .any(|s| s.target.is_local() && s.target.enabled)
+        {
+            return Err("no enabled local worker".into());
+        }
+        self.lock_seq += 1;
+        let request_id = format!("lk-{}-{}", std::process::id(), self.lock_seq);
+        self.locks.push(LockEntry {
+            req: LockReq {
+                request_id: request_id.clone(),
+                cmd,
+            },
+            slot: None,
+        });
+        Ok(request_id)
+    }
+    pub fn lock_pending(&self) -> bool {
+        !self.locks.is_empty()
+    }
+
+    fn pump_locks(&mut self, ev: &mut Vec<SchedEvent>) {
+        for l in 0..self.locks.len() {
+            if self.locks[l].slot.is_some() {
+                continue;
+            }
+            let Some(&c) = self
+                .order
+                .iter()
+                .find(|c| self.slots[**c].target.is_local() && self.slots[**c].target.enabled)
+            else {
+                continue;
+            };
+            match self.slots[c].status.clone() {
+                TargetStatus::Fresh => self.spawn_if_fresh(c),
+                // The worker that owned the lost writer has exited: restarting it for this explicit recovery
+                // request is the point (no job is running on it).
+                TargetStatus::Down(_) | TargetStatus::Stopped if self.slots[c].conn.is_none() => {
+                    self.reset_target(&self.slots[c].target.id.clone());
+                    self.spawn_if_fresh(c);
+                }
+                TargetStatus::Ready
+                    if self.slots[c].job.is_none() && self.slots[c].hello.is_some() =>
+                {
+                    let req = self.locks[l].req.clone();
+                    self.slots[c].job = Some(format!("lock:{}", req.request_id));
+                    let sent = self.slots[c]
+                        .conn
+                        .as_mut()
+                        .map(|conn| conn.send(&Cmd::Lock(&req)));
+                    if matches!(sent, Some(Ok(()))) {
+                        self.locks[l].slot = Some(c);
+                    } else {
+                        self.lose(
+                            c,
+                            "could not send the lock request to the worker".into(),
+                            ev,
+                        );
+                        return;
+                    }
+                }
+                TargetStatus::Refused(why) => {
+                    let e = self.locks.remove(l);
+                    ev.push(SchedEvent::HintLock {
+                        request_id: e.req.request_id,
+                        outcome: LockOutcome::Refused {
+                            code: "unavailable".into(),
+                            message: why,
+                            lock: None,
+                        },
+                    });
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn lock_reply(&mut self, i: usize, event: Event, ev: &mut Vec<SchedEvent>) {
+        let (rid, outcome) = match event {
+            Event::HintLock {
+                request_id, lock, ..
+            } => (request_id, LockOutcome::Inspected(lock)),
+            Event::HintLockCleared {
+                request_id,
+                recovered,
+                warning,
+                ..
+            } => (request_id, LockOutcome::Cleared { recovered, warning }),
+            Event::HintLockRefused {
+                request_id,
+                code,
+                message,
+                lock,
+                ..
+            } => (
+                request_id,
+                LockOutcome::Refused {
+                    code,
+                    message,
+                    lock,
+                },
+            ),
+            Event::Rejected {
+                request_id: Some(request_id),
+                code,
+                message,
+                ..
+            } => (
+                request_id,
+                LockOutcome::Refused {
+                    code,
+                    message,
+                    lock: None,
+                },
+            ),
+            _ => return,
+        };
+        let Some(l) = self
+            .locks
+            .iter()
+            .position(|l| l.slot == Some(i) && l.req.request_id == rid)
+        else {
+            self.lose(i, format!("unexpected lock reply {rid}"), ev);
+            return;
+        };
+        self.locks.remove(l);
+        if self.slots[i].job.as_deref() == Some(format!("lock:{rid}").as_str()) {
+            self.slots[i].job = None;
+        }
+        ev.push(SchedEvent::HintLock {
+            request_id: rid,
+            outcome,
+        });
+    }
+
+    /// Something is queued, starting or running (Key or task).
+    pub fn running(&self) -> bool {
+        self.jobs.iter().any(|e| !e.state.is_terminal())
+            || self.tasks.iter().any(|t| !t.state.is_terminal())
+    }
+    /// Running, or a Lost writer still fences its folder.
+    pub fn busy(&self) -> bool {
+        self.jobs.iter().any(|e| e.state.fences()) || self.tasks.iter().any(|t| t.state.fences())
+    }
+    /// Lost tasks whose writer is not proven stopped.
+    pub fn task_attention(&self) -> Vec<TaskEntry> {
+        self.tasks
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.state,
+                    JobState::Lost {
+                        writer_stopped: false,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn task_snapshot(&self) -> Vec<TaskEntry> {
+        self.tasks.clone()
+    }
+    pub fn task(&self, id: &str) -> Option<&TaskEntry> {
+        self.tasks.iter().find(|t| t.job.job_id == id)
+    }
+
+    /// State of a Key job or task by id.
+    pub fn state_of(&self, id: &str) -> Option<&JobState> {
+        self.jobs
+            .iter()
+            .find(|e| e.job.job_id == id)
+            .map(|e| &e.state)
+            .or_else(|| {
+                self.tasks
+                    .iter()
+                    .find(|t| t.job.job_id == id)
+                    .map(|t| &t.state)
+            })
+    }
+
+    /// Queue a task on the local worker. `after` may name Key jobs or other tasks.
+    pub fn submit_task(&mut self, job: TaskJob, after: Vec<String>) -> Result<(), SubmitError> {
+        job.validate().map_err(|m| {
+            SubmitError::Invalid(JobError {
+                field: "task",
+                message: m,
+            })
+        })?;
+        if self.state_of(&job.job_id).is_some() {
+            return Err(SubmitError::DuplicateId);
+        }
+        for d in &after {
+            if self.state_of(d).is_none() {
+                return Err(SubmitError::UnknownDependency(d.clone()));
+            }
+        }
+        let fence = job.fence();
+        if let Some(t) = self
+            .tasks
+            .iter()
+            .find(|t| t.state.fences() && t.job.fence() == fence)
+        {
+            return Err(SubmitError::Collision {
+                with: t.job.job_id.clone(),
+            });
+        }
+        if job.kind.writes_clip() {
+            if let Some(e) = self.jobs.iter().find(|e| {
+                e.state.fences()
+                    && e.job.clip_root == job.clip_root
+                    && !after.contains(&e.job.job_id)
+            }) {
+                return Err(SubmitError::Collision {
+                    with: e.job.job_id.clone(),
+                });
+            }
+        }
+        self.tasks.push(TaskEntry {
+            job: Arc::new(job),
+            after,
+            state: JobState::Queued,
+            cancel_requested: false,
+            last_activity: None,
+        });
+        Ok(())
     }
     pub fn job(&self, id: &str) -> Option<&JobEntry> {
         self.jobs.iter().find(|e| e.job.job_id == id)
@@ -465,7 +774,7 @@ impl Scheduler {
     /// Queued → `Cancelled` now. Dispatched/running → ask the worker; the state changes on its `done`.
     pub fn cancel(&mut self, id: &str) {
         let Some(j) = self.jobs.iter().position(|e| e.job.job_id == id) else {
-            return;
+            return self.cancel_task(id);
         };
         match self.jobs[j].state {
             JobState::Queued => self.jobs[j].state = JobState::Cancelled,
@@ -495,9 +804,36 @@ impl Scheduler {
         }
     }
 
+    fn cancel_task(&mut self, id: &str) {
+        let Some(t) = self.tasks.iter().position(|t| t.job.job_id == id) else {
+            return;
+        };
+        match self.tasks[t].state {
+            JobState::Queued => self.tasks[t].state = JobState::Cancelled,
+            JobState::Dispatching { .. } | JobState::Running { .. } => {
+                self.tasks[t].cancel_requested = true;
+                if let Some(c) = self
+                    .slots
+                    .iter_mut()
+                    .find(|s| s.job.as_deref() == Some(id))
+                    .and_then(|s| s.conn.as_mut())
+                {
+                    let _ = c.cancel(id);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Explicit recovery: the user states the lost job's writer is gone. Releases its folder fence and cleans
     /// that job's own lock/temp files (the folder must be reachable locally, e.g. shared storage).
     pub fn confirm_writer_stopped(&mut self, id: &str) -> Option<Recovery> {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.job.job_id == id) {
+            if let JobState::Lost { writer_stopped, .. } = &mut t.state {
+                *writer_stopped = true;
+            }
+            return None;
+        }
         let e = self.jobs.iter_mut().find(|e| e.job.job_id == id)?;
         let JobState::Lost {
             writer_stopped,
@@ -569,6 +905,13 @@ impl Scheduler {
             if self.jobs[j].state == JobState::Queued {
                 self.jobs[j].state = JobState::Cancelled;
             }
+        }
+        for t in self
+            .tasks
+            .iter_mut()
+            .filter(|t| t.state == JobState::Queued)
+        {
+            t.state = JobState::Cancelled;
         }
         let ids: Vec<String> = self.slots.iter().map(|s| s.target.id.clone()).collect();
         ids.iter().for_each(|i| self.stop_target(i));
@@ -695,6 +1038,8 @@ impl Scheduler {
         }
         self.poll_preflight(&mut ev);
         self.dispatch(&mut ev);
+        self.dispatch_tasks(&mut ev);
+        self.pump_locks(&mut ev);
         ev
     }
 
@@ -737,19 +1082,57 @@ impl Scheduler {
                 }
             }
         }
-        if let Some(id) = self.slots[i].job.take() {
+        if let Some(id) = self.slots[i].job.clone() {
             if let Some(j) = self.jobs.iter().position(|e| e.job.job_id == id) {
+                self.slots[i].job = None;
                 self.slots[i].lost_job = Some(id);
                 self.set(
                     j,
                     JobState::Lost {
                         target,
-                        reason,
+                        reason: reason.clone(),
                         writer_stopped: false,
                         recovery: None,
                     },
                     ev,
                 );
+            }
+        }
+        if let Some(id) = self.slots[i].job.take() {
+            if let Some(t) = self.tasks.iter().position(|t| t.job.job_id == id) {
+                self.slots[i].lost_job = Some(id);
+                self.tasks[t].state = JobState::Lost {
+                    target: self.slots[i].target.id.clone(),
+                    reason: reason.clone(),
+                    writer_stopped: false,
+                    recovery: None,
+                };
+                ev.push(SchedEvent::Changed(self.tasks[t].job.job_id.clone()));
+            }
+        }
+        // A lock request in flight on this worker can no longer be answered.
+        let gone: Vec<String> = self
+            .locks
+            .iter()
+            .filter(|l| l.slot == Some(i))
+            .map(|l| l.req.request_id.clone())
+            .collect();
+        for rid in gone {
+            self.locks.retain(|l| l.req.request_id != rid);
+            ev.push(SchedEvent::HintLock {
+                request_id: rid,
+                outcome: LockOutcome::Refused {
+                    code: "worker_lost".into(),
+                    message: "the worker ended before answering; nothing was changed".into(),
+                    lock: None,
+                },
+            });
+            if self.slots[i]
+                .job
+                .as_deref()
+                .is_some_and(|j| j.starts_with("lock:"))
+            {
+                self.slots[i].job = None;
             }
         }
         if self.slots[i].conn.is_none() {
@@ -765,6 +1148,17 @@ impl Scheduler {
             s.status = TargetStatus::Stopped;
         }
         let proven = writer_proven(s.target.is_local(), cfg!(windows));
+        if let (Some(id), true) = (s.lost_job.clone(), proven) {
+            if let Some(t) = self.tasks.iter().position(|t| t.job.job_id == id) {
+                s.lost_job = None;
+                if let JobState::Lost { writer_stopped, .. } = &mut self.tasks[t].state {
+                    *writer_stopped = true;
+                }
+                ev.push(SchedEvent::Changed(id));
+                return;
+            }
+        }
+        let s = &mut self.slots[i];
         if let (Some(id), true) = (s.lost_job.take(), proven) {
             if let Some(j) = self.jobs.iter().position(|e| e.job.job_id == id) {
                 let e = &self.jobs[j];
@@ -804,6 +1198,18 @@ impl Scheduler {
         if let Event::Hello(h) = event {
             return self.hello(i, h, ev);
         }
+        if matches!(
+            event,
+            Event::HintLock { .. }
+                | Event::HintLockCleared { .. }
+                | Event::HintLockRefused { .. }
+                | Event::Rejected {
+                    request_id: Some(_),
+                    ..
+                }
+        ) {
+            return self.lock_reply(i, event, ev);
+        }
         let want = self.slots[i].job.clone();
         let (Some(id), Some(got)) = (want, event.job_id().map(str::to_owned)) else {
             self.lose(i, "event with no job running".into(), ev);
@@ -813,7 +1219,9 @@ impl Scheduler {
             self.lose(i, format!("event for job {got} while running {id}"), ev);
             return;
         }
-        let j = self.jobs.iter().position(|e| e.job.job_id == id).unwrap();
+        let Some(j) = self.jobs.iter().position(|e| e.job.job_id == id) else {
+            return self.handle_task(i, &id, event, ev);
+        };
         self.jobs[j].last_activity = Some(Instant::now());
         let target = self.slots[i].target.id.clone();
         let st = self.jobs[j].state.clone();
@@ -985,6 +1393,11 @@ impl Scheduler {
         if !h.capabilities.key || !h.capabilities.publish_modes.contains(&e.job.publish) {
             return Cand::No("worker cannot key with publish=final".into());
         }
+        if e.job.mode == crate::jobs::JobMode::Replace
+            && !h.capabilities.key_modes.iter().any(|m| m == "replace")
+        {
+            return Cand::No("this worker cannot replace results (update it)".into());
+        }
         if let Some(need) = e.min_vram_gb.filter(|n| gpu.vram_gb < *n) {
             return Cand::No(format!(
                 "{:.1} GB VRAM, job needs {need:.1} GB",
@@ -1059,7 +1472,7 @@ impl Scheduler {
             }
             let mut wait = false;
             for d in self.jobs[j].after.clone() {
-                let st = &self.job(&d).unwrap().state;
+                let st = self.state_of(&d).cloned().unwrap_or(JobState::Cancelled);
                 if st.completed() {
                     continue;
                 }
@@ -1165,6 +1578,202 @@ impl Scheduler {
             .map(|conn| conn.send(&Cmd::Key(job)));
         if !matches!(sent, Some(Ok(()))) {
             self.lose(c, "could not send the job to the worker".into(), ev);
+        }
+    }
+
+    /// Tasks run on the local worker only. `Err` = never eligible, `Ok(None)` = worker not ready yet.
+    fn task_slot(&self, job: &TaskJob) -> Result<Option<usize>, String> {
+        let kind = job.kind;
+        let mut pending = None;
+        let mut reasons = vec![];
+        for &c in &self.order {
+            let s = &self.slots[c];
+            if !s.target.is_local() || !s.target.enabled {
+                continue;
+            }
+            match &s.status {
+                TargetStatus::Refused(r) | TargetStatus::Down(r) => reasons.push(r.clone()),
+                TargetStatus::Stopping | TargetStatus::Stopped => reasons.push("stopped".into()),
+                TargetStatus::Fresh | TargetStatus::Starting => pending = Some(c),
+                TargetStatus::Ready => {
+                    let Some(h) = s.hello.as_ref() else {
+                        pending = Some(c);
+                        continue;
+                    };
+                    let caps = &h.capabilities;
+                    if caps.tasks.get(kind.wire()).copied().unwrap_or(false) {
+                        let want = |k: &str| job.params.get(k).and_then(Value::as_str);
+                        let missing = match kind {
+                            TaskKind::Birefnet => want("variant")
+                                .filter(|v| !caps.birefnet_variants.iter().any(|x| x == v))
+                                .map(|v| {
+                                    format!("BiRefNet variant {v} is not installed on the worker")
+                                }),
+                            TaskKind::SamPreview | TaskKind::SamTrack => want("tracker_model")
+                                .filter(|v| !caps.sam_models.iter().any(|x| x == v))
+                                .map(|v| format!("SAM model {v} is not installed on the worker")),
+                            _ => None,
+                        };
+                        if let Some(why) = missing {
+                            reasons.push(why);
+                        } else if s.job.is_none() {
+                            return Ok(Some(c));
+                        } else {
+                            pending = Some(c);
+                        }
+                    } else {
+                        reasons.push(format!(
+                            "the worker cannot run {} (model or dependency not ready: see Settings > Models)",
+                            kind.label()
+                        ));
+                    }
+                }
+            }
+        }
+        match pending {
+            Some(c)
+                if self.slots[c].job.is_none() && self.slots[c].status == TargetStatus::Ready =>
+            {
+                Ok(Some(c))
+            }
+            Some(_) => Ok(None),
+            None if reasons.is_empty() => Err("no enabled local worker".into()),
+            None => Err(reasons.join("; ")),
+        }
+    }
+
+    fn dispatch_tasks(&mut self, ev: &mut Vec<SchedEvent>) {
+        for t in 0..self.tasks.len() {
+            if self.tasks[t].state != JobState::Queued {
+                continue;
+            }
+            let mut wait = false;
+            for d in self.tasks[t].after.clone() {
+                let st = self.state_of(&d).cloned().unwrap_or(JobState::Cancelled);
+                if st.completed() {
+                    continue;
+                }
+                if st.is_terminal() {
+                    self.tasks[t].state = JobState::Failed {
+                        reason: format!("dependency {d} did not complete"),
+                    };
+                    ev.push(SchedEvent::Changed(self.tasks[t].job.job_id.clone()));
+                    break;
+                }
+                wait = true;
+            }
+            if wait || self.tasks[t].state != JobState::Queued {
+                continue;
+            }
+            let jobc = self.tasks[t].job.clone();
+            match self.task_slot(&jobc) {
+                Err(reason) => {
+                    self.tasks[t].state = JobState::Failed { reason };
+                    ev.push(SchedEvent::Changed(self.tasks[t].job.job_id.clone()));
+                }
+                Ok(None) => {
+                    if let Some(c) = self.order.iter().copied().find(|c| {
+                        self.slots[*c].target.is_local()
+                            && self.slots[*c].status == TargetStatus::Fresh
+                    }) {
+                        self.spawn_if_fresh(c);
+                    }
+                }
+                Ok(Some(c)) => {
+                    let job = self.tasks[t].job.clone();
+                    self.slots[c].job = Some(job.job_id.clone());
+                    self.tasks[t].last_activity = Some(Instant::now());
+                    self.tasks[t].state = JobState::Dispatching {
+                        target: self.slots[c].target.id.clone(),
+                    };
+                    ev.push(SchedEvent::Changed(job.job_id.clone()));
+                    let sent = self.slots[c]
+                        .conn
+                        .as_mut()
+                        .map(|conn| conn.send(&Cmd::Task(&job)));
+                    if !matches!(sent, Some(Ok(()))) {
+                        self.lose(c, "could not send the task to the worker".into(), ev);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_task(&mut self, i: usize, id: &str, event: Event, ev: &mut Vec<SchedEvent>) {
+        let Some(t) = self.tasks.iter().position(|t| t.job.job_id == id) else {
+            self.lose(i, format!("event for unknown job {id}"), ev);
+            return;
+        };
+        self.tasks[t].last_activity = Some(Instant::now());
+        let target = self.slots[i].target.id.clone();
+        let st = self.tasks[t].state.clone();
+        let accepted = matches!(st, JobState::Running { .. });
+        let mut set = |me: &mut Self, s: JobState| {
+            me.tasks[t].state = s;
+            ev.push(SchedEvent::Changed(id.to_owned()));
+        };
+        match event {
+            Event::Accepted { .. } if matches!(st, JobState::Dispatching { .. }) => set(
+                self,
+                JobState::Running {
+                    target,
+                    phase: "accepted".into(),
+                    done: 0,
+                    total: 0,
+                },
+            ),
+            Event::Rejected { code, message, .. } if matches!(st, JobState::Dispatching { .. }) => {
+                self.slots[i].job = None;
+                set(
+                    self,
+                    JobState::Rejected {
+                        target,
+                        code,
+                        message,
+                    },
+                )
+            }
+            Event::Progress {
+                phase, done, total, ..
+            } if accepted => set(
+                self,
+                JobState::Running {
+                    target,
+                    phase,
+                    done,
+                    total,
+                },
+            ),
+            Event::Status { message, .. } if accepted => {
+                if let JobState::Running { phase, .. } = &mut self.tasks[t].state {
+                    *phase = message;
+                }
+                ev.push(SchedEvent::Changed(id.to_owned()))
+            }
+            Event::Warning { message, .. } if accepted => ev.push(SchedEvent::Warning {
+                job_id: id.to_owned(),
+                message,
+            }),
+            Event::Preview {
+                frame_stem,
+                width,
+                height,
+                mask_png,
+                score,
+                ..
+            } if accepted => ev.push(SchedEvent::Preview {
+                job_id: id.to_owned(),
+                frame_stem,
+                width,
+                height,
+                mask_png,
+                score,
+            }),
+            Event::Done(info) if accepted => {
+                self.slots[i].job = None;
+                set(self, JobState::Done { target, info })
+            }
+            other => self.lose(i, format!("unexpected {other:?} in state {st:?}"), ev),
         }
     }
 

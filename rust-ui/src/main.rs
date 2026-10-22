@@ -3,7 +3,7 @@ use ck::ui::{App, AppOptions, Tab};
 use eframe::egui;
 
 fn usage() -> ! {
-    eprintln!("usage: corridorkey-ui [PROJECT_DIR] [--global-output-dir D] [--cache-mb N] [--window WxH]\n       [--open-clip NAME] [--tab media|hint|key|review|deliver] [--view input|hint|fg|matte|comp|processed]\n       [--ab VIEW] [--frame N] [--play] [--data-dir D (new projects go in D/Projects)] [--import FILE]... [--import-folder DIR]... [--auto-confirm]  (the last three: QA) [--keys i,o,Shift+Right,click:605x66 (synthetic egui events, QA)] [--screenshot FILE.png [--screenshot-after SECS]]  (dev/evidence options)");
+    eprintln!("usage: corridorkey-ui [--version | --self-check] [PROJECT_DIR] [--global-output-dir D] [--cache-mb N] [--window WxH]\n       [--open-clip NAME] [--tab media|hint|key|review|deliver] [--view input|hint|fg|matte|comp|processed]\n       [--ab VIEW] [--frame N] [--play] [--data-dir D (new projects go in D/Projects)] [--import FILE]... [--import-folder DIR]... [--auto-confirm]  (the last three: QA) [--keys i,o,Shift+Right,click:605x66 (synthetic egui events, QA)] [--screenshot FILE.png [--screenshot-after SECS]]  (dev/evidence options)");
     std::process::exit(2)
 }
 
@@ -14,9 +14,47 @@ fn view(s: &str) -> View {
         .unwrap_or_else(|| usage())
 }
 
+/// `--version` / `--self-check`: no window, no worker. The self-check resolves the install descriptor the same
+/// way the app does and reports it as one JSON line; exit 0 only when a usable runtime and Python were found.
+fn headless(a: &[String]) -> Option<i32> {
+    let version = env!("CARGO_PKG_VERSION");
+    if a.iter().any(|x| x == "--version" || x == "-V") {
+        println!("corridorkey-ui {version}");
+        return Some(0);
+    }
+    if !a.iter().any(|x| x == "--self-check") {
+        return None;
+    }
+    let l = ck::runtime::launch(None);
+    let python = l
+        .python
+        .clone()
+        .or_else(|| l.repo.as_ref().map(|r| ck::import::python(r)));
+    let helper_ok = l
+        .repo
+        .as_ref()
+        .is_some_and(|r| r.join("backend/worker/__main__.py").is_file());
+    let py_ok = python.as_ref().is_some_and(|p| p.is_file());
+    let ok = l.problem.is_none() && helper_ok && py_ok;
+    println!(
+        "{}",
+        serde_json::json!({
+            "app": "corridorkey-ui", "version": version, "ok": ok,
+            "installed": l.install.is_some(),
+            "repo": l.repo, "python": python, "worker_module": helper_ok, "python_found": py_ok,
+            "problem": l.problem,
+            "data_dir": ck::runtime::default_data_dir(&l),
+        })
+    );
+    Some(if ok { 0 } else { 1 })
+}
+
 fn main() -> eframe::Result {
-    ck::ui::platform::prefer_xwayland();
     let a: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = headless(&a) {
+        std::process::exit(code);
+    }
+    ck::ui::platform::prefer_xwayland();
     let mut o = AppOptions::default();
     let mut size = (1440.0f32, 900.0f32);
     let mut i = 0;

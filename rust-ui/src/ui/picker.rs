@@ -13,6 +13,16 @@ pub enum PickKind {
     Location,
     /// An existing project to add clips to.
     AddTo,
+    /// One companion alpha/mask movie for the open clip.
+    HintMovie,
+    /// The folder a missing external image sequence now lives in.
+    Relink,
+    /// A replacement movie for a clip whose movie is gone.
+    RelinkMovie,
+    /// A folder of alpha/mask frames to import into the open clip.
+    HintSequence,
+    /// Destination folder for an exported video.
+    ExportFolder,
 }
 
 /// Blocks until the user chooses; an empty list = cancelled. Tests inject a mock.
@@ -42,6 +52,33 @@ pub fn rfd_backend() -> Backend {
                 .collect(),
             PickKind::Location => d
                 .set_title("Choose the folder to create the new project in")
+                .pick_folder()
+                .into_iter()
+                .collect(),
+            PickKind::HintMovie => d
+                .set_title("Choose the alpha or mask movie for this clip")
+                .add_filter("Movies", &VIDEO_EXTS)
+                .pick_file()
+                .into_iter()
+                .collect(),
+            PickKind::Relink => d
+                .set_title("Choose the folder that now holds this clip's image sequence")
+                .pick_folder()
+                .into_iter()
+                .collect(),
+            PickKind::RelinkMovie => d
+                .set_title("Choose the movie for this clip")
+                .add_filter("Movies", &VIDEO_EXTS)
+                .pick_file()
+                .into_iter()
+                .collect(),
+            PickKind::HintSequence => d
+                .set_title("Choose the folder of alpha or mask frames (PNG/EXR)")
+                .pick_folder()
+                .into_iter()
+                .collect(),
+            PickKind::ExportFolder => d
+                .set_title("Choose the folder for the exported video")
                 .pick_folder()
                 .into_iter()
                 .collect(),

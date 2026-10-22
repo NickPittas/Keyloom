@@ -369,7 +369,7 @@ fn drop_on_settings_is_refused_and_keeps_the_open_clip() {
     back(&ctx, &mut app);
     run(&ctx, &mut app, vec![]);
     assert!(app.in_workspace() && !app.import_active());
-    assert!(app.notice().unwrap().contains("close Settings"));
+    assert!(app.notice().unwrap().contains("leave Settings"));
     assert_eq!(snap(&app), before, "same clip, playhead and range");
 }
 

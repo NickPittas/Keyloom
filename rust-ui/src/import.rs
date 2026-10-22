@@ -16,6 +16,8 @@ pub struct PlanItem {
     pub reason: Option<String>,
     /// "320×180 · 24 fps · 48 frames" etc., only from what the probe really returned.
     pub detail: String,
+    /// (width, height, fps, frame count) exactly as probed; `None` for sequences / failed probes.
+    pub probed: Option<(u32, u32, f64, Option<u64>)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -81,6 +83,15 @@ pub fn parse_event(line: &str) -> Option<Event> {
                         renamed_from: g("renamed_from"),
                         reason: g("reason"),
                         detail: d.join(" · "),
+                        probed: match (num("width"), num("height"), num("fps")) {
+                            (Some(w), Some(h), Some(f)) => Some((
+                                w as u32,
+                                h as u32,
+                                f,
+                                num("frame_count").filter(|c| *c > 0.0).map(|c| c as u64),
+                            )),
+                            _ => None,
+                        },
                     }
                 })
                 .collect(),
@@ -147,11 +158,6 @@ pub struct Sources {
     pub folders: Vec<PathBuf>,
 }
 
-fn repo_root(over: Option<&Path>) -> PathBuf {
-    over.map(Path::to_path_buf)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
-}
-
 pub fn python(repo: &Path) -> PathBuf {
     if let Some(p) = std::env::var_os("CK_PYTHON") {
         return p.into();
@@ -172,20 +178,42 @@ pub struct Job {
 
 impl Job {
     /// `dry_run` only probes and plans (no writes). Errors name the missing python/helper path.
+    /// No build-time default: the explicit `repo` argument, then `CK_REPO`, then the install
+    /// descriptor, then developer checkout discovery (`crate::runtime::launch`).
     pub fn spawn(
         req: &Request,
         src: &Sources,
         dry_run: bool,
         repo: Option<&Path>,
     ) -> Result<Job, String> {
-        let repo = repo_root(repo);
+        let launch = match repo {
+            Some(r) => crate::runtime::launch_explicit(r),
+            None => crate::runtime::launch(None),
+        };
+        let Some(repo) = launch.repo else {
+            return Err(launch.problem.map(|p| format!("The installed runtime is unusable: {p}")).unwrap_or_else(|| {
+                "No CorridorKey runtime was found: pass --repo, set CK_REPO or CK_INSTALL, install the packaged runtime, or run from a checkout.".into()
+            }));
+        };
         let helper = repo.join("rust-ui/tools/ck_import.py");
-        let py = python(&repo);
+        let py = std::env::var_os("CK_PYTHON")
+            .map(PathBuf::from)
+            .or_else(|| launch.python.clone())
+            .unwrap_or_else(|| python(&repo));
         if !py.is_file() {
-            return Err(format!(
-                "Python not found at {} (set CK_PYTHON or create the repo .venv)",
-                py.display()
-            ));
+            return Err(
+                if launch.python.is_some() && std::env::var_os("CK_PYTHON").is_none() {
+                    format!(
+                    "Installed Python is missing at {}. Repair the installation, or set CK_PYTHON.",
+                    py.display()
+                )
+                } else {
+                    format!(
+                        "Python not found at {} (set CK_PYTHON or create the repo .venv)",
+                        py.display()
+                    )
+                },
+            );
         }
         if !helper.is_file() {
             return Err(format!("Import helper not found at {}", helper.display()));
@@ -238,6 +266,7 @@ impl Job {
         for f in &src.folders {
             c.arg(format!("--folder={}", f.display()));
         }
+        crate::runtime::prepare_python_command(&mut c, launch.install.as_ref());
         let mut child = c
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

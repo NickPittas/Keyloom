@@ -1,8 +1,10 @@
 //! egui front end (provisional toolkit). Core modules never import this, so a toolkit swap stays here.
 pub mod ai;
+pub mod annotate;
 pub mod app;
 pub mod graph;
 pub mod import;
+pub mod models;
 pub mod picker;
 pub mod platform;
 pub mod settings;

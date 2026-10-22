@@ -11,6 +11,7 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     None,
+    OpenModels,
     /// `Page::saved()` changed and is on disk: apply UI scale now; RAM/workers take effect at the
     /// next clip open (do not rebuild the open viewer).
     Applied,
@@ -26,6 +27,7 @@ pub struct Page {
     draft: Settings,
     /// Last Apply failure; cleared on the next successful Apply, Cancel or reopening the page.
     error: Option<String>,
+    models_rect: Option<egui::Rect>,
     apply_rect: Option<egui::Rect>,
     cancel_rect: Option<egui::Rect>,
 }
@@ -37,6 +39,7 @@ impl Page {
             store,
             draft,
             error: None,
+            models_rect: None,
             apply_rect: None,
             cancel_rect: None,
         }
@@ -49,7 +52,14 @@ impl Page {
     pub fn cancel_rect(&self) -> Option<egui::Rect> {
         self.cancel_rect
     }
+    pub fn models_rect(&self) -> Option<egui::Rect> {
+        self.models_rect
+    }
 
+    /// The preferences file (presets live beside it).
+    pub fn store_path(&self) -> Option<&std::path::Path> {
+        self.store.path()
+    }
     pub fn saved(&self) -> &Settings {
         self.store.saved()
     }
@@ -120,12 +130,12 @@ impl Page {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
-                .show(ui, |ui| self.body(ui));
+                .show(ui, |ui| self.body(ui, &mut ev));
         });
         ev
     }
 
-    fn body(&mut self, ui: &mut Ui) {
+    fn body(&mut self, ui: &mut Ui, ev: &mut Event) {
         if let Some(p) = &self.store.problem {
             note(ui, p, theme::FOCUS);
         }
@@ -138,6 +148,11 @@ impl Page {
         }
         if let Some(p) = self.store.path() {
             dim(ui, &format!("Stored in {}", p.display()));
+        }
+        let models = ui.button("Models & runtime…");
+        self.models_rect = Some(models.rect);
+        if models.clicked() {
+            *ev = Event::OpenModels;
         }
         let d = &mut self.draft;
 
@@ -199,12 +214,11 @@ impl Page {
         );
         dim(ui, "Auto lets the engine pick; Low selects its conservative low-VRAM path. Neither caps memory.");
         choice(ui, "Hint mode", &mut d.ai.hint_mode, &cfg::HINT_MODES);
-        choice(
-            ui,
-            "Temporal window",
-            &mut d.ai.temporal_window,
-            &cfg::TEMPORAL_WINDOWS,
-        );
+        ui.horizontal(|ui| {
+            ui.label("Temporal awareness");
+            super::ai::temporal_choice(ui, "settings_temporal", &mut d.ai.temporal_window);
+        });
+        dim(ui, &cfg::temporal_explain(&d.ai.temporal_window, None));
         unit(ui, "Hint quality", &mut d.ai.hint_quality);
         theme::checkbox(ui, &mut d.ai.carry_hint, "Carry hint between windows");
         unit(ui, "Carry hint quality", &mut d.ai.carry_hint_quality);
@@ -258,8 +272,8 @@ fn opt_text(ui: &mut Ui, label: &str, v: &mut Option<String>) {
 fn targets_ui(ui: &mut Ui, targets: &mut Vec<Target>) {
     ui.heading("AI worker targets");
     dim(ui, "No targets = one local worker on GPU 0. One worker runs one job at a time; jobs are placed by Auto (local first) or on a chosen target. Applied after running jobs finish.");
-    dim(ui, "Storage: shared. Every machine must mount the same NAS; transfer copies are not used. The NAS must support hard links; otherwise Key fails before loading the model. Remote launch (Linux and Windows over SSH with your key/agent, no passwords stored) has not been tested against real machines. A remote job also needs this machine's local worker to be Ready first, so the model can be verified.");
-    dim(ui, "Windows workers: prefer UNC paths (\\\\server\\share). The SSH account must already have access to the NAS; drive letters mapped in a desktop login usually do not exist in an SSH session. Windows deployment is not verified.");
+    dim(ui, "Synthetic local-GPU, Linux SSH, and Windows local-disk SSH smoke checks passed. Windows NAS/service deployment, packaged UI, and full workflows remain unverified.");
+    dim(ui, "Windows SSH workers may not see desktop mapped drives.");
     let mut remove = None;
     for (i, t) in targets.iter_mut().enumerate() {
         egui::CollapsingHeader::new(format!("{} ({})", t.id, if t.is_local() { "local" } else { "SSH" })).id_salt(("target", i)).show(ui, |ui| {
@@ -292,7 +306,7 @@ fn targets_ui(ui: &mut Ui, targets: &mut Vec<Target>) {
                     ui.horizontal(|ui| {
                         ui.label("Remote OS");
                         ui.selectable_value(os, RemoteOs::Linux, "Linux");
-                        ui.selectable_value(os, RemoteOs::Windows, "Windows (untested)");
+                        ui.selectable_value(os, RemoteOs::Windows, "Windows (local-disk smoke tested)");
                     });
                     text(ui, "Host (ssh name or address)", host);
                     opt_text(ui, "User (empty = ssh config)", user);

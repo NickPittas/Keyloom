@@ -290,6 +290,16 @@ impl Default for View {
     }
 }
 impl View {
+    /// A saved view: no automatic refit over it.
+    pub fn restored(pan: Vec2, zoom: f32) -> Self {
+        View {
+            pan,
+            zoom,
+            user_moved: true,
+            fitted: true,
+            ..View::default()
+        }
+    }
     pub fn fit(&mut self, g: &Graph, rect: Rect) {
         let b = g.bounds();
         if !b.is_positive() || rect.width() < 1.0 || rect.height() < 1.0 {

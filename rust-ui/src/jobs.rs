@@ -18,6 +18,8 @@ pub const OUTPUT_KEYS: [&str; 4] = ["fg", "matte", "comp", "processed"];
 pub enum JobMode {
     New,
     Resume,
+    /// Replace the files of an existing app-owned result of the same shape (backend `key_modes` has `replace`).
+    Replace,
 }
 
 /// What the worker must be. `None` digest = the caller has no reference digest (identity unverifiable).

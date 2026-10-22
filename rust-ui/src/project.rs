@@ -168,6 +168,9 @@ pub struct Clip {
     pub keyframes: Vec<usize>,
     pub notes: Vec<String>,
     pub sample_size: Option<(u32, u32)>,
+    /// `clip.json["ck_native"]` as stored: native-UI state (hint route, annotations, range stems...).
+    /// Written key by key (`persist::update_native`), so unknown keys survive.
+    pub native: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -262,7 +265,33 @@ fn root_input_video(cr: &Path) -> Option<PathBuf> {
     v.into_iter().next()
 }
 
+/// Absolute and lexically clean (`.`/`..` folded, no symlink resolution): job paths must not contain `..`.
+pub fn clean_abs(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let a = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut out = PathBuf::new();
+    for c in a.components() {
+        match c {
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_)) | None
+                ) {
+                    out.pop();
+                }
+            }
+            Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn load_project(root: &Path, opts: &LoadOptions) -> Result<Project, String> {
+    // Every path derived from the project (clip roots, staging, outputs) must be valid in a worker with a
+    // different working directory: absolute once, here. Symlinks are not resolved.
+    let abs_root = clean_abs(root);
+    let root = abs_root.as_path();
     if !root.is_dir() {
         return Err(format!("Not a folder: {}", root.display()));
     }
@@ -511,6 +540,15 @@ fn load_clip(
     } else if cr.join("Source").is_dir() {
         match first_video(&cr.join("Source")).or_else(|| orig.clone().filter(|p| p.is_file())) {
             Some(path) => Source::Video { path },
+            // A movie clip whose movie vanished stays listed (error state) so it can be relinked; the Qt app
+            // does not list it. Anything else without a source is still not listed.
+            None if src_meta.and_then(|m| m.get("filename")).is_some() => {
+                error = Some(format!(
+                    "Source movie missing: nothing in {} (relink the movie to extract frames again)",
+                    cr.join("Source").display()
+                ));
+                Source::Missing
+            }
             None => return Err(format!("Clip '{folder}': 'Source' dir has no video.")),
         }
     } else if let (Some("sequence"), Some(p)) = (src_type, &orig) {
@@ -546,12 +584,26 @@ fn load_clip(
         let b = r.get("out_point")?.as_u64()? as usize;
         Some((a, b))
     });
+    let mut in_out = in_out;
     if let Some((a, b)) = in_out {
         if !input_files.is_empty() && (a > b || b >= input_files.len()) {
             notes.push(format!(
                 "Stored In/Out {a}–{b} is outside the {} source frames",
                 input_files.len()
             ));
+        }
+        // The native UI also records the boundary stems: a changed source never shifts the range silently.
+        let stems = get("ck_native").and_then(|n| n.get("range_stems"));
+        let want = |k: &str| stems.and_then(|s| s.get(k)).and_then(Value::as_str);
+        if let (Some(i), Some(o)) = (want("in"), want("out")) {
+            let at = |n: usize| input_files.get(n).map(|f| f.0.as_str());
+            if !input_files.is_empty() && (at(a) != Some(i) || at(b) != Some(o)) {
+                notes.push(
+                    "Source changed: the stored In/Out no longer matches its frames; re-set In/Out"
+                        .into(),
+                );
+                in_out = None;
+            }
         }
     }
 
@@ -690,6 +742,7 @@ fn load_clip(
         manifest,
         keyframes,
         notes,
+        native: get("ck_native").cloned().unwrap_or(Value::Null),
         sample_size: vm.as_ref().and_then(|v| {
             Some((
                 v.get("width")?.as_u64()? as u32,

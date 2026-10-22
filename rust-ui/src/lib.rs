@@ -1,14 +1,23 @@
-//! CorridorKey native viewer core. Everything here is read-only with respect to project data and
-//! free of UI types so the toolkit can be swapped (see `ui`).
+//! CorridorKey native app core and UI-independent project utilities (see `ui`).
 pub mod contracts;
 pub mod decode;
 pub mod frames;
+pub mod hints;
 pub mod import;
 pub mod jobs;
+pub mod models;
 pub mod natural_sort;
+pub mod persist;
+pub mod presets;
 pub mod project;
+pub mod queue;
+pub mod relink;
+pub mod runtime;
 pub mod scheduler;
 pub mod settings;
+pub mod sha256;
+pub mod tasks;
 pub mod ui;
 pub mod worker;
 pub mod workflow;
+pub mod workspace;

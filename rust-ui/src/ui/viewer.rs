@@ -31,6 +31,10 @@ struct Tex {
 }
 
 pub struct Viewer {
+    /// Hint-page annotation tools and overlay (source-pixel coordinates).
+    pub ann: super::annotate::AnnState,
+    /// Hint keyframe marks as timeline indices (drawn as ticks).
+    pub marks: Vec<usize>,
     pub clip: usize,
     pub index: FrameIndex,
     pub store: FrameStore,
@@ -179,6 +183,8 @@ impl Viewer {
         .find(|v| index.view_frames(*v) > 0)
         .unwrap_or(View::Input);
         Self {
+            ann: super::annotate::AnnState::new(),
+            marks: vec![],
             clip: clip_idx,
             index,
             store,
@@ -727,7 +733,7 @@ impl Viewer {
         if icon_btn(&mut t, 0, false, "Go to start (Home)").clicked() {
             self.set_playhead(0);
         }
-        if icon_btn(&mut t, 1, false, "Step back (←)").clicked() {
+        if icon_btn(&mut t, 1, false, "Step back (Left)").clicked() {
             self.step(-1);
         }
         if icon_btn(
@@ -750,7 +756,7 @@ impl Viewer {
         {
             self.toggle_play(1);
         }
-        if icon_btn(&mut t, 4, false, "Step forward (→)").clicked() {
+        if icon_btn(&mut t, 4, false, "Step forward (Right)").clicked() {
             self.step(1);
         }
         if icon_btn(&mut t, 5, false, "Go to end (End)").clicked() {
@@ -916,7 +922,7 @@ impl Viewer {
             }
         }
         if resp.dragged_by(egui::PointerButton::Middle)
-            || (!wipe_active && resp.dragged_by(egui::PointerButton::Primary))
+            || (!wipe_active && !self.ann.active() && resp.dragged_by(egui::PointerButton::Primary))
         {
             self.pan += resp.drag_delta();
         }
@@ -1019,6 +1025,10 @@ impl Viewer {
                 notices.push(format!("B ({}) has no frame here", self.b_view.label()));
             }
         }
+        // Annotation overlay/tools live on the Input view only (source pixels = that frame's pixels).
+        if self.view == View::Input && !wipe_active {
+            self.ann.run(ctx, &p, resp, img, asz);
+        }
         if !a_ready {
             notices.push("Decoding… (showing previous frame)".into());
         }
@@ -1035,7 +1045,7 @@ impl Viewer {
             notices.push("Alpha shown over checker".into());
         }
         if self.view == View::Input && self.linear {
-            notices.push("Input interpreted as Linear → sRGB view".into());
+            notices.push("Input interpreted as Linear, sRGB view".into());
         }
         for (k, n) in notices.iter().enumerate() {
             p.text(
@@ -1102,6 +1112,15 @@ impl Viewer {
                 ),
                 0.0,
                 ACCENT.linear_multiply(0.45),
+            );
+        }
+        for m in &self.marks {
+            p.line_segment(
+                [
+                    Pos2::new(x_of(*m), track.top() - 4.0),
+                    Pos2::new(x_of(*m), track.bottom()),
+                ],
+                Stroke::new(2.0, Color32::from_rgb(120, 220, 140)),
             );
         }
         // Holes in the current view: thin dark ticks, so missing frames stay visible.
