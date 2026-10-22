@@ -70,8 +70,9 @@ auth config changed). OpenSSH default shell is `cmd.exe`; PowerShell 5 is availa
 - Models are read from `…\ComfyUI\models\CorridorKey2\upstream`; hello reports `corridorkey_v2.safetensors`
   `c43596de…` (same as the UI host and the Linux deployment).
 
-**Driver:** `rust-ui/tools/win_smoke_worker.py`. The launcher is the production `remote_command()` output wrapped in
-`powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand …`. Timeout bookkeeping (hardened after the recorded
+**Driver:** `rust-ui/tools/win_smoke_worker.py`. The launcher defaults to the **byte-identical production
+`remote_command()`** output wrapped in `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand …`
+(the former test-only `set CORRIDORKEY_V2_MODELS_DIR=…&&` prefix is now opt-in via `--models-env`, default off). Timeout bookkeeping (hardened after the recorded
 runs below): every non-worker remote command is capped at 15 s; **every single wait on the worker stream is capped at
 15 s** (`WAIT_CAP` — longer silence fails); each invocation carries **one absolute monotonic stage budget**
 (`--stage-budget`, required for `job`/`full`/`eofmid` because GPU model load alone exceeds 15 s — the longer bound must
@@ -83,7 +84,9 @@ recorded runs below used the pre-hardening driver (job-total default 120 s, 20�
 bookkeeping changed, so no remote rerun was needed.
 
 **Tests and outcomes**
-1. `--stage hello` (+ EOF idle): RTX 4090, `capabilities.key=true`, model SHA match, exit 0.
+1. `--stage hello` (+ EOF idle): RTX 4090, `capabilities.key=true`, model SHA match, exit 0. Re-run 2026-10-22
+   with the **bare production launcher** (no `--models-env`, models resolved via `ckmodels.pth` alone): hard 15 s
+   stage budget, elapsed 3.2 s, hello at 1.58 s, SHA assertion passed, exit 0 asserted, no owned pids.
 2. `--stage full --fmt exr` (real EXR output through the production `_write_exr_float32` path): w1 `complete` 7/7 with
    a complete manifest; w2 `cancelled` at 3 published; w3 rejected `exists`; EOF-idle exit 0; reconnect + EOF mid-job
    drained to the terminal event. Job artifacts verified on disk: Fg `shot_*.exr` channels B/G/R all **FLOAT
@@ -103,12 +106,14 @@ The recorded runs still launch the worker with a test-only `set CORRIDORKEY_V2_M
 `py\Lib\site-packages\ckmodels.pth` whose import line does
 `os.environ.setdefault("CORRIDORKEY_V2_MODELS_DIR", <upstream models dir>)` — site.py executes it at interpreter start,
 so `Target.python = C:\Users\Nick\ck-wsmoke-1022a\py\python.exe` works exactly, with a byte-identical production
-launcher and no env prefix; `setdefault` never overrides an explicit env. A production-fidelity alternative for a later
-run is populating/junctioning the `%LOCALAPPDATA%` default itself. The next GPU run should switch to the `.pth` route
-and drop the prefix — not yet exercised end-to-end.
+launcher and no env prefix; `setdefault` never overrides an explicit env. **Verified 2026-10-22 at the hello/hash level** with the bare launcher
+(see test 1); a GPU job under this exact config is still pending, so full end-to-end under the latest config is **not**
+claimed — the recorded GPU jobs (tests 2–3) used the env-prefix launcher and the pre-hardening driver. A
+production-fidelity alternative for a later run is populating/junctioning the `%LOCALAPPDATA%` default itself.
 
 **Limits.** NAS UNC paths (`\\192.168.100.10\Projects`) **not tested** over this worker (auth unresolved; no guessing).
-The models-config item above is verified only at the interpreter level, not yet in a full GPU run. Single Windows host,
+The models-config item is verified at hello/hash level under the bare launcher; the pending GPU job under this exact
+config is the remaining gap. Single Windows host,
 synthetic 256×256 7-frame clip; PowerShell progress records add CLIXML noise to stderr (harmless); runtime-deps' cv2
 4.11 shadows ComfyUI's newer cv2 (worker EXR path uses the OpenEXR bindings, not cv2). Not deployment-ready: the NAS
 item and the `.pth`-route GPU run must land first.

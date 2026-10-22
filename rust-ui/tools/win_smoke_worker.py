@@ -86,12 +86,20 @@ def cleanup(args):
         print("killed owned pid", pid, file=sys.stderr)
 
 
+def launch_command(args):
+    """Remote command for the worker. Byte-identical to the production remote_command() by
+    default; the TEST-ONLY --models-env flag adds the cmd.exe `set CORRIDORKEY_V2_MODELS_DIR=…&&`
+    prefix (the default route resolves models via the task-local py's ckmodels.pth)."""
+    base = remote_command(args.task + chr(92) + "repo", args.python, args.gpu)
+    if getattr(args, "models_env", False):
+        return f"set CORRIDORKEY_V2_MODELS_DIR={args.models}&& {base}"
+    return base
+
+
 class Worker:
     def __init__(self, args):
         self.args = args
-        # `set` is cmd.exe syntax (OpenSSH's default shell here): test-only way to point the stock launcher at the models.
-        remote = f"set CORRIDORKEY_V2_MODELS_DIR={args.models}&& {remote_command(args.task + chr(92) + 'repo', args.python, args.gpu)}"
-        self.p = subprocess.Popen(["ssh", "-S", args.sock, "-o", "BatchMode=yes", args.host, remote],
+        self.p = subprocess.Popen(["ssh", "-S", args.sock, "-o", "BatchMode=yes", args.host, launch_command(args)],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.err, self.events, self.t0 = [], [], time.time()
         self.q = queue.Queue()
@@ -186,6 +194,10 @@ def main():
                     help="hello: hello + stdin EOF exit only (no model); job: + one key job; "
                          "full: everything; eofmid: hello + one job killed by stdin EOF mid-job, "
                          "drained to the terminal done event")
+    ap.add_argument("--models-env", action="store_true",
+                    help="TEST-ONLY: add the cmd `set CORRIDORKEY_V2_MODELS_DIR=<models>&&` prefix to the "
+                         "launcher. Default: bare production remote_command(); models must resolve without "
+                         "an env prefix (task-local py ckmodels.pth).")
     ap.add_argument("--stage-budget", type=int, default=None,
                     help="absolute monotonic budget in seconds for the WHOLE invocation "
                          "(required for job/full/eofmid: GPU model load alone exceeds the 15s wait cap, "
@@ -210,6 +222,8 @@ def main():
         assert h["capabilities"]["key"], w.tail()
         if args.stage == "hello":
             w.p.stdin.close(); rep["eof_idle_exit"] = w.assert_exit("hello EOF idle")
+            rep["owned_pids_after_exit"] = owned_pids(args)
+            assert not rep["owned_pids_after_exit"], rep["owned_pids_after_exit"]
         elif args.stage == "eofmid":
             out_e = args.task + "\\work\\oute" + str(int(time.time()))
             w.send({"cmd": "key", "job": make_job(args, "e1", out_e + "\\v001", sha=sha)})

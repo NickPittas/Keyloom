@@ -122,4 +122,14 @@ r = subprocess.run([sys.executable, str(HERE / "win_smoke_worker.py"), "--sock",
 assert r.returncode == 2 and "--stage-budget" in r.stderr, (r.returncode, r.stderr[-200:])
 print("ok 10 parser rejects GPU stage without --stage-budget")
 
-print("SELFTEST PASS (10 checks)")
+# 11. launch_command: byte-identical production launcher by default; prefix only with --models-env
+class _A: pass
+a = _A(); a.task, a.python, a.gpu, a.models, a.models_env = "T", "P", 0, "M", False
+bare = wsw.launch_command(a)
+assert bare == wsw.remote_command("T" + chr(92) + "repo", "P", 0), bare
+assert "set CORRIDORKEY" not in bare
+a.models_env = True
+assert wsw.launch_command(a).startswith("set CORRIDORKEY_V2_MODELS_DIR=M&& ")
+print("ok 11 launch_command bare production default, prefix only with --models-env")
+
+print("SELFTEST PASS (11 checks)")
