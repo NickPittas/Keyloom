@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -127,7 +128,7 @@ def test_stop_playback_wraps_scrubber(tmp_path):
 # ── window wiring ──
 
 def test_sync_selected_clip_view_refreshes_keyframe_tools():
-    w = MainWindow.__new__(MainWindow)
+    w = SimpleNamespace(_invalidate_hint_keyframe_context=lambda: None)
     seen = []
 
     class _V:
