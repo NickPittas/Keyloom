@@ -35,7 +35,7 @@ cargo run --release -- --data-dir /tmp/ck --import a.mp4 --import b.mov --auto-c
 Useful options (all optional; see `--help`): `--global-output-dir D` (stands in for the Qt-only global output
 preference, which is not read), `--cache-mb N` (frame cache budget in MB; default = half of the available RAM, 1–8 GB), `--open-clip NAME`,
 `--tab media|hint|key|review|deliver`, `--view input|hint|fg|matte|comp|processed`, `--ab VIEW`, `--frame N`, `--play`,
-`--window WxH`, QA options `--keys i,Shift+Right,click:605x66` (synthetic egui events, one per 400 ms, state printed to
+`--window WxH`, QA options `--keys i,Shift+Right,click:605x66,rclick:605x66` (synthetic egui events, one per 400 ms, state printed to
 stderr) and the evidence option `--screenshot FILE.png [--screenshot-after SECS]` (writes a PNG, then exits).
 
 Keys: `B` back · `1`–`5` tabs · `G` show/hide graph · `F` focus viewer · `Esc` leave focus/sheet · `Space` play ·
@@ -67,6 +67,9 @@ bash tools/isolated-test.sh /usr/bin/cargo test --offline
 bash tools/isolated-test.sh /usr/bin/env CK_PREVIEW_PROJECT=../Projects/<p> /usr/bin/cargo test --release --offline --test real_preview -- --ignored --nocapture
 bash tools/virtual-display-test.sh /usr/bin/timeout 30 target/release/corridorkey-ui --screenshot target/test.png --screenshot-after 2
 ```
+
+The virtual-display wrapper runs a private Xvfb at 1440x900; `CK_DISPLAY_SIZE=2400x1500` (still private, still
+its own Xvfb) lets an evidence run use a larger window, e.g. `--window 2240x1440`.
 
 The opt-in RAM test needs a real project with at least 129 Input frames. The separate `decode` tests use
 `CK_REAL_PROJECT` and `CK_REAL_REFERENCE` (an independent Python OpenEXR statistics dump), passed through
@@ -123,8 +126,10 @@ and looping apply to the next clip you open, and `--cache-mb` overrides the save
 
 - **Hint page**: routes Import alpha / GVM / BiRefNet (all variants) / Chroma key / MatAnyone2 / VideoMaMa, Bypass (keeps settings and assets), SAM tracker model, SAM points / one box / paint on the Input frame (source-pixel coordinates), preview, track mask, sparse keyframe marks, a separate chroma holdout (`holdout_strokes.json`, not SAM paint), chroma colour pick. Generated hints are staged outside the clip and published by the worker, replacing only the frames of In/Out; the previous hint stays until the new set validates. Route availability comes from the worker's real model readiness.
 - **Media**: frame extraction, relink of a missing image sequence (stored In/Out and result stems must match) or movie (size, rate and frame count checked first; a partial match needs your confirmation), companion alpha/mask movie import, and companion alpha/mask **image-sequence** import (PNG/EXR, stems/size/In-Out coverage checked, existing hint frames never replaced; the clip's hint lock is held during the copy).
-- **Key**: one-off and batch review, hint steps chained ahead of Key (explicit prerequisites), *Temporal awareness* labels over the exact wire presets, **Replace** of an app-owned result (same files and range; confirmation required; needs a worker advertising `key_modes: replace`), New version and Resume as before.
-- **Deliver**: output location templates, workflow/export presets (field merge; never copies range, colour, prompts or locations), video export (MP4, alpha MOV ProRes 4444, alpha WebM; audio is not included; never overwrites a file).
+- **Key**: one-off and batch review, hint steps chained ahead of Key (explicit prerequisites), *Temporal awareness* labels over the exact wire presets, **Replace** of an app-owned result (same files and range; confirmation required; needs a worker advertising `key_modes: replace`), New version and Resume (Resume is unavailable when a pipeline regenerates hints).
+- **Deliver**: one row per enabled output, independently set to an EXR/PNG image sequence or a video. MP4 offers H.264/H.265, MOV offers ProRes 422/4444, and WebM offers VP9; each video keeps its own codec and CRF/qscale. EXR compression is shared. Videos never overwrite existing files and contain no audio. “Export existing Key result” encodes videos without running Key again.
+- **Batch presets**: configure Hint, Key and Deliver, then save the workflow preset from Key or Deliver. On the main batch screen choose **Preset**, select clips and click **Key selected…**, then review and queue. Each clip uses its own range, input colour, client, prompts and marks. Hints disabled means Key only. SAM and Chroma pre-mattes must already cover that clip's required frames; missing ones block the clip with a precompute instruction. GVM and BiRefNet generate pre-mattes automatically. Direct uses that pre-matte as the hint; MatAnyone2/VideoMaMa refine it first. Key runs next, followed by every video delivery, in order. Image sequences are the Key outputs. A default output location uses each clip's own output folder; applying it resets a project-wide custom location. Version 2 single-video presets remain readable; legacy parameter/output presets are labelled partial.
+- **Batch queue**: each clip has its own section with ordered Pre-matte, Hint, Keying and Export rows for the steps it uses. Progress comes from the worker; queued steps show Waiting or Queued. Multiple video exports share an Export row with per-product statuses. Precomputed SAM/Chroma guides are labelled Precomputed. Cancel is beside each live stage; Details retains warnings and recovery controls.
 - **Saved state**: `clip.json` (`in_out_range` plus boundary stems, `ck_native` hint route/annotations), the session file (input colour), `project.json` (`ck_native.workspace`), `presets.json` beside the preferences, `.ck_queue.json` in the project. Unknown keys are preserved; unreadable files are set aside, not overwritten.
 - **Tasks run on the local worker only** (remote scheduling is deferred). One GPU job at a time, shared with Key.
 

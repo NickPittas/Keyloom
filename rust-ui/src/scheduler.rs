@@ -353,6 +353,9 @@ pub struct Scheduler {
     /// Test hook: while set to `true` the preflight helper thread waits, so a test can hold a preflight pending.
     #[doc(hidden)]
     pub preflight_hold: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The physical GPU is held for one received attempt (claim → preflight → start → finish): until released,
+    /// only the jobs/tasks registered for it may be dispatched, so a local Queue entry cannot slip in between.
+    net_hold: Option<(String, std::collections::BTreeSet<String>)>,
 }
 
 /// Outcome of testing one target for one job.
@@ -410,7 +413,28 @@ impl Scheduler {
             allow_unverified: false,
             hello_timeout: Duration::from_secs(600),
             preflight_hold: None,
+            net_hold: None,
         })
+    }
+
+    /// `after` plus everything those ids transitively wait for: all of them finish before the new job starts.
+    fn ancestors(&self, after: &[String]) -> Vec<String> {
+        let mut seen: Vec<String> = vec![];
+        let mut todo: Vec<String> = after.to_vec();
+        while let Some(id) = todo.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            let deps = self
+                .jobs
+                .iter()
+                .find(|e| e.job.job_id == id)
+                .map(|e| &e.after)
+                .or_else(|| self.tasks.iter().find(|t| t.job.job_id == id).map(|t| &t.after));
+            todo.extend(deps.into_iter().flatten().cloned());
+            seen.push(id);
+        }
+        seen
     }
 
     pub fn submit(&mut self, s: Submit) -> Result<(), SubmitError> {
@@ -438,11 +462,12 @@ impl Scheduler {
             });
         }
         // A hint writer on the same clip may replace what Key reads: only a declared dependency may run with it.
+        let before = self.ancestors(&s.after);
         if let Some(t) = self.tasks.iter().find(|t| {
             t.state.fences()
                 && t.job.kind.writes_clip()
                 && t.job.clip_root == s.job.clip_root
-                && !s.after.contains(&t.job.job_id)
+                && !before.contains(&t.job.job_id)
         }) {
             return Err(SubmitError::Collision {
                 with: t.job.job_id.clone(),
@@ -496,7 +521,7 @@ impl Scheduler {
 
     fn pump_locks(&mut self, ev: &mut Vec<SchedEvent>) {
         for l in 0..self.locks.len() {
-            if self.locks[l].slot.is_some() {
+            if self.locks[l].slot.is_some() || self.net_hold.is_some() {
                 continue;
             }
             let Some(&c) = self
@@ -610,6 +635,41 @@ impl Scheduler {
     }
 
     /// Something is queued, starting or running (Key or task).
+    /// Hold the GPU for a received attempt. False (nothing held) while any local job, task or lock is active
+    /// or queued, or while another attempt holds it; the same attempt may call it again.
+    pub fn reserve_net(&mut self, attempt: &str) -> bool {
+        if let Some((a, _)) = &self.net_hold {
+            return a == attempt;
+        }
+        if self.running() || self.busy() || self.slots.iter().any(|s| s.job.is_some()) || !self.locks.is_empty() {
+            return false;
+        }
+        self.net_hold = Some((attempt.to_owned(), Default::default()));
+        true
+    }
+    /// Let a held attempt's jobs/tasks dispatch. False when `attempt` is not the holder.
+    pub fn allow_net(&mut self, attempt: &str, ids: &[String]) -> bool {
+        match &mut self.net_hold {
+            Some((a, set)) if a == attempt => {
+                set.extend(ids.iter().cloned());
+                true
+            }
+            _ => false,
+        }
+    }
+    pub fn release_net(&mut self, attempt: &str) {
+        if self.net_hold.as_ref().is_some_and(|(a, _)| a == attempt) {
+            self.net_hold = None;
+        }
+    }
+    pub fn net_held(&self) -> bool {
+        self.net_hold.is_some()
+    }
+    /// A held GPU only serves its attempt's own jobs.
+    fn held_out(&self, id: &str) -> bool {
+        self.net_hold.as_ref().is_some_and(|(_, ids)| !ids.contains(id))
+    }
+
     pub fn running(&self) -> bool {
         self.jobs.iter().any(|e| !e.state.is_terminal())
             || self.tasks.iter().any(|t| !t.state.is_terminal())
@@ -673,10 +733,10 @@ impl Scheduler {
             }
         }
         let fence = job.fence();
-        if let Some(t) = self
-            .tasks
-            .iter()
-            .find(|t| t.state.fences() && t.job.fence() == fence)
+        let before = self.ancestors(&after);
+        if let Some(t) = self.tasks.iter().find(|t| {
+            t.state.fences() && t.job.fence() == fence && !before.contains(&t.job.job_id)
+        })
         {
             return Err(SubmitError::Collision {
                 with: t.job.job_id.clone(),
@@ -686,7 +746,7 @@ impl Scheduler {
             if let Some(e) = self.jobs.iter().find(|e| {
                 e.state.fences()
                     && e.job.clip_root == job.clip_root
-                    && !after.contains(&e.job.job_id)
+                    && !before.contains(&e.job.job_id)
             }) {
                 return Err(SubmitError::Collision {
                     with: e.job.job_id.clone(),
@@ -1467,7 +1527,7 @@ impl Scheduler {
         }
         let mut reserved: Vec<usize> = vec![];
         for j in 0..self.jobs.len() {
-            if self.jobs[j].state != JobState::Queued {
+            if self.jobs[j].state != JobState::Queued || self.held_out(&self.jobs[j].job.job_id) {
                 continue;
             }
             let mut wait = false;
@@ -1644,7 +1704,7 @@ impl Scheduler {
 
     fn dispatch_tasks(&mut self, ev: &mut Vec<SchedEvent>) {
         for t in 0..self.tasks.len() {
-            if self.tasks[t].state != JobState::Queued {
+            if self.tasks[t].state != JobState::Queued || self.held_out(&self.tasks[t].job.job_id) {
                 continue;
             }
             let mut wait = false;

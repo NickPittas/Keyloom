@@ -13,6 +13,8 @@ pub enum PickKind {
     Location,
     /// An existing project to add clips to.
     AddTo,
+    /// Existing parent folder in which File > New project creates the new project folder.
+    NewProject,
     /// One companion alpha/mask movie for the open clip.
     HintMovie,
     /// The folder a missing external image sequence now lives in.
@@ -23,6 +25,8 @@ pub enum PickKind {
     HintSequence,
     /// Destination folder for an exported video.
     ExportFolder,
+    /// Local folder for a Path Mapping row in Settings.
+    MappingRoot,
 }
 
 /// Blocks until the user chooses; an empty list = cancelled. Tests inject a mock.
@@ -55,6 +59,11 @@ pub fn rfd_backend() -> Backend {
                 .pick_folder()
                 .into_iter()
                 .collect(),
+            PickKind::NewProject => d
+                .set_title("Choose the folder to create the new project in")
+                .pick_folder()
+                .into_iter()
+                .collect(),
             PickKind::HintMovie => d
                 .set_title("Choose the alpha or mask movie for this clip")
                 .add_filter("Movies", &VIDEO_EXTS)
@@ -79,6 +88,11 @@ pub fn rfd_backend() -> Backend {
                 .collect(),
             PickKind::ExportFolder => d
                 .set_title("Choose the folder for the exported video")
+                .pick_folder()
+                .into_iter()
+                .collect(),
+            PickKind::MappingRoot => d
+                .set_title("Choose the folder where this PC sees the shared location")
                 .pick_folder()
                 .into_iter()
                 .collect(),

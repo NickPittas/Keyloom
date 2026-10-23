@@ -13,7 +13,6 @@ DefaultDirName={localappdata}\Programs\CorridorKey
 DisableProgramGroupPage=yes
 DisableDirPage=no
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=@OUT@
@@ -21,7 +20,8 @@ OutputBaseFilename=CorridorKey-{#VID}-windows-x86_64-setup
 Compression=lzma2/fast
 SolidCompression=no
 DiskSpanning=yes
-DiskSliceSize=max
+; 1900 MiB slices: GitHub release assets are limited to 2 GiB. The exe and every -N.bin must sit in one folder.
+DiskSliceSize=1992294400
 UninstallDisplayIcon={app}\versions\{#VID}\bin\corridorkey-ui.exe
 CloseApplications=no
 DirExistsWarning=no

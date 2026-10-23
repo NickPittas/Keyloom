@@ -96,6 +96,11 @@ def probe_hello(gpu_arg: int | None) -> dict:
             prop = torch.cuda.get_device_properties(idx)
             gpu = {"index": gpu_arg if gpu_arg is not None else idx, "name": prop.name,
                    "vram_gb": round(prop.total_memory / 2**30, 1)}
+            try:  # identity of the device actually opened (not the NVML index); local use never depends on it
+                from backend.worker.gpu_identity import device_identity
+                gpu.update(device_identity(prop))
+            except Exception as exc:  # noqa: BLE001
+                gpu.update(uuid=None, uuid_status="unverified", uuid_reason=f"identity probe failed: {type(exc).__name__}")
     except Exception as exc:  # noqa: BLE001 - no usable GPU is a valid answer
         sys.stderr.write(f"GPU probe failed: {exc}\n")
     if gpu is None:

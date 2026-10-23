@@ -166,6 +166,32 @@ fn overlay(base: &mut Value, over: &Value) {
     }
 }
 
+/// Can a shot override this Key/output field on top of a preset? Source-bound colour and the hint mode
+/// (recorded separately as `ck_native.hint_mode`) cannot be field overrides.
+pub fn is_overridable(k: &str) -> bool {
+    !matches!(k, "input_is_linear" | "use_alpha_hint" | "hint_mode")
+        && (Params::default().to_value().get(k).is_some() || OutputCfg::default().to_value().get(k).is_some())
+}
+
+/// Copy the named fields from `src` over `p`/`o`: preset base -> explicit shot overrides.
+pub fn copy_fields(p: &mut Params, o: &mut OutputCfg, sp: &Params, so: &OutputCfg, keys: &std::collections::BTreeSet<String>) {
+    let (mut pv, mut ov) = (p.to_value(), o.to_value());
+    let (spv, sov) = (sp.to_value(), so.to_value());
+    for k in keys.iter().filter(|k| is_overridable(k)) {
+        for (dst, src) in [(&mut pv, &spv), (&mut ov, &sov)] {
+            if let (Some(d), Some(v)) = (dst.get_mut(k.as_str()), src.get(k.as_str())) {
+                *d = v.clone();
+            }
+        }
+    }
+    if let Ok(x) = serde_json::from_value(pv) {
+        *p = x;
+    }
+    if let Ok(x) = serde_json::from_value(ov) {
+        *o = x;
+    }
+}
+
 /// Params + outputs for a clip. Precedence: the clip's own `workflow`, then the Qt session values, then the
 /// saved AI defaults. `input_is_linear` is left to the caller (the clip's interpretation). Notes say what
 /// was unusable and ignored.
@@ -186,7 +212,7 @@ pub fn seed(clip: &Clip, project: &Project, st: &Settings) -> (Params, OutputCfg
     let (mut pv, mut ov) = (p.to_value(), OutputCfg::default().to_value());
     let mut notes = vec![];
     let from_workflow = clip.workflow.as_ref().and_then(|w| w.get("params"));
-    for src in [project.session_params.as_ref(), from_workflow]
+    for src in [project.session_params.as_ref(), from_workflow, clip.native.get("draft").and_then(|d| d.get("params"))]
         .into_iter()
         .flatten()
     {
@@ -204,12 +230,24 @@ pub fn seed(clip: &Clip, project: &Project, st: &Settings) -> (Params, OutputCfg
     for src in [
         project.session_output_config.as_ref(),
         clip.workflow.as_ref().and_then(|w| w.get("output_config")),
+        clip.native.get("draft").and_then(|d| d.get("out")),
     ]
     .into_iter()
     .flatten()
     {
         overlay(&mut ov, src);
     }
+    // The consumption mode is a per-clip decision. Only the clip's own choice (`ck_native.hint_mode`, written
+    // when the user picks one) is explicit. Session and queued-job values are snapshots of what Key last ran
+    // with (often the out-of-box `none`), so a clip with a saved hint route and hint frames on disk follows
+    // those frames over them, exactly as `note_generated_hints` does in-session; they apply otherwise.
+    if let Some(m) = crate::persist::clip_hint_mode(clip) {
+        pv["hint_mode"] = json!(m);
+    } else if let Some((m, why)) = derived_hint_mode(clip) {
+        pv["hint_mode"] = json!(m);
+        notes.push(why);
+    }
+    pv["use_alpha_hint"] = json!(pv["hint_mode"] != "none"); // always follows hint_mode
     let params = serde_json::from_value::<Params>(pv)
         .ok()
         .filter(|p| p.validate().is_ok())
@@ -227,6 +265,43 @@ pub fn seed(clip: &Clip, project: &Project, st: &Settings) -> (Params, OutputCfg
             OutputCfg::default()
         });
     (params, out, notes)
+}
+
+/// The hint-consumption mode a clip implies when nothing was chosen explicitly: a saved, non-bypassed hint
+/// route with `AlphaHint` frames on disk means Key must read that hint. Hints only on the marked frames mean
+/// `keyframes`, anything else `full`. `None` = no saved route or no hints, so the default stays.
+fn derived_hint_mode(clip: &Clip) -> Option<(&'static str, String)> {
+    let cfg = crate::hints::HintCfg::load(clip);
+    if cfg.bypass || clip.native.get("hint").is_none() || clip.alpha_frames == 0 {
+        return None;
+    }
+    let dir = clip.root.join(crate::hints::HINT_DIR);
+    let have: std::collections::BTreeSet<String> = crate::project::list_images(&dir)
+        .into_iter()
+        .map(|h| h.0)
+        .collect();
+    if have.is_empty() {
+        return None;
+    }
+    let marks: std::collections::BTreeSet<String> = clip
+        .keyframes
+        .iter()
+        .filter_map(|k| clip.input_files.get(*k).map(|f| f.0.clone()))
+        .collect();
+    let mode = if !marks.is_empty() && have.is_subset(&marks) {
+        "keyframes"
+    } else {
+        "full"
+    };
+    Some((
+        mode,
+        format!(
+            "Hint mode {mode}: this clip has a saved {} -> {} route and {} hint frame(s) on disk. Change it under Properties > Hint; bypassing the hint means none.",
+            cfg.guide.label(),
+            cfg.finish.label(),
+            have.len()
+        ),
+    ))
 }
 
 // ---------------------------------------------------------------- output location
@@ -375,7 +450,7 @@ pub struct Existing {
     pub replace_files: usize,
 }
 
-fn abs(p: &Path) -> PathBuf {
+pub fn abs(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
@@ -934,6 +1009,8 @@ fn build(
             protocol: PROTOCOL,
             models: [(MODEL.to_string(), i.digest.map(str::to_owned))].into(),
         },
+        source_map: vec![],
+        enforce_fixed_window: false,
     }
 }
 

@@ -330,6 +330,160 @@ fn model_asset_changes_wait_for_idle_workers_to_exit() {
     fs::remove_dir_all(e.base).unwrap();
 }
 
+/// A clip's client is stored in the clip itself (not in the session), so Board, Key and the batch agree and
+/// the queued job goes to that machine.
+/// The node graph writes the same `HintCfg` the Hint page holds: a rewire is visible on the page at once and
+/// is on disk for the next session.
+/// The approved design's SAM tools: a vertical icon strip with the six prompts, preview/track and the edit
+/// actions; Chroma gets only its colour picker; the holdout tools never appear in either.
+#[test]
+fn the_hint_tool_strip_is_vertical_and_shows_only_the_route_s_tools() {
+    use ck::ui::annotate::Tool;
+    let e = env(
+        "strip",
+        &[
+            ("sam", 3, json!({"ck_native": {"hint": {"guide": "sam", "final": "matanyone2"}}})),
+            ("chroma", 3, json!({"ck_native": {"hint": {"guide": "chroma", "final": "direct"}}})),
+        ],
+        json!({"version": 2}),
+    );
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, Some("sam"));
+    app.switch_tab(Tab::Hint);
+    settle(&ctx, &mut app);
+    let tools: Vec<Tool> = app.tool_strip_rects().iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        tools,
+        vec![
+            Tool::FgPoint,
+            Tool::BgPoint,
+            Tool::PaintFg,
+            Tool::PaintBg,
+            Tool::Erase,
+            Tool::Box
+        ],
+        "SAM prompts only: no holdout tools in the strip"
+    );
+    let rects: Vec<Rect> = app.tool_strip_rects().iter().map(|(_, r)| *r).collect();
+    assert!(
+        rects.windows(2).all(|w| (w[0].center().x - w[1].center().x).abs() < 0.5
+            && w[1].center().y > w[0].center().y),
+        "the tools are one column, top to bottom: {rects:?}"
+    );
+    assert!(rects.iter().all(|r| r.width() < 40.0), "icon buttons, not a row of labels");
+
+    // Chroma: exactly the screen-colour picker (clips are listed in name order).
+    let chroma = load_project(&e.project, &LoadOptions::default())
+        .unwrap()
+        .clips
+        .iter()
+        .position(|c| c.folder == "chroma")
+        .expect("chroma clip");
+    app.open_clip(&ctx, chroma);
+    app.switch_tab(Tab::Hint);
+    settle(&ctx, &mut app);
+    let tools: Vec<Tool> = app.tool_strip_rects().iter().map(|(t, _)| *t).collect();
+    assert_eq!(tools, vec![Tool::Pick], "Chroma's strip is the colour picker only");
+}
+
+#[test]
+fn a_graph_rewire_and_the_hint_page_are_one_config() {
+    let e = env(
+        "graph-cfg",
+        &[("c1", 3, json!({"ck_native": {"hint": {"guide": "sam", "final": "direct"}}}))],
+        json!({"version": 2}),
+    );
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, Some("c1"));
+    settle(&ctx, &mut app);
+    let mut cfg = app.hint_cfg_for_test().expect("open clip has a config");
+    assert_eq!((cfg.guide, cfg.finish), (ck::hints::Producer::Sam, ck::hints::Final::Direct));
+
+    // What `Graph::rewire` produces for Pre-matte -> Hint: a refiner is now in the route.
+    cfg.finish = ck::hints::Final::Videomama;
+    app.hint_apply_cfg_for_test(cfg.clone());
+    settle(&ctx, &mut app);
+    assert_eq!(
+        app.hint_cfg_for_test().unwrap().finish,
+        ck::hints::Final::Videomama,
+        "the page shows the graph's change without a reload"
+    );
+
+    let clip = load_project(&e.project, &LoadOptions::default())
+        .unwrap()
+        .clips
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        ck::hints::HintCfg::load(&clip).finish,
+        ck::hints::Final::Videomama,
+        "and it is saved in the clip"
+    );
+}
+
+#[test]
+fn a_clip_client_is_saved_in_the_clip_and_the_queued_job_uses_it() {
+    let e = env("clip-client", &[("c1", 3, matte_png())], json!({"version": 2}));
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, None);
+    app.select_folders(&["c1"]);
+    let clip = load_project(&e.project, &LoadOptions::default())
+        .unwrap()
+        .clips
+        .into_iter()
+        .next()
+        .unwrap();
+
+    // Automatic by default: the session default (`Automatic`) is what a job would use.
+    assert_eq!(ck::persist::clip_client(&clip), None);
+    assert_eq!(app.ai().clip_placement(&clip), ck::scheduler::Placement::Auto);
+
+    // The Key panel's combo and the Board's assignment both go through this call.
+    app.ai_mut().set_clip_client(&clip, Some("l0")).unwrap();
+
+    // It is in the clip file, so another session (a fresh load) sees the same assignment.
+    let again = load_project(&e.project, &LoadOptions::default())
+        .unwrap()
+        .clips
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(ck::persist::clip_client(&again), Some("l0".to_string()));
+    assert_eq!(
+        app.ai().clip_placement(&again),
+        ck::scheduler::Placement::Target("l0".into())
+    );
+
+    // A job queued for that clip carries the clip's client, even though the session default stays Automatic.
+    app.ai_mut().scheduler_mut().probe(Some("l0"));
+    pump(&ctx, &mut app, "local ready", |a| {
+        a.ai().scheduler().reference().is_some()
+    });
+    confirm_batch(&ctx, &mut app);
+    let snap = app.ai().scheduler().snapshot();
+    assert_eq!(snap.len(), 1, "exactly one clip queued");
+    assert_eq!(
+        snap[0].placement,
+        ck::scheduler::Placement::Target("l0".into()),
+        "the job goes to the clip's client"
+    );
+    assert!(matches!(
+        app.ai().placement,
+        ck::scheduler::Placement::Auto
+    ));
+
+    // Automatic can be chosen again: the key disappears instead of freezing a machine name.
+    app.ai_mut().set_clip_client(&again, None).unwrap();
+    let third = load_project(&e.project, &LoadOptions::default())
+        .unwrap()
+        .clips
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(ck::persist::clip_client(&third), None);
+}
+
 #[test]
 fn batch_review_shows_paths_then_places_clips_and_offers_a_new_version_for_existing_results() {
     let mut blocked = matte_png();
@@ -1026,6 +1180,12 @@ fn a_lock_owned_by_an_active_job_of_this_session_cannot_be_released_from_the_gat
     )
     .unwrap();
     assert_eq!(app.ai().lock_owner(&id), ck::ui::ai::LockOwner::Session);
+    app.open_clip(&ctx, 0);
+    app.switch_tab(Tab::Key);
+    gate_ready(&ctx, &mut app);
+    let text: Vec<_> = texts_at(&ctx, &mut app).into_iter().map(|t| t.0).collect();
+    assert!(text.iter().any(|t| t == "Processing this clip…"), "{text:?}");
+    assert!(!text.iter().any(|t| t.contains("This folder is locked") || t.contains("Fix the items above")), "{text:?}");
     // Even if a stale gate frame offered the button, the handler refuses a session-owned id.
     let r = app.ai_mut().release_lock(&dir, &id);
     assert!(r.is_err() && lock.exists(), "{r:?}");
@@ -1323,4 +1483,403 @@ fn a_force_stopped_idle_worker_blocks_the_target_swap_until_it_has_exited() {
     });
     assert!(!app.ai().targets_pending());
     fs::remove_dir_all(e.base).unwrap();
+}
+
+// ---------------------------------------------------------------- hint consumption reaches Key
+
+fn hinted_clip(bypass: bool, extra: Value) -> Value {
+    let mut v = matte_png();
+    v["ck_native"] = json!({
+        "hint": {"guide": "sam", "final": "matanyone2", "bypass": bypass, "sam_model": "base_plus"}
+    });
+    if let Some(o) = extra.as_object() {
+        for (k, val) in o {
+            v["ck_native"][k] = val.clone();
+        }
+    }
+    v
+}
+
+fn write_hints(e: &Env, clip: &str, n: u32) {
+    let dir = e.project.join("clips").join(clip).join("AlphaHint");
+    fs::create_dir_all(&dir).unwrap();
+    for i in 0..n {
+        write_png(&dir.join(format!("f_{}.png", 1101 + i)));
+    }
+}
+
+fn queued_params(app: &App) -> Vec<Value> {
+    app.ai()
+        .scheduler()
+        .snapshot()
+        .into_iter()
+        .map(|e| e.job.params.clone())
+        .collect()
+}
+
+/// Start the fake local worker. The gate is only polled while a clip's panel is drawn, so callers that open a
+/// clip also wait for it (`gate_ready`).
+fn start_local(ctx: &egui::Context, app: &mut App) {
+    app.ai_mut().scheduler_mut().probe(Some("l0"));
+    pump(ctx, app, "local ready", |a| {
+        a.ai().scheduler().reference().is_some()
+    });
+}
+
+/// The reported bug: a clip with a saved SAM -> MatAnyone2 route and hint frames on disk, but no stored Key
+/// params, used to queue `hint_mode: none` — so Key ignored the hints that were just generated. The one-off
+/// Key button must consume them.
+#[test]
+fn a_saved_hint_route_and_hint_frames_are_consumed_by_the_one_off_job() {
+    let e = env(
+        "hint-one-off",
+        &[("c1", 2, hinted_clip(false, json!({})))],
+        json!({"version": 2}),
+    );
+    write_hints(&e, "c1", 2);
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, Some("c1"));
+    app.switch_tab(Tab::Key);
+    settle(&ctx, &mut app);
+    start_local(&ctx, &mut app);
+    gate_ready(&ctx, &mut app);
+
+    // The panel shows the derived mode; the job must freeze the same value.
+    let clip = app.clip_for_test();
+    app.ai_mut()
+        .submit_current(&clip, ck::workflow::Intent::New)
+        .expect("queued");
+    let p = queued_params(&app);
+    assert_eq!(p.len(), 1, "one clip, one job");
+    assert_eq!(p[0]["hint_mode"], "full", "hint frames on disk are consumed");
+    assert_eq!(p[0]["use_alpha_hint"], true);
+}
+
+/// The batch path seeds each row from the same place, so it must consume the hints too.
+#[test]
+fn a_saved_hint_route_and_hint_frames_are_consumed_by_every_batch_row() {
+    let e = env(
+        "hint-batch",
+        &[
+            ("c1", 2, hinted_clip(false, json!({}))),
+            ("c2", 2, hinted_clip(false, json!({}))),
+        ],
+        json!({"version": 2}),
+    );
+    write_hints(&e, "c1", 2);
+    write_hints(&e, "c2", 2);
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, None);
+    app.select_folders(&["c1", "c2"]);
+    settle(&ctx, &mut app);
+    start_local(&ctx, &mut app);
+    confirm_batch(&ctx, &mut app);
+
+    let p = queued_params(&app);
+    assert_eq!(p.len(), 2, "both clips queued");
+    for job in p {
+        assert_eq!(job["hint_mode"], "full", "each row consumes its hints");
+        assert_eq!(job["use_alpha_hint"], true);
+    }
+}
+
+/// An explicit choice still wins: `none` on the clip, and a bypassed route, both stay off.
+#[test]
+fn an_explicit_none_or_a_bypass_is_never_turned_back_on() {
+    for (tag, clip_json, why) in [
+        (
+            "hint-explicit-none",
+            hinted_clip(false, json!({"hint_mode": "none"})),
+            "explicit none",
+        ),
+        (
+            "hint-bypass",
+            hinted_clip(true, json!({})),
+            "bypassed route",
+        ),
+    ] {
+        let e = env(tag, &[("c1", 2, clip_json)], json!({"version": 2}));
+        write_hints(&e, "c1", 2);
+        let ctx = egui::Context::default();
+        let mut app = app_for(&e, &ctx, Some("c1"));
+        app.switch_tab(Tab::Key);
+        settle(&ctx, &mut app);
+        start_local(&ctx, &mut app);
+        gate_ready(&ctx, &mut app);
+        let clip = app.clip_for_test();
+        app.ai_mut()
+            .submit_current(&clip, ck::workflow::Intent::New)
+            .expect("queued");
+        let p = queued_params(&app);
+        assert_eq!(p[0]["hint_mode"], "none", "{why}: hints stay unread");
+        assert_eq!(p[0]["use_alpha_hint"], false, "{why}");
+    }
+}
+
+/// A client assigned in one project must not follow a same-named clip folder into another project.
+#[test]
+fn a_clip_client_never_leaks_into_another_project_with_the_same_clip_folder() {
+    let e = env(
+        "client-leak",
+        &[("shot-01", 2, matte_png())],
+        json!({"version": 2}),
+    );
+    // A second project with the SAME clip folder name, in the same test root.
+    let other = e.base.join("proj2");
+    let oc = other.join("clips").join("shot-01");
+    fs::create_dir_all(oc.join("Frames")).unwrap();
+    for i in 0..2 {
+        write_png(&oc.join(format!("Frames/f_{}.png", 1101 + i)));
+    }
+    fs::write(
+        oc.join(".video_metadata.json"),
+        r#"{"fps":24.0,"width":4,"height":4}"#,
+    )
+    .unwrap();
+    fs::write(oc.join("clip.json"), matte_png().to_string()).unwrap();
+    fs::write(other.join("project.json"), json!({"version": 2}).to_string()).unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, Some("shot-01"));
+    settle(&ctx, &mut app);
+    let first = load_project(&e.project, &LoadOptions::default()).unwrap().clips[0].clone();
+    app.ai_mut().set_clip_client(&first, Some("l0")).unwrap();
+
+    // Same session, other project: nothing is assigned there.
+    app.open_project_for_test(&ctx, &other);
+    settle(&ctx, &mut app);
+    let second = load_project(&other, &LoadOptions::default()).unwrap().clips[0].clone();
+    assert_eq!(second.folder, first.folder, "same clip folder name");
+    assert_ne!(second.root, first.root, "different project folders");
+    assert_eq!(app.ai().own_client(&second), None, "no leaked assignment");
+    assert_eq!(
+        app.ai().clip_placement(&second),
+        ck::scheduler::Placement::Auto,
+        "the new project's clip follows the session default again"
+    );
+    // And the first project's clip still has it.
+    assert_eq!(app.ai().own_client(&first), Some("l0".to_string()));
+}
+
+/// Generating hints in a session whose Key panel was already showing the default `none` must switch the panel
+/// on (so the button that follows consumes them), but never over an explicit `none`.
+#[test]
+fn generating_hints_turns_an_untouched_mode_on_and_leaves_an_explicit_none_alone() {
+    let e = env(
+        "hint-promote",
+        &[
+            ("c1", 2, hinted_clip(false, json!({}))),
+            ("c2", 2, hinted_clip(false, json!({"hint_mode": "none"}))),
+        ],
+        json!({"version": 2}),
+    );
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, Some("c1"));
+    settle(&ctx, &mut app);
+    let project = load_project(&e.project, &LoadOptions::default()).unwrap();
+    let settings = ck::settings::Settings::default();
+    let (c1, c2) = (project.clips[0].clone(), project.clips[1].clone());
+
+    // Seeded before any hint exists: the default off.
+    assert_eq!(
+        app.ai_mut()
+            .draft(&c1, &project, &settings)
+            .params
+            .hint_mode,
+        "none"
+    );
+    app.ai_mut().note_generated_hints(&c1, false);
+    assert_eq!(
+        app.ai_mut()
+            .draft(&c1, &project, &settings)
+            .params
+            .hint_mode,
+        "full",
+        "an untouched mode follows the generation"
+    );
+
+    // Marked-frame generation asks for exactly the marked frames.
+    app.ai_mut().note_generated_hints(&c1, true);
+    assert_eq!(
+        app.ai_mut()
+            .draft(&c1, &project, &settings)
+            .params
+            .hint_mode,
+        "keyframes"
+    );
+
+    // The explicit `none` is the user's decision: it stays off.
+    assert_eq!(
+        app.ai_mut()
+            .draft(&c2, &project, &settings)
+            .params
+            .hint_mode,
+        "none"
+    );
+    app.ai_mut().note_generated_hints(&c2, false);
+    assert_eq!(
+        app.ai_mut()
+            .draft(&c2, &project, &settings)
+            .params
+            .hint_mode,
+        "none",
+        "an explicit none is never turned back on"
+    );
+}
+
+#[test]
+fn generated_hints_survive_reload_over_a_frozen_none_snapshot_but_not_an_explicit_none() {
+    let snap = json!({"workflow": {"version": 1, "params": {"hint_mode": "none"}, "output_config": {}}});
+    let mk = |extra: Value| {
+        let mut v = hinted_clip(false, extra);
+        v["workflow"] = snap["workflow"].clone();
+        v
+    };
+    let e = env(
+        "hint-reload",
+        &[("c1", 2, mk(json!({}))), ("c2", 2, mk(json!({"hint_mode": "none"})))],
+        json!({"version": 2}),
+    );
+    // A Qt-style session that also froze the default `none`.
+    fs::write(
+        e.project.join(".corridorkey_session.json"),
+        json!({"version": 1, "params": {"hint_mode": "none"}}).to_string(),
+    )
+    .unwrap();
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, Some("c1"));
+    settle(&ctx, &mut app);
+    let settings = ck::settings::Settings::default();
+    let load = || load_project(&e.project, &LoadOptions::default()).unwrap();
+    let project = load();
+    let (c1, _) = (project.clips[0].clone(), project.clips[1].clone());
+    let mode = |app: &mut App, c: &_, p: &_| app.ai_mut().draft(c, p, &settings).params.hint_mode.clone();
+
+    assert_eq!(mode(&mut app, &c1, &project), "none", "before any hint exists");
+    app.ai_mut().note_generated_hints(&c1, false);
+    assert_eq!(mode(&mut app, &c1, &project), "full", "in-session promotion over the snapshot");
+
+    // Hints land on disk; a reopened project (fresh app, fresh drafts) resolves the same way.
+    write_hints(&e, "c1", 2);
+    write_hints(&e, "c2", 2);
+    let project = load();
+    let (c1, c2) = (project.clips[0].clone(), project.clips[1].clone());
+    let ctx2 = egui::Context::default();
+    let mut app2 = app_for(&e, &ctx2, Some("c1"));
+    assert_eq!(mode(&mut app2, &c1, &project), "full", "reload keeps the generated mode");
+    assert_eq!(seed(&c1, &project, &settings).0.hint_mode, "full");
+    assert!(seed(&c1, &project, &settings).0.use_alpha_hint);
+    // The user's explicit none in ck_native still wins everywhere.
+    assert_eq!(mode(&mut app2, &c2, &project), "none");
+    app2.ai_mut().note_generated_hints(&c2, false);
+    assert_eq!(seed(&c2, &project, &settings).0.hint_mode, "none");
+}
+
+#[test]
+fn a_clip_without_its_own_client_is_labelled_as_following_the_named_session_default() {
+    use ck::scheduler::Placement;
+    use ck::ui::ai::inherit_text;
+    let e = env("client-label", &[("c1", 2, matte_png())], json!({"version": 2}));
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, None);
+    let clip = load_project(&e.project, &LoadOptions::default()).unwrap().clips[0].clone();
+    assert_eq!(inherit_text(&app.ai().placement), "Automatic");
+    app.ai_mut().placement = Placement::Target("l0".into());
+    // What is shown (the inherit entry names l0) is what a queued job would use.
+    assert_eq!(inherit_text(&app.ai().placement), "Session default (l0)");
+    assert_eq!(app.ai().clip_placement(&clip), Placement::Target("l0".into()));
+    // Choosing the inherit entry (None) keeps following l0; an own client wins.
+    app.ai_mut().set_clip_client(&clip, None).unwrap();
+    assert_eq!(app.ai().clip_placement(&clip), Placement::Target("l0".into()));
+    app.ai_mut().set_clip_client(&clip, Some("r1")).unwrap();
+    assert_eq!(app.ai().clip_placement(&clip), Placement::Target("r1".into()));
+}
+
+/// Text drawn this frame, with where it was drawn (later = on top, so an open popup comes last).
+fn texts_at(ctx: &egui::Context, app: &mut App) -> Vec<(String, egui::Rect)> {
+    fn walk(s: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match s {
+            egui::Shape::Text(t) => {
+                out.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2())))
+            }
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let raw = RawInput {
+        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 900.0))),
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(raw, |ui| app.frame(ui));
+    let mut v = vec![];
+    for c in &out.shapes {
+        let mut drawn = vec![];
+        walk(&c.shape, &mut drawn);
+        v.extend(drawn.into_iter().filter(|(_, r)| c.clip_rect.contains(r.center())));
+    }
+    out.textures_delta.clear();
+    v
+}
+
+fn click_text(ctx: &egui::Context, app: &mut App, text: &str) {
+    let r = texts_at(ctx, app)
+        .into_iter()
+        .rev()
+        .find(|(t, _)| t == text)
+        .unwrap_or_else(|| panic!("no {text:?} on screen"))
+        .1;
+    click_on(ctx, app, r.center());
+    settle(ctx, app);
+}
+
+/// The Hint panel saves the pick to disk; the open clip the Generate button reads must see it too, or
+/// generating "promotes" the draft back over the user's own `none`.
+#[test]
+fn picking_none_in_the_hint_panel_then_promoting_keeps_none() {
+    let e = env("hint-pick-none", &[("c1", 2, {
+            let mut c = hinted_clip(false, json!({}));
+            c["ck_native"]["hint"] = json!({"guide": "chroma", "final": "direct", "bypass": false});
+            c
+        })], json!({"version": 2}));
+    write_hints(&e, "c1", 2);
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx, Some("c1"));
+    app.switch_tab(Tab::Hint);
+    settle(&ctx, &mut app);
+    let settings = ck::settings::Settings::default();
+    let mode = |app: &mut App| {
+        let clip = app.clip_for_test();
+        let p = load_project(&e.project, &LoadOptions::default()).unwrap();
+        app.ai_mut().draft(&clip, &p, &settings).params.hint_mode.clone()
+    };
+    assert_eq!(mode(&mut app), "full", "hints on disk and no choice yet");
+
+    // Scroll only the Properties area until the consumption control is actually visible.
+    for _ in 0..12 {
+        if texts_at(&ctx, &mut app).iter().any(|(t, _)| t == "full") {
+            break;
+        }
+        run(&ctx, &mut app, vec![
+            Event::PointerMoved(egui::pos2(1300.0, 500.0)),
+            Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -80.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel },
+        ]);
+        settle(&ctx, &mut app);
+    }
+    click_text(&ctx, &mut app, "full"); // open the Hint mode combo
+    click_text(&ctx, &mut app, "none"); // the user's own pick
+    assert_eq!(mode(&mut app), "none");
+    assert_eq!(ck::persist::clip_hint_mode(&app.clip_for_test()).as_deref(), Some("none"), "open clip sees the saved pick");
+
+    // What a queued Generate calls on the open clip's snapshot (clicking Generate needs worker plumbing this
+    // fixture does not have; the snapshot is what carried the stale mode).
+    let clip = app.clip_for_test();
+    app.ai_mut().note_generated_hints(&clip, false);
+    assert_eq!(mode(&mut app), "none", "generating must not override the user's none");
+    app.switch_tab(Tab::Key);
+    settle(&ctx, &mut app);
+    start_local(&ctx, &mut app);
+    gate_ready(&ctx, &mut app);
+    let clip = app.clip_for_test();
+    app.ai_mut().submit_current(&clip, ck::workflow::Intent::New).expect("queued");
+    assert_eq!(queued_params(&app).last().unwrap()["hint_mode"], "none");
 }

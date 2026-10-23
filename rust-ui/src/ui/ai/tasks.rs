@@ -110,7 +110,7 @@ impl AiUi {
         let (id, kind) = (job.job_id.clone(), job.kind);
         self.sched
             .submit_task(job, after)
-            .map_err(|e| format!("not queued: {e:?}"))?;
+            .map_err(|e| self.submit_error_text(clip, &e))?;
         self.tracked.push(Tracked {
             warnings: vec![],
             job_id: id.clone(),
@@ -206,6 +206,26 @@ impl AiUi {
                     .state_of(&t.job_id)
                     .is_some_and(|s| !s.is_terminal())
         })
+    }
+
+    /// The newest finished/ongoing task of `kind` for this clip that publishes into `dir` (`AlphaHint` or
+    /// `VideoMamaMaskHint`). One kind (SAM tracking, a producer) can publish into either, so the column a job
+    /// belongs to is its actual `publish_dir`, not just its kind.
+    pub fn latest_task_in(&self, folder: &str, kind: TaskKind, dir: &str) -> Option<String> {
+        self.tracked
+            .iter()
+            .rev()
+            .find(|t| {
+                t.folder == folder
+                    && self.sched.task(&t.job_id).is_some_and(|e| {
+                        e.job.kind == kind
+                            && e.job
+                                .publish_dir
+                                .as_deref()
+                                .is_some_and(|p| p.file_name().is_some_and(|n| n == dir))
+                    })
+            })
+            .map(|t| t.job_id.clone())
     }
 
     /// The newest finished/ongoing task of `kind` for this clip.
@@ -531,6 +551,9 @@ impl AiUi {
             .as_deref()
             .and_then(|j| self.sched.state_of(j).cloned());
         if let (Some(j), Some(st)) = (&lock.job_id, known) {
+            if matches!(st, JobState::Dispatching { .. } | JobState::Running { .. }) {
+                return; // The normal task row already shows this writer's progress and Cancel control.
+            }
             let t = if st.is_terminal()
                 && !matches!(
                     st,
@@ -894,8 +917,8 @@ impl AiUi {
             return;
         }
         ui.separator();
-        ui.label(RichText::new("Earlier sessions").color(DIM));
         let mut dismiss = None;
+        egui::CollapsingHeader::new(format!("Earlier sessions · {} jobs", older.len())).default_open(false).show(ui, |ui| {
         for h in &older {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(&h.folder).strong());
@@ -918,6 +941,7 @@ impl AiUi {
                 }
             });
         }
+        });
         if let Some(id) = dismiss {
             self.tk.history.retain(|h| h.id != id);
             self.tk.last_saved.clear();

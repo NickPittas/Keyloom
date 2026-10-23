@@ -532,6 +532,13 @@ def _run_manager_op(op: str, args) -> int:
         if result is None:
             return 1
         return 0 if result["ok"] else 1
+    if op == "delete":
+        if args.profile or not targets:
+            mgr.emit({"event": "op-done", "op": op, "ok": False,
+                      "error": "target-required", "message": "select the managed model to delete with --target"})
+            return 2
+        result = guarded(lambda: mgr.op_delete(targets))
+        return 0 if result is not None and result["ok"] else 1
     if op == "cancel":
         result = guarded(lambda: mgr.cancel_running_download(args.operation_id))
         if result is None:
@@ -568,6 +575,8 @@ def main():
                          help="Download artifacts (JSON events; pinned, staged, cancellable)")
     manager.add_argument("--repair", action="store_true",
                          help="Repair invalid/unverified artifacts (JSON events)")
+    manager.add_argument("--delete", action="store_true",
+                         help="Delete only the selected catalog-managed model files")
     manager.add_argument("--cancel", action="store_true",
                          help="Signal cancellation to a running download")
     manager.add_argument("--operation-id", default=None, metavar="ID",
@@ -593,6 +602,8 @@ def main():
         return _run_manager_op("download", args)
     if args.repair:
         return _run_manager_op("repair", args)
+    if args.delete:
+        return _run_manager_op("delete", args)
     if args.cancel:
         return _run_manager_op("cancel", args)
     if args.check and args.json:

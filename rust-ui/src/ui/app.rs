@@ -10,22 +10,30 @@ use crate::contracts::*;
 use crate::decode::exr_header_summary;
 use crate::frames::{Availability, FrameIndex};
 use crate::import::Sources;
+use crate::hints::Final;
 use crate::project::*;
 use crate::settings::{default_path, Store};
-use eframe::egui::{self, Align, Color32, Key, Layout, Panel, RichText, Sense, Ui, Vec2};
+use eframe::egui::{self, Color32, Key, Panel, RichText, Sense, Ui, Vec2};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
 pub const BANNER: &str = "Import > Hint > Key > Review > Deliver | In/Out, colour and hint settings are saved in the project";
+mod driver;
 mod hint;
 mod media;
+mod project_shell;
 mod ws;
-const GRAPH_DEFAULT: f32 = 220.0;
+/// 24 px less than before: the always-visible metrics footer takes that from the viewer.
+const GRAPH_DEFAULT: f32 = 156.0;
 const GRAPH_MIN: f32 = 120.0;
-/// Hint page bar: actions, tools and brush rows stay visible without scrolling.
-const HINT_TOOLS_H: f32 = 132.0;
+/// Narrow windows: the graph shrinks to this before the viewer does (the graph pans, the Hint image stays large).
+const GRAPH_MIN_NARROW: f32 = 88.0;
+/// Narrow windows open the graph short, so the viewer keeps its height (the graph pans; Fit keeps it clear of its button).
+const GRAPH_DEFAULT_NARROW: f32 = 148.0;
+/// Hint page bar: progress, marks and overlay on the left; the generate actions sit in the same panel on the right.
+const HINT_TOOLS_H: f32 = 160.0;
 const GRAPH_HEADER: f32 = 32.0;
 const MIN_VIEWER: f32 = 300.0;
 
@@ -52,6 +60,7 @@ impl Tab {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Node {
     Media,
+    PreMatte,
     Hint,
     Key,
     Out(View),
@@ -60,6 +69,7 @@ fn to_kind(n: Node) -> graph::NodeKind {
     use graph::{NodeKind as K, OutKind as O};
     match n {
         Node::Media => K::Media,
+        Node::PreMatte => K::PreMatte,
         Node::Hint => K::Hint,
         Node::Key => K::Key,
         Node::Out(View::Fg) => K::Out(O::Fg),
@@ -72,6 +82,7 @@ fn from_kind(k: graph::NodeKind) -> Node {
     use graph::{NodeKind as K, OutKind as O};
     match k {
         K::Media => Node::Media,
+        K::PreMatte => Node::PreMatte,
         K::Hint => Node::Hint,
         K::Key => Node::Key,
         K::Out(O::Fg) => Node::Out(View::Fg),
@@ -84,6 +95,7 @@ impl Node {
     fn title(self) -> &'static str {
         match self {
             Node::Media => "Media",
+            Node::PreMatte => "Pre-matte",
             Node::Hint => "Hint",
             Node::Key => "Key",
             Node::Out(v) => v.label(),
@@ -92,7 +104,7 @@ impl Node {
     fn tab(self) -> Tab {
         match self {
             Node::Media => Tab::Media,
-            Node::Hint => Tab::Hint,
+            Node::PreMatte | Node::Hint => Tab::Hint,
             Node::Key => Tab::Key,
             Node::Out(_) => Tab::Deliver,
         }
@@ -111,6 +123,10 @@ pub enum CloseState {
 
 #[derive(Default, Clone)]
 pub struct AppOptions {
+    pub start_background: bool,
+    pub instance_dir: Option<PathBuf>,
+    /// Shown as the first notice (startup problems the user must see).
+    pub startup_notice: Option<String>,
     pub project: Option<PathBuf>,
     pub global_output_dir: Option<PathBuf>,
     pub cache_mb: Option<usize>,
@@ -133,6 +149,10 @@ pub struct AppOptions {
     pub auto_confirm: bool,
     /// Preferences file; `None` = the user's default location. Tests point this at a temp file.
     pub settings_path: Option<PathBuf>,
+    /// Local CPU/RAM/GPU sampler: `Off` (default) starts nothing; the binary uses `Local`.
+    pub metrics: crate::metrics::Source,
+    /// Network client link: `Off` (default, what tests use) starts nothing; the binary uses `Local`.
+    pub net: crate::netlink::Source,
 }
 
 pub struct App {
@@ -159,17 +179,32 @@ pub struct App {
     inject_i: usize,
     inject_t: Instant,
     inject_reported: usize,
+    /// A secondary-click release still owed to egui: egui only counts a right click whose press it saw on an
+    /// earlier frame, so the press and the release go out on consecutive frames.
+    inject_release: Option<egui::Pos2>,
+    /// Frames to wait before the owed secondary release (see `inject_release`).
+    inject_release_wait: u8,
     inject_report: u8,
     /// Back clicked during this frame: applied after the workspace finishes rendering.
     back_requested: bool,
     back_rect: Option<egui::Rect>,
     header_rects: Vec<egui::Rect>,
+    /// Tools panel above the graph, its status (left) and action (right) regions from the last frame (layout tests).
+    tools_rects: Option<[egui::Rect; 3]>,
     imp: ImportUi,
     pending_reload: Option<PathBuf>,
     qa_import: Option<Sources>,
     picker: Picker,
     /// A finished dialog waits here until the Board is showing and no import is running.
     held_pick: Option<(PickKind, Vec<PathBuf>)>,
+    /// The last created-project reload was refused (old project kept): its "open the new clip" must not run.
+    reload_refused: bool,
+    /// File button and its New project item, from the last frame (menu tests; the item only while the menu is open).
+    new_menu_rects: [Option<egui::Rect>; 2],
+    /// File > New project: the chosen parent folder and the project name being typed.
+    new_project_draft: Option<(PathBuf, String)>,
+    new_project_error: Option<String>,
+    new_project_create_rect: Option<egui::Rect>,
     /// "Open clip settings" button rectangles from the last Board frame: top bar, then per-card (layout tests).
     open_rects: Vec<(Option<usize>, egui::Rect)>,
     /// Settings and Models pages replace the Board/workspace while open, which stay untouched underneath.
@@ -177,6 +212,21 @@ pub struct App {
     settings_open: bool,
     models: super::models::Page,
     models_open: bool,
+    /// Clients page (real machines, live state). Replaces Board/workspace while open, like Settings.
+    clients_open: bool,
+    /// One long-lived sampler for the whole session (see `metrics`); the footer and the local client card read it.
+    metrics: driver::Held<crate::metrics::Supervisor>,
+    metrics_wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    metrics_rect: Option<egui::Rect>,
+    remote: driver::Held<crate::remote::Remote>,
+    /// The runtime driver thread (set by `App::new`, the window path); `None` = this host ticks inline from `frame`.
+    driver: Option<driver::Driver>,
+    net_repo: Option<PathBuf>,
+    net_python: Option<PathBuf>,
+    clients_rect: Option<egui::Rect>,
+    /// Remote clients' reported telemetry by target id; filled by the network API once it exists, empty until then.
+    client_telemetry: std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>,
+    clients_back_rect: Option<egui::Rect>,
     settings_rect: Option<egui::Rect>,
     /// The Settings button was clicked this frame; handled once the screen has finished drawing.
     settings_requested: bool,
@@ -184,25 +234,58 @@ pub struct App {
     models_back_rect: Option<egui::Rect>,
     /// A clip an import asked to open while the page was showing.
     pending_open: Option<String>,
-    ai: AiUi,
+    ai: driver::Held<AiUi>,
     close: CloseState,
     /// The user chose Quit anyway, or all graceful work has stopped: a close request now goes through.
     close_force: bool,
+    /// Explicit Quit was chosen: closing really closes even in background mode.
+    pub(super) quitting: bool,
     close_rects: Vec<egui::Rect>,
     /// Output-location editor for the open project (Deliver tab).
     loc_note: Option<String>,
     /// (range, linear) whose save failed: not retried every frame, shown in the notice instead.
     persist_failed: Option<(Option<(usize, usize)>, bool)>,
     hint: hint::State,
+    /// Route/delivery edits of shots that could not be written when they were left (shown as unsaved).
+    hint_unsaved: std::collections::BTreeMap<String, hint::Unsaved>,
+    recent: project_shell::Recent,
+    /// Last explicit/implicit Save failure; the indicator stays Unsaved until a Save succeeds.
+    save_error: Option<String>,
+    /// Key-panel draft (params + output config) per clip: clips opened this load, what disk holds, and whether the open one differs.
+    draft_clips: BTreeSet<String>,
+    draft_saved: std::collections::BTreeMap<String, Value>,
+    draft_dirty: bool,
+    /// project.json `output_location` as last read or written (for the Unsaved indicator).
+    loc_saved: Option<Value>,
     ws: ws::WsState,
     media: media::MediaState,
     last_ctx: Option<egui::Context>,
+    /// Board thumbnails: decoded off the UI thread, kept per source frame.
+    thumbs: Option<super::thumbs::Thumbs>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, opts: AppOptions) -> Self {
+        let notice = opts.startup_notice.clone();
         let mut app = Self::with_ctx(&cc.egui_ctx, opts);
+        app.ai.notice = notice;
         app.models.start_background(&cc.egui_ctx);
+        // The window path runs scheduling, workers and the network client off the frame loop.
+        app.release_shared();
+        let parts = driver::Parts {
+            ai: app.ai.shared(),
+            remote: app.remote.shared(),
+            metrics: app.metrics.shared(),
+            repo: app.net_repo.clone(),
+            python: app.net_python.clone(),
+            ctx: cc.egui_ctx.clone(),
+        };
+        let first = driver::Snapshot { settings: app.settings.saved().clone(), path: app.settings.store_path().map(PathBuf::from) };
+        match driver::Driver::start(parts, first) {
+            Ok(d) => app.driver = Some(d),
+            Err(e) => app.ai.notice = Some(format!("The background driver could not start ({e}); work advances only while the window is drawn.")),
+        }
+        app.release_shared();
         app
     }
 
@@ -223,6 +306,7 @@ impl App {
         // Runtime resolution (descriptor / CK_REPO / checkout discovery) happens once here; import
         // and AI launching re-resolve on demand, never from a build-time path.
         let launch = crate::runtime::launch(opts.repo.as_deref());
+        let recent = project_shell::Recent::load(settings.store_path());
         let mut app = App {
             path_input: opts
                 .project
@@ -254,10 +338,13 @@ impl App {
             inject_i: 0,
             inject_t: Instant::now(),
             inject_reported: 0,
+            inject_release: None,
+            inject_release_wait: 1,
             inject_report: 0,
             back_requested: false,
             back_rect: None,
             header_rects: vec![],
+            tools_rects: None,
             imp: ImportUi::new(
                 opts.data_dir
                     .clone()
@@ -273,27 +360,53 @@ impl App {
             ),
             picker: Picker::new(dialogs),
             held_pick: None,
+            reload_refused: false,
+            new_menu_rects: [None; 2],
+            new_project_draft: None,
+            new_project_error: None,
+            new_project_create_rect: None,
             open_rects: vec![],
             settings,
             settings_open: false,
             models,
             models_open: false,
+            clients_open: false,
+            metrics: driver::Held::new(opts.metrics.supervisor(opts.repo.as_deref().or(launch.repo.as_deref()), launch.python.clone())),
+            metrics_wake: None,
+            metrics_rect: None,
+            remote: driver::Held::new(crate::remote::Remote::new(opts.net.clone())),
+            driver: None,
+            net_repo: opts.repo.clone().or(launch.repo.clone()),
+            net_python: launch.python.clone(),
+            clients_rect: None,
+            client_telemetry: Default::default(),
+            clients_back_rect: None,
             settings_rect: None,
             settings_requested: false,
             settings_back_rect: None,
             models_back_rect: None,
             pending_open: None,
-            ai: AiUi::new(&settings_saved, opts.repo.as_deref()),
+            ai: driver::Held::new(AiUi::new(&settings_saved, opts.repo.as_deref())),
             close: CloseState::None,
             close_force: false,
+            quitting: false,
             close_rects: vec![],
             loc_note: None,
             persist_failed: None,
             hint: Default::default(),
+            hint_unsaved: Default::default(),
+            recent,
+            save_error: None,
+            draft_clips: BTreeSet::new(),
+            draft_saved: Default::default(),
+            draft_dirty: false,
+            loc_saved: None,
             ws: Default::default(),
             media: Default::default(),
             last_ctx: None,
+            thumbs: None,
         };
+        app.ai.set_presets_file(crate::presets::file_beside(app.settings.store_path()));
         if opts.project.is_some() {
             app.load(ctx);
             if let (Some(name), Some(p)) = (&opts.open_clip, &app.project) {
@@ -335,16 +448,27 @@ impl App {
         let lo = LoadOptions {
             global_output_dir: self.opts.global_output_dir.clone(),
         };
+        let prev = self.project.as_ref().map(|p| p.root.clone());
         match load_project(&PathBuf::from(self.path_input.trim()), &lo) {
             Ok(p) => {
+                // Same-root reloads (import progress) keep unsaved drafts, their baselines and the location.
+                let switched = prev.as_ref() != Some(&p.root);
                 self.summaries = p.clips.iter().map(card_summary).collect();
                 self.project = Some(p);
                 self.load_error = None;
+                self.reload_refused = false;
+                if switched {
+                    self.save_error = None;
+                    self.forget_project_state();
+                    self.init_location();
+                }
+                self.record_recent();
             }
             Err(e) => {
                 self.summaries.clear();
                 self.project = None;
                 self.load_error = Some(e);
+                self.forget_project_state();
             }
         }
         // A reload of the same project keeps a waiting plan; switching projects forgets it (its "open
@@ -352,6 +476,14 @@ impl App {
         self.imp
             .project_changed(self.project.as_ref().map(|p| p.root.as_path()));
         ctx.request_repaint();
+    }
+
+    /// A different project is loading: nothing keyed by clip folder may carry over (same names, other project).
+    fn forget_project_state(&mut self) {
+        self.draft_clips.clear();
+        self.draft_saved.clear();
+        self.draft_dirty = false;
+        self.ai.forget_project();
     }
 
     fn folder_of(&self, i: usize) -> Option<String> {
@@ -427,6 +559,10 @@ impl App {
         if let Some(l) = saved.or_else(|| self.clip().and_then(crate::workflow::default_location)) {
             self.loc = l;
         }
+        self.mark_location_clean();
+        if let Some(c) = self.clip().cloned() {
+            self.adopt_draft(&c);
+        }
         self.tab = Tab::Media;
         self.node = Node::Media;
         self.focus_mode = false;
@@ -467,6 +603,8 @@ impl App {
 
     // ------------------------------------------------------------------ keyboard
     fn keys(&mut self, ctx: &egui::Context) {
+        self.shortcuts(ctx);
+        self.new_project_window(ctx);
         // A focused graph node is a button, not text entry: shortcuts (F, B, 1-5, Esc…) must keep working there.
         if ctx.egui_wants_keyboard_input() {
             return;
@@ -482,6 +620,12 @@ impl App {
             // The page owns the keyboard: no workspace shortcuts, Esc = Cancel.
             if pressed(Key::Escape) {
                 self.close_settings();
+            }
+            return;
+        }
+        if self.clients_open {
+            if pressed(Key::Escape) {
+                self.clients_open = false;
             }
             return;
         }
@@ -569,7 +713,7 @@ impl App {
     fn board(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         // Buttons stay off while an import runs or a dialog is already open (one at a time).
-        let busy = self.imp.busy() || self.picker.pending().is_some();
+        let busy = self.imp.busy() || self.dialog_active();
         let why = if self.picker.pending().is_some() {
             "A file dialog is open"
         } else if self.imp.busy_what().contains("running") {
@@ -581,32 +725,7 @@ impl App {
         self.open_rects.clear();
         let has_project = self.project.is_some();
         if !has_project {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| {
-                ui.heading("Bring in footage to start");
-                ui.label(
-                    RichText::new("Movies are copied into a new project and converted to EXR frames. Image sequences are used where they are. Your original files are never modified.")
-                        .color(DIM),
-                );
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 40.0).min(520.0);
-                    ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
-                    let big = |t: &str| egui::Button::new(RichText::new(t).size(16.0).strong()).min_size(Vec2::new(w / 3.0 - 6.0, 44.0));
-                    if ui.add_enabled(!busy, big("Import clips…")).on_disabled_hover_text(why).clicked() {
-                        want = Some(PickKind::Clips);
-                    }
-                    if ui.add_enabled(!busy, big("Import folder…")).on_disabled_hover_text(why).clicked() {
-                        want = Some(PickKind::Folder);
-                    }
-                    if ui.add_enabled(!busy, big("Open project…")).on_disabled_hover_text(why).clicked() {
-                        want = Some(PickKind::Project);
-                    }
-                });
-                ui.label(RichText::new("You can also drop movie files or folders onto this window.").color(DIM).size(12.0));
-                self.settings_button(ui);
-            });
-            ui.add_space(8.0);
+            self.welcome(ui, busy, why, &mut want);
         } else {
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -630,7 +749,6 @@ impl App {
                 {
                     want = Some(PickKind::Project);
                 }
-                self.settings_button(ui);
             });
         }
         if let Some(k) = want {
@@ -639,9 +757,6 @@ impl App {
         self.imp.ui(ui);
         if let Some(k) = self.imp.dest_pick_requested.take() {
             self.request_pick(&ctx, k);
-        }
-        if let Some(e) = &self.load_error {
-            ui.colored_label(Color32::from_rgb(235, 120, 120), e);
         }
         let Some(p) = &self.project else { return };
         let mut open_idx = None;
@@ -662,7 +777,7 @@ impl App {
         for n in &p.notes {
             ui.colored_label(WARN, n);
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let mut all = !p.clips.is_empty() && sel.len() == p.clips.len();
             if super::theme::checkbox(ui, &mut all, "All").changed() {
                 sel = if all {
@@ -680,7 +795,7 @@ impl App {
                     .and_then(|i| p.clips.get(*i))
                     .is_some_and(|c| matches!(self.imp.card_state(c), CardState::Idle));
             let r = ui
-                .add_enabled(ready, egui::Button::new("Open clip settings"))
+                .add_enabled(ready, egui::Button::new("Open clip"))
                 .on_disabled_hover_text(if one {
                     "This clip has no frames yet"
                 } else {
@@ -692,6 +807,9 @@ impl App {
             }
             let picks: Vec<usize> = sel.iter().copied().collect();
             self.ai.batch_ui(ui, p, self.settings.saved(), &picks);
+            ui.separator();
+            let chosen: Vec<&Clip> = picks.iter().filter_map(|i| p.clips.get(*i)).collect();
+            self.ai.assign_selected_ui(ui, &chosen);
         });
         if let Some(n) = self.ai.notice.clone() {
             ui.colored_label(WARN, n);
@@ -702,48 +820,81 @@ impl App {
         self.ai.batch_review(ui);
         self.ai.unresolved_ui(ui);
         ui.separator();
-        let total_w = ui.available_width();
-        let queue_w = if total_w > 900.0 { 230.0 } else { 0.0 };
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(
-                Vec2::new(total_w - queue_w - 36.0, ui.available_height()),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| {
-                            for (i, c) in p.clips.iter().enumerate() {
-                                // No overlay interaction on the frame: it would sit above the card's own buttons.
-                                egui::Frame::group(ui.style())
-                                    .inner_margin(8.0)
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        card(
-                                            ui,
-                                            i,
-                                            c,
-                                            &mut sel,
-                                            &mut open_idx,
-                                            self.imp.card_state(c),
-                                            &mut resume_idx,
-                                            self.summaries.get(i).map_or("", String::as_str),
-                                            &mut self.open_rects,
-                                        );
-                                    });
-                            }
-                        });
-                },
-            );
-            if queue_w > 0.0 {
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.set_width(queue_w);
-                    ui.label(RichText::new("Queue").strong());
-                    self.ai.queue_ui(ui);
-                    self.ai.history_ui(ui);
+        // Thumbnails decode in the background; the grid draws placeholders until a frame arrives.
+        if self.thumbs.is_none() {
+            self.thumbs = Some(super::thumbs::Thumbs::new(&ctx));
+        }
+        let all_clips: Vec<&Clip> = p.clips.iter().collect();
+        if let Some(t) = &mut self.thumbs {
+            t.request(&all_clips);
+            t.tick();
+        }
+        let local_view = self.metrics.view(std::time::Instant::now());
+        let active = self.active_gpus();
+        let mut queue_actions = vec![];
+        if ui.available_width() > 760.0 {
+            Panel::right("board_queue")
+                .resizable(true)
+                .default_size(540.0)
+                .min_size(340.0)
+                .max_size(900.0)
+                .show_separator_line(true)
+                .show(ui, |ui| {
+                    queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active, &self.client_telemetry);
                 });
-            }
-        });
+        } else {
+            Panel::bottom("board_queue_bottom").resizable(true).default_size(280.0).min_size(150.0).show(ui, |ui| { queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active, &self.client_telemetry); });
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                // Approved density: compact cards, five across when the queue panel leaves room.
+                let card_w = 220.0;
+                let gap = 10.0;
+                // Never more columns than clips, so a single clip gets a readable card instead of a stamp.
+                let fit = ((ui.available_width() + gap) / (card_w + gap)).floor().max(1.0) as usize;
+                let cols = fit.min(p.clips.len().max(1));
+                // A card never stretches past a readable width, even when the board holds one clip.
+                let w = ((ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32)
+                    .clamp(170.0, card_w);
+                let mut base = 0usize;
+                for row in p.clips.chunks(cols) {
+                    let first = base;
+                    base += row.len();
+                    ui.horizontal_top(|ui| {
+                        for (k, c) in row.iter().enumerate() {
+                            let i = first + k;
+                            let st = self.imp.card_state(c);
+                            // A cell is its own top-down layout: a group frame inside a horizontal row would
+                            // otherwise lay the card's lines out side by side.
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(w, 0.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    egui::Frame::group(ui.style()).inner_margin(8.0).show(
+                                        ui,
+                                        |ui| {
+                                            ui.set_width(w - 18.0);
+                                            board_card(
+                                                ui,
+                                                i,
+                                                c,
+                                                st,
+                                                &mut sel,
+                                                &mut open_idx,
+                                                &mut resume_idx,
+                                                self.thumbs.as_mut(),
+                                                &mut self.ai,
+                                                &mut self.open_rects,
+                                            );
+                                        },
+                                    );
+                                },
+                            );
+                        }
+                    });
+                }
+            });
         self.selected = sel;
         if let Some(i) = resume_idx {
             if let Some(c) = p.clips.get(i) {
@@ -754,6 +905,20 @@ impl App {
         if let Some(i) = open_idx {
             self.open_clip(&ctx, i);
         }
+        for action in queue_actions { self.net_action(action); }
+    }
+
+    fn batch_queue(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote::Remote, local: &crate::metrics::View, active: &[u32], telemetry: &std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>) -> Vec<crate::remote::Action> {
+        ui.heading("Queue");
+        let mut actions = vec![];
+        egui::ScrollArea::vertical().id_salt("batch_work_queue").auto_shrink([false; 2]).show(ui, |ui| {
+            actions = remote.queue_ui(ui);
+            if !ai.queue_view().is_empty() || !remote.has_queue() {
+                ai.queue_ui(ui, local, active, telemetry);
+            }
+            egui::CollapsingHeader::new("Earlier local tasks").show(ui, |ui| ai.history_ui(ui));
+        });
+        actions
     }
 
     // ------------------------------------------------------------------ workspace
@@ -764,12 +929,12 @@ impl App {
         if self.open.is_none() {
             return;
         }
-        if narrow && !self.props_sheet {
+        if narrow && !self.props_sheet && !matches!(self.tab, Tab::Key | Tab::Deliver) {
             self.ai_watch(&ctx);
         }
 
         let mut hr: Vec<egui::Rect> = vec![];
-        Panel::top("header").show(ui, |ui| {
+        Panel::top("header").frame(egui::Frame::new().fill(theme::CARD).inner_margin(8)).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let back = ui.button("‹ Back to batch").on_hover_text("B");
                 hr.push(back.rect);
@@ -825,31 +990,42 @@ impl App {
                 .exact_size(if narrow { 36.0 } else { 26.0 })
                 .show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
-                        // Fixed-height bar: room for the global button without costing viewer height.
-                        self.settings_button(ui);
-                        if narrow && ui.button("Key clip").clicked() {
-                            self.ai_quick_submit();
-                        }
+                        // Fixed-height bar: room for the global buttons without costing viewer height.
                         self.ai_bar_status(ui);
                     });
                 });
+            if !narrow || self.props_sheet {
+                Panel::right("props")
+                    .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(14).stroke(egui::Stroke::new(1.0, Color32::from_rgb(96, 120, 104))))
+                    .default_size(380.0)
+                    .min_size(300.0)
+                    .max_size(520.0)
+                    .show_separator_line(true)
+                    .resizable(true)
+                    .show(ui, |ui| self.properties(ui));
+            }
             // Resizable graph panel; its max keeps the viewer at least MIN_VIEWER px tall (Hint image stays large).
-            let tools_h = match (self.tab, narrow) {
-                (Tab::Hint, false) => HINT_TOOLS_H,
-                // Narrow: the viewer keeps its height; the action row is first, the rest scrolls.
-                (Tab::Hint, true) => 100.0,
+            let actions = self.clip().is_some_and(|c| matches!(self.tab, Tab::Hint | Tab::Key | Tab::Deliver) || self.tab == Tab::Media && self.media_has_actions(c));
+            let tools_h = match (actions, narrow) {
+                (true, false) => HINT_TOOLS_H,
+                // Narrow: the viewer keeps its height; the action group is first, the status scrolls below it.
+                (true, true) => 96.0,
                 _ => 78.0,
             };
-            let max_h = (ui.available_height() - 34.0 - 26.0 - tools_h - MIN_VIEWER).max(GRAPH_MIN);
+            let graph_min = if narrow { GRAPH_MIN_NARROW } else { GRAPH_MIN };
+            let max_h = (ui.available_height() - 34.0 - 26.0 - tools_h - MIN_VIEWER).max(graph_min);
             if self.graph_collapsed {
                 Panel::bottom("graph_collapsed")
+                    .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(8))
                     .exact_size(GRAPH_HEADER)
                     .show(ui, |ui| self.graph_header(ui));
             } else {
-                Panel::bottom("graph")
+                // Separate ids: each mode keeps its own dragged height (a narrow window must not inherit a wide one's).
+                Panel::bottom(if narrow { "graph_narrow" } else { "graph" })
+                    .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(10).stroke(egui::Stroke::new(1.0, Color32::from_rgb(69, 91, 76))))
                     .resizable(true)
-                    .default_size(GRAPH_DEFAULT)
-                    .min_size(GRAPH_MIN)
+                    .default_size(if narrow { GRAPH_DEFAULT_NARROW } else { GRAPH_DEFAULT })
+                    .min_size(graph_min)
                     .max_size(max_h)
                     .show(ui, |ui| {
                         self.graph_header(ui);
@@ -857,30 +1033,99 @@ impl App {
                         self.graph(ui, h);
                     });
             }
-            Panel::bottom("pagetools")
-                .exact_size(tools_h)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| self.page_tools(ui));
-                });
-            if !narrow || self.props_sheet {
-                Panel::right("props")
-                    .default_size(310.0)
-                    .min_size(240.0)
-                    .resizable(true)
-                    .show(ui, |ui| self.properties(ui));
-            }
+            Panel::bottom(if narrow { "pagetools_narrow" } else { "pagetools" })
+                .frame(egui::Frame::new().fill(theme::CARD).inner_margin(12).stroke(egui::Stroke::new(1.0, Color32::from_rgb(83, 103, 90))))
+                .resizable(true)
+                .default_size(tools_h)
+                .min_size(64.0)
+                .max_size((ui.available_height() - MIN_VIEWER).max(64.0))
+                .show_separator_line(true)
+                .show(ui, |ui| self.tools_row(ui, actions, narrow));
         }
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(v) = &mut self.viewer {
-                // Keep repainting while playing: with all frames cached no decode completes to wake the UI.
-                if v.tick() {
-                    ctx.request_repaint();
+            // The Hint page's tools sit beside the viewer, not above it: a narrow icon column on the left.
+            ui.horizontal_top(|ui| {
+                self.hint_tool_strip(ui);
+                if let Some(v) = &mut self.viewer {
+                    // Keep repainting while playing: with all frames cached no decode completes to wake the UI.
+                    if v.tick() {
+                        ctx.request_repaint();
+                    }
+                    // The viewer fills what the strip left; a plain call inside a horizontal row would get the
+                    // row's remaining width but no height.
+                    let size = ui.available_size();
+                    ui.allocate_ui_with_layout(
+                        size,
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| v.ui(ui),
+                    );
                 }
-                v.ui(ui);
-            }
+            });
         });
+    }
+
+    /// The one panel above the graph: page status (progress, marks, overlay) on the left, a vertical divider,
+    /// and the centered primary action group on the right. Narrow windows stack the two inside the same panel.
+    fn tools_row(&mut self, ui: &mut Ui, actions: bool, narrow: bool) {
+        let full = ui.available_rect_before_wrap();
+        let scroll = |id: &'static str| egui::ScrollArea::vertical().id_salt(id).auto_shrink([false; 2]);
+        if !actions || narrow {
+            self.tools_rects = Some([full, full, full]);
+            scroll("page_scroll").show(ui, |ui| {
+                if actions {
+                    self.action_bar(ui, false);
+                    ui.separator();
+                }
+                self.page_tools(ui);
+            });
+            return;
+        }
+        let mid = full.min.x + full.width() * 0.34;
+        let left = egui::Rect::from_min_max(full.min, egui::pos2(mid - 6.0, full.max.y));
+        let right = egui::Rect::from_min_max(egui::pos2(mid + 6.0, full.min.y), full.max);
+        self.tools_rects = Some([full, left, right]);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
+            scroll("page_scroll").show(ui, |ui| self.page_tools(ui));
+        });
+        ui.painter().vline(mid, full.y_range(), ui.visuals().widgets.noninteractive.bg_stroke);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| self.action_bar(ui, true));
+    }
+
+    /// The page's processing actions (Generate / Key / Render / Export) in one centered group of sensible width.
+    fn action_bar(&mut self, ui: &mut Ui, scroll: bool) {
+        let Some(clip) = self.clip().cloned() else {
+            return;
+        };
+        let w = ui.available_width().min(if self.tab == Tab::Hint { 760.0 } else { 520.0 });
+        let pad = ((ui.available_width() - w) / 2.0).max(0.0);
+        ui.horizontal_top(|ui| {
+            ui.add_space(pad);
+            ui.allocate_ui_with_layout(
+                egui::vec2(w, if scroll { ui.available_height() } else { 0.0 }),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    if scroll {
+                        egui::ScrollArea::vertical()
+                            .id_salt("action_scroll")
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| self.action_body(ui, &clip));
+                    } else {
+                        self.action_body(ui, &clip);
+                    }
+                },
+            );
+        });
+    }
+
+    fn action_body(&mut self, ui: &mut Ui, clip: &Clip) {
+        let video = self.hint.deliveries_has_video();
+        match self.tab {
+            Tab::Media => self.media_actions(ui, clip),
+            Tab::Hint => self.hint_actions(ui, clip),
+            Tab::Deliver if video => self.deliver_action(ui, clip),
+            Tab::Key => self.key_actions(ui, clip, "Key clip"),
+            _ => self.key_actions(ui, clip, "Render image sequences"),
+        }
     }
 
     fn graph_header(&mut self, ui: &mut Ui) {
@@ -906,18 +1151,26 @@ impl App {
         let (Some(clip), Some(v)) = (self.clip().cloned(), self.viewer.as_ref()) else {
             return;
         };
+        let mut cfg = self.hint_cfg_for(&clip);
+        let pending: Vec<Node> = [Node::PreMatte, Node::Hint, Node::Key, Node::Out(View::Fg), Node::Out(View::Matte), Node::Out(View::Comp), Node::Out(View::Processed)].into_iter().filter(|n| self.stage_pending(*n)).collect();
         let badge = |n: Node| -> String {
+            if pending.contains(&n) { return "Update required".to_string(); }
             match n {
                 Node::Media => format!(
                     "{} · {} fr",
                     if v.linear { "Linear" } else { "sRGB" },
                     clip.input_files.len()
                 ),
+                Node::PreMatte => {
+                    // Direct: the pre-matte is the hint itself, otherwise it is the refiner's guide.
+                    let n = if cfg.finish == Final::Direct { clip.alpha_frames } else { clip.mask_frames };
+                    if n > 0 { format!("Pre-matte · {n} frames") } else { "Pre-matte · none yet".into() }
+                }
                 Node::Hint => {
                     if clip.alpha_frames > 0 {
-                        format!("{} hint frames", clip.alpha_frames)
+                        format!("Hint · {} frames", clip.alpha_frames)
                     } else {
-                        "No hint yet".into()
+                        "Hint · none yet".into()
                     }
                 }
                 Node::Key => clip
@@ -938,14 +1191,28 @@ impl App {
             }
         };
         let dashed = |n: Node| match n {
+            Node::PreMatte => (if cfg.finish == Final::Direct { clip.alpha_frames } else { clip.mask_frames }) == 0,
             Node::Hint => clip.alpha_frames == 0,
             Node::Out(view) => v.index.view_frames(view) == 0,
             _ => false,
         };
+        let ctx = ui.ctx().clone();
+        // What Key will actually read: the graph must not show a hint edge into Key that Key ignores.
+        let hint_consumed = match &self.project {
+            Some(p) => self
+                .ai
+                .draft(&clip, p, self.settings.saved())
+                .params
+                .hint_mode
+                != "none",
+            None => false,
+        };
+        let menu = self.node_menu(&clip, &cfg);
         let (g, gv) = self
             .graphs
             .entry(clip.folder.clone())
-            .or_insert_with(|| (graph::Graph::corridorkey(), graph::View::default()));
+            .or_insert_with(|| (graph::Graph::new(), graph::View::default()));
+        g.sync(&cfg, hint_consumed);
         let ev = graph::show(
             ui,
             g,
@@ -955,10 +1222,24 @@ impl App {
                 badge: badge(from_kind(k)),
                 dimmed: false,
                 dashed: dashed(from_kind(k)),
+                actions: menu
+                    .iter()
+                    .find(|(n, _, _)| *n == from_kind(k))
+                    .map(|(_, _, a)| a.clone())
+                    .unwrap_or_default(),
+                note: menu
+                    .iter()
+                    .find(|(n, _, _)| *n == from_kind(k))
+                    .and_then(|(_, note, _)| note.clone()),
             },
             height,
         );
         match ev {
+            Some(graph::Event::Connect(c)) => {
+                if g.rewire(&mut cfg, c) {
+                    self.hint_set_cfg(&clip, cfg);
+                }
+            }
             Some(graph::Event::Select(k)) => self.node = from_kind(k),
             Some(graph::Event::Open(k)) => {
                 // Same path as clicking the tab, so the viewer's default view follows too.
@@ -967,7 +1248,122 @@ impl App {
                 self.switch_tab(n.tab());
                 self.node = n;
             }
+            Some(graph::Event::Menu(k, a)) => self.node_action(&ctx, &clip, from_kind(k), a),
             None => {}
+        }
+    }
+
+    /// Context-menu entries per node, built from what this build can actually do. A format is named only when
+    /// the worker writes it (hints/guides are 8-bit PNG; Key products are EXR/PNG by their output setting).
+    #[allow(clippy::type_complexity)]
+    fn node_menu(
+        &self,
+        clip: &Clip,
+        cfg: &crate::hints::HintCfg,
+    ) -> Vec<(Node, Option<String>, Vec<(graph::Action, String, bool)>)> {
+        let local = self.ai.local_caps();
+        let ready = |k: crate::tasks::TaskKind| {
+            local
+                .as_ref()
+                .is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false))
+        };
+        let busy = self.ai.task_busy(&clip.folder);
+        let guide_ok = !cfg.bypass && !busy && ready(cfg.guide.task());
+        let fin_ok = !cfg.bypass
+            && !busy
+            && cfg
+                .finish
+                .task()
+                .map_or(cfg.finish == Final::Direct && guide_ok, ready);
+        let mut out = vec![];
+        for node in [Node::Media, Node::PreMatte, Node::Hint, Node::Key] {
+            let (note, actions): (Option<String>, Vec<(graph::Action, String, bool)>) = match node {
+                Node::Media => {
+                    let missing = matches!(clip.source, Source::Missing) || clip.error.is_some();
+                    (
+                        None,
+                        vec![
+                            (graph::Action::Open, "Open Media".into(), true),
+                            (
+                                graph::Action::Relink,
+                                "Relink missing footage…".into(),
+                                missing,
+                            ),
+                        ],
+                    )
+                }
+                Node::PreMatte => (
+                    Some("Pre-matte frames are written to VideoMamaMaskHint as 8-bit PNG.".into()),
+                    vec![
+                        (graph::Action::Open, "Open Pre-matte".into(), true),
+                        (
+                            graph::Action::GenerateRange,
+                            format!("Generate {} over In/Out", cfg.guide.label()),
+                            guide_ok,
+                        ),
+                        (
+                            graph::Action::GenerateMarks,
+                            "Generate on marked frames".into(),
+                            guide_ok,
+                        ),
+                    ],
+                ),
+                Node::Hint => (
+                    Some(
+                        "Hint frames are written to AlphaHint as 8-bit PNG (no EXR hint output)."
+                            .into(),
+                    ),
+                    vec![
+                        (graph::Action::Open, "Open Hint".into(), true),
+                        (
+                            graph::Action::GenerateRange,
+                            format!("Generate {} hint over In/Out", cfg.finish.label()),
+                            fin_ok,
+                        ),
+                        (
+                            graph::Action::GenerateMarks,
+                            "Generate on marked frames".into(),
+                            fin_ok,
+                        ),
+                    ],
+                ),
+                _ => (
+                    Some("Key reads the hint; results are EXR/PNG image sequences per Deliver.".into()),
+                    vec![(graph::Action::Open, "Open Key".into(), true)],
+                ),
+            };
+            out.push((node, note, actions));
+        }
+        out
+    }
+
+    /// Apply a node context action through the same paths the pages use (no shortcut around the gate).
+    fn node_action(
+        &mut self,
+        ctx: &egui::Context,
+        clip: &Clip,
+        node: Node,
+        action: graph::Action,
+    ) {
+        match action {
+            graph::Action::Open => {
+                self.node = node;
+                self.switch_tab(node.tab());
+                self.node = node;
+            }
+            graph::Action::Relink => {
+                let _ = self.request_pick(ctx, PickKind::Relink);
+            }
+            graph::Action::GenerateRange | graph::Action::GenerateMarks => {
+                // The same validated path the Hint page uses: settings are saved, In/Out is respected, and a
+                // refusal is reported instead of silently starting nothing.
+                let marks = action == graph::Action::GenerateMarks;
+                self.node = node;
+                self.tab = Tab::Hint;
+                let pre_matte = node == Node::PreMatte;
+                self.hint_run_from_graph(pre_matte, marks);
+                let _ = clip;
+            }
         }
     }
 
@@ -975,7 +1371,7 @@ impl App {
         let (Some(clip), Some(v)) = (self.clip().cloned(), self.viewer.as_ref()) else {
             return;
         };
-        let (v_linear, v_len, v_range, v_range_text) =
+        let (_v_linear, v_len, v_range, v_range_text) =
             (v.linear, v.index.len(), v.range, v.range_text());
         let v_view_frames: Vec<(View, usize)> =
             [View::Fg, View::Matte, View::Comp, View::Processed]
@@ -984,33 +1380,17 @@ impl App {
                 .collect();
         match self.tab {
             Tab::Media => {
-                ui.label(format!(
-                    "Source: {}",
-                    match &clip.source {
-                        Source::Sequence { dir, external } => format!(
-                            "{} frames in {}{}",
-                            clip.input_files.len(),
-                            dir.display(),
-                            if *external {
-                                " (external, not copied)"
-                            } else {
-                                ""
-                            }
-                        ),
-                        Source::Video { path } => format!(
-                            "video {} — native movie decode not integrated yet (staged)",
-                            path.display()
-                        ),
-                        Source::Missing => "no source found".into(),
-                    }
-                ));
-                if matches!(clip.source, Source::Missing) || clip.error.is_some() {
-                    if ui.button("Relink missing footage…").on_hover_text("Choose the folder the image sequence now lives in; its frames must match the stored identity").clicked() {
+                self.media_details(ui, &clip);
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if (matches!(clip.source, Source::Missing) || clip.error.is_some())
+                        && ui.button("Relink missing footage…").on_hover_text("Choose the folder the image sequence now lives in; its frames must match the stored identity").clicked()
+                    {
                         let ctx = ui.ctx().clone();
                         self.request_pick(&ctx, PickKind::Relink);
                     }
-                }
-                ui.label(format!("Input colour: {} ({}). Change it in Properties > Media (saved in the project).", if v_linear { "Linear" } else { "sRGB" }, color_origin_text(&clip)));
+                    ui.label(RichText::new("Input colour and companion imports are in Properties (right).").color(DIM).size(11.5));
+                });
             }
             Tab::Hint => {
                 self.hint_tools(ui, &clip);
@@ -1021,7 +1401,7 @@ impl App {
                     "Key will process {} of {} frames. {}",
                     n, v_len, v_range_text
                 ));
-                ui.label(RichText::new("Set options in Properties, then press Key clip (summary, blockers and target are in the Properties footer).").color(DIM).size(12.0));
+                ui.label(RichText::new("Set options in Properties (right). Key clip, Resume and Replace are in the action area on the right; drag the panel edge to resize.").color(DIM).size(12.0));
             }
             Tab::Review => {
                 ui.label("Playback of files already on disk. Missing frames show “No file on disk”; frames outside In/Out show “Outside In/Out”.");
@@ -1038,7 +1418,7 @@ impl App {
                         .as_ref()
                         .map_or("unknown".into(), |p| p.display().to_string())
                 ));
-                ui.label(RichText::new("Video export, presets and the output location are in Properties (right), export first.").color(DIM).size(12.0));
+                ui.label(RichText::new("Choose image sequence or video settings in Properties (right); render or export in the action area on the right.").color(DIM).size(12.0));
                 ui.label(RichText::new(format!("Resolved from: {} · Legacy layout <output>/FG|Matte|Comp|Processed/<stem>.<ext>", clip.output_dir_note)).color(DIM).size(12.0));
             }
         }
@@ -1052,22 +1432,39 @@ impl App {
             };
             (c.clone(), p.session_output_config.clone(), self.node)
         };
-        ui.heading(format!("Properties: {}", node.title()));
-        // Pinned footer first so it keeps its space.
-        // The Key footer (summary, target, Key button) belongs to the Key page only; Media, Hint, Review and Deliver
-        // need the panel's height for their own controls.
-        if self.tab == Tab::Key {
-            Panel::bottom("props_footer")
-                .show_separator_line(true)
-                .show(ui, |ui| {
-                    self.key_footer(ui, &clip);
-                });
-        }
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            // Deliver: the video export is the primary action, first and always visible, whichever node is selected.
+        // Deliver is one page with two halves, so it is titled as the page, not as the product node.
+        ui.heading(format!(
+            "Properties: {}",
             if self.tab == Tab::Deliver {
-                self.export_ui(ui, &clip);
+                "Deliver"
+            } else {
+                node.title()
+            }
+        ));
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            if self.tab == Tab::Key {
+                theme::section(ui, "Render client", |ui| self.ai.render_client_ui(ui, &clip));
+                egui::CollapsingHeader::new("Worker details").show(ui, |ui| self.ai.worker_controls(ui));
+                ui.add_space(8.0);
+            }
+            if self.tab == Tab::Deliver {
+                self.preset_ui(ui, &clip);
                 ui.separator();
+                self.deliver_ui(ui, &clip);
+                ui.separator();
+                self.ai.render_client_ui(ui, &clip);
+                ui.separator();
+                // Everything about *where* and *how* is behind folds: it is settings, not the action.
+                egui::CollapsingHeader::new("Output folder & templates")
+                    .default_open(false)
+                    .show(ui, |ui| self.location_preview(ui, &clip));
+                egui::CollapsingHeader::new("How the files are written")
+                    .default_open(false)
+                    .show(ui, |ui| self.output_details(ui, &clip));
+                egui::CollapsingHeader::new("Workers")
+                    .default_open(false)
+                    .show(ui, |ui| self.ai.worker_controls(ui));
+                return;
             }
             match node {
             Node::Media => {
@@ -1096,17 +1493,23 @@ impl App {
                     ui.colored_label(WARN, "Saving the new colour interpretation…");
                 }
                 self.media_props(ui, &clip);
+                self.media_paths(ui, &clip);
             }
-            Node::Hint => {
+            Node::PreMatte | Node::Hint => {
                 kv(ui, "Hint frames", &clip.alpha_frames.to_string());
                 kv(ui, "Mask hint frames", &clip.mask_frames.to_string());
                 kv(ui, "Keyframe marks", &if clip.keyframes.is_empty() { "none".into() } else { format!("{:?}", clip.keyframes) });
                 ui.separator();
                 self.hint_props(ui, &clip);
                 ui.separator();
-                if let Some(p) = &self.project {
-                    self.ai.hint_controls(ui, &clip, p, self.settings.saved());
+                let saved = self
+                    .project
+                    .as_ref()
+                    .is_some_and(|p| self.ai.hint_controls(ui, &clip, p, self.settings.saved()));
+                if saved {
+                    self.refresh_clip(&ui.ctx().clone(), &clip.folder);
                 }
+                self.hint_cleanup_props(ui, &clip);
             }
             Node::Key => {
                 if let Some(p) = &self.project {
@@ -1119,7 +1522,7 @@ impl App {
                     self.ai.output_controls(ui, &clip, p, st, None);
                 }
                 ui.separator();
-                self.preset_ui(ui, &clip, false);
+                self.preset_ui(ui, &clip);
                 if let Some(m) = &clip.manifest {
                     ui.separator();
                     ui.label(RichText::new("Last run (manifest)").strong());
@@ -1174,6 +1577,44 @@ impl App {
             }
             }
         });
+    }
+
+    /// Deliver's second fold: the parts of a sequence run that are explanation, not action.
+    fn output_details(&mut self, ui: &mut Ui, clip: &Clip) {
+        ui.label(
+            RichText::new("Key writes each product as its own EXR/PNG sequence into the output folder. Existing results are kept unless you explicitly confirm Replace.")
+                .color(DIM)
+                .size(12.0),
+        );
+        if let Some(m) = &clip.manifest {
+            kv(ui, "Last run engine", &m.engine);
+            kv(ui, "Complete", &m.complete.to_string());
+            if m.raw.get("exr_lossy").and_then(Value::as_bool) == Some(true) {
+                kv(
+                    ui,
+                    "EXR",
+                    &format!(
+                        "lossy {} ({})",
+                        m.exr_compression.as_deref().unwrap_or("?"),
+                        m.raw
+                            .get("exr_pixel_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                    ),
+                );
+            }
+        }
+        if let Some(r) = clip.result_range_text() {
+            kv(ui, "Result covers", &r);
+        }
+        kv(
+            ui,
+            "Output folder",
+            &clip
+                .output_dir
+                .as_ref()
+                .map_or("unknown".into(), |d| d.display().to_string()),
+        );
     }
 
     /// Output location editor: templates are saved to `project.json` and used by every Key job of this project.
@@ -1233,10 +1674,28 @@ impl App {
             .first()
             .map(|k| resolve_path(&self.loc, &vals, k.0, kinds.len(), frame, k.1))
         {
-            Some(Ok(p)) => ui.label(RichText::new(display(&p)).monospace().size(12.0)),
-            Some(Err(e)) => ui.colored_label(Color32::from_rgb(225, 110, 110), format!("{e:?}")),
-            None => ui.colored_label(WARN, "No output enabled"),
-        };
+            Some(Ok(p)) => {
+                let text = display(&p);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Resolves to").color(DIM).size(11.5));
+                    ui.add(
+                        egui::Label::new(RichText::new(&text).monospace().size(11.0))
+                            .truncate(),
+                    )
+                    .on_hover_text(&text);
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                });
+            }
+
+            Some(Err(e)) => {
+                ui.colored_label(Color32::from_rgb(225, 110, 110), format!("{e:?}"));
+            }
+            None => {
+                ui.colored_label(WARN, "No output enabled");
+            }
+        }
         ui.label(RichText::new("{resolution} is a label only; nothing is resized. All machines write to this same storage.").color(DIM).size(12.0));
         let root_dir = self.project.as_ref().map(|p| p.root.clone());
         ui.horizontal_wrapped(|ui| {
@@ -1300,12 +1759,13 @@ impl App {
         }
     }
 
-    fn key_footer(&mut self, ui: &mut Ui, clip: &Clip) {
+    fn key_actions(&mut self, ui: &mut Ui, clip: &Clip, action: &str) {
         let range = self.ai_open_range();
         let lin = self.viewer.as_ref().is_some_and(|v| v.linear);
         if let Some(p) = &self.project {
-            self.ai
-                .key_panel(ui, clip, p, self.settings.saved(), range, lin);
+            theme::section(ui, "Keying", |ui| {
+                self.ai.key_panel(ui, clip, p, self.settings.saved(), range, lin, action);
+            });
         }
     }
 
@@ -1320,18 +1780,6 @@ impl App {
         };
         self.ai
             .watch_gate(ctx, &p.clips[i], p, self.settings.saved(), range, lin);
-    }
-
-    /// Narrow-layout "Key clip": queues the job the gate froze for the current range.
-    fn ai_quick_submit(&mut self) {
-        let Some(c) = self.clip().cloned() else {
-            return;
-        };
-        self.ai.notice = self
-            .ai
-            .submit_current(&c, crate::workflow::Intent::New)
-            .err()
-            .map(|e| format!("Not queued: {e}"));
     }
 
     fn ai_bar_status(&mut self, ui: &mut Ui) {
@@ -1403,7 +1851,9 @@ impl App {
 
     /// Poll the scheduler; re-read the LOCAL manifest of any clip a job published to or finished.
     fn ai_tick(&mut self, ctx: &egui::Context) {
-        for r in self.ai.tick() {
+        // With the driver running, scheduling already happened off-frame: the UI only adopts its results.
+        let due = if self.driver.is_some() { self.ai.take_refreshes() } else { self.ai.tick() };
+        for r in due {
             self.refresh_clip(ctx, &r.folder);
         }
         if self.ai.active() {
@@ -1413,10 +1863,21 @@ impl App {
 
     /// Active work cancels the close request; graceful stop keeps the window updating until it exits.
     fn close_tick(&mut self, ctx: &egui::Context) {
+        // Hiding also works on compositors without minimize support; relaunch restores this window.
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.close_force
+            && !self.quitting
+            && self.close == CloseState::None
+            && self.settings.saved().interface.background
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_force {
             let (jobs, alive, models) = (
                 self.ai.running_jobs(),
-                self.ai.workers_alive(),
+                self.ai.workers_alive() || !self.remote.quiescent(),
                 self.models.busy(),
             );
             if jobs || alive || models {
@@ -1426,12 +1887,13 @@ impl App {
                         self.close = CloseState::Prompt;
                     } else {
                         self.ai.begin_stop(); // only idle workers: no question to ask
+                        self.remote.shutdown_requested();
                         self.close = CloseState::Stopping;
                     }
                 }
             }
         }
-        if self.close == CloseState::Stopping && self.ai.all_stopped() && !self.models.busy() {
+        if self.close == CloseState::Stopping && self.ai.all_stopped() && self.remote.quiescent() && !self.models.busy() {
             self.close_force = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1465,6 +1927,7 @@ impl App {
                         stop = a.clicked();
                         if b.clicked() {
                             next = CloseState::None;
+                            self.quitting = false;
                         }
                         quit = c.clicked();
                     });
@@ -1489,6 +1952,7 @@ impl App {
                 self.models.stop_for_close(ctx);
             }
             self.ai.begin_stop();
+            self.remote.shutdown_requested();
             next = CloseState::Stopping;
         }
         self.close = next;
@@ -1590,83 +2054,203 @@ fn card_summary(c: &Clip) -> String {
     )
 }
 
+/// One Board card: thumbnail, name/state, the compact facts, and the clip's own render client.
 #[allow(clippy::too_many_arguments)]
-fn card(
+fn board_card(
     ui: &mut Ui,
     i: usize,
     c: &Clip,
+    st: CardState,
     sel: &mut BTreeSet<usize>,
     open: &mut Option<usize>,
-    st: CardState,
     resume: &mut Option<usize>,
-    summary: &str,
+    mut thumbs: Option<&mut super::thumbs::Thumbs>,
+    ai: &mut AiUi,
     open_rects: &mut Vec<(Option<usize>, egui::Rect)>,
 ) {
-    ui.horizontal(|ui| {
-        let mut on = sel.contains(&i);
-        if super::theme::checkbox(ui, &mut on, "").changed() {
-            if on {
+    let idle = matches!(st, CardState::Idle);
+    let mut on = sel.contains(&i);
+    let thumb_h = ((ui.available_width()) * 9.0 / 16.0).clamp(56.0, 118.0);
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .corner_radius(4.0)
+        .show(ui, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), thumb_h),
+                Sense::click(),
+            );
+            let tex = match thumbs.as_mut() {
+                Some(t) => t.texture(ui.ctx(), c),
+                None => None,
+            };
+            if let Some(t) = tex {
+                let img = t.size_vec2();
+                let scale = (rect.width() / img.x).min(rect.height() / img.y);
+                let size = img * scale;
+                let r = egui::Rect::from_center_size(rect.center(), size);
+                ui.painter().image(
+                    t.id(),
+                    r,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            } else {
+                let why = thumbs
+                    .as_deref()
+                    .and_then(|t| t.failed(c))
+                    .map_or_else(
+                        || {
+                            if idle {
+                                "decoding thumbnail…".to_string()
+                            } else {
+                                "no frames yet".to_string()
+                            }
+                        },
+                        |e| format!("first frame unreadable: {e}"),
+                    );
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    why,
+                    egui::FontId::proportional(11.0),
+                    DIM,
+                );
+            }
+            if idle && resp.double_clicked() {
+                *open = Some(i);
+            }
+        });
+    ui.horizontal_wrapped(|ui| {
+        let mut on_box = on;
+        if super::theme::checkbox(ui, &mut on_box, "").changed() {
+            if on_box {
                 sel.insert(i);
             } else {
                 sel.remove(&i);
             }
+            on = on_box;
         }
-        let idle = matches!(st, CardState::Idle);
-        let name = ui.add(
-            egui::Label::new(RichText::new(&c.display_name).strong().size(15.0))
-                .sense(Sense::click()),
+        ui.add(egui::Label::new(RichText::new(&c.display_name).strong().size(13.0)).truncate())
+            .on_hover_text(&c.display_name);
+        ui.label(
+            RichText::new(c.state.label())
+                .color(Color32::from_rgb(150, 190, 150))
+                .size(11.0),
         );
-        if idle && name.on_hover_text("Double-click to open").double_clicked() {
-            *open = Some(i);
-        }
-        ui.label(RichText::new(c.state.label()).color(Color32::from_rgb(150, 190, 150)));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let r = ui
-                .add_enabled(idle, egui::Button::new("Open clip settings"))
-                .on_disabled_hover_text("Frames are not ready yet");
-            open_rects.push((Some(i), r.rect));
-            if r.clicked() {
-                *open = Some(i);
-            }
-            if matches!(st, CardState::NeedsFrames | CardState::Failed(_))
-                && ui.button("Resume extraction").clicked()
-            {
-                *resume = Some(i);
-            }
-        });
     });
     match &st {
         CardState::Busy(t, f) => {
             ui.add(egui::ProgressBar::new(*f).text(t.as_str()));
         }
         CardState::Waiting => {
-            ui.label(RichText::new("Waiting for its turn to extract…").color(WARN));
+            ui.label(RichText::new("Waiting for its turn to extract…").size(11.0).color(WARN));
         }
         CardState::Failed(m) => {
             ui.colored_label(
                 Color32::from_rgb(235, 120, 120),
-                format!("Extraction failed: {m}"),
+                RichText::new(format!("Extraction failed: {m}")).size(11.0),
             );
         }
         CardState::NeedsFrames => {
-            ui.label(RichText::new("Frames not extracted yet (import stopped or failed). The source movie is safe in this clip's Source folder.").color(WARN));
+            ui.label(RichText::new("Frames not extracted yet. The source movie is safe in this clip's Source folder.").size(11.0).color(WARN));
         }
         CardState::Idle => {}
     }
-    if !matches!(st, CardState::Idle) {
-        // No frames yet: readiness/range/fps lines would be misleading placeholders.
-        return;
+    if matches!(st, CardState::Idle) {
+        let facts = match c.sample_size {
+            Some((w, h)) => format!("{}×{} · {:.0} fps · {} fr", w, h, c.fps, c.input_files.len()),
+            None => format!("{:.0} fps · {} fr", c.fps, c.input_files.len()),
+        };
+        ui.label(RichText::new(facts).color(DIM).size(10.5));
+        ui.label(RichText::new(board_status(c)).color(DIM).size(10.5));
     }
-    ui.label(RichText::new(readiness(c)).color(DIM));
-    ui.label(summary);
-    for n in &c.notes {
-        ui.colored_label(WARN, n);
+    // One Open affordance (the thumbnail also opens on double-click) and the clip's client on the same row.
+    ui.horizontal_wrapped(|ui| {
+        let r = ui
+            .add_enabled(idle, egui::Button::new("Open").small())
+            .on_disabled_hover_text("Frames are not ready yet")
+            .on_hover_text("Open this clip (or double-click its thumbnail)");
+        open_rects.push((Some(i), r.rect));
+        if r.clicked() {
+            *open = Some(i);
+        }
+        if matches!(st, CardState::NeedsFrames | CardState::Failed(_))
+            && ui.small_button("Resume").clicked()
+        {
+            *resume = Some(i);
+        }
+        if idle {
+            ai.client_combo(ui, c);
+        }
+    });
+}
+
+/// One short line per clip, from what the load already read (no directory listings per frame): the generated
+/// masks, the clip state and whether a result was recorded.
+fn board_status(c: &Clip) -> String {
+    let mut parts: Vec<String> = vec![];
+    if c.alpha_frames > 0 {
+        parts.push(format!("Hint {}", c.alpha_frames));
     }
+    if c.mask_frames > 0 {
+        parts.push(format!("Guide {}", c.mask_frames));
+    }
+    if !c.keyframes.is_empty() {
+        parts.push(format!("{} marks", c.keyframes.len()));
+    }
+    match &c.manifest {
+        Some(m) if m.complete => parts.push("result recorded".into()),
+        Some(_) => parts.push("partial result".into()),
+        None => parts.push("no result yet".into()),
+    }
+    parts.join(" · ")
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe skips ui() for hidden/occluded Windows windows, but keeps calling logic().
+        if let Some(dir) = &self.opts.instance_dir {
+            if std::fs::remove_file(dir.join("instance.show")).is_ok() {
+                self.opts.start_background = false;
+                crate::background::show(ctx);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        if self.opts.start_background {
+            if ctx.cumulative_frame_nr() > 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.opts.start_background = false;
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn on_exit(&mut self) {
+        self.release_shared();
+        if let Some(d) = &self.driver {
+            d.stop();
+        }
+        self.metrics.stop(); // kill + reap the helper
+    }
+
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         use egui::{Event, Modifiers, PointerButton, Pos2};
+        // The release lands two frames after the press: egui opens a context menu on the release, and a
+        // release in that very same frame would count as the click that closes it again.
+        if let Some(pos) = self.inject_release {
+            if self.inject_release_wait > 0 {
+                self.inject_release_wait -= 1;
+                return;
+            }
+            self.inject_release = None;
+            raw.events.push(Event::PointerButton {
+                pos,
+                button: PointerButton::Secondary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            });
+            return;
+        }
         if self.inject_i >= self.opts.keys.len()
             || self.started.elapsed().as_secs_f32() < 2.5
             || self.inject_t.elapsed().as_millis() < 400
@@ -1677,23 +2261,42 @@ impl eframe::App for App {
         self.inject_i += 1;
         self.inject_t = Instant::now();
         self.inject_report = 3;
-        if let Some(xy) = tok.strip_prefix("click:") {
+        // `text:abc` types into the focused field (QA: forms such as pairing).
+        if let Some(t) = tok.strip_prefix("text:") {
+            raw.events.push(Event::Text(t.to_owned()));
+            return;
+        }
+        // `click:XxY` = primary, `rclick:XxY` = secondary (QA evidence for context menus).
+        if let Some((button, xy)) = tok
+            .strip_prefix("rclick:")
+            .map(|xy| (PointerButton::Secondary, xy))
+            .or_else(|| tok.strip_prefix("click:").map(|xy| (PointerButton::Primary, xy)))
+        {
             let (x, y) = xy.split_once('x').unwrap_or(("0", "0"));
             let pos = Pos2::new(x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0));
             raw.events.push(Event::PointerMoved(pos));
-            for pressed in [true, false] {
+            raw.events.push(Event::PointerButton {
+                pos,
+                button,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            });
+            if button == PointerButton::Secondary {
+                self.inject_release = Some(pos);
+            } else {
                 raw.events.push(Event::PointerButton {
                     pos,
-                    button: PointerButton::Primary,
-                    pressed,
+                    button,
+                    pressed: false,
                     modifiers: Modifiers::NONE,
                 });
             }
             return;
         }
-        let (mods, name) = match tok.strip_prefix("Shift+") {
-            Some(n) => (Modifiers::SHIFT, n),
-            None => (Modifiers::NONE, tok.as_str()),
+        let (mods, name) = match (tok.strip_prefix("Shift+"), tok.strip_prefix("Ctrl+")) {
+            (Some(n), _) => (Modifiers::SHIFT, n),
+            (_, Some(n)) => (Modifiers::COMMAND, n),
+            _ => (Modifiers::NONE, tok.as_str()),
         };
         let Some(key) = Key::from_name(name) else {
             return;
@@ -1721,7 +2324,11 @@ impl App {
             self.pending_reload = Some(p);
         }
         if let Some(r) = self.picker.poll() {
-            self.held_pick = Some(r);
+            if r.0 == PickKind::MappingRoot {
+                self.settings.browse_done(r.1.into_iter().next());
+            } else {
+                self.held_pick = Some(r);
+            }
         }
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -1772,11 +2379,29 @@ impl App {
                 self.apply_pick(ctx);
             }
             if let Some(p) = self.pending_reload.take() {
-                self.path_input = p.display().to_string();
-                self.reload_keep_selection(ctx);
+                // A reload clears drafts and output location: save them first, or keep the old project open.
+                let old = self.project.as_ref().map(|o| o.root.clone()).filter(|r| *r != p);
+                let saved = match old {
+                    Some(_) if self.unsaved() => self.save_project(),
+                    _ => Ok(()),
+                };
+                if let (Err(e), Some(old)) = (saved, old) {
+                    self.ai.notice = Some(format!(
+                        "New project created at {}, but {} was kept open: {e}. Open it with File > Open project.",
+                        p.display(),
+                        old.display()
+                    ));
+                    self.reload_refused = true;
+                } else {
+                    self.path_input = p.display().to_string();
+                    self.reload_keep_selection(ctx);
+                }
             }
             if let Some(name) = out.open_clip {
-                self.pending_open = Some(name);
+                // A refused switch leaves the old project open: never open the new project's clip name in it.
+                if !std::mem::take(&mut self.reload_refused) {
+                    self.pending_open = Some(name);
+                }
             }
             if !self.settings_open {
                 if let Some(name) = self.pending_open.take() {
@@ -1794,7 +2419,7 @@ impl App {
                 self.imp.begin_qa(ctx, root.as_deref(), src);
             }
             if !dropped.is_empty() {
-                if self.picker.pending().is_some() {
+                if self.dialog_active() {
                     self.imp
                         .notify("Dropped files were not imported: a file dialog is open. Close it and drop them again.");
                 } else if self.imp.busy() {
@@ -1821,12 +2446,16 @@ impl App {
 
     /// A file dialog is open, or its answer is held and not applied yet.
     fn dialog_active(&self) -> bool {
-        self.picker.pending().is_some() || self.held_pick.is_some()
+        self.picker.pending().is_some() || self.held_pick.is_some() || self.new_project_draft.is_some()
     }
 
     /// Open a native dialog off the UI thread. False when one is already open or an import is running.
     pub fn request_pick(&mut self, ctx: &egui::Context, kind: PickKind) -> bool {
         let dest = matches!(kind, PickKind::Location | PickKind::AddTo);
+        // The New project name window is a dialog too: nothing else may start behind it.
+        if self.new_project_draft.is_some() {
+            return false;
+        }
         // A destination is only chosen for a waiting plan; other dialogs never open while an import is busy.
         if (dest && !self.imp.has_pending()) || (!dest && self.imp.busy()) {
             return false;
@@ -1845,6 +2474,24 @@ impl App {
     }
     pub fn project_root(&self) -> Option<&std::path::Path> {
         self.project.as_ref().map(|p| p.root.as_path())
+    }
+
+    /// Clients and Settings buttons: one global pair, shown in the Board and the workspace bar (not per clip).
+    fn clients_button(&mut self, ui: &mut Ui) -> egui::Rect {
+        let r = ui
+            .add_enabled(
+                !self.settings_open && !self.models_open && !self.clients_open,
+                egui::Button::new("Clients"),
+            )
+            .on_hover_text("Render clients: machines, connection, models, what each is running");
+        if r.clicked() {
+            if let Some(v) = &mut self.viewer {
+                v.pause();
+            }
+            self.clients_open = true;
+        }
+        self.clients_rect = Some(r.rect);
+        r.rect
     }
 
     /// The one global Settings button, shown in the Board and the workspace header (not per clip).
@@ -1879,14 +2526,122 @@ impl App {
         self.imp.busy() || self.imp.has_pending()
     }
     /// Mutate the open viewer (tests).
+    /// The open clip as the panels see it (test hook).
+    pub fn clip_for_test(&self) -> Clip {
+        self.clip().cloned().expect("a clip is open")
+    }
+
+    /// Switch projects exactly as the "Open project" flow does (test hook: one AI session, two projects).
+    pub fn open_project_for_test(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        self.path_input = path.display().to_string();
+        self.load(ctx);
+    }
+
     pub fn viewer_mut_for_test(&mut self, f: impl FnOnce(&mut Viewer)) {
         if let Some(v) = &mut self.viewer {
             f(v);
         }
     }
+    /// The name window's Create button and the folder it will create in (tests).
+    pub fn new_project_create_rect(&self) -> Option<egui::Rect> {
+        self.new_project_create_rect
+    }
+    pub fn new_project_parent(&self) -> Option<&std::path::Path> {
+        self.new_project_draft.as_ref().map(|d| d.0.as_path())
+    }
+    pub fn new_menu_rects(&self) -> [Option<egui::Rect>; 2] {
+        self.new_menu_rects
+    }
     pub fn settings_open(&self) -> bool {
         self.settings_open
     }
+    /// GPUs (NVML/PCI index, the worker's `--gpu`) that a local worker is running a job on right now.
+    fn active_gpus(&self) -> Vec<u32> {
+        self.ai
+            .scheduler()
+            .targets()
+            .iter()
+            .filter(|t| t.local && t.busy_with.is_some())
+            .filter_map(|t| t.hello.as_ref()?.gpu.as_ref().map(|g| g.index))
+            .collect()
+    }
+
+    /// Per frame: drive the network client (connect, stats, Batch submissions, receiving) without blocking.
+    fn net_tick(&mut self, now: std::time::Instant, wake: &std::sync::Arc<dyn Fn() + Send + Sync>) {
+        if !self.remote.available() {
+            return;
+        }
+        if self.driver.is_none() {
+            let view = self.metrics.view(now);
+            let mut env = crate::remote::Env {
+                settings: self.settings.saved(),
+                settings_path: self.settings.store_path(),
+                ai: &mut self.ai,
+                metrics: &view,
+                repo: self.net_repo.as_deref(),
+                python: self.net_python.as_deref(),
+                wake,
+            };
+            self.remote.tick(now, &mut env);
+            for f in self.remote.take_finished() {
+                if let Some(ctx) = self.last_ctx.clone() {
+                    self.refresh_clip(&ctx, &f);
+                }
+            }
+        }
+        if let Some(c) = self.remote.take_paired() {
+            self.settings.open();
+            let n = &mut self.settings.draft_mut().network;
+            (n.enabled, n.credentials) = (true, c);
+            if !self.settings.apply() {
+                self.ai.notice = Some("Paired, but the connection settings could not be saved.".into());
+            }
+        }
+    }
+
+    fn net_action(&mut self, a: crate::remote::Action) {
+        use crate::remote::Action;
+        match a {
+            Action::Pair { invitation, name } => self.remote.pair(invitation, name),
+            Action::Enable(on) => {
+                self.settings.open();
+                self.settings.draft_mut().network.enabled = on;
+                self.settings.apply();
+            }
+            Action::Receive(on) => {
+                self.settings.open();
+                self.settings.draft_mut().network.receive = on;
+                self.settings.apply();
+            }
+            Action::CancelJob(id) => self.remote.cancel_job(&id),
+            Action::ForgetAttempt => {
+                let env = crate::remote::Env {
+                    settings: self.settings.saved(),
+                    settings_path: self.settings.store_path(),
+                    ai: &mut self.ai,
+                    metrics: &crate::metrics::View::Starting,
+                    repo: None,
+                    python: None,
+                    wake: &(std::sync::Arc::new(|| {}) as std::sync::Arc<dyn Fn() + Send + Sync>),
+                };
+                self.remote.forget_attempt(&env);
+            }
+        }
+    }
+
+    /// The footer's rectangle from the last frame (layout tests).
+    pub fn metrics_rect(&self) -> Option<egui::Rect> {
+        self.metrics_rect
+    }
+
+    /// Remote client telemetry as the network API reports it (`None` = forget it again).
+    pub fn set_client_telemetry(&mut self, target_id: &str, t: Option<crate::metrics::ClientTelemetry>) {
+        match t {
+            Some(t) => self.client_telemetry.insert(target_id.to_owned(), t),
+            None => self.client_telemetry.remove(target_id),
+        };
+    }
+
     pub fn settings_page(&mut self) -> &mut SettingsPage {
         &mut self.settings
     }
@@ -1899,6 +2654,15 @@ impl App {
     }
     pub fn models_back_rect(&self) -> Option<egui::Rect> {
         self.models_back_rect
+    }
+    pub fn clients_rect(&self) -> Option<egui::Rect> {
+        self.clients_rect
+    }
+    pub fn clients_open(&self) -> bool {
+        self.clients_open
+    }
+    pub fn clients_back_rect(&self) -> Option<egui::Rect> {
+        self.clients_back_rect
     }
 
     /// True while a file dialog is open (tests).
@@ -1942,8 +2706,7 @@ impl App {
                 },
             ),
             PickKind::Project => {
-                self.path_input = paths[0].display().to_string();
-                self.load(ctx);
+                self.open_project_path(ctx, paths[0].clone());
             }
             PickKind::Location => {
                 self.imp.set_dest(ctx, Dest::NewIn(paths[0].clone()));
@@ -1951,11 +2714,13 @@ impl App {
             PickKind::AddTo => {
                 self.imp.set_dest(ctx, Dest::Add(paths[0].clone()));
             }
+            PickKind::NewProject => self.ask_project_name(paths[0].clone()),
             PickKind::HintMovie => self.hint_picked(paths[0].clone(), true),
             PickKind::ExportFolder => self.hint_picked(paths[0].clone(), false),
             PickKind::Relink => self.relink_picked(ctx, paths[0].clone()),
             PickKind::RelinkMovie => self.movie_picked(paths[0].clone()),
             PickKind::HintSequence => self.sequence_picked(paths[0].clone()),
+            PickKind::MappingRoot => {} // answered inside Settings (see import_tick)
         }
     }
 
@@ -1976,6 +2741,10 @@ impl App {
     pub fn open_frame_count(&self) -> Option<usize> {
         self.clip().map(|c| c.input_files.len())
     }
+    /// Tools panel, status region and action region above the graph from the last frame (layout tests).
+    pub fn tools_rects(&self) -> Option<[egui::Rect; 3]> {
+        self.tools_rects
+    }
     /// Rectangles of the workspace header controls from the last frame (layout tests).
     pub fn header_rects(&self) -> &[egui::Rect] {
         &self.header_rects
@@ -1987,6 +2756,10 @@ impl App {
             .get(f)
             .map(|(_, v)| (v.canvas, v.node_rects.clone()))
     }
+    /// Prompt tools of the Hint page's vertical strip, with their screen rects (layout tests).
+    pub fn tool_strip_rects(&self) -> &[(super::annotate::Tool, egui::Rect)] {
+        &self.hint.strip_rects
+    }
     pub fn viewer_height_hint(&self) -> Option<f32> {
         self.viewer.as_ref().map(|v| v.draw_h)
     }
@@ -1997,7 +2770,26 @@ impl App {
     pub fn back_rect(&self) -> Option<egui::Rect> {
         self.back_rect
     }
+    /// Hand the shared runtime objects back to the driver.
+    fn release_shared(&mut self) {
+        self.ai.release();
+        self.remote.release();
+        self.metrics.release();
+    }
+
     pub fn frame(&mut self, ui: &mut Ui) {
+        // Take the shared objects in the driver's lock order for the whole frame, give them back at its end.
+        self.ai.hold();
+        self.remote.hold();
+        self.metrics.hold();
+        if let Some(d) = &self.driver {
+            d.publish(self.settings.saved(), self.settings.store_path());
+        }
+        self.frame_inner(ui);
+        self.release_shared();
+    }
+
+    fn frame_inner(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.import_tick(&ctx);
         self.ai
@@ -2005,7 +2797,9 @@ impl App {
         self.ai_tick(&ctx);
         self.last_ctx = Some(ctx.clone());
         self.persist_media();
+        self.hint_pending_refresh();
         self.hint_sync();
+        self.feedback_tick();
         self.media_poll(&ctx);
         self.workspace_sync();
         self.ai
@@ -2031,13 +2825,30 @@ impl App {
             .set_model_mutation_active(self.models.blocks_worker_launch());
         self.close_tick(&ctx);
         self.keys(&ctx);
+        let now = std::time::Instant::now();
+        let wake = self
+            .metrics_wake
+            .get_or_insert_with(|| {
+                let c = ctx.clone();
+                std::sync::Arc::new(move || c.request_repaint())
+            })
+            .clone();
+        if self.driver.is_none() {
+            self.metrics.tick(now, &wake);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(1)); // ages (stale) advance without any new sample
+        self.net_tick(now, &wake);
+        let active = self.active_gpus();
+        let cells = crate::metrics::view_cells(&self.metrics.view(now), &active);
+        // Outermost bottom panel: on every page (Board, clip, Settings, Clients, Models), fixed height.
+        let metrics_panel = Panel::bottom("system_metrics")
+            .exact_size(super::metrics_bar::FOOTER_H)
+            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(egui::Margin::symmetric(8, 0)))
+            .show(ui, |ui| super::metrics_bar::footer(ui, &cells));
+        self.metrics_rect = Some(metrics_panel.response.rect);
         let mut open_models = false;
         Panel::top("banner").show(ui, |ui| {
-            ui.label(
-                RichText::new(BANNER)
-                    .color(Color32::from_rgb(225, 190, 110))
-                    .size(12.5),
-            );
+            self.chrome(ui);
             if !self.models_open && self.models.startup_ui(ui) {
                 open_models = true;
             }
@@ -2068,8 +2879,19 @@ impl App {
                 }
             });
             if self.settings_open {
-                match self.settings.ui(ui) {
+                let ev = self.settings.ui(ui);
+                if let Some((_, dir)) = self.settings.take_browse() {
+                    let c = ctx.clone();
+                    if !self.picker.start(PickKind::MappingRoot, dir, move || c.request_repaint()) {
+                        self.settings.browse_done(None);
+                    }
+                }
+                match ev {
                     super::settings::Event::Applied => {
+                        let i = &self.settings.saved().interface;
+                        if let Err(e) = crate::background::sync_login(i.launch_at_login) {
+                            self.settings.set_error(format!("Settings saved, but the sign-in entry could not be updated: {e}"));
+                        }
                         ctx.set_zoom_factor(self.settings.saved().interface.ui_scale);
                         self.ai
                             .set_targets(self.settings.saved(), self.opts.repo.as_deref());
@@ -2079,6 +2901,34 @@ impl App {
                     }
                     super::settings::Event::Closed => self.close_settings(),
                     super::settings::Event::None => {}
+                }
+            }
+        } else if self.clients_open {
+            Panel::top("clients_nav").show(ui, |ui| {
+                let back = ui.button("‹ Back");
+                self.clients_back_rect = Some(back.rect);
+                if back.clicked() {
+                    self.clients_open = false;
+                }
+            });
+            if self.clients_open {
+                let default = self.ai.placement.clone();
+                let mut net_actions = vec![];
+                let local_view = self.metrics.view(std::time::Instant::now());
+                let active_now = self.active_gpus();
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            let paired = self.remote.other_installations();
+                            if let Some(p) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.client_telemetry, &paired) {
+                                self.ai.placement = p;
+                            }
+                            net_actions = self.remote.ui(ui, self.settings.saved());
+                        });
+                });
+                for a in net_actions {
+                    self.net_action(a);
                 }
             }
         } else if self.viewer.is_some() && self.open.is_some() {
@@ -2441,6 +3291,327 @@ mod settings_handoff_tests {
         assert!(started(&log).is_empty());
         drop(app);
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    fn project_with_clip(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("clips/a/Frames")).unwrap();
+        std::fs::write(root.join("project.json"), br#"{"version":2}"#).unwrap();
+        std::fs::write(root.join("clips/a/.video_metadata.json"), br#"{"fps":24.0}"#).unwrap();
+        let mut e = png::Encoder::new(std::fs::File::create(root.join("clips/a/Frames/f_0.png")).unwrap(), 4, 4);
+        e.set_color(png::ColorType::Rgb);
+        e.set_depth(png::BitDepth::Eight);
+        e.write_header().unwrap().write_image_data(&[0u8; 48]).unwrap();
+    }
+
+    #[test]
+    fn new_project_from_an_open_clip_returns_to_the_batch_and_keeps_every_clip_draft() {
+        let (repo, _log) = stub_repo("newclip");
+        let cur = repo.parent().unwrap().join("cur");
+        project_with_clip(&cur);
+        let parent = repo.parent().unwrap().to_path_buf();
+        let backend: Backend = std::sync::Arc::new(move |_, _| vec![parent.clone()]);
+        let ctx = egui::Context::default();
+        let mut app = App::with_picker(
+            &ctx,
+            AppOptions { repo: Some(repo.clone()), project: Some(cur.clone()), ..AppOptions::default() },
+            backend,
+        );
+        pump(&ctx, &mut app, |_| true);
+        app.open_clip(&ctx, 0);
+        pump(&ctx, &mut app, |a| a.in_workspace() && a.draft_clips.contains("a"));
+        // An edited draft stays "unsaved" after leaving the clip (the guard must not forget it).
+        app.draft_saved.insert("a".into(), serde_json::json!({"stale": true}));
+        app.back_requested = true;
+        pump(&ctx, &mut app, |a| !a.in_workspace());
+        assert!(app.unsaved(), "closed clip's unsaved draft still counts");
+        app.open_clip(&ctx, 0);
+        pump(&ctx, &mut app, |a| a.in_workspace());
+        assert!(app.new_project_pick(&ctx));
+        pump(&ctx, &mut app, |a| !a.in_workspace() && a.new_project_parent().is_some());
+        assert!(!app.unsaved(), "saved before leaving");
+        assert_eq!(app.project_root(), Some(cur.as_path()));
+        drop(app);
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    #[test]
+    fn a_new_project_reload_saves_edits_first_or_keeps_the_old_project_with_a_notice() {
+        use std::os::unix::fs::PermissionsExt;
+        let (repo, _log) = stub_repo("reload");
+        let base = repo.parent().unwrap().to_path_buf();
+        let (cur, fresh) = (base.join("cur"), base.join("fresh"));
+        project_with_clip(&cur);
+        project_with_clip(&fresh);
+        let ctx = egui::Context::default();
+        let mut app = App::with_picker(
+            &ctx,
+            AppOptions { repo: Some(repo.clone()), project: Some(cur.clone()), ..AppOptions::default() },
+            std::sync::Arc::new(|k, _| panic!("no dialog ({k:?})")),
+        );
+        pump(&ctx, &mut app, |_| true);
+        app.loc.root = "/edited".into();
+        std::fs::set_permissions(&cur, std::fs::Permissions::from_mode(0o500)).unwrap();
+        app.pending_reload = Some(fresh.clone());
+        pump(&ctx, &mut app, |_| true);
+        std::fs::set_permissions(&cur, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(app.project_root(), Some(cur.as_path()), "old project kept");
+        assert!(app.unsaved());
+        let n = app.ai.notice.clone().unwrap();
+        assert!(n.contains(&fresh.display().to_string()) && n.contains("Open project"), "{n}");
+        // With a working save the edit is flushed to disk, then the new project loads.
+        app.pending_reload = Some(fresh.clone());
+        pump(&ctx, &mut app, |a| a.project_root() == Some(fresh.as_path()));
+        assert!(std::fs::read_to_string(cur.join("project.json")).unwrap().contains("/edited"));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn edit_draft(app: &mut App, v: f64) {
+        let c = app.clip_for_test();
+        let p = app.project.as_ref().unwrap();
+        app.ai.draft(&c, p, app.settings.saved()).params.despill_strength = v;
+    }
+    fn draft_despill(app: &mut App) -> f64 {
+        let c = app.project.as_ref().unwrap().clips[0].clone();
+        let p = app.project.as_ref().unwrap();
+        app.ai.draft(&c, p, app.settings.saved()).params.despill_strength
+    }
+    fn app_on(repo: &std::path::Path, root: &std::path::Path) -> (egui::Context, App) {
+        let ctx = egui::Context::default();
+        let mut app = App::with_picker(
+            &ctx,
+            AppOptions { repo: Some(repo.into()), project: Some(root.into()), ..AppOptions::default() },
+            std::sync::Arc::new(|k, _| panic!("no dialog ({k:?})")),
+        );
+        pump(&ctx, &mut app, |_| true);
+        (ctx, app)
+    }
+
+    #[test]
+    fn switching_projects_with_a_same_named_clip_never_carries_the_old_draft() {
+        let (repo, _log) = stub_repo("xproj");
+        let base = repo.parent().unwrap().to_path_buf();
+        let (a, b) = (base.join("A"), base.join("B"));
+        project_with_clip(&a);
+        project_with_clip(&b);
+        let (ctx, mut app) = app_on(&repo, &a);
+        app.open_clip(&ctx, 0);
+        pump(&ctx, &mut app, |x| x.draft_clips.contains("a"));
+        edit_draft(&mut app, 0.123);
+        pump(&ctx, &mut app, |_| true);
+        assert!(app.unsaved());
+        app.open_project_for_test(&ctx, &b);
+        app.open_clip(&ctx, 0);
+        pump(&ctx, &mut app, |x| x.draft_clips.contains("a"));
+        assert_ne!(draft_despill(&mut app), 0.123, "B shows its own default, not A's edit");
+        assert!(!app.unsaved(), "B is clean against its own baseline");
+        drop(app);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_same_project_reload_keeps_unsaved_drafts_dirty_and_saveable() {
+        let (repo, _log) = stub_repo("sameroot");
+        let a = repo.parent().unwrap().join("A");
+        project_with_clip(&a);
+        let (ctx, mut app) = app_on(&repo, &a);
+        app.open_clip(&ctx, 0);
+        pump(&ctx, &mut app, |x| x.draft_clips.contains("a"));
+        edit_draft(&mut app, 0.123);
+        app.back_requested = true;
+        pump(&ctx, &mut app, |x| !x.in_workspace());
+        app.pending_reload = Some(a.clone());
+        pump(&ctx, &mut app, |_| true);
+        assert!(app.unsaved(), "the reload must not turn an unsaved draft into Saved");
+        assert_eq!(draft_despill(&mut app), 0.123);
+        app.save_project().unwrap();
+        pump(&ctx, &mut app, |_| true);
+        assert!(!app.unsaved());
+        let meta = std::fs::read_to_string(a.join("clips/a/clip.json")).unwrap();
+        assert!(meta.contains("0.123"), "{meta}");
+        drop(app);
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    #[test]
+    fn a_refused_switch_blocks_opening_the_new_projects_clip_in_the_old_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let (repo, _log) = stub_repo("refuse");
+        let base = repo.parent().unwrap().to_path_buf();
+        let (cur, fresh) = (base.join("cur"), base.join("fresh"));
+        project_with_clip(&cur);
+        project_with_clip(&fresh);
+        let (ctx, mut app) = app_on(&repo, &cur);
+        app.loc.root = "/edited".into();
+        std::fs::set_permissions(&cur, std::fs::Permissions::from_mode(0o500)).unwrap();
+        app.pending_reload = Some(fresh.clone());
+        pump(&ctx, &mut app, |_| true);
+        std::fs::set_permissions(&cur, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(app.reload_refused && app.project_root() == Some(cur.as_path()));
+        app.pending_reload = Some(fresh.clone());
+        pump(&ctx, &mut app, |x| x.project_root() == Some(fresh.as_path()));
+        assert!(!app.reload_refused, "an accepted switch clears the refusal");
+        drop(app);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Click Create once the name window has settled (an anchored egui Window moves after its first frames).
+    fn click_create(ctx: &egui::Context, app: &mut App) {
+        for _ in 0..4 {
+            pump(ctx, app, |_| true);
+        }
+        let at = app.new_project_create_rect().expect("name window drawn").center();
+        click(ctx, app, at);
+    }
+
+    fn click(ctx: &egui::Context, app: &mut App, at: egui::Pos2) {
+        let b = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![b(true)], vec![b(false)], vec![]] {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| app.frame(ui)).textures_delta.clear();
+        }
+    }
+
+    /// An app whose New project dialog answers `picked` (None = cancelled); any other dialog is a bug.
+    fn new_project_app(tag: &str, project: Option<&str>, picked: Option<&str>) -> (egui::Context, App, PathBuf, PathBuf) {
+        let (repo, log) = stub_repo(&format!("np-{tag}"));
+        let base = repo.parent().unwrap().to_path_buf();
+        let cur = base.join("cur");
+        let parent = base.join("where");
+        std::fs::create_dir_all(&parent).unwrap();
+        if project.is_some() {
+            project_with_clip(&cur);
+        }
+        let answer: Vec<PathBuf> = picked.map(|_| parent.clone()).into_iter().collect();
+        let backend: Backend = std::sync::Arc::new(move |k, _| {
+            assert_eq!(k, PickKind::NewProject, "only the New project folder dialog may open");
+            answer.clone()
+        });
+        let ctx = egui::Context::default();
+        let mut app = App::with_picker(
+            &ctx,
+            AppOptions { repo: Some(repo), project: project.map(|_| cur.clone()), ..AppOptions::default() },
+            backend,
+        );
+        pump(&ctx, &mut app, |_| true);
+        (ctx, app, cur, log)
+    }
+
+    #[test]
+    fn file_menu_new_project_from_an_open_clip_creates_and_opens_an_empty_project() {
+        let (ctx, mut app, cur, log) = new_project_app("menu", Some("clip"), Some("go"));
+        app.open_clip(&ctx, 0);
+        pump(&ctx, &mut app, |a| a.in_workspace());
+        let at = app.new_menu_rects()[0].expect("File drawn").center();
+        click(&ctx, &mut app, at);
+        let at = app.new_menu_rects()[1].expect("New project… in the open File menu").center();
+        click(&ctx, &mut app, at);
+        pump(&ctx, &mut app, |a| !a.in_workspace() && a.new_project_parent().is_some());
+        assert_eq!(app.project_root(), Some(cur.as_path()), "old project stays open until Create");
+        click_create(&ctx, &mut app);
+        let made = cur.parent().unwrap().join("where/New project");
+        pump(&ctx, &mut app, |a| a.project_root() == Some(made.as_path()));
+        assert_eq!(app.project.as_ref().unwrap().clips.len(), 0);
+        assert!(app.loc.root.as_os_str().is_empty(), "the previous project's output folder is not inherited");
+        assert!(!app.unsaved());
+        let pj: serde_json::Value = serde_json::from_slice(&std::fs::read(made.join("project.json")).unwrap()).unwrap();
+        assert_eq!((pj["version"].as_i64(), pj["clips"].as_array().map(Vec::len)), (Some(2), Some(0)));
+        assert!(made.join("clips").is_dir() && std::fs::read_dir(made.join("clips")).unwrap().next().is_none());
+        assert!(cur.join("clips/a/Frames/f_0.png").is_file(), "previous project untouched");
+        assert!(calls(&log).iter().all(|c| c.contains("backend.worker")), "only the clip worker ran: {:?}", calls(&log));
+        assert!(!app.in_workspace() && !app.imp.has_pending() && !app.dialog_active());
+        drop(app);
+        let _ = std::fs::remove_dir_all(cur.parent().unwrap());
+    }
+
+    #[test]
+    fn new_project_from_the_welcome_page_needs_no_open_project() {
+        let (ctx, mut app, cur, log) = new_project_app("cold", None, Some("go"));
+        assert!(app.project_root().is_none() && app.request_pick(&ctx, PickKind::NewProject));
+        pump(&ctx, &mut app, |a| a.new_project_parent().is_some());
+        click_create(&ctx, &mut app);
+        let made = cur.parent().unwrap().join("where/New project");
+        pump(&ctx, &mut app, |a| a.project_root() == Some(made.as_path()));
+        assert!(app.project.as_ref().unwrap().clips.is_empty() && started(&log).is_empty());
+        drop(app);
+        let _ = std::fs::remove_dir_all(cur.parent().unwrap());
+    }
+
+    #[test]
+    fn cancelled_new_project_keeps_the_open_project_and_creates_nothing() {
+        let (ctx, mut app, cur, _log) = new_project_app("cancel", Some("clip"), None);
+        assert!(app.new_project_pick(&ctx));
+        pump(&ctx, &mut app, |a| !a.picking() && !a.dialog_active());
+        assert_eq!(app.project_root(), Some(cur.as_path()));
+        assert!(app.new_project_parent().is_none());
+        assert!(std::fs::read_dir(cur.parent().unwrap().join("where")).unwrap().next().is_none());
+        drop(app);
+        let _ = std::fs::remove_dir_all(cur.parent().unwrap());
+    }
+
+    #[test]
+    fn new_project_is_refused_when_unsaved_work_cannot_be_saved() {
+        use std::os::unix::fs::PermissionsExt;
+        let (ctx, mut app, cur, _log) = new_project_app("dirty", Some("clip"), Some("go"));
+        app.loc.root = "/somewhere/else".into();
+        assert!(app.unsaved());
+        std::fs::set_permissions(&cur, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(!app.new_project_pick(&ctx));
+        std::fs::set_permissions(&cur, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!app.picking() && app.unsaved() && app.project_root() == Some(cur.as_path()));
+        assert!(app.ai.notice.as_deref().unwrap().contains("Not starting a new project"));
+        drop(app);
+        let _ = std::fs::remove_dir_all(cur.parent().unwrap());
+    }
+
+    #[test]
+    fn the_name_window_blocks_every_other_dialog_and_import_start() {
+        let (ctx, mut app, cur, log) = new_project_app("modal", Some("clip"), Some("go"));
+        assert!(app.new_project_pick(&ctx));
+        pump(&ctx, &mut app, |a| a.new_project_parent().is_some());
+        // The backend panics on any kind but NewProject, so a false here also means no dialog was opened.
+        for k in [PickKind::Clips, PickKind::Folder, PickKind::Project, PickKind::NewProject] {
+            assert!(!app.request_pick(&ctx, k), "{k:?}");
+        }
+        assert!(!app.new_project_pick(&ctx) && !app.picking());
+        dropped(&ctx, &mut app, &cur);
+        pump(&ctx, &mut app, |_| true);
+        assert!(!app.imp.has_pending() && !app.imp.busy(), "a drop must not start an import behind the window");
+        assert!(app.new_project_parent().is_some() && app.project_root() == Some(cur.as_path()));
+        assert!(started(&log).is_empty());
+        drop(app);
+        let _ = std::fs::remove_dir_all(cur.parent().unwrap());
+    }
+
+    #[test]
+    fn creating_over_a_populated_folder_is_refused_and_keeps_the_open_project() {
+        let (ctx, mut app, cur, log) = new_project_app("exists", Some("clip"), Some("go"));
+        let taken = cur.parent().unwrap().join("where/New project");
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("precious.txt"), b"keep").unwrap();
+        assert!(app.new_project_pick(&ctx));
+        pump(&ctx, &mut app, |a| a.new_project_parent().is_some());
+        click_create(&ctx, &mut app);
+        pump(&ctx, &mut app, |a| a.new_project_error.is_some());
+        assert!(app.new_project_error.as_deref().unwrap().contains("already exists"));
+        assert_eq!(app.project_root(), Some(cur.as_path()));
+        assert!(app.new_project_parent().is_some(), "window stays so another name can be typed");
+        assert_eq!(std::fs::read(taken.join("precious.txt")).unwrap(), b"keep");
+        assert!(!taken.join("project.json").exists() && started(&log).is_empty());
+        for bad in ["", "  ", ".", "..", "a/b", "a\\b"] {
+            assert!(crate::project::create_empty_project(taken.parent().unwrap(), bad).is_err(), "{bad:?}");
+        }
+        drop(app);
+        let _ = std::fs::remove_dir_all(cur.parent().unwrap());
     }
 
     #[test]

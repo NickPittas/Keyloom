@@ -19,6 +19,34 @@ pub struct Gpu {
     pub index: u32,
     pub name: String,
     pub vram_gb: f64,
+    /// Canonical `GPU-<uuid>` of the CUDA device the worker opened. Only trust it when `uuid_status == "verified"`.
+    /// Absent (older worker) or unverified means remote/network eligibility is unavailable; local use is unaffected
+    /// and the index/name/memory are never promoted to an identity.
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub uuid_status: Option<String>,
+    #[serde(default)]
+    pub uuid_reason: Option<String>,
+}
+
+/// `GPU-` + lowercase 8-4-4-4-12 hex, exactly what the worker and the coordinator use.
+pub fn is_canonical_uuid(u: &str) -> bool {
+    let Some(rest) = u.strip_prefix("GPU-") else { return false };
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() == 5 && parts.iter().zip([8, 4, 4, 4, 12]).all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+impl Gpu {
+    /// The verified identity, or why there is none (shown to the user; a receiver must refuse network work without it).
+    pub fn verified_uuid(&self) -> Result<&str, String> {
+        match (self.uuid.as_deref(), self.uuid_status.as_deref()) {
+            (Some(u), Some("verified")) if is_canonical_uuid(u) => Ok(u),
+            (Some(_), Some("verified")) => Err("the reported GPU uuid is not in canonical GPU-<8-4-4-4-12 hex> form".into()),
+            (_, Some(_)) => Err(self.uuid_reason.clone().unwrap_or_else(|| "the GPU identity is unverified".into())),
+            (_, None) => Err("this worker predates GPU identity reporting".into()),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelId {
@@ -557,6 +585,11 @@ impl Target {
             }
             TargetKind::Ssh { ssh, .. } => {
                 let mut c = Command::new(ssh.clone().unwrap_or_else(|| "ssh".into()));
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    c.creation_flags(0x0800_0000);
+                }
                 c.args(self.ssh_args()?);
                 c
             }

@@ -43,11 +43,12 @@ time.sleep(cfg.get("hello_delay", 0))
 emit({
     "event": "hello", "protocol": cfg.get("protocol", 1), "worker_rev": "fake", "engine": "corridorkey-v2",
     "host": cfg.get("host", "fakehost"),
-    "gpu": None if cfg.get("no_gpu") else {"index": cfg.get("gpu", gpu), "name": "Fake GPU", "vram_gb": cfg.get("vram", 24.0)},
+    "gpu": None if cfg.get("no_gpu") else {"index": cfg.get("gpu", gpu), "name": "Fake GPU", "vram_gb": cfg.get("vram", 24.0),
+            **({"uuid": cfg["uuid"], "uuid_status": "verified"} if cfg.get("uuid") else {})},
     "models": {"corridorkey_v2": {"path": "/m/ck.safetensors", "bytes": 1, "sha256": cfg.get("sha")}},
     "capabilities": {"key": True, "generate_hint": True, "publish_modes": ["final"], "key_modes": cfg.get("key_modes", ["new", "resume", "replace"]),
                      "birefnet_variants": cfg.get("variants", ["Matting"]), "sam_models": cfg.get("sam", ["small", "base_plus", "large"]),
-                     "tasks": cfg.get("tasks", {k: True for k in ("gvm", "birefnet", "chroma", "sam_preview", "sam_track", "matanyone2", "videomama", "export_video", "prepare_source", "import_hint")})},
+                     "tasks": cfg.get("tasks", {k: True for k in ("gvm", "birefnet", "chroma", "sam_preview", "sam_track", "matanyone2", "videomama", "prematte_hint", "export_video", "prepare_source", "import_hint")})},
 })
 
 
@@ -65,7 +66,7 @@ def cancelled(job_id, wait=0.0):
 
 def run(job):
     jid, p = job["job_id"], job["params"]
-    mode = p.get("fake", "ok")
+    mode = cfg.get("modes", {}).get("key") or p.get("fake", "ok")  # FAKE_CFG.modes: per-kind override
     files = [path for paths in job["outputs"].values() for path in paths]
     log({"event": "job", "job_id": jid, "mode": mode, "key_mode": job.get("mode"), "first": files[0], "clip_root": job["clip_root"],
          "require": job["require"], "path_map": job["path_map"], "manifest_dir": job["manifest_dir"]})
@@ -107,7 +108,7 @@ def run(job):
             pass
         return emit({"event": "done", "job_id": jid, "outcome": "cancelled", "message": None, "error_kind": None,
                      "manifest": None, "published": 0, "skipped": 0, "expected": len(files), "manifest_complete": False})
-    delay, pub, skipped = p.get("delay", 0.0), 0, 0
+    delay, pub, skipped = p.get("delay", cfg.get("key_delay", 0.0)), 0, 0
     for n, path in enumerate(files):
         if cancelled(jid):
             return emit({"event": "done", "job_id": jid, "outcome": "cancelled", "message": None, "error_kind": None,
@@ -124,6 +125,16 @@ def run(job):
         emit({"event": "progress", "job_id": jid, "phase": "publish", "done": n + 1, "total": len(files)})
         if delay:
             time.sleep(delay)
+    if cfg.get("manifest") and mode != "fail" and files:  # what the real worker writes: the frozen params and outputs
+        oc, rng = job["output_config"], job["range"]
+        names = ("fg", "matte", "comp", "processed")
+        src = sorted(os.path.splitext(n)[0] for n in os.listdir(os.path.join(job["clip_root"], "Frames")))
+        stems = src[src.index(rng["in_stem"]):src.index(rng["out_stem"]) + 1]
+        rel = {k: [os.path.relpath(f, job["manifest_dir"]) for f in v] for k, v in job["outputs"].items()}
+        open(os.path.join(job["manifest_dir"], ".corridorkey_manifest.json"), "w").write(json.dumps({
+            "version": 3, "engine": "corridorkey-v2", "clip_id": job["clip_id"], "job_id": jid,
+            "enabled_outputs": [n for n in names if oc.get(n + "_enabled")], "formats": {n: oc.get(n + "_format") for n in names if oc.get(n + "_enabled")},
+            "exr_compression": oc.get("exr_compression"), "params": p, "range": rng, "source_stems": stems, "files": rel, "complete": True}))
     emit({"event": "done", "job_id": jid, "outcome": "failed" if mode == "fail" else "complete",
           "message": "boom" if mode == "fail" else None, "error_kind": "engine" if mode == "fail" else None,
           "manifest": "/etc/elsewhere/.corridorkey_manifest.json" if mode == "badmanifest" else job["manifest_dir"] + "/.corridorkey_manifest.json", "published": pub, "skipped": skipped,
@@ -132,7 +143,7 @@ def run(job):
 
 def run_task(job):
     jid, p, kind = job["job_id"], job["params"], job["kind"]
-    mode = p.get("fake", "ok")
+    mode = cfg.get("modes", {}).get(kind) or p.get("fake", "ok")
     log({"event": "task", "job_id": jid, "kind": kind, "mode": mode, "params": p, "staging": job["staging_dir"],
          "publish": job["publish_dir"], "range": job["range"]})
     if mode == "reject":
@@ -142,6 +153,8 @@ def run_task(job):
         os._exit(3)
     done = {"event": "done", "job_id": jid, "outcome": "complete", "message": None, "error_kind": None,
             "manifest": None, "published": 0, "skipped": 0, "expected": 0, "manifest_complete": False, "kind": kind}
+    if cfg.get("task_delay"):
+        time.sleep(cfg["task_delay"])
     if mode == "hold":
         emit({"event": "progress", "job_id": jid, "phase": "track", "done": 0, "total": 2})
         while not cancelled(jid, 0.05):

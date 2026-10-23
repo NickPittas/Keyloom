@@ -91,6 +91,8 @@ def test_display_coded_exr_warns(env, monkeypatch, caplog):
     caplog.set_level(logging.WARNING)
     res = _run_dir(env, d, InferenceParams())
     assert len(res.warnings) == 1 and "display-coded" in res.warnings[0]
+    assert "expected for display-coded movie frames" in res.warnings[0]
+    assert "only for scene-linear EXR plates" in res.warnings[0]
     assert any("display-coded" in r.getMessage() for r in caplog.records)
 
 

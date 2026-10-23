@@ -274,3 +274,34 @@ fn replace_mode_reaches_only_workers_that_advertise_it() {
         .collect();
     assert_eq!(j[0]["key_mode"], "replace");
 }
+
+#[test]
+fn hint_writer_chained_after_another_writer_on_same_clip_is_accepted() {
+    let (base, mut s) = sched("chain2", json!({}));
+    s.submit_task(task(&base, "h1", TaskKind::Birefnet, "hold"), vec![])
+        .unwrap();
+    let mut t2 = task(&base, "h2", TaskKind::Videomama, "ok");
+    t2.clip_root = base.join("h1_clip");
+    t2.staging_dir = Some(base.join("stg/h2"));
+    t2.publish_dir = Some(base.join("h1_clip/AlphaHint"));
+    // Declared dependency on the writer: it cannot run concurrently, so it must not collide.
+    assert_eq!(s.submit_task(t2, vec!["h1".into()]), Ok(()));
+}
+
+#[test]
+fn key_after_two_chained_writers_is_accepted_but_a_stranger_still_collides() {
+    let (base, mut s) = sched("chain3", json!({}));
+    s.submit_task(task(&base, "h1", TaskKind::Birefnet, "hold"), vec![])
+        .unwrap();
+    let mut t2 = task(&base, "h2", TaskKind::Matanyone2, "ok");
+    t2.clip_root = base.join("h1_clip");
+    t2.staging_dir = Some(base.join("stg/h2"));
+    s.submit_task(t2, vec!["h1".into()]).unwrap();
+    let key = |id: &str, after: Vec<String>| {
+        let mut k = job(&base, id, 2, "ok");
+        k.clip_root = base.join("h1_clip");
+        Submit { job: k, placement: Placement::Auto, after, min_vram_gb: None }
+    };
+    assert!(matches!(s.submit(key("k0", vec![])), Err(SubmitError::Collision { .. })));
+    assert_eq!(s.submit(key("k1", vec!["h2".into()])), Ok(()));
+}

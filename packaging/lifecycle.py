@@ -6,7 +6,7 @@ uninstall/models/status). Layout under PREFIX:
 
     versions/<ver>/   one self-contained bundle (bin/, app/, runtime/, manifest)
     current -> versions/<ver>   (Linux symlink; Windows uses receipt + shortcuts)
-    bin/corridorkey[-setup]     stable shims
+    bin/corridorkey[-setup|-coordinator]  stable shims
     receipt.json                owned files + state (the only thing uninstall trusts)
 
 User data (projects, settings, models) lives OUTSIDE PREFIX and is never touched.
@@ -168,6 +168,32 @@ def check_glibc(manifest: dict) -> None:
                            "use an installer built for an older glibc")
 
 
+# OS-provided libraries the bundle deliberately does not ship (graphics/windowing stack + NVIDIA driver).
+# Each tuple = alternatives; one must load. Checked before anything is extracted into place.
+LINUX_SYSTEM_LIBS = (("libGL.so.1", "libEGL.so.1"), ("libxkbcommon.so.0",), ("libX11.so.6", "libwayland-client.so.0"),
+                     ("libfontconfig.so.1",), ("libfreetype.so.6",), ("libglib-2.0.so.0",), ("libdbus-1.so.3",),
+                     ("libstdc++.so.6",))
+APT_HINT = ("sudo apt install libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 libx11-6 libxcursor1 libxi6 "
+            "libfontconfig1 libfreetype6 libglib2.0-0 libdbus-1-3 libstdc++6")
+
+
+def check_system_libs() -> None:
+    import ctypes
+
+    def loads(n):
+        try:
+            (ctypes.WinDLL if IS_WIN else ctypes.CDLL)(n)
+            return True
+        except OSError:
+            return False
+    missing = [] if IS_WIN else [" or ".join(alts) for alts in LINUX_SYSTEM_LIBS if not any(loads(n) for n in alts)]
+    if missing:
+        raise InstallError("missing OS libraries: " + ", ".join(missing) + f"\n  Debian/Ubuntu/Mint: {APT_HINT}")
+    if not loads("nvcuda.dll" if IS_WIN else "libcuda.so.1"):  # advisory: app and models install; GPU workflows need the driver
+        say("WARNING: NVIDIA driver (CUDA) not found. CorridorKey needs an NVIDIA GPU + driver to run; install the "
+            "current NVIDIA driver (Linux Mint: Driver Manager) before use.")
+
+
 def run_selfcheck(version_dir: Path, timeout: int = 300) -> dict:
     """Launch validation from an unrelated CWD with a polluted-env-free child:
     the bundled interpreter imports every engine, and the real UI binary resolves the descriptor."""
@@ -263,6 +289,7 @@ def write_shortcuts(version_dir: Path, prefix: Path) -> None:
                            check=True, capture_output=True, timeout=60)
         finally:
             os.unlink(f.name)
+        update_windows_autostart(version_dir, prefix)
         return
     sp["desktop"].parent.mkdir(parents=True, exist_ok=True)
     tmp = sp["desktop"].with_suffix(".tmp")
@@ -279,9 +306,59 @@ def remove_shortcuts(prefix: Path) -> None:
     if IS_WIN:
         _unlink_owned(sp["lnk"])
         _unlink_owned(sp["start_menu_dir"])
+    remove_autostart(prefix)
 
 
-SHIM_NAMES = ("corridorkey.cmd", "corridorkey-setup.cmd") if IS_WIN else ("corridorkey", "corridorkey-setup")
+# Per-user background autostart is written by the app, never by the installer. Contract: it launches the stable
+# Linux shim PREFIX/bin/corridorkey; Windows GUI exe, rewritten on activation/rollback (no console at login).
+# Linux: $XDG_CONFIG_HOME/autostart/corridorkey.desktop containing X-CorridorKey-Owner=<owner_id(prefix)>.
+# Windows: HKCU\Software\Microsoft\Windows\CurrentVersion\Run value "CorridorKey" under this prefix.
+# Uninstall removes only an entry that matches this prefix; anything else is left alone.
+AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def owns_windows_autostart(value: str, prefix: Path) -> bool:
+    return any(value.lower().startswith('"' + str(prefix / d).lower() + "\\") for d in ("bin", "versions"))
+
+
+def update_windows_autostart(version_dir: Path, prefix: Path) -> None:
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY, 0,
+                          winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE)
+    except FileNotFoundError:
+        return
+    with k:
+        try:
+            value = str(winreg.QueryValueEx(k, "CorridorKey")[0])
+        except FileNotFoundError:
+            return
+        if owns_windows_autostart(value, prefix):
+            winreg.SetValueEx(k, "CorridorKey", 0, winreg.REG_SZ,
+                             f'"{version_dir / "bin/corridorkey-ui.exe"}" --background')
+
+
+def remove_autostart(prefix: Path) -> None:
+    if IS_WIN:
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY, 0,
+                                winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as k:
+                val = str(winreg.QueryValueEx(k, "CorridorKey")[0])
+                if owns_windows_autostart(val, prefix):
+                    winreg.DeleteValue(k, "CorridorKey")
+        except OSError:
+            pass
+        return
+    d = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "autostart/corridorkey.desktop"
+    if d.is_file() and not d.is_symlink() and \
+            f"X-CorridorKey-Owner={owner_id(prefix)}" in d.read_text(encoding="utf-8", errors="replace"):
+        d.unlink()
+
+
+# Order matters: SHIM_NAMES[1] is the setup shim (install's "Resume with" hint).
+SHIM_NAMES = (("corridorkey.cmd", "corridorkey-setup.cmd", "corridorkey-coordinator.cmd") if IS_WIN
+              else ("corridorkey", "corridorkey-setup", "corridorkey-coordinator"))
 
 
 def write_shims(prefix: Path) -> None:
@@ -295,6 +372,10 @@ def write_shims(prefix: Path) -> None:
             "corridorkey.cmd": f'@echo off\n{cur}\n{env}\nstart "" "%~dp0..\\versions\\%CKV%\\bin\\corridorkey-ui.exe" %*\n',
             "corridorkey-setup.cmd": f'@echo off\n{cur}\n{env}\n"%~dp0..\\versions\\%CKV%\\runtime\\python\\python.exe" -I -B '
                                      '"%~dp0..\\versions\\%CKV%\\app\\packaging\\lifecycle.py" --prefix "%~dp0.." %*\n',
+            # Server mode is opt-in: this shim only runs when invoked; it opens nothing by itself.
+            # -P keeps the caller's working directory off sys.path; relative --state-dir stays relative to it.
+            "corridorkey-coordinator.cmd": f'@echo off\n{cur}\n{env}\nset "PYTHONPATH=%~dp0..\\versions\\%CKV%\\app"\n'
+                                           '"%~dp0..\\versions\\%CKV%\\runtime\\python\\python.exe" -B -P -m backend.coordinator %*\n',
         }
     else:
         env = "unset PYTHONPATH PYTHONHOME VIRTUAL_ENV PYTHONSTARTUP PYTHONUSERBASE\nPYTHONNOUSERSITE=1; export PYTHONNOUSERSITE\n"
@@ -302,6 +383,11 @@ def write_shims(prefix: Path) -> None:
             "corridorkey": env + 'exec "$(dirname "$0")/../current/bin/corridorkey-ui" "$@"\n',
             "corridorkey-setup": env + 'P="$(dirname "$0")/.."\nexec "$P/current/runtime/python/bin/python3" -I -B '
                                        '"$P/current/app/packaging/lifecycle.py" --prefix "$P" "$@"\n',
+            # Server mode is opt-in: this shim only runs when invoked; it opens nothing by itself.
+            # -P keeps the caller's working directory off sys.path; relative --state-dir stays relative to it.
+            "corridorkey-coordinator": env + 'P="$(cd "$(dirname "$0")/.." && pwd)"\n'
+                                             'PYTHONPATH="$P/current/app"; export PYTHONPATH\n'
+                                             'exec "$P/current/runtime/python/bin/python3" -B -P -m backend.coordinator "$@"\n',
         }
     for name, text in files.items():
         p = bindir / name
@@ -546,9 +632,11 @@ def cmd_install(a) -> int:
         manifest = read_manifest(payload)
         version = safe_version(manifest["version_id"])
         check_glibc(manifest)
+        check_system_libs()
         preflight(prefix, manifest.get("total_bytes", 0))
     else:  # Windows installer already placed files into versions/<version>
         version = safe_version(a.version or "")
+        check_system_libs()
         if not (prefix / "versions" / version).is_dir():
             raise InstallError("install needs --payload or an existing --version under PREFIX/versions")
     if payload and not (prefix / RECEIPT).exists():

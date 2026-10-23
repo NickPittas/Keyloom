@@ -32,7 +32,7 @@ from ..errors import CorridorKeyError, JobCancelledError
 from ..frame_io import imread_unicode, imwrite_unicode
 from .key_job import (
     MANIFEST_NAME, PROTOCOL, KeyJobRejected, PublishError, _clean_abs, _freeze, _inside,
-    _is_int, _JOB_ID_RE, _KeyClip, _boot_id, _proc_start_ticks, _link_noclobber, _make_dirs_or_reject, _rm, _rollback,
+    _check_source_map, _is_int, _JOB_ID_RE, _KeyClip, _boot_id, _proc_start_ticks, _link_noclobber, _make_dirs_or_reject, _rm, _rollback,
     _thaw, _write_tmp,
 )
 
@@ -42,7 +42,11 @@ TaskRejected = KeyJobRejected
 HINT_LOCK = ".corridorkey_hint.lock"
 HINT_PROVENANCE = ".corridorkey_hint.json"
 HINT_DST = {"gvm": "AlphaHint", "birefnet": "AlphaHint", "chroma": "AlphaHint",
-            "matanyone2": "AlphaHint", "videomama": "AlphaHint", "sam_track": "VideoMamaMaskHint"}
+            "matanyone2": "AlphaHint", "videomama": "AlphaHint", "prematte_hint": "AlphaHint", "sam_track": "VideoMamaMaskHint"}
+# gvm/birefnet/chroma/sam_track make either the final AlphaHint or a guiding VideoMamaMaskHint (chosen by
+# publish_dir); matanyone2/videomama/prematte_hint only ever make AlphaHint from the existing VideoMamaMaskHint guide
+# (prematte_hint promotes it unchanged except the feather cleanup; no model, no GPU).
+PRODUCERS = ("gvm", "birefnet", "chroma", "sam_track")
 KINDS = (*HINT_DST, "sam_preview", "export_video", "prepare_source", "import_hint")
 RANGED = (*HINT_DST, "sam_preview", "export_video")  # prepare_source/import_hint are whole-movie
 _JOB_KEYS = ("job_id", "kind", "clip_id", "clip_root", "range", "params", "staging_dir",
@@ -52,8 +56,18 @@ SAM_IDS = {"small": "facebook/sam2.1-hiera-small", "base_plus": "facebook/sam2.1
            "large": "facebook/sam2.1-hiera-large"}
 SAM_ARTIFACTS = {"small": "sam2-small", "base_plus": "sam2-base-plus", "large": "sam2-large"}
 CONTAINERS = {"mp4": ".mp4", "mov_prores4444": ".mov", "webm_alpha": ".webm"}
-_ALPHA_CONTAINERS = ("mov_prores4444", "webm_alpha")
+# container -> (default codec, allowed codecs); the legacy container names can host every codec of their file type
+CODECS = {"mp4": ("h264", ("h264", "hevc")), "mov_prores4444": ("prores4444", ("prores422", "prores4444")),
+          "webm_alpha": ("vp9", ("vp9",))}
+# codec -> (pix_fmt, quality range, default quality); only these flags are ever passed to FFmpeg
+CODEC_SPEC = {"h264": ("yuv420p", (0, 51), 18), "hevc": ("yuv420p", (0, 51), 23),
+              "prores422": ("yuv422p10le", (1, 31), 9), "prores4444": ("yuva444p10le", (1, 31), 9),
+              "vp9": ("yuva420p", (0, 63), 18)}
+_ALPHA_CODECS = ("prores4444", "vp9")
 _IMG = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".exr")
+
+
+_CLEANUP_KINDS = ("gvm", "birefnet", "chroma", "sam_preview", "sam_track", "matanyone2", "videomama", "prematte_hint")
 
 
 def _rej(code: str, message: str):
@@ -87,6 +101,7 @@ def task_capabilities(status: dict | None, *, gpu: bool, ffmpeg: bool, repos: di
     tasks = {"gvm": gpu and ok("gvm"), "birefnet": gpu and bool(variants),
              "chroma": True, "sam_preview": gpu and bool(sam), "sam_track": gpu and bool(sam),
              "matanyone2": gpu and ok("matanyone2"), "videomama": gpu and ok("videomama", "videomama-svd"),
+             "prematte_hint": True,  # pure cv2/numpy (imported above): needs neither a GPU nor a model
              "export_video": ffmpeg, "prepare_source": ffmpeg, "import_hint": ffmpeg}
     reasons = {}
     if not gpu:
@@ -144,7 +159,30 @@ def _prompt(p, what):
     return {"points": pts, "boxes": boxes, "mask_png": p.get("mask_png")}
 
 
+_NEUTRAL_CLEANUP = {"grow": 0, "fill_holes": False, "feather": 0.0}
+
+
+def _cleanup_params(c) -> dict:
+    _keys(c, (), tuple(_NEUTRAL_CLEANUP), "mask_cleanup")
+    out = {**_NEUTRAL_CLEANUP, **c}
+    if not _is_int(out["grow"]) or not -100 <= out["grow"] <= 100:
+        _rej("invalid", "mask_cleanup.grow must be an integer in [-100, 100]")
+    if not isinstance(out["fill_holes"], bool):
+        _rej("invalid", "mask_cleanup.fill_holes must be a boolean")
+    out["feather"] = float(_num(out["feather"], 0, 100, "mask_cleanup.feather"))
+    return out
+
+
 def _check_params(kind: str, p) -> dict:
+    """Kind-specific strict parse; hint-making kinds also take an optional ``mask_cleanup``."""
+    if isinstance(p, dict) and "mask_cleanup" in p and kind in _CLEANUP_KINDS:
+        p = dict(p)
+        cleanup = _cleanup_params(p.pop("mask_cleanup"))
+        return {**_check_kind(kind, p), "mask_cleanup": cleanup}
+    return _check_kind(kind, p)
+
+
+def _check_kind(kind: str, p) -> dict:
     if kind == "gvm":
         _keys(p, ())
         return {}
@@ -185,6 +223,9 @@ def _check_params(kind: str, p) -> dict:
                 _rej("invalid", "frames must be a non-empty object keyed by frame stem")
             out["frames"] = {s: _prompt(v, f"frames.{s}") for s, v in p["frames"].items()}
         return out
+    if kind == "prematte_hint":
+        _keys(p, ())
+        return {}
     if kind == "matanyone2":
         _keys(p, (), ("mask_stem",))
         return {"mask_stem": p.get("mask_stem")}
@@ -195,7 +236,8 @@ def _check_params(kind: str, p) -> dict:
             _rej("invalid", "chunk_size must be an integer in [1, 64]")
         return {"chunk_size": cs}
     if kind == "export_video":
-        _keys(p, ("product", "manifest_dir", "dest", "container", "fps", "allow_partial"), ("audio",))
+        _keys(p, ("product", "manifest_dir", "dest", "container", "fps", "allow_partial"),
+              ("audio", "codec", "quality"))
         if p["product"] not in ("fg", "matte", "comp", "processed"):
             _rej("invalid", "product must be fg, matte, comp or processed")
         if p["container"] not in CONTAINERS:
@@ -208,9 +250,17 @@ def _check_params(kind: str, p) -> dict:
         dest = _clean_abs(p["dest"], "dest", names=True)
         if os.path.splitext(dest)[1].lower() != CONTAINERS[p["container"]]:
             _rej("invalid", f"dest must end with {CONTAINERS[p['container']]} for {p['container']}")
-        if p["container"] in _ALPHA_CONTAINERS and p["product"] not in ("processed",):
-            _rej("invalid", "alpha containers need the 'processed' product (the only RGBA output)")
-        return {"product": p["product"], "manifest_dir": _clean_abs(p["manifest_dir"], "manifest_dir", names=True),
+        default, allowed = CODECS[p["container"]]
+        codec = default if p.get("codec") is None else p["codec"]
+        if codec not in allowed:
+            _rej("invalid", f"codec must be one of {list(allowed)} for {p['container']}")
+        _, (lo, hi), q_default = CODEC_SPEC[codec]
+        quality = p.get("quality")
+        if quality is None:
+            quality = q_default
+        elif not _is_int(quality) or not lo <= quality <= hi:
+            _rej("invalid", f"quality must be an integer in [{lo}, {hi}] for {codec}")
+        return {"codec": codec, "quality": quality, "product": p["product"], "manifest_dir": _clean_abs(p["manifest_dir"], "manifest_dir", names=True),
                 "dest": dest, "container": p["container"], "fps": p["fps"],
                 "allow_partial": p["allow_partial"], "audio": "none"}
     if kind == "prepare_source":
@@ -237,6 +287,7 @@ class TaskJob:
     staging_dir: str | None
     publish_dir: str | None
     require: MappingProxyType
+    source_map: tuple = ()  # receiver-resolved external source (see key_job._check_source_map)
 
     @property
     def frames(self) -> int:
@@ -251,6 +302,10 @@ class TaskJob:
         if missing or unknown:
             _rej("protocol", f"job keys: missing {sorted(missing)}, unknown {sorted(unknown)}")
         d = _thaw(d)
+        smap = ()
+        if isinstance(d.get("params"), dict) and "source_map" in d["params"]:
+            d["params"] = dict(d["params"])  # a receiver-resolved source rides in params; not a kind parameter
+            smap = _check_source_map(d["params"].pop("source_map"))
         if not isinstance(d["job_id"], str) or not _JOB_ID_RE.match(d["job_id"]):
             _rej("protocol", "job_id must match [A-Za-z0-9._-]{1,64}")
         kind = d["kind"]
@@ -280,7 +335,7 @@ class TaskJob:
                 or not all(isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in req["models"].items())):
             _rej("invalid", f"require must be {{protocol: {PROTOCOL}, models: {{name: sha|null}}}}")
         return cls(d["job_id"], kind, d["clip_id"], root, None if r is None else _freeze(r),
-                   _freeze(params), stg, pub, _freeze(req))
+                   _freeze(params), stg, pub, _freeze(req), smap)
 
 
 # ---------------------------------------------------------------------- disk helpers
@@ -309,7 +364,7 @@ def _images(directory: str) -> dict:
 
 
 def _real_clip(job: TaskJob):
-    clip = _KeyClip(name=os.path.basename(job.clip_root), root_path=job.clip_root)
+    clip = _KeyClip(name=os.path.basename(job.clip_root), root_path=job.clip_root, source_map=job.source_map)
     if not os.path.isdir(job.clip_root):
         _rej("paths", f"clip_root does not exist: {job.clip_root}")
     try:
@@ -739,9 +794,10 @@ def _preflight(job: TaskJob) -> _Ctx:
         ctx.clip, ctx.files = _real_clip(job)
         ctx.stems = [os.path.splitext(f)[0] for f in ctx.files]
         if job.kind in HINT_DST:
-            want = os.path.join(job.clip_root, HINT_DST[job.kind])
-            if os.path.normcase(os.path.abspath(job.publish_dir)) != os.path.normcase(want):
-                _rej("paths", f"publish_dir must be {want}")
+            allowed = ("AlphaHint", "VideoMamaMaskHint") if job.kind in PRODUCERS else ("AlphaHint",)
+            wants = [os.path.join(job.clip_root, n) for n in allowed]
+            if os.path.normcase(os.path.abspath(job.publish_dir)) not in {os.path.normcase(w) for w in wants}:
+                _rej("paths", f"publish_dir must be one of {wants}")
             ctx.lock = _HintLock(job)
             ctx.lock.acquire()
             _recover_prev(job.publish_dir)  # restore an interrupted publish before any engine work
@@ -758,11 +814,12 @@ def _preflight(job: TaskJob) -> _Ctx:
             if not ctx.masks:
                 _rej("invalid", f"MatAnyone2 needs a mask for {ctx.stems[0]} in VideoMamaMaskHint "
                                 "(run Track Mask or import a mask)")
-        elif k == "videomama":
+        elif k in ("videomama", "prematte_hint"):
+            what = "VideoMaMa" if k == "videomama" else "Using the pre-matte as the hint"
             ctx.masks = _mask_sources(job, ctx.stems)
             miss = [s for s in ctx.stems if s not in ctx.masks]
             if miss:
-                _rej("invalid", f"VideoMaMa needs dense masks; {len(miss)} range frame(s) have none "
+                _rej("invalid", f"{what} needs dense masks; {len(miss)} range frame(s) have none "
                                 f"(first: {miss[0]}). Run Track Mask first.")
         elif k in ("sam_preview", "sam_track"):
             frames = ({p["frame_stem"]: p["prompts"]} if k == "sam_preview" else dict(p["frames"]))
@@ -888,6 +945,53 @@ def _chroma(job: TaskJob, ctx: _Ctx, view, cancel, prog) -> None:
         prog(view.name, i + 1, len(files))
 
 
+def cleanup_mask(a: np.ndarray, c) -> np.ndarray:
+    """Hole fill -> grow/shrink -> feather on a uint8/uint16 gray mask; neutral settings return ``a`` untouched."""
+    grow, fill, feather = int(c.get("grow", 0)), bool(c.get("fill_holes", False)), float(c.get("feather", 0.0))
+    if not (grow or fill or feather > 0):
+        return a
+    if fill:  # background not connected to the border is a hole; soft values are raised to full
+        half = np.iinfo(a.dtype).max // 2
+        n, lab = cv2.connectedComponents((a <= half).astype(np.uint8), connectivity=4)
+        outer = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
+        hole = (a <= half) & ~np.isin(lab, list(outer))
+        a = np.where(hole, np.iinfo(a.dtype).max, a).astype(a.dtype)
+    if grow:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (abs(grow) * 2 + 1,) * 2)
+        a = cv2.dilate(a, k) if grow > 0 else cv2.erode(a, k)
+    if feather > 0:
+        a = cv2.GaussianBlur(a, (0, 0), feather)
+    return a
+
+
+def stage_cleanup(kind: str, publish_dir: str | None, c) -> dict:
+    """The part of the shared cleanup this stage applies, so each operation runs once along guide -> refiner -> hint.
+
+    Guide producers (and the SAM preview) grow/fill but never feather (a soft edge would be re-binarized wider);
+    refiners only feather (the guide is already grown/filled); a direct hint applies everything.
+    """
+    if not c:
+        return {}
+    if kind in ("matanyone2", "videomama", "prematte_hint"):
+        return {**c, "grow": 0, "fill_holes": False}
+    if kind == "sam_preview" or os.path.basename(publish_dir or "") == "VideoMamaMaskHint":
+        return {**c, "feather": 0.0}
+    return c
+
+
+def _cleanup_staged(job: TaskJob, ctx: _Ctx, staged: str, cancel) -> None:
+    c = stage_cleanup(job.kind, job.publish_dir, job.params.get("mask_cleanup"))
+    if not c or not (c["grow"] or c["fill_holes"] or c["feather"] > 0):
+        return
+    for stem in ctx.stems:
+        if cancel.is_set():
+            raise JobCancelledError(job.job_id, 0)
+        path = os.path.join(staged, f"{stem}.png")
+        m = imread_unicode(path, cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH)
+        if m is None or not imwrite_unicode(path, cleanup_mask(m, c)):
+            raise CorridorKeyError(f"Cannot clean up mask for {stem}")
+
+
 def _run_hint(svc, job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     prog = _Progress(ev, job.kind)
     status = lambda m: ev("status", message=m)  # noqa: E731
@@ -896,9 +1000,11 @@ def _run_hint(svc, job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     view = _build_view(job, ctx.clip, ctx.files, ctx.work,
                        masks=ctx.masks if k in ("videomama", "matanyone2") else None)
     n = len(ctx.stems)
-    if k == "sam_track":
+    staged = os.path.join(view.root_path, "AlphaHint")  # every engine stages here; publish_dir picks the destination
+    if k == "prematte_hint":
+        _promote_guide(job, ctx, view, staged, cancel)
+    elif k == "sam_track":
         masks = _sam(svc, job, ctx, view, ev, cancel, prog, status, warn)
-        staged = os.path.join(view.root_path, "VideoMamaMaskHint")
         os.makedirs(staged)
         for stem, m in zip(ctx.stems, masks):
             if not imwrite_unicode(os.path.join(staged, f"{stem}.png"), np.where(np.asarray(m) > 0, 255, 0).astype(np.uint8)):
@@ -916,13 +1022,14 @@ def _run_hint(svc, job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
         elif k == "videomama":
             svc.run_videomama(view, job=cj, on_progress=prog, on_warning=warn, on_status=status,
                               chunk_size=p["chunk_size"])
-        staged = os.path.join(view.root_path, "AlphaHint")
     if cancel.is_set():
         raise JobCancelledError(view.name, 0)
     first = imread_unicode(os.path.join(view.input_asset.path, ctx.files[0]), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
     size = first.shape[:2] if first is not None else None
     ev("status", message="Validating generated hints...")
     _validate_set(staged, ctx.stems, size, cancel)
+    # Guide stages skip feather and keep their gray values: refiners/prematte threshold at 10 when they load the guide.
+    _cleanup_staged(job, ctx, staged, cancel)
     if cancel.is_set():
         raise JobCancelledError(view.name, 0)
     prov = {"kind": k, "job_id": job.job_id, "clip_id": job.clip_id, "range": _thaw(job.range),
@@ -930,13 +1037,34 @@ def _run_hint(svc, job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     prog(view.name, n, n)
     ev("status", message="Publishing hints...")
     published = publish_hint_dir(staged, job.publish_dir, ctx.stems, job, prov, guard=ctx.lock.verify)
-    if k == "sam_track":
+    if os.path.basename(job.publish_dir) == "VideoMamaMaskHint":  # a guide, not a final hint: record it
         ctx.lock.verify()
         _atomic_json(os.path.join(job.clip_root, MASK_TRACK_MANIFEST), {
-            "source": "sam2", "frame_stems": sorted(_images(job.publish_dir)),
-            "model_id": SAM_IDS[p["tracker_model"]]})
+            "source": "sam2" if k == "sam_track" else k, "frame_stems": sorted(_images(job.publish_dir)),
+            "model_id": SAM_IDS[p["tracker_model"]] if k == "sam_track" else None})
     return {"published": published, "expected": n, "hint_dir": job.publish_dir, "complete": True,
             "outputs": [job.publish_dir]}
+
+
+def _promote_guide(job: TaskJob, ctx: _Ctx, view, staged: str, cancel) -> None:
+    """Copy this range's guide frames (read-only) into ``staged`` as gray PNGs of exactly the source size.
+
+    grow/fill were applied when the guide was made, so only the feather runs afterwards (``_cleanup_staged``)."""
+    os.makedirs(staged)
+    first = imread_unicode(os.path.join(view.input_asset.path, ctx.files[0]), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
+    if first is None:
+        raise CorridorKeyError("Cannot read the first source frame")
+    for i, stem in enumerate(ctx.stems):
+        if cancel.is_set():
+            raise JobCancelledError(view.name, i)
+        m = imread_unicode(ctx.masks[stem], cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH)
+        if m is None or m.size == 0:
+            raise CorridorKeyError(f"Guide mask {stem} is unreadable; nothing was published.")
+        if m.shape != first.shape[:2]:
+            raise CorridorKeyError(f"Guide mask {stem} is {m.shape[1]}x{m.shape[0]}, the source is "
+                                   f"{first.shape[1]}x{first.shape[0]}; nothing was published.")
+        if not imwrite_unicode(os.path.join(staged, f"{stem}.png"), m):
+            raise CorridorKeyError(f"Cannot stage hint frame for {stem}")
 
 
 def _sam(svc, job: TaskJob, ctx: _Ctx, view, ev, cancel, prog, status, warn):
@@ -983,6 +1111,7 @@ def _run_preview(svc, job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     prog, status = _Progress(ev, "sam_preview"), (lambda m: ev("status", message=m))
     masks = _sam(svc, job, ctx, view, ev, cancel, prog, status, lambda m: ev("warning", message=str(m)))
     mask = np.where(np.asarray(masks[0]) > 0, 255, 0).astype(np.uint8)
+    mask = cleanup_mask(mask, stage_cleanup("sam_preview", None, job.params.get("mask_cleanup")))
     out = os.path.join(job.staging_dir, f"preview-{job.job_id}.png")  # ours; Rust removes it after use
     ok, buf = cv2.imencode(".png", mask)
     if not ok:
@@ -1124,8 +1253,11 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     owned_part = False
     proc, helpers, stop = None, [], threading.Event()
     try:
-        alpha = p["container"] in _ALPHA_CONTAINERS
-        pix = {"mp4": "yuv420p", "mov_prores4444": "yuva444p10le", "webm_alpha": "yuva420p"}[p["container"]]
+        codec, q = p["codec"], str(p["quality"])
+        pix = CODEC_SPEC[codec][0]
+        # the stream has an alpha plane (opaque for RGB/gray inputs); transparency is real only for 'processed'
+        alpha_plane = codec in _ALPHA_CODECS
+        alpha = alpha_plane and p["product"] == "processed"
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-n"]
         if raw:
             first = _read_exr(ctx.files[0])
@@ -1144,16 +1276,19 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
         cmd += ["-vf", f"scale=in_range=pc:out_color_matrix=bt709:out_range=tv,format={pix}", "-colorspace", "bt709"]
         if p["product"] != "matte":
             cmd += ["-color_primaries", "bt709", "-color_trc", "iec61966-2-1"]
-        if p["container"] == "mov_prores4444":
-            cmd += ["-c:v", "prores_ks", "-profile:v", "4444", "-qscale:v", "9", "-pix_fmt", pix,
-                    "-vendor", "apl0", "-f", "mov"]
-        elif p["container"] == "webm_alpha":
-            cmd += ["-c:v", "libvpx-vp9", "-pix_fmt", pix, "-b:v", "0", "-crf", "18", "-auto-alt-ref", "0",
+        if codec.startswith("prores"):
+            cmd += ["-c:v", "prores_ks", "-profile:v", "4444" if codec == "prores4444" else "standard",
+                    "-qscale:v", q, "-pix_fmt", pix, "-vendor", "apl0", "-f", "mov"]
+        elif codec == "vp9":
+            cmd += ["-c:v", "libvpx-vp9", "-pix_fmt", pix, "-b:v", "0", "-crf", q, "-auto-alt-ref", "0",
                     "-row-mt", "1", "-f", "webm"]
+        elif codec == "hevc":
+            cmd += ["-c:v", "libx265", "-crf", q, "-pix_fmt", pix, "-tag:v", "hvc1",
+                    "-x265-params", "log-level=error", "-f", "mp4"]
         else:
-            cmd += ["-c:v", "libx264", "-crf", "18", "-pix_fmt", pix, "-f", "mp4"]
-            if p["product"] == "processed":
-                ev("warning", message="MP4 has no alpha channel; transparency is not kept.")
+            cmd += ["-c:v", "libx264", "-crf", q, "-pix_fmt", pix, "-f", "mp4"]
+        if p["product"] == "processed" and not alpha_plane:
+            ev("warning", message="This codec has no alpha channel; transparency is not kept.")
         cmd += ["-an", part]
         ev("warning", message="Audio is not included in exported videos.")
         owned_part = True
@@ -1220,7 +1355,7 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
         if proc.returncode != 0:
             text = b"".join(err).decode("utf-8", "replace").strip()
             raise CorridorKeyError("FFmpeg export failed:\n" + "\n".join(text.splitlines()[:20]))
-        _ffprobe_check(part, n, float(p["fps"]), alpha)
+        _ffprobe_check(part, n, float(p["fps"]), alpha_plane)
         _link_noclobber(part, p["dest"])  # hard link then drop the .part; never replaces
         owned_part = False
     except BaseException:
@@ -1233,7 +1368,8 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
             _rm(part)
         shutil.rmtree(scratch, ignore_errors=True)
     return {"published": n, "expected": n, "hint_dir": None, "complete": True, "outputs": [p["dest"]],
-            "frames": n, "fps": float(p["fps"]), "container": p["container"], "audio": "none",
+            "frames": n, "fps": float(p["fps"]), "container": p["container"], "codec": codec,
+            "quality": p["quality"], "audio": "none",
             "alpha": alpha, "partial": ctx.partial}
 
 

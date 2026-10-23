@@ -245,9 +245,12 @@ impl Viewer {
         self.straight = processed_is_straight(clip);
         for v in View::ALL {
             for (i, stem) in self.index.stems.iter().enumerate() {
-                if !old.view_has(v, stem) {
+                // Hint/guide frames are rewritten in place by generation jobs: never keep their old pixels.
+                if !old.view_has(v, stem) || matches!(v, View::Hint | View::Guide) {
                     if let Availability::Present(p) = self.index.availability(v, i, None) {
                         self.store.forget_path(&p);
+                        self.tex.retain(|k, _| k.path != p);
+                        self.tex_order.retain(|k| k.path != p);
                     }
                 }
             }
@@ -606,6 +609,7 @@ impl Viewer {
             Err(match v {
                 View::Input => "No source frames",
                 View::Hint => "No hint yet",
+                View::Guide => "No guide yet",
                 _ => "Output off / nothing on disk",
             })
         }

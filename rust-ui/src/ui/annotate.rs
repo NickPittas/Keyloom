@@ -127,6 +127,9 @@ pub struct AnnState {
     pub holdout: Vec<PaintStroke>,
     /// Preview mask PNG to tint over the frame (current prompt signature only; the host decides).
     pub preview: Option<PathBuf>,
+    /// Guide/hint frame to tint over the Input frame (any hint image type); tint colour.
+    pub mask: Option<(PathBuf, [u8; 3])>,
+    mask_tex: Option<(PathBuf, Option<std::time::SystemTime>, Option<TextureHandle>)>,
     drag: Vec<[f64; 2]>,
     box_start: Option<[f64; 2]>,
     tex: Option<(PathBuf, Option<TextureHandle>)>,
@@ -176,6 +179,32 @@ impl AnnState {
         self.tex.as_ref().and_then(|t| t.1.as_ref())
     }
 
+    /// Soft tint of the grey level of a hint/guide frame. Keyed by file time: generation rewrites frames in
+    /// place. ponytail: decoded on the UI thread, so playback with an overlay is limited by that decode.
+    fn mask_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
+        let (want, tint) = self.mask.clone()?;
+        let mtime = std::fs::metadata(&want).and_then(|m| m.modified()).ok();
+        if self
+            .mask_tex
+            .as_ref()
+            .is_none_or(|(p, t, _)| *p != want || *t != mtime)
+        {
+            let tex = crate::decode::decode_display(&want, crate::decode::Interp::Matte)
+                .ok()
+                .map(|f| {
+                    let rgba: Vec<u8> = f
+                        .rgba
+                        .chunks_exact(4)
+                        .flat_map(|px| [tint[0], tint[1], tint[2], (px[0] as f32 * 0.55) as u8])
+                        .collect();
+                    let img = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &rgba);
+                    ctx.load_texture("hint-overlay", img, TextureOptions::LINEAR)
+                });
+            self.mask_tex = Some((want, mtime, tex));
+        }
+        self.mask_tex.as_ref().and_then(|t| t.2.as_ref())
+    }
+
     /// Draw the overlays and handle the active tool for one frame. `img` is the on-screen frame rectangle.
     pub fn run(
         &mut self,
@@ -185,6 +214,14 @@ impl AnnState {
         img: Rect,
         size: [usize; 2],
     ) {
+        if let Some(t) = self.mask_texture(ctx) {
+            p.image(
+                t.id(),
+                img,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
         if let Some(t) = self.preview_tex(ctx) {
             p.image(
                 t.id(),

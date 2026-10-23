@@ -304,11 +304,41 @@ impl App {
         self.media.note.as_deref()
     }
 
+    pub(super) fn media_has_actions(&self, clip: &Clip) -> bool {
+        self.media.movie.as_ref().is_some_and(|m| m.folder == clip.folder)
+            || self.media.seq.as_ref().is_some_and(|s| s.clip_folder == clip.folder)
+    }
+
+    pub(super) fn media_actions(&mut self, ui: &mut Ui, clip: &Clip) {
+        let mut extract = false;
+        let mut start = false;
+        let mut cancel = false;
+        theme::section(ui, "Media preparation", |ui| {
+            if let Some(m) = self.media.movie.as_ref().filter(|m| m.folder == clip.folder) {
+                let ready = self.ai.local_caps().as_ref().is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false))
+                    && (matches!(m.verdict, Some(Ok(true))) || matches!(m.verdict, Some(Ok(false))) && m.confirm);
+                extract = ui.add_enabled(ready, egui::Button::new("Extract frames from this movie").fill(theme::ACCENT)).clicked();
+            }
+            if let Some(s) = self.media.seq.as_ref().filter(|s| s.clip_folder == clip.folder) {
+                ui.horizontal(|ui| {
+                    if let Some((_, stop)) = &s.run {
+                        ui.label("Importing frames…");
+                        if ui.button("Stop import").clicked() { stop.store(true, std::sync::atomic::Ordering::Relaxed); }
+                    } else {
+                        start = ui.add_enabled(s.plan.is_ok(), egui::Button::new("Import mask frames").fill(theme::ACCENT)).clicked();
+                        cancel = ui.button("Cancel import").clicked();
+                    }
+                });
+            }
+        });
+        if extract {
+            if let Err(e) = self.extract_relinked_movie() { self.media.note = Some(e); }
+        }
+        if start { self.start_sequence_import(ui.ctx()); }
+        if cancel { self.media.seq = None; }
+    }
+
     pub(super) fn media_props(&mut self, ui: &mut Ui, clip: &Clip) {
-        let caps = self.ai.local_caps();
-        let prep_ok = caps
-            .as_ref()
-            .is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false));
         let movie_gone = clip.error.is_some()
             && matches!(clip.source, Source::Missing)
             && stored_filename(clip).is_some();
@@ -319,7 +349,7 @@ impl App {
                 let ctx = ui.ctx().clone();
                 self.request_pick(&ctx, PickKind::RelinkMovie);
             }
-            let (mut go, mut cancel_relink) = (false, false);
+            let mut cancel_relink = false;
             if let Some(m) = &mut self.media.movie {
                 ui.label(
                     RichText::new(m.path.display().to_string())
@@ -362,21 +392,10 @@ impl App {
                                 "I confirm this is the same footage",
                             );
                         }
-                        let ok = prep_ok && (*verified || m.confirm);
-                        go = ui
-                            .add_enabled(ok, egui::Button::new("Extract frames from this movie"))
-                            .on_disabled_hover_text(if prep_ok {
-                                "Confirm first"
-                            } else {
-                                "The worker cannot extract frames (FFmpeg)"
-                            })
-                            .clicked();
+
                     }
                 }
                 cancel_relink = ui.button("Cancel relink").clicked();
-            }
-            if go {
-                let _ = self.extract_relinked_movie();
             }
             if cancel_relink {
                 self.media.movie = None;
@@ -396,8 +415,6 @@ impl App {
             let range = self
                 .ai_open_range()
                 .unwrap_or((0, clip.input_files.len() - 1));
-            let mut start = false;
-            let mut cancel = false;
             if let Some(s) = self
                 .media
                 .seq
@@ -435,28 +452,9 @@ impl App {
                         ));
                     }
                 }
-                ui.horizontal(|ui| {
-                    if s.run.is_some() {
-                        ui.label("Importing…");
-                        if ui.button("Stop").clicked() {
-                            if let Some((_, c)) = &s.run {
-                                c.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                    } else {
-                        start = ui
-                            .add_enabled(s.plan.is_ok(), egui::Button::new("Import"))
-                            .clicked();
-                        cancel = ui.button("Cancel").clicked();
-                    }
-                });
+                ui.label(RichText::new("Use the import action above the node graph.").color(DIM).size(12.0));
             }
-            if start {
-                self.start_sequence_import(ui.ctx());
-            }
-            if cancel {
-                self.media.seq = None;
-            }
+
         }
         if let Some(n) = &self.media.note {
             ui.label(RichText::new(n).color(WARN).size(12.0));
@@ -472,4 +470,102 @@ fn stored_filename(c: &Clip) -> Option<String> {
         .get("filename")?
         .as_str()
         .map(str::to_owned)
+}
+
+/// Media page summary (bottom bar): the source, its span and interpretation, and one line about everything
+/// already on disk. Every row is a real path from the loaded clip; nothing is guessed.
+impl App {
+    pub(super) fn media_details(&mut self, ui: &mut Ui, clip: &Clip) {
+        let row = |ui: &mut Ui, label: &str, text: &str, copy: Option<&str>| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(label).color(DIM).size(11.5));
+                ui.add(egui::Label::new(RichText::new(text).monospace().size(11.0)).truncate())
+                    .on_hover_text(text);
+                if let Some(c) = copy {
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(c.to_owned());
+                    }
+                }
+            });
+        };
+        match &clip.source {
+            Source::Sequence { dir, external } => row(
+                ui,
+                if *external {
+                    "Source · external sequence"
+                } else {
+                    "Source · sequence"
+                },
+                &dir.display().to_string(),
+                Some(&dir.display().to_string()),
+            ),
+            Source::Video { path } => row(
+                ui,
+                "Source · movie",
+                &path.display().to_string(),
+                Some(&path.display().to_string()),
+            ),
+            Source::Missing => {
+                ui.label(RichText::new("Source · missing (relink in Properties)").color(WARN).size(11.5));
+            }
+        }
+        let stems = &clip.input_files;
+        let span = match (stems.first(), stems.last()) {
+            (Some(a), Some(b)) if stems.len() > 1 => format!("{} … {}", a.0, b.0),
+            (Some(a), _) => a.0.clone(),
+            _ => "none".into(),
+        };
+        let size = clip.sample_size.map_or_else(
+            || format!("{:.3} fps{}", clip.fps, if clip.fps_assumed { " (assumed)" } else { "" }),
+            |(w, h)| {
+                format!(
+                    "{w}×{h} · {:.3} fps{}",
+                    clip.fps,
+                    if clip.fps_assumed { " (assumed)" } else { "" }
+                )
+            },
+        );
+        row(ui, "Frames", &format!("{} · {span}", stems.len()), None);
+        row(
+            ui,
+            "Format",
+            &format!(
+                "{size} · {} · {}",
+                if clip.input_is_linear { "linear" } else { "sRGB" },
+                color_origin_text(clip)
+            ),
+            None,
+        );
+    }
+
+    /// Full path inventory for the Media properties panel: every folder this clip reads or writes.
+    pub(super) fn media_paths(&mut self, ui: &mut Ui, clip: &Clip) {
+        let row = |ui: &mut Ui, label: &str, text: &str| {
+            ui.label(RichText::new(label).color(DIM).size(11.5));
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Label::new(RichText::new(text).monospace().size(11.0)).truncate())
+                    .on_hover_text(text);
+                if ui.small_button("Copy").clicked() {
+                    ui.ctx().copy_text(text.to_owned());
+                }
+            });
+        };
+        for (label, view, n) in [
+            ("Pre-matte guide folder", View::Guide, clip.mask_frames),
+            ("Final hint folder", View::Hint, clip.alpha_frames),
+        ] {
+            if let Some(p) = clip.view_dir(view) {
+                row(ui, &format!("{label} ({n} frames)"), &p.display().to_string());
+            }
+        }
+        if let Some(d) = &clip.output_dir {
+            row(ui, "Output folder", &d.display().to_string());
+        }
+        if let Some(m) = &clip.manifest_dir {
+            row(ui, "Last run wrote to", &m.display().to_string());
+        }
+        if let Some(r) = clip.result_range_text() {
+            ui.label(RichText::new(format!("Result covers {r}")).color(DIM).size(11.5));
+        }
+    }
 }

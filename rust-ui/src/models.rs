@@ -20,6 +20,7 @@ pub enum Action {
     Download(String),
     DownloadProfile(Profile),
     Repair(String),
+    Delete(String),
     Cancel,
 }
 
@@ -37,6 +38,7 @@ impl Action {
             Self::VerifyAll | Self::Verify(_) => "verify",
             Self::Download(_) | Self::DownloadProfile(_) => "download",
             Self::Repair(_) => "repair",
+            Self::Delete(_) => "delete",
             Self::Cancel => "cancel",
         }
     }
@@ -44,7 +46,7 @@ impl Action {
     pub fn requires_operation_id(&self) -> bool {
         matches!(
             self,
-            Self::Download(_) | Self::DownloadProfile(_) | Self::Repair(_) | Self::Cancel
+            Self::Download(_) | Self::DownloadProfile(_) | Self::Repair(_) | Self::Delete(_) | Self::Cancel
         )
     }
 
@@ -65,6 +67,7 @@ impl Action {
                 .into(),
             ],
             Self::Repair(id) => vec!["--repair".into(), "--target".into(), id.into()],
+            Self::Delete(id) => vec!["--delete".into(), "--target".into(), id.into()],
             Self::Cancel => vec!["--cancel".into()],
         }
     }
@@ -237,6 +240,7 @@ pub struct Job {
 
 impl Job {
     fn spawn(mut command: Command, program: &Path) -> Result<Self, String> {
+        crate::runtime::prepare_python_command(&mut command, None);
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

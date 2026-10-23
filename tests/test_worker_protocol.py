@@ -322,7 +322,8 @@ def test_hello_reports_real_hash_and_gpu(tmp_path, monkeypatch):
     h = worker_mod.probe_hello(1)
     m = h["models"]["corridorkey_v2"]
     assert m["sha256"] == hashlib.sha256(b"fake checkpoint").hexdigest() and m["bytes"] == w.stat().st_size
-    assert h["gpu"] == {"index": 1, "name": "Fake GPU", "vram_gb": 8.0}
+    assert h["gpu"]["uuid"] is None and h["gpu"]["uuid_status"] == "unverified"  # the fake props have no uuid: never guessed
+    assert {k: h["gpu"][k] for k in ("index", "name", "vram_gb")} == {"index": 1, "name": "Fake GPU", "vram_gb": 8.0}
     assert h["capabilities"]["key"] is True
 
 

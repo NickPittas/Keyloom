@@ -51,7 +51,13 @@ corridorkey.desktop` (Exec scrubs PYTHONPATH/PYTHONHOME), `PREFIX/bin/{corridork
 version/pointer/shortcuts (or removes everything on a first install); a crash leaves a journal that the next run
 (`corridorkey-setup recover`, also automatic) finishes.
 Exit 0 = everything Ready; **3 = app installed but models incomplete/skipped**; 2 = refused/failed; 130 = interrupted.
+Release upload (GitHub 2 GiB/asset limit): add `--split` to `bundle.py linux` to also write `X.run.partNNN` (<=1900 MiB each) +
+`X.run.parts.sha256`. User: `sha256sum -c X.run.parts.sha256 && cat X.run.part[0-9][0-9][0-9] > X.run && sha256sum -c X.run.sha256 && chmod +x X.run`. The unsplit `.run` is unchanged.
+**OS prerequisites (not bundled; checked before install, with an apt hint for Debian/Ubuntu/Mint):** GL/EGL, X11 or Wayland client,
+xkbcommon, fontconfig, freetype, glib, dbus, libstdc++, and the proprietary NVIDIA driver (`libcuda.so.1`; a missing driver only warns,
+since models can still be installed). Python, Rust, FFmpeg, the CUDA toolkit and GCC are NOT needed on the target.
 Later: `PREFIX/bin/corridorkey-setup {status [--verify] | models | repair | rollback | recover | uninstall}`;
+server mode: `PREFIX/bin/corridorkey-coordinator {serve|pair|revoke|abandon} ...` (runs the bundled `backend.coordinator`; `serve` only listens when started, loopback by default);
 `X.run --repair` restores damaged files from the payload (models re-verified only with `--models full`).
 Two versions are kept (active + previous). Concurrent installers on one prefix are not supported.
 
@@ -59,11 +65,19 @@ Two versions are kept (active + previous). Concurrent installers on one prefix a
 Installs to `%LOCALAPPDATA%\Programs\CorridorKey\versions\<id>`, then runs the same `lifecycle.py`
 (validation, Start Menu shortcut, receipt, optional full models task with a visible console). Drive-root folders and an
 already-installed identical build are refused; a failed launch validation sets a nonzero setup exit code
-(`GetCustomSetupExitCode`) and the previous version's shim runs `recover` to delete the failed one. Add/Remove Programs
+(`GetCustomSetupExitCode`) and the previous version's shim runs `recover` to delete the failed one. Windows needs no VC++ Redistributable: the Microsoft VC runtime DLLs are bundled beside python.exe and the UI. The NVIDIA driver
+is the only prerequisite (missing driver warns). Per-user only (no elevation prompt). Inno slices are 1900 MiB: upload the exe plus every `-N.bin` and
+the `.sha256` (one line per file); all must be in one folder to install.
+Add/Remove Programs
 and the uninstaller come from Inno. Uninstall deletes only the exact version dir Inno created plus receipt-validated
 versions carrying our own manifest; the running version is removed by a detached `cmd`. The Start Menu shortcut targets
 the exe directly, so it does not scrub PYTHONPATH (the Rust side must). Repair of damaged files on Windows =
 reinstall after uninstall. `/TASKS="!models"` makes a silent app-only install. Native build and installation checks are recorded in the acceptance document below.
+
+## Background autostart contract (written by the app, removed by uninstall)
+Linux launches the stable shim `PREFIX/bin/corridorkey`. Windows launches the GUI exe directly; activation and rollback rewrite an existing owned entry. Linux:
+`$XDG_CONFIG_HOME/autostart/corridorkey.desktop` containing `X-CorridorKey-Owner=<sha256(str(PREFIX))[:16]>` (`lifecycle.owner_id`).
+Windows: `HKCU\\...\\Run` value `CorridorKey` whose command points into this prefix. `lifecycle.remove_autostart` deletes only a matching entry.
 
 ## Preserved on uninstall/update/repair
 Projects, outputs, models, HF cache and settings live outside the install prefix and are never

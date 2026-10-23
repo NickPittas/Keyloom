@@ -54,6 +54,113 @@ pub fn save_range(
     })
 }
 
+/// The render client this clip is assigned to (`ck_native.client`). `None` = Automatic.
+pub fn clip_client(clip: &Clip) -> Option<String> {
+    clip.native
+        .get("client")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Assign a clip to a configured client id, or `None` for Automatic. Only this key changes.
+pub fn save_client(clip: &Clip, id: Option<&str>) -> Result<(), String> {
+    update_native(&clip.meta_path, |n| match id {
+        Some(id) => {
+            n.insert("client".into(), json!(id));
+        }
+        None => {
+            n.remove("client");
+        }
+    })
+}
+
+/// The Key hint-consumption mode the user picked for this clip (`ck_native.hint_mode`). Absent = nothing was
+/// chosen explicitly, so defaults apply. Distinct from `workflow.params.hint_mode`, which a queued job froze.
+pub fn clip_hint_mode(clip: &Clip) -> Option<String> {
+    clip.native
+        .get("hint_mode")
+        .and_then(Value::as_str)
+        .filter(|m| crate::settings::HINT_MODES.contains(m))
+        .map(str::to_owned)
+}
+
+/// The user's own hint-mode pick: `clip_hint_mode` minus a value that only records what an applied preset
+/// resolved to (`ck_native.hint_mode_src` = "preset"). Batch presets must not override this one.
+pub fn explicit_hint_mode(clip: &Clip) -> Option<String> {
+    clip_hint_mode(clip).filter(|_| clip.native.get("hint_mode_src").and_then(Value::as_str) != Some("preset"))
+}
+
+/// The preset the (not overridden) route/delivery was last applied from, for honest Reset labels.
+pub fn write_src(meta: &Path, key: &str, preset: Option<&str>) -> Result<(), String> {
+    update_native(meta, |n| match preset {
+        Some(p) => {
+            n.insert(format!("{key}_src"), json!(p));
+        }
+        None => {
+            n.remove(&format!("{key}_src"));
+        }
+    })
+}
+
+/// What a hint-mode pick returns to on Reset: `(value, came from a preset)` as it was before the first pick.
+pub fn hint_mode_base(clip: &Clip) -> Option<(String, bool)> {
+    let b = clip.native.get("hint_mode_base")?;
+    Some((b.get("value")?.as_str().filter(|m| crate::settings::HINT_MODES.contains(m))?.to_owned(), b.get("preset")?.as_bool()?))
+}
+
+/// The user's own pick. The first pick (not a re-pick) records `base`, the inherited mode it replaces.
+pub fn save_hint_pick(clip: &Clip, mode: &str, base: (&str, bool)) -> Result<(), String> {
+    if !crate::settings::HINT_MODES.contains(&mode) {
+        return Err(format!("{mode} is not a hint mode"));
+    }
+    update_native(&clip.meta_path, |n| {
+        let picked = n.contains_key("hint_mode") && n.get("hint_mode_src").and_then(Value::as_str) != Some("preset");
+        n.insert("hint_mode".into(), json!(mode));
+        n.remove("hint_mode_src");
+        if !picked {
+            n.insert("hint_mode_base".into(), json!({"value": base.0, "preset": base.1}));
+        }
+    })
+}
+
+/// A confirmed preset speaks for an existing pick's base: Reset now returns to that preset's mode.
+pub fn set_hint_base(clip: &Clip, value: &str, preset: bool) -> Result<(), String> {
+    update_native(&clip.meta_path, |n| {
+        if n.contains_key("hint_mode_base") || n.contains_key("hint_mode") {
+            n.insert("hint_mode_base".into(), json!({"value": value, "preset": preset}));
+        }
+    })
+}
+
+/// Persist the mode an applied preset resolved to (survives reload like a pick, but is not an override).
+pub fn save_preset_hint_mode(clip: &Clip, mode: &str) -> Result<(), String> {
+    save_hint_mode(clip, Some(mode))?;
+    update_native(&clip.meta_path, |n| {
+        n.insert("hint_mode_src".into(), json!("preset"));
+        n.remove("hint_mode_base"); // no pick to return from
+    })
+}
+
+/// Record (or forget, with `None`) this clip's explicit hint-consumption choice.
+pub fn save_hint_mode(clip: &Clip, mode: Option<&str>) -> Result<(), String> {
+    if let Some(m) = mode {
+        if !crate::settings::HINT_MODES.contains(&m) {
+            return Err(format!("{m} is not a hint mode"));
+        }
+    }
+    update_native(&clip.meta_path, |n| match mode {
+        Some(m) => {
+            n.insert("hint_mode".into(), json!(m));
+            n.remove("hint_mode_src");
+        }
+        None => {
+            n.remove("hint_mode");
+            n.remove("hint_mode_src");
+            n.remove("hint_mode_base");
+        }
+    })
+}
+
 /// Input colour interpretation in the project session file (`clip_input_is_linear`, the key the Qt app uses).
 pub fn save_colour(project_root: &Path, clip_name: &str, linear: bool) -> Result<(), String> {
     let candidates = [

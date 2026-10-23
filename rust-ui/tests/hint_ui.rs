@@ -31,6 +31,58 @@ fn png(p: &std::path::Path) {
 }
 
 #[test]
+fn an_owned_running_hint_lock_is_not_presented_as_a_recovery_warning() {
+    let base = tmp("owned-hint-lock");
+    let root = base.join("proj");
+    let clip_root = root.join("clips/c");
+    std::fs::create_dir_all(clip_root.join("Frames")).unwrap();
+    png(&clip_root.join("Frames/f_1.png"));
+    std::fs::write(clip_root.join("clip.json"), "{}").unwrap();
+    std::fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
+    let repo = make_repo(&base, "worker", json!({}));
+    let settings = base.join("settings.json");
+    std::fs::write(&settings, json!({"version":1,"ai_targets":[{"id":"local","kind":"local","repo":repo,"python":PY,"gpu":0}]}).to_string()).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = App::with_ctx(&ctx, AppOptions {
+        project: Some(root), settings_path: Some(settings), open_clip: Some("c".into()), tab: Some(Tab::Key), ..Default::default()
+    });
+    let clip = app.clip_for_test();
+    let cfg = ck::hints::HintCfg::default();
+    let mut job = ck::hints::Ctx {
+        clip: &clip, range: (0, 0), job_id: "owned-hint".into(), staging: base.join("stage")
+    }.producer(&cfg, &ck::hints::Annotations::default(), false, ck::hints::GUIDE_DIR).unwrap();
+    job.params["fake"] = json!("hold");
+    app.ai_mut().submit_task(&clip, job, vec![], 0).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !matches!(app.ai().scheduler().state_of("owned-hint"), Some(ck::scheduler::JobState::Running { .. })) {
+        frames(&ctx, &mut app, 1);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let lock = clip_root.join(".corridorkey_hint.lock");
+    std::fs::write(&lock, json!({"job_id":"owned-hint","pid":123,"host":"fakehost"}).to_string()).unwrap();
+    let mut out = ctx.run_ui(RawInput::default(), |ui| app.ai_mut().hint_lock_ui(ui, &clip));
+    fn text(shape: &egui::Shape, output: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => output.push(t.galley.text().to_string()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| text(s, output)),
+            _ => {}
+        }
+    }
+    let mut labels = vec![];
+    for s in &out.shapes { text(&s.shape, &mut labels); }
+    out.textures_delta.clear();
+    assert!(!labels.iter().any(|s| s.contains("Hint lock") || s.contains("Confirm")), "{labels:?}");
+    assert!(lock.exists(), "a normal running lock must stay intact");
+    app.ai_mut().cancel("owned-hint");
+    while app.ai().scheduler().state_of("owned-hint").is_some_and(|s| !s.is_terminal()) {
+        frames(&ctx, &mut app, 1);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
 fn pages_render_and_in_out_and_colour_are_saved_immediately() {
     let base = tmp("ui");
     let proj = base.join("proj");
@@ -505,7 +557,7 @@ fn import_refuses_while_a_hint_lock_exists_and_blocks_hint_jobs_while_it_runs() 
         job_id: "g1".into(),
         staging: base.join("stg"),
     }
-    .route(&ck::hints::HintCfg::default())
+    .producer(&ck::hints::HintCfg::default(), &ck::hints::Annotations::default(), false, "AlphaHint")
     .unwrap();
     let c = ck::project::load_project(&proj, &ck::project::LoadOptions::default())
         .unwrap()

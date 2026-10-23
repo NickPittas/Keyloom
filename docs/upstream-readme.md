@@ -1,0 +1,693 @@
+# EZ-CorridorKey2 — CorridorKey 2.0 fork (private, personal use)
+
+> **EZ-CorridorKey2 is a personal-use fork of EZ-CorridorKey whose keyer is CorridorKey 2.0 (NVIDIA CUDA only).**
+> The CorridorKey v1 engine is replaced; this is not a general release. Upstream: [edenaion/EZ-CorridorKey](https://github.com/edenaion/EZ-CorridorKey) v2.1.5.
+
+## Requirements and setup
+
+- NVIDIA GPU with CUDA and Python 3.11. CPU, MPS and macOS are not supported.
+- Install with `1-install.sh` / `1-install.bat`, then fetch the weights with `python scripts/setup_models.py --corridorkey` (also offered by the in-app setup wizard).
+- The engine is vendored in `CorridorKeyV2/`. Weights (about 5 GB) live in the per-OS app data dir, by default `~/.local/share/EZ-CorridorKey2/CorridorKeyV2` (see `backend/v2_paths.py`); override with `CORRIDORKEY_V2_MODELS_DIR`.
+- Scratch/temp files go to the system temp dir; override with `CORRIDORKEY_V2_SCRATCH_DIR` (`backend/service/inference.py`).
+
+## CorridorKey 2.0 behaviour
+
+- Whole-clip inference (`backend/service/core.py`): every run infers the entire clip. Inference settings (`InferenceParams`, `ui/widgets/parameter_panel.py`): optional AlphaHint source (GVM / BiRefNet / VideoMaMa / MatAnyone2) with quality, carry hint, VRAM profile (auto / low), despill strength, and cutout linear (shown disabled).
+- Outputs: `FG/`, `Matte/`, `Comp/`, `Processed/` folders as EXR or PNG, plus the manifest `.corridorkey_manifest.json`. The In/Out range only limits which frames are written; resume re-publishes only frames missing from a compatible earlier run. Separate In/Out runs do not add up to a finished clip — run the full clip (or Resume) to mark it complete.
+- Progress is shown per phase. Cancel is cooperative (stops after the current GPU step); quitting during a job asks first.
+- CLI: `python clip_manager.py --action run_inference [--non-interactive]`.
+- Not available: live single-frame re-key, parallel clips, model resolution/backend settings, MLX, and automatic updates (disabled; `3-update.sh` / `3-update.bat` refuse to run, the Update button is hidden). Update by `git pull` from your own remote.
+
+## Licensing and provenance
+
+- Engine provenance: [`CorridorKeyV2/VENDORED.md`](CorridorKeyV2/VENDORED.md); engine license: [`CorridorKeyV2/LICENSE`](CorridorKeyV2/LICENSE); third-party notices: [`CorridorKeyV2/THIRD_PARTY_NOTICES.md`](CorridorKeyV2/THIRD_PARTY_NOTICES.md).
+- The upstream EZ-CorridorKey repo has no standalone license file at its root; its README states CC BY-NC-SA 4.0 (see "Licensing & Attribution" below).
+- Personal use only; do not redistribute.
+
+---
+
+# Original EZ-CorridorKey README (v1 — historical)
+
+> Everything below is the upstream v1 README. Instructions that no longer apply are marked "(Removed in CorridorKey 2.0 fork.)".
+
+# EZ-CorridorKey **v2.1.5**
+
+[![Release](https://img.shields.io/badge/Release-v2.1.5-FFF203?style=flat-square&labelColor=141300)](https://github.com/edenaion/EZ-CorridorKey/releases/latest)
+[![Stars](https://img.shields.io/github/stars/edenaion/EZ-CorridorKey?style=flat-square&labelColor=141300&color=FFF203)](https://github.com/edenaion/EZ-CorridorKey/stargazers)
+[![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-FFF203?style=flat-square&labelColor=141300)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+[![Discord](https://img.shields.io/badge/Discord-EZSCAPE-5865F2?style=flat-square&labelColor=000000&logo=discord&logoColor=50FF80)](https://discord.gg/TyxNjcWeF3)
+[![EZSCAPE](https://img.shields.io/badge/EZSCAPE-Plugins&Tools-50FF80?style=flat-square&labelColor=000000)](https://www.ezscape.space)
+[![Platform](https://img.shields.io/badge/platform-Win%20%7C%20Mac%20%7C%20Linux-454430?style=flat-square&labelColor=141300)]()
+
+<p><img alt="🇺🇸 English" src="https://img.shields.io/static/v1?label=%F0%9F%87%BA%F0%9F%87%B8&message=English&color=FFF203&labelColor=141300&style=flat-square"> <a href="docs/i18n/README.fr.md"><img alt="🇫🇷 Français" src="https://img.shields.io/static/v1?label=%F0%9F%87%AB%F0%9F%87%B7&message=Fran%C3%A7ais&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.de.md"><img alt="🇩🇪 Deutsch" src="https://img.shields.io/static/v1?label=%F0%9F%87%A9%F0%9F%87%AA&message=Deutsch&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.es.md"><img alt="🇪🇸 Español" src="https://img.shields.io/static/v1?label=%F0%9F%87%AA%F0%9F%87%B8&message=Espa%C3%B1ol&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.it.md"><img alt="🇮🇹 Italiano" src="https://img.shields.io/static/v1?label=%F0%9F%87%AE%F0%9F%87%B9&message=Italiano&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.pt.md"><img alt="🇧🇷 Português (Brasil)" src="https://img.shields.io/static/v1?label=%F0%9F%87%A7%F0%9F%87%B7&message=Portugu%C3%AAs%20%28Brasil%29&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.ja.md"><img alt="🇯🇵 日本語" src="https://img.shields.io/static/v1?label=%F0%9F%87%AF%F0%9F%87%B5&message=%E6%97%A5%E6%9C%AC%E8%AA%9E&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.ko.md"><img alt="🇰🇷 한국어" src="https://img.shields.io/static/v1?label=%F0%9F%87%B0%F0%9F%87%B7&message=%ED%95%9C%EA%B5%AD%EC%96%B4&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.zh.md"><img alt="🇨🇳 简体中文" src="https://img.shields.io/static/v1?label=%F0%9F%87%A8%F0%9F%87%B3&message=%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.ru.md"><img alt="🇷🇺 Русский" src="https://img.shields.io/static/v1?label=%F0%9F%87%B7%F0%9F%87%BA&message=%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.pl.md"><img alt="🇵🇱 Polski" src="https://img.shields.io/static/v1?label=%F0%9F%87%B5%F0%9F%87%B1&message=Polski&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.tr.md"><img alt="🇹🇷 Türkçe" src="https://img.shields.io/static/v1?label=%F0%9F%87%B9%F0%9F%87%B7&message=T%C3%BCrk%C3%A7e&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.hi.md"><img alt="🇮🇳 हिन्दी" src="https://img.shields.io/static/v1?label=%F0%9F%87%AE%F0%9F%87%B3&message=%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.id.md"><img alt="🇮🇩 Bahasa Indonesia" src="https://img.shields.io/static/v1?label=%F0%9F%87%AE%F0%9F%87%A9&message=Bahasa%20Indonesia&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.vi.md"><img alt="🇻🇳 Tiếng Việt" src="https://img.shields.io/static/v1?label=%F0%9F%87%BB%F0%9F%87%B3&message=Ti%E1%BA%BFng%20Vi%E1%BB%87t&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.uk.md"><img alt="🇺🇦 Українська" src="https://img.shields.io/static/v1?label=%F0%9F%87%BA%F0%9F%87%A6&message=%D0%A3%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%81%D1%8C%D0%BA%D0%B0&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.zh-Hant.md"><img alt="🇹🇼 繁體中文" src="https://img.shields.io/static/v1?label=%F0%9F%87%B9%F0%9F%87%BC&message=%E7%B9%81%E9%AB%94%E4%B8%AD%E6%96%87&color=454430&labelColor=0E0D00&style=flat-square"></a></p>
+
+> **Latest release: [v2.1.5](https://github.com/edenaion/EZ-CorridorKey/releases/tag/v2.1.5):** Matte quality fix. AI alpha mattes no longer trace a thin dark band around the subject on high-resolution footage ([#179](https://github.com/edenaion/EZ-CorridorKey/issues/179)), and alpha is now clamped to the valid range after upscaling so premultiplied output stays clean. See the [full changelog](CHANGELOG.md).
+
+A full desktop GUI for [Niko Pueringer's CorridorKey](https://github.com/nikopueringer/CorridorKey) — the AI chroma keyer by Corridor Digital that physically unmixes foreground from background, preserving hair, motion blur, and translucency.
+
+This GUI replaces the CLI drag-and-drop workflow with a complete desktop application while preserving 100% backward compatibility (`python main.py --cli` still runs the original wizard).
+
+Official site, install guide, and downloads: **[ezcorridorkey.com](https://ezcorridorkey.com)**
+
+![EZ-CorridorKey](docs/screenshots/EZ-CorridorKey_Inference_Done.jpg)
+
+### Contents
+
+- [Installation](#installation) — Desktop installer, CLI setup, Docker
+- [Uninstalling](#uninstalling) — Remove the app cleanly
+- [Application Layout](#application-layout) — UI overview
+- [Quick Start](#quick-start) — Import, generate alpha, run inference
+- [Keyboard Shortcuts](#keyboard-shortcuts) — Full hotkey reference
+- [View Modes](#view-modes) — Output channel switching
+- [Inference Controls](#inference-controls) — Parameters and output formats
+- [Hardware Requirements](#hardware-requirements) — VRAM, GPU, and platform info
+- [Security](#security) — Verified downloads, signed updates, checksums
+- [Localization](#localization) — Translate EZ-CorridorKey into your language
+- [Contributing](#contributing--support) — How to help and get help
+
+[![Star History Chart](https://api.star-history.com/svg?repos=edenaion/EZ-CorridorKey&type=Date)](https://star-history.com/#edenaion/EZ-CorridorKey&Date)
+
+| Capability          | CLI (Upstream)              | GUI (This Project)                                   |
+| ------------------- | --------------------------- | ---------------------------------------------------- |
+| Import clips        | Drag onto .bat file         | Drag-drop into app, or File > Import                 |
+| Configure inference | Terminal prompts            | Sliders, dropdowns, checkboxes                       |
+| Monitor progress    | Terminal text output        | Progress bars, frame counter, ETA                    |
+| Preview results     | Open output folder manually | Real-time dual viewer (input vs output)              |
+| Job management      | One clip at a time          | Queue with batch processing + full pipeline mode     |
+| GPU monitoring      | None                        | Live VRAM meter in brand bar                         |
+| Keyboard shortcuts  | None                        | 20+ hotkeys                                          |
+| Sound feedback      | None                        | 7 context-aware sound effects                        |
+| Session persistence | None                        | Recent projects, auto-save                           |
+| Paint / masking     | Manual external tool        | Built-in brush for masks + chroma key holdout        |
+| Alpha generators    | None                        | GVM, BiRefNet, VideoMaMa, MatAnyone2, Chroma Key, Apple Vision (macOS) |
+| Apple Silicon       | MPS only                    | (Removed in CorridorKey 2.0 fork.) |
+
+---
+
+## Installation
+
+**Prefer video?** Watch the [step-by-step tutorial](https://www.youtube.com/watch?v=ezg_1oQzz7w) by the app's creator:
+
+<a href="https://www.youtube.com/watch?v=ezg_1oQzz7w"><img src="https://img.youtube.com/vi/ezg_1oQzz7w/maxresdefault.jpg" alt="EZ-CorridorKey video tutorial" width="640"></a>
+
+### Desktop App Installer (recommended)
+
+**Don't want to deal with Python, git, or the command line?** A full Windows installer and portable exe are available. Mac users can grab the v2.0.0 macOS `.pkg` while the native Mac app is in production. Entirely optional and free, donations help support active development.
+
+[![Download on Gumroad](https://img.shields.io/badge/Download-Gumroad-ff90e8?style=for-the-badge&logo=gumroad&logoColor=white)](https://edenaion.gumroad.com/)
+
+The installer includes everything — Python runtime, AI models, GPU libraries — no setup required. Just install and run.
+
+### Terminal (CLI) Install (Windows / macOS / Linux)
+
+1. Clone or download this repository.
+2. The one-click path provisions and uses managed Python 3.11 automatically, so you do not need to pre-install Python just to use `1-install`.
+3. Run the installer for your platform:
+   - **Windows:** Double-click `1-install.bat`
+   - **macOS / Linux:** `chmod +x 1-install.sh && ./1-install.sh`
+4. The installer handles everything: managed Python, virtual environment, dependencies (including the correct PyTorch backend for your GPU when available), verification, and model downloads.
+5. To launch: double-click `2-start.bat` (Windows) or `./2-start.sh` (macOS/Linux).
+
+**Prerequisites:**
+
+- For the one-click installer: no preinstalled Python required
+- For manual installs: [Python 3.10–3.13](https://python.org) (3.14 is not yet supported)
+- **Windows/Linux:** NVIDIA GPU with CUDA support (8 GB+ VRAM recommended). Keep your driver current — the installer verifies the torch runtime and will stop with diagnostics instead of silently leaving you on the wrong backend.
+- **macOS:** (Removed in CorridorKey 2.0 fork.)
+
+**What the installer does:**
+
+- Checks for [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (C++ compiler needed by OpenEXR) — offers to auto-install if missing
+- Installs [uv](https://docs.astral.sh/uv/) and provisions managed Python 3.11 for the installer path
+- Creates a `.venv` virtual environment in the project folder
+- Installs the correct PyTorch backend for your platform/GPU and verifies the resulting torch runtime before reporting success
+- Downloads and installs [FFmpeg](https://ffmpeg.org/) locally if not found on PATH (used for video import)
+- Downloads CorridorKey v1 model checkpoint (blue/green) (Removed in CorridorKey 2.0 fork.)
+- Optionally installs SAM2 tracking support and pre-downloads the default Base+ checkpoint (324 MB)
+- Optionally downloads BiRefNet (~940 MB), MatAnyone2 (~135 MB), GVM (~6 GB), and VideoMaMa (~37 GB) alpha hint generators
+- Creates a desktop shortcut (optional)
+
+**Updating:**
+
+- **Windows Desktop App Installer users:** The app checks for updates automatically. When a new version is available, click the update button in the app. It downloads a lightweight patch and relaunches.
+- **macOS Desktop App users:** The app checks for updates automatically. When a new version is available, click the update button in the app. It downloads a lightweight patch and relaunches.
+- **CLI users:** Double-click `3-update.bat` (Windows) or run `./3-update.sh` (macOS/Linux). This pulls the latest code via git, or downloads a ZIP if git isn't available.
+
+> **Note:** The update ZIP on GitHub Releases (`EZ-CorridorKey-windows-x64.zip`) is for Windows Desktop App Installer users only. It patches an existing installation. CLI users should continue using `3-update.bat` / `3-update.sh`.
+
+### Alternate Installation: Docker
+
+For Linux users or remote/cloud setups, EZ-CorridorKey can run inside Docker with browser-based access via noVNC. See [docker/README.md](docker/README.md) for setup instructions. The native install above is recommended for Windows and macOS.
+
+---
+
+## Uninstalling
+
+### Desktop app installer
+
+**Windows:**
+☼ Open Settings > Apps > Installed Apps
+☼ Find **EZ-CorridorKey** and click Uninstall
+☼ This removes the application and Start Menu shortcut
+☼ Your projects and downloaded models are stored in `%APPDATA%\EZ-CorridorKey\`. Delete that folder to remove all user data.
+
+**macOS:**
+☼ Drag `/Applications/EZ-CorridorKey.app` to the Trash
+☼ Your projects, preferences, and downloaded models are stored in `~/Library/Application Support/EZ-CorridorKey/`. Delete that folder to remove all user data.
+
+### CLI install (git clone)
+
+☼ Delete the cloned repository folder (e.g. `EZ-CorridorKey/`). This includes the `.venv` virtual environment, downloaded models, and all project data inside `Projects/`.
+☼ If you created a desktop shortcut during install, delete it manually.
+☼ No system-level files are modified by the CLI install. Nothing else to clean up.
+
+### Hugging Face model cache
+
+Some optional models (BiRefNet, SAM2) are downloaded via Hugging Face Hub and cached outside the project folder. To reclaim that disk space:
+
+☼ **Windows:** `%USERPROFILE%\.cache\huggingface\hub\`
+☼ **macOS / Linux:** `~/.cache/huggingface/hub/`
+
+This cache is shared across all applications that use Hugging Face. If you use other AI tools, only delete the specific model folders (e.g. `models--ZhengPeng7--BiRefNet`, `models--facebook--sam2.1-hiera-base-plus`) rather than the entire `hub/` directory.
+
+---
+
+## Application Layout
+
+```
++--------------------------------------------------------------------+
+| File | Edit | View | Help                             Volume ---->-|
+| CORRIDORKEY                                        RTX 5090  ## 4GB|
++------+------------------------+---------------------+--------------+
+|      |      241 frames - RAW | IN|FG|MATTE[COMP]PROC| ALPHA GEN    |
+|  Q   |                       |                      |  GVM/BIREFNET|
+|  U   +-----------------------+----------------------+  MATANYONE2  |
+|      |                       |                      |  VIDEOMAMA   |
+|  E   |                       |                      |  EXPORT MASK |
+|  U   |                       |                      |--------------+
+|  E   |   INPUT viewer        |   OUTPUT viewer      | INFERENCE    |
+|      |   (left image)        |   (right image)      |  Color Space |
+|      |                       |                      |  Despill     |
+| tab  |                       |                      |  Despeckle   |
+|      |                       |                      |  Refiner     |
+|      |                       |                      |  Live Preview|
+|      |                       |                      |--------------+
+|      |                       |                      | OUTPUT       |
+|      |                       |                      |  FG          |
+|      |                       |                      |  Matte       |
+|      |                       |                      |  Comp        |
+|      |                    SCRUBBER                  |  Processed   |
+|------+<<-<-------In=====================Out----->->>+--------------|
+|INPUT (3)               + ADD | EXPORTS (2)                         |
+| +-----+ +-----+ +-----+      | +-----+ +-----+                     |
+| |thumb| |thumb| |thumb|      | |thumb| |thumb| ..                  |
+| +-----+ +-----+ +-----+      | +-----+ +-----+                     |
++--------------------------------------------------------------------+
+|  Status Bar                                         [RUN INFERENCE]|
++--------------------------------------------------------------------+
+```
+
+- **Brand bar + menu** — top row with logo, menu bar, GPU name + VRAM meter
+- **Queue panel** — collapsible sidebar (left), toggle with **Q**
+- **Dual viewer** — center, split into INPUT (left) and switchable output (right)
+- **Parameter panel** — right sidebar with Alpha Generation, Inference, and Output controls
+- **I/O tray** — horizontal thumbnail strip below the viewer
+- **Status bar** — progress bar and RUN INFERENCE button
+
+---
+
+## Quick Start
+
+### 1. Import
+
+Drop a video file onto the welcome screen (or File > Import Clips > Import Video). The video is automatically extracted to a high-quality image sequence:
+
+1. **FFmpeg extracts** each frame as **EXR half-float** (ZIP16 compression)
+2. **Recompression pass** converts ZIP16 → **DWAB** (VFX-standard lossy compression, ~4× smaller)
+
+This two-pass approach preserves full floating-point precision from the video decoder — no 8-bit quantization, no banding. Even 8-bit source video benefits because FFmpeg's internal YUV→RGB conversion stays in float, avoiding rounding errors that accumulate in integer pipelines. The DWAB-compressed EXR frames are typically comparable in size to PNG while retaining 16-bit half-float dynamic range.
+
+The recompression runs in a separate process so the UI stays fully responsive during extraction.
+
+**Companion hints:** files with "alphahint" or "maskhint" anywhere in the filename (case insensitive) are automatically paired with the matching clip as alpha or mask hints instead of being imported as separate clips. Works for video imports and frame sequence folders alike.
+
+### 2. Generate Alpha Hint
+
+Your clip starts in **RAW** state (gray badge). You need an alpha hint before running inference.
+
+**Option A — Chroma Key (manual, no AI model):**
+Click **CHROMA KEY** in the parameter panel. Color-difference keyer for green or blue screen footage. Press **E** to activate the eyedropper, then drag across the screen to sample a range of colors. Adjust Key Strength, Clip Black, and Clip White to refine the matte. Click **GENERATE** to produce the alpha hint.
+
+**Option B — One-click alpha generators:**
+- **GVM Auto** — click **GVM AUTO** in the parameter panel. Works great for most green screen footage with people.
+- **BiRefNet** (recommended) — click **BIREFNET** in the parameter panel. Fast, accurate, and works well on a wide range of footage.
+- **Apple Vision** (macOS 14+) — click **APPLE VISION** in the parameter panel. Apple's Neural Engine segments the foreground, no painting or annotation needed. Auto-hidden on other platforms.
+
+
+**Option C — MatAnyone2 / VideoMaMa:**
+These models need a mask hint. Two ways to provide one:
+
+*C1. Paint + Track (from scratch):*
+1. Press **1** to activate foreground mode (green)
+2. Paint over the subject on a few key frames
+3. Press **2** to switch to background mode (red)
+4. Paint over background areas
+5. Click **TRACK MASK** to generate a dense SAM2 mask track
+6. Click **MATANYONE2** or **VIDEOMAMA** in the parameter panel
+
+*C2. Import mask (bring your own):*
+1. Click the **+** button next to **VIDEOMAMA** to import a pre-made mask sequence or video
+2. Click **MATANYONE2** or **VIDEOMAMA** to run the model
+
+**Option D — Import Alpha (bring your own):**
+If you already have alpha mattes from another tool (Rotobrush, Silhouette, Resolve, Nuke, etc.), click **IMPORT ALPHA** in the parameter panel and choose either an image folder or a matte video file.
+
+- Supported image formats: **PNG, JPG, JPEG, TIF, TIFF, EXR**
+- Supported alpha-video path: standard video files accepted by the normal clip importer (for example **MOV** or **MP4**)
+- Images and visible matte videos should be **grayscale** (white = foreground, black = background)
+- Frame count should match your input sequence
+- Non-PNG stills are automatically converted to grayscale PNG on import
+- Imported alpha videos are decoded into grayscale `AlphaHint/*.png` frames so they follow the same downstream path as image-sequence hints
+- Imported files are copied into the clip's `AlphaHint/` folder and the clip advances to **READY** state
+
+You can re-import at any time — if the clip already has alpha hints, you'll be asked whether to overwrite them.
+
+### 3. Run Inference
+
+Your clip is now **READY** (yellow badge). Adjust parameters as needed, then click **RUN INFERENCE** (or **Ctrl+R**).
+
+### Batch Pipeline (Unattended)
+
+Two ways to run a batch:
+
+**From the I/O tray:** select multiple clips (Ctrl+click or Shift+click), then click **RUN PIPELINE** in the status bar.
+
+**From a folder:** File > Batch Pipeline opens a dialog for processing an entire folder of clips. Pick the folder, choose which alpha generation model to use (GVM, BiRefNet, VideoMaMa, MatAnyone2), and run everything autonomously. Per-clip overrides let you mix models in one batch. Live progress bars and checkmarks track each clip's status. Image sequence subfolders are detected and can be mixed with videos in the same batch.
+
+For tray-selected clips, the system automatically:
+
+1. Detects each clip's state and paint strokes
+2. Runs **TRACK MASK** and then **VideoMaMa** for painted clips
+3. Runs **GVM Auto** for unpainted RAW clips
+4. Chains **inference** after each alpha generation completes
+
+The entire pipeline is cancellable (Esc) and checkpointable — if interrupted, restarting picks up where each clip left off.
+
+### 4. Review
+
+Switch between view modes to inspect results:
+
+- **COMP** — key over checkerboard
+- **FG** — check for green fringing
+- **MATTE** — inspect alpha quality
+- **PROCESSED** — production RGBA
+
+Outputs are written to the project's `Output/` subdirectories during inference (configurable — see [Custom Output Directory](#custom-output-directory)).
+
+---
+
+## Keyboard Shortcuts
+
+Viewable and rebindable in-app via Edit > Hotkeys.
+
+### Global
+
+| Shortcut         | Action                         |
+| ---------------- | ------------------------------ |
+| **Ctrl+R**       | Run inference on selected clip |
+| **Ctrl+Shift+R** | Run all ready clips (batch)    |
+| **Esc**          | Stop / cancel current job      |
+| **Ctrl+S**       | Save session                   |
+| **Ctrl+O**       | Open project                   |
+| **Ctrl+M**       | Toggle mute (sound on/off)     |
+| **Home**         | Return to welcome screen       |
+| **Del**          | Remove selected clips          |
+| **Q**            | Toggle queue panel             |
+| **Ctrl+,**       | Toggle Preferences             |
+| **F12**          | Toggle debug console           |
+
+### Viewer
+
+| Shortcut                 | Action                                    |
+| ------------------------ | ----------------------------------------- |
+| **F1–F7**                | View modes: INPUT, MASK, ALPHA, FG, MATTE, COMP, PROC |
+| **A**                    | Toggle A/B wipe comparison                |
+| **Ctrl + scroll wheel**  | Zoom in/out toward cursor (0.25x to 8.0x) |
+| **Shift + scroll wheel** | Horizontal pan (left/right)               |
+| **Left-click + drag**    | Pan the image (paint, eyedropper, and wipe tools take priority) |
+| **Middle-click + drag**  | Pan the image                             |
+| **Double-click**         | Reset zoom to 100%                        |
+
+Pan and zoom are tandem: both viewers always show the same region, and double-click reset applies to both.
+
+### Timeline
+
+| Shortcut  | Action               |
+| --------- | -------------------- |
+| **Space** | Play / Pause         |
+| **I**     | Set in-point marker  |
+| **O**     | Set out-point marker |
+| **Alt+I** | Clear in/out range   |
+
+### Paint
+
+| Shortcut                 | Action                                      |
+| ------------------------ | ------------------------------------------- |
+| **1**                    | Foreground paint brush (green). In chroma key mode, paints holdout mask (force opaque) |
+| **2**                    | Background paint brush (red). In chroma key mode, paints holdout mask (force transparent) |
+| **C**                    | Cycle foreground brush color (green / blue) |
+| **E**                    | Eyedropper (pick screen color for chroma key) |
+| **`**                    | Toggle chroma key mode                      |
+| **Shift + drag up/down** | Resize brush                                |
+| **Alt + left-drag**      | Draw straight line                          |
+| **Ctrl+Z**               | Undo last stroke on current frame           |
+| **Ctrl+C**               | Clear all paint strokes                     |
+
+---
+
+## View Modes
+
+The view mode bar at the top of each viewport switches what the right viewer displays:
+
+| Mode          | Source                | What You See                                              |
+| ------------- | --------------------- | --------------------------------------------------------- |
+| **INPUT**     | `Input/` or `Frames/` | Original unprocessed footage                              |
+| **MASK**      | Paint strokes         | Foreground (green/blue) and background (red) paint masks  |
+| **ALPHA**     | `AlphaHint/`          | Alpha hint used as input to inference                     |
+| **FG**        | `Output/FG/`          | Foreground with green spill removed                       |
+| **MATTE**     | `Output/Matte/`       | Alpha matte (white = opaque, black = transparent)         |
+| **COMP**      | `Output/Comp/`        | Final key composited over checkerboard                    |
+| **PROCESSED** | `Output/Processed/`   | Production RGBA — straight linear for Resolve/compositing |
+
+---
+
+## Inference Controls
+
+| Control              | Range        | Default    | Description                                           |
+| -------------------- | ------------ | ---------- | ----------------------------------------------------- |
+| **BG Color**         | Auto, Green, Blue | Auto  | Screen type for inference. Auto detects from the frame |
+| **Color Space**      | sRGB, Linear | sRGB       | How CorridorKey interprets the input before inference |
+| **Despill Strength** | 0.0 – 1.0    | 1.0        | Green spill removal intensity                         |
+| **Despeckle**        | 0 – 999999 px | ON, 400 px | Removes isolated artifacts smaller than threshold     |
+| **Garbage Matte**    | 1 – 500 px   | OFF, 20 px | Dilates the alpha hint and zeroes everything outside it |
+| **Refiner Scale**    | 0.0 – 3.0    | 1.0        | Edge refinement. 0 = disabled                         |
+| **Live Preview**     | —            | ON         | Reprocess current frame when parameters change        |
+
+**Color Space behavior**
+
+- The **left INPUT viewer** always shows CorridorKey's current interpretation of the source. If the input looks wrong there, your future inference results and exports will be based on that wrong interpretation too.
+- Changing **Color Space** before clicking **RUN INFERENCE** affects how the next live preview and the next export run are generated.
+- Changing **Color Space** after outputs already exist does **not** rewrite those files on disk. It only updates the viewer and live preview. To keep that new interpretation in saved files, rerun inference.
+- CorridorKey auto-detects color space from file type and metadata when possible, but you can override it if the INPUT viewer does not look representative.
+- With **Live Preview** enabled, the first adjustment after a fresh launch may pause briefly while the inference engine loads.
+
+**Middle-click** any slider to reset it to default.
+
+### Output Format
+
+Each output channel can be individually enabled and set to EXR or PNG:
+
+| Output        | Default | Format | Description                                             |
+| ------------- | ------- | ------ | ------------------------------------------------------- |
+| **FG**        | ON      | EXR    | Foreground RGB with spill removed                       |
+| **Matte**     | ON      | EXR    | Single-channel alpha                                    |
+| **Comp**      | ON      | PNG    | Key over checkerboard (for review)                      |
+| **Processed** | ON      | EXR    | Full RGBA straight linear (for Resolve and compositing) |
+
+---
+
+## Status Colors
+
+| Color  | State      | Meaning                                   |
+| ------ | ---------- | ----------------------------------------- |
+| Orange | EXTRACTING | Video being extracted to image sequence   |
+| Gray   | RAW        | Frames loaded, no alpha hint yet          |
+| Blue   | MASKED     | Paint masks created (ready for VideoMaMa) |
+| Yellow | READY      | Alpha hint available, ready for inference |
+| Green  | COMPLETE   | Inference finished, outputs available     |
+| Red    | ERROR      | Processing failed — can retry             |
+
+---
+
+## Frame Scrubber
+
+The scrubber below the dual viewer provides:
+
+- **Transport buttons:** First frame, step back, play/pause, step forward, last frame
+- **Playback is CAPPED:** Pressing spacebar will play back footage at a hardcoded rate of 3FPS. This is intentional, the files are large.
+- **Coverage bar:** Three color-coded lanes showing which frames have paint strokes (green), alpha hints (white), and inference output (yellow)
+- **In/Out markers:** Press **I** / **O** to set a sub-range for processing. When set, the RUN button changes to "RUN SELECTED" and playback loops within the range.
+
+---
+
+## Project Structure
+
+Each imported clip creates a project folder:
+
+```
+Projects/
+  260301_093000_Woman_Jumps/
+    Source/              # Original video
+    Frames/              # Extracted EXR DWAB half-float image sequence
+    AlphaHint/           # Generated alpha hints
+    Output/
+      FG/                # Foreground EXR/PNG
+      Matte/             # Alpha matte EXR/PNG
+      Comp/              # Checkerboard composite PNG
+      Processed/         # Production RGBA EXR
+    project.json         # Metadata and settings
+```
+
+---
+
+## Preferences
+
+Access via Edit > Preferences.
+
+| Setting                      | Default            | Description                                                 |
+| ---------------------------- | ------------------ | ----------------------------------------------------------- |
+| **Show tooltips**            | ON                 | Helpful tooltips on all controls                            |
+| **UI sounds**                | ON                 | Sound effects for actions                                   |
+| **Copy source videos**       | ON                 | Copy imports into project folder (OFF = reference in place) |
+| **Loop playback**            | ON                 | Loop within in/out range during playback                    |
+| **Default output directory** | (inside project)   | Global output location — outputs go to `<dir>/<Project>/<Clip>/` |
+| **FFmpeg path**              | (auto-detected)    | Browse for a custom FFmpeg binary if auto-detection fails       |
+
+### Custom Output Directory
+
+By default, inference output is written to `Output/` inside each clip folder. You can redirect output at three levels:
+
+- **Global**: Preferences > Output > Default output directory
+- **Per-project**: File > Set Project Output Folder
+- **Per-clip**: Right-click a clip > Set Output Directory
+
+Priority: per-clip > per-project > global preference > default.
+
+When using a non-default directory, outputs are organized as `<dir>/<ProjectName>/<ClipName>/FG/`, `Matte/`, etc. to prevent collisions between projects. The per-project setting persists to `project.json`.
+
+---
+
+## Running from the Command Line
+
+```bash
+# GUI mode (default)
+python main.py
+
+# CLI mode (original terminal wizard)
+python main.py --cli
+
+# Verbose logging
+python main.py --log-level DEBUG
+```
+
+Logs are written to `logs/backend/YYMMDD_HHMMSS_corridorkey.log`.
+
+---
+
+## Hardware Requirements
+
+### Windows / Linux (NVIDIA CUDA)
+
+|          | Minimum       | Recommended        | Comfortable                   |
+| -------- | ------------- | ------------------ | ----------------------------- |
+| **VRAM** | 8 GB          | 12 GB              | 16 GB+                        |
+| **GPU**  | NVIDIA (CUDA) | Ampere+ (RTX 30xx) | Ada/Blackwell (RTX 40xx/50xx) |
+
+#### VRAM modes
+
+| Mode                  | VRAM usage | 4K speed    | How it works                             |
+| --------------------- | ---------- | ----------- | ---------------------------------------- |
+| **Speed** (≥12 GB)    | ~8.7 GB    | ~1.5s/frame | Full-frame refiner, full torch.compile   |
+| **Low-VRAM** (<12 GB) | ~2.5 GB    | ~1.6s/frame | 512×512 tiled refiner, selective compile |
+
+VRAM mode selection / `CORRIDORKEY_OPT_MODE` / `--opt-mode`: (Removed in CorridorKey 2.0 fork.)
+
+### macOS (Apple Silicon)
+
+(Removed in CorridorKey 2.0 fork.)
+
+
+---
+
+## Quality Verification
+
+EZ-CorridorKey's optimizations (Hiera FlashAttention, TF32 tensor cores, torch.compile, tiled refiner) produce output identical to upstream CorridorKey within float32 noise floor — verified across PSNR, SSIM, MS-SSIM, LPIPS, and DeltaE 2000.
+
+![Quality Comparison](docs/screenshots/quality_comparison_v1.5.0.png)
+
+---
+
+## Security
+
+### Verified download sources
+
+The only official sources for EZ-CorridorKey are:
+
+☼ **GitHub:** [github.com/edenaion/EZ-CorridorKey/releases](https://github.com/edenaion/EZ-CorridorKey/releases)
+☼ **Gumroad:** [edenaion.gumroad.com](https://edenaion.gumroad.com/)
+
+Any other site hosting EZ-CorridorKey downloads is **unverified and potentially malware**. Do not download from third-party mirrors, repackaging sites, or file-sharing links. If you see EZ-CorridorKey hosted elsewhere, please report it in [GitHub Issues](https://github.com/edenaion/EZ-CorridorKey/issues) or in the [EZSCAPE Discord](https://discord.gg/TyxNjcWeF3).
+
+### Code signing
+
+☼ **Windows:** The installer (.exe) is signed via Azure Trusted Signing. Windows SmartScreen shows **EZscape Ventures LLC** as the verified publisher.
+☼ **macOS:** The .pkg is code-signed and Apple-notarized under **Developer ID: Edward Zisk (UX6RDC39ZW)**. Gatekeeper verifies it on first launch.
+
+### Signed updates
+
+Starting with v1.10.0, every GitHub release ships a signed manifest (`manifest.json` + `manifest.json.sig`). When the in-app updater downloads a new version, it verifies the Ed25519 signature and SHA-256 hash before applying the update. If either check fails, the update is rejected and the user is warned.
+
+This means even if the GitHub account were compromised, the attacker could not push a malicious update to installed users without also possessing the offline signing key.
+
+The verification code is open source: [`backend/update_verify.py`](backend/update_verify.py).
+
+### Checksums
+
+Each release includes a `SHA256SUMS.txt` file listing the SHA-256 hash of every release artifact. Use it to confirm your download is genuine and not corrupted. Put `SHA256SUMS.txt` in the same folder as the file you downloaded, then follow the steps for your system.
+
+**Windows (PowerShell):**
+
+```powershell
+# In the download folder (Shift + right-click > "Open PowerShell window here")
+Get-FileHash .\EZ-CorridorKey-2.1.0-Windows-x64-Setup.exe -Algorithm SHA256
+# Open SHA256SUMS.txt, find the line ending in that filename, compare the hash.
+# The two strings must match exactly. If they differ, do not run the file, download it again.
+```
+
+**macOS (Terminal):**
+
+```bash
+cd ~/Downloads   # wherever you saved the files
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+# Expect: EZ-CorridorKey-2.0.0-macOS-arm64.dmg: OK
+# If it says FAILED, the file is corrupted or tampered with, download it again.
+```
+
+**Linux:**
+
+```bash
+cd ~/Downloads
+sha256sum -c SHA256SUMS.txt --ignore-missing
+# Expect OK next to each file you downloaded.
+```
+
+### Git integrity
+
+All commits to `main` are signed with an Ed25519 SSH key. Branch protection enforces signed commits, pull request reviews, and blocks force pushes and branch deletion.
+
+### VirusTotal
+
+Independent scans:
+
+- [**EZ-CorridorKey.exe** (v2.0.0, signed inner executable) — VirusTotal scan](https://www.virustotal.com/gui/file/627129e270cfced9174866cc434cc5e295fae6e315d614d2f1de99cf27ff3820?nocache=1)
+- [**EZ-CorridorKey.exe** (v1.10.0, signed inner executable) — VirusTotal scan](https://www.virustotal.com/gui/file/82019d296fbc8064fcbac99e71699a0ee5d81ee2893b4d3dbbb25f265282ba0f?nocache=1)
+
+> **Third-party models:** The core CorridorKey checkpoint (`CorridorKey.pth`) is the only model we can vouch for. Optional models (SAM2, GVM, VideoMaMa, MatAnyone2, BiRefNet) are downloaded from their respective authors' repositories -- use them at your own discretion.
+
+---
+
+## Privacy
+
+EZ-CorridorKey sends no telemetry by default. No usage analytics, no tracking, ever.
+
+Two things can send data, both under your control:
+
+☼ **Report Issue**: when you file a report from the Help menu, the diagnostic summary you see in the dialog can also be sent directly to the developer. A visible checkbox controls it per report.
+☼ **Crash reporting**: an optional toggle in Preferences > Privacy, off by default. When you enable it, crash details are sent automatically.
+
+What a report contains: crash details, GPU/driver info, OS and app version. What it never contains: your media, file names, projects, or personal info. File paths are anonymized before sending.
+
+---
+
+## Localization
+
+EZ-CorridorKey supports translation into any language. All UI strings are extracted into standard Qt `.ts` files that translators can edit with [Qt Linguist](https://doc.qt.io/qt-6/linguist-translators.html) (free) or any text editor.
+
+**How to add your language:**
+
+1. Copy `ui/translations/corridorkey_en.ts` to your language code (e.g. `corridorkey_fr.ts` for French)
+2. Open the new file in Qt Linguist and fill in translations
+3. Compile it: `pyside6-lrelease ui/translations/corridorkey_fr.ts`
+4. Submit a pull request with both the `.ts` and `.qm` files
+
+Full instructions with examples are in [`ui/translations/TRANSLATING.md`](ui/translations/TRANSLATING.md).
+
+**Current languages:** English plus German, Spanish, French, Hindi, Indonesian, Italian, Japanese, Korean, Polish, Portuguese (Brazil), Russian, Turkish, Ukrainian, Vietnamese, Chinese (Simplified), and Chinese (Traditional, Taiwan). Pick yours in Edit > Preferences. Want to see your language here or improve upon a translation? PRs welcome.
+
+---
+
+## Contributing & Support
+
+EZ-CorridorKey is a labor of love — built and maintained by one man from Brooklyn for the VFX community. If this tool saves you time on a project, consider paying it forward:
+
+[![Sponsor](https://img.shields.io/badge/GitHub-Sponsor-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/edenaion)
+[![Ko-Fi](https://img.shields.io/badge/Ko--fi-Support%20Development-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/edenaion)
+[![EZSCAPE Plugins](https://img.shields.io/badge/EZSCAPE-Plugins%20%26%20Tools-50FF80?style=for-the-badge&labelColor=000000)](https://www.ezscape.space)
+[![RunPod](https://img.shields.io/badge/RunPod-Cloud%20GPU-673AB7?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJ3aGl0ZSI+PHBhdGggZD0iTTEyIDJMMiA3bDEwIDUgMTAtNS0xMC01ek0yIDE3bDEwIDUgMTAtNS0xMC01LTEwIDV6TTIgMTJsMTAgNSAxMC01LTEwLTUtMTAgNXoiLz48L3N2Zz4=&logoColor=white)](https://runpod.io?ref=2k18fmnh)
+
+- **Star this repo** if you find it useful -- it helps others discover the project
+- **Purchase a plugin** -- I pour my heart into [EZSCAPE plugins](https://www.ezscape.space)
+- **Report bugs** via [GitHub Issues](https://github.com/edenaion/EZ-CorridorKey/issues)
+- **Contribute code** -- see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines
+- **Security issues** -- see [SECURITY.md](SECURITY.md) for responsible disclosure
+
+Need GPU compute for inference? [RunPod](https://runpod.io?ref=2k18fmnh) offers on-demand cloud GPUs — great for batch processing large shoots without tying up your local machine. Using my referral link will enable me to build more tools for all!
+
+### Community
+
+[![Discord - EZSCAPE](https://img.shields.io/badge/EZSCAPE-Support%20%26%20Chill-5865F2?style=flat-square&labelColor=000000&logo=discord&logoColor=50FF80)](https://discord.gg/TyxNjcWeF3)
+[![Discord - Corridor Creates](https://img.shields.io/badge/Corridor%20Creates-Community-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/zvwUrdWXJm)
+
+---
+
+## Licensing & Attribution
+
+This project wraps [Niko Pueringer's CorridorKey](https://github.com/nikopueringer/CorridorKey), licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+
+GUI/SFX/Workflow/QA/Maintenance by [Ed Zisk](https://www.edzisk.com).
+
+<details>
+<summary><strong>Contributors</strong></summary>
+
+- Logo by [Sara Ann Stewart](https://www.instagram.com/sarastewartwork)
+- Hiera optimization by [Jhe Kim](https://github.com/Raiden129)
+- Tiling optimization by [MarcelLieb](https://github.com/MarcelLieb)
+- MLX Apple Silicon backend by [Cristopher Yates](https://github.com/cmoyates) ([corridorkey-mlx](https://github.com/cmoyates/corridorkey-mlx))
+- FX graph cache from [99oblivius](https://github.com/99oblivius) ([CorridorKey-Engine](https://github.com/99oblivius/CorridorKey-Engine))
+- BiRefNet integration adapted from [Warwlock](https://github.com/Warwlock)'s [upstream PR](https://github.com/edenaion/EZ-CorridorKey/pull/10)
+- Docker / noVNC browser mode by [DCRepublic](https://github.com/DCRepublic)
+
+</details>
+
+<details>
+<summary><strong>Optional modules & licenses</strong></summary>
+
+- **SAM 2.1** ([facebookresearch/sam2](https://github.com/facebookresearch/sam2)) — Apache 2.0
+- **GVM** ([aim-uofa/GVM](https://github.com/aim-uofa/GVM)) — CC BY-NC-SA 4.0
+- **VideoMaMa** ([cvlab-kaist/VideoMaMa](https://github.com/cvlab-kaist/VideoMaMa)) — CC BY-NC 4.0, model weights under Stability AI Community License
+- **MatAnyone2** ([pq-yang/MatAnyone2](https://github.com/pq-yang/MatAnyone2)) — Apache 2.0
+- **BiRefNet** ([ZhengPeng7/BiRefNet](https://github.com/ZhengPeng7/BiRefNet)) — MIT
+
+</details>
+
+If you use or build on this project, please star this repo and credit the contributors.

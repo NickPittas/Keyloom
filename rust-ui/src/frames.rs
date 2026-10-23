@@ -89,7 +89,7 @@ impl FrameIndex {
         let Some(stem) = self.stems.get(i) else {
             return Availability::NoFile;
         };
-        if v != View::Input && v != View::Hint {
+        if !matches!(v, View::Input | View::Hint | View::Guide) {
             if let Some((a, b)) = range {
                 if i < a || i > b {
                     return Availability::OutsideRange;
@@ -137,7 +137,7 @@ pub fn view_interp(
     straight_alpha: bool,
 ) -> Interp {
     match v {
-        View::Hint | View::Matte => Interp::Matte,
+        View::Hint | View::Guide | View::Matte => Interp::Matte,
         _ if ext_of(path) == "png" => Interp::Passthrough,
         View::Input if !input_is_linear => Interp::Passthrough,
         View::Processed if !straight_alpha => Interp::LinearToSrgbPremul,
@@ -255,11 +255,13 @@ pub struct Done {
     pub key: Key,
     pub result: Result<Arc<DisplayFrame>, String>,
     pub ms: f64,
+    generation: u64,
 }
 
 struct Queue {
     wanted: Vec<Key>,
     inflight: HashSet<Key>,
+    generations: HashMap<PathBuf, u64>,
     shutdown: bool,
 }
 struct Shared {
@@ -308,6 +310,7 @@ impl Loader {
             q: Mutex::new(Queue {
                 wanted: vec![],
                 inflight: HashSet::new(),
+                generations: HashMap::new(),
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -318,7 +321,7 @@ impl Loader {
                 let (sh, tx, decode, wake): (Arc<Shared>, Sender<Done>, DecodeFn, _) =
                     (shared.clone(), tx.clone(), decode.clone(), wake.clone());
                 std::thread::spawn(move || loop {
-                    let key = {
+                    let (key, generation) = {
                         let mut q = sh.q.lock().unwrap();
                         loop {
                             if q.shutdown {
@@ -328,7 +331,8 @@ impl Loader {
                             {
                                 let k = q.wanted.remove(pos);
                                 q.inflight.insert(k.clone());
-                                break k;
+                                let generation = *q.generations.get(&k.path).unwrap_or(&0);
+                                break (k, generation);
                             }
                             q = sh.cv.wait(q).unwrap();
                         }
@@ -344,7 +348,7 @@ impl Loader {
                     let ms = t.elapsed().as_secs_f64() * 1000.0;
                     // The key stays in `inflight` until the UI absorbs this result (`ack`), so a re-request in the
                     // meantime cannot decode it again.
-                    let _ = tx.send(Done { key, result, ms });
+                    let _ = tx.send(Done { key, result, ms, generation });
                     if let Some(w) = &wake {
                         w();
                     }
@@ -371,8 +375,25 @@ impl Loader {
         q.wanted.retain(|w| w != k);
     }
 
+    fn invalidate_path(&self, path: &std::path::Path) {
+        let mut q = self.shared.q.lock().unwrap();
+        *q.generations.entry(path.to_owned()).or_default() += 1;
+        q.wanted.retain(|k| k.path != path);
+    }
+
+    fn is_current(&self, d: &Done) -> bool {
+        self.shared.q.lock().unwrap().generations.get(&d.key.path).copied().unwrap_or(0)
+            == d.generation
+    }
+
     pub fn try_recv(&self) -> Option<Done> {
         self.rx.try_recv().ok()
+    }
+    /// Take the next finished decode and acknowledge it, so the key may be requested again.
+    pub fn take(&mut self) -> Option<Done> {
+        let d = self.rx.try_recv().ok()?;
+        self.ack(&d.key);
+        Some(d)
     }
     pub fn recv_timeout(&self, d: std::time::Duration) -> Option<Done> {
         self.rx.recv_timeout(d).ok()
@@ -463,6 +484,9 @@ impl FrameStore {
     fn absorb(&mut self, d: Done) {
         self.decode_ms.push(d.ms);
         self.loader.ack(&d.key);
+        if !self.loader.is_current(&d) {
+            return; // A publication replaced this path while its old pixels were being decoded.
+        }
         match d.result {
             Ok(f) if f.bytes() > self.cache.budget() => {
                 // Refused by the cache: record it so the frame is not decoded again and the UI can say why.
@@ -494,6 +518,7 @@ impl FrameStore {
 
     /// Forget everything known about `path` (cached pixels, recorded failures and retry counts).
     pub fn forget_path(&mut self, path: &std::path::Path) {
+        self.loader.invalidate_path(path);
         self.cache.remove_path(path);
         self.errors.retain(|k, _| k.path != path);
         self.attempts.retain(|k, _| k.path != path);
@@ -815,6 +840,33 @@ mod tests {
         assert!(s2.wait_one(Duration::from_secs(2)));
         assert!(!s2.retry(&k2), "budget exhausted");
         assert_eq!(s2.retries_left(&k2), 0);
+    }
+
+    #[test]
+    fn a_replaced_path_rejects_pixels_from_an_already_running_decode() {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let release_rx = Mutex::new(release_rx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let decode: DecodeFn = Arc::new(move |_| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                Ok(px("old mask"))
+            } else {
+                Ok(px("new mask"))
+            }
+        });
+        let mut store = FrameStore::new(10_000, 1, decode, None);
+        let k = key(0);
+        store.request(k.clone(), vec![]);
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        store.forget_path(&k.path);
+        release_tx.send(()).unwrap();
+        assert!(store.wait_one(Duration::from_secs(2)));
+        assert!(matches!(store.lookup(&k), Lookup::Loading));
+        store.request(k.clone(), vec![]);
+        assert_eq!(wait_ready(&mut store, &k).info, "new mask");
     }
 
     #[test]

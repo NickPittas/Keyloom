@@ -52,6 +52,13 @@ pub struct KeyJob {
     #[serde(default)]
     pub path_map: Vec<(String, String)>,
     pub require: Require,
+    /// Network receiver only: `[(path clip.json records, folder this PC resolved through its own mapping)]`, at most
+    /// one. Lets the worker read an external source without ever using the sender's path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_map: Vec<(String, String)>,
+    /// Network receiver only: a pinned temporal window that does not fit the free GPU memory fails instead of warning.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enforce_fixed_window: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +237,9 @@ impl KeyJob {
         if !self.path_map.is_empty() {
             // Mapping is the scheduler's business per target; the wire job always carries [].
             return err("path_map", "must be empty (targets own their path maps)");
+        }
+        if self.source_map.len() > 1 || self.source_map.iter().any(|(r, l)| r.is_empty() || !is_abs(l)) {
+            return err("source_map", "at most one [recorded path, absolute local folder] entry");
         }
         if self.require.protocol != PROTOCOL || self.require.models.is_empty() {
             return err("require", "needs protocol 1 and at least one model");

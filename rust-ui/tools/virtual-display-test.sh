@@ -7,7 +7,9 @@ set -euo pipefail
 ulimit -c 0
 mkdir -p /tmp/.X11-unix
 export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
-/home/npittas/.cache/corridorkey-test-display/Xvfb :99 -screen 0 1440x900x24 -nolisten tcp -extension GLX >/tmp/xvfb.log 2>&1 &
+# CK_DISPLAY_SIZE lets a run use a larger (still private, still Xvfb) screen, e.g. 2400x1500 for a
+# large-window evidence shot. The default stays the acceptance size.
+/home/npittas/.cache/corridorkey-test-display/Xvfb :99 -screen 0 "${CK_DISPLAY_SIZE:-1440x900}"x24 -nolisten tcp -extension GLX >/tmp/xvfb.log 2>&1 &
 display_pid=$!
 trap "kill $display_pid 2>/dev/null || true" EXIT
 export DISPLAY=:99

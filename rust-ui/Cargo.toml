@@ -1,6 +1,6 @@
 [package]
 name = "corridorkey-ui"
-version = "0.1.0"
+version = "2.2.0"
 edition = "2021"
 default-run = "corridorkey-ui"
 description = "Native CorridorKey project viewer: imports footage into new projects (first slice, provisional toolkit)"
@@ -25,6 +25,11 @@ natord = "1.0.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 rfd = "0.17.2"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading"] }
 
 [profile.release]
 debug = false

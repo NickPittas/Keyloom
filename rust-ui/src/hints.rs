@@ -16,6 +16,43 @@ pub const SAM_MODELS: [(&str, &str); 3] = [
     ("base_plus", "Base+"),
     ("large", "Large"),
 ];
+const SAM_REPOS: [(&str, &str); 3] = [
+    ("small", "facebook/sam2.1-hiera-small"),
+    ("base_plus", "facebook/sam2.1-hiera-base-plus"),
+    ("large", "facebook/sam2.1-hiera-large"),
+];
+/// The worker's short SAM key for a short key or a full HuggingFace repo id (settings store the latter).
+pub fn canonical_sam_model(s: &str) -> Option<&'static str> {
+    SAM_REPOS.iter().find(|m| m.0 == s || m.1 == s).map(|m| m.0)
+}
+
+/// Post-processing of every generated mask (guide, direct hint, refined hint, SAM preview). Neutral = identity.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaskCleanup {
+    /// Pixels to grow (+) or shrink (-) the mask by.
+    pub grow: i64,
+    pub fill_holes: bool,
+    /// Gaussian sigma in pixels.
+    pub feather: f64,
+}
+impl Default for MaskCleanup {
+    fn default() -> Self {
+        Self { grow: 0, fill_holes: false, feather: 0.0 }
+    }
+}
+impl MaskCleanup {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(-100..=100).contains(&self.grow) {
+            return Err("mask grow must be -100..100 px".into());
+        }
+        if !(self.feather.is_finite() && (0.0..=100.0).contains(&self.feather)) {
+            return Err("mask feather must be 0..100 px".into());
+        }
+        Ok(())
+    }
+}
+
 pub const BIREFNET_VARIANTS: [&str; 16] = [
     "Matting",
     "Matting HR",
@@ -52,9 +89,13 @@ pub fn staging_root(project_root: &Path, clip_root: &Path, folder: &str) -> Path
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub const HINT_DIR: &str = "AlphaHint";
+pub const GUIDE_DIR: &str = "VideoMamaMaskHint";
+
+/// Legacy single route (configs written before guide/final were separate); read only, see `HintCfg::load`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Route {
+enum Route {
     Import,
     Gvm,
     Birefnet,
@@ -63,38 +104,80 @@ pub enum Route {
     Videomama,
 }
 
-impl Route {
-    pub const ALL: [Route; 6] = [
-        Route::Import,
-        Route::Gvm,
-        Route::Birefnet,
-        Route::Chroma,
-        Route::Matanyone2,
-        Route::Videomama,
+/// Who makes the guide mask (`VideoMamaMaskHint`) - or, with `Final::Direct`, the final hint itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Producer {
+    Sam,
+    Gvm,
+    Birefnet,
+    Chroma,
+}
+
+impl Producer {
+    pub const ALL: [Producer; 4] = [
+        Producer::Sam,
+        Producer::Gvm,
+        Producer::Birefnet,
+        Producer::Chroma,
     ];
     pub fn label(self) -> &'static str {
         match self {
-            Route::Import => "Import alpha",
-            Route::Gvm => "GVM",
-            Route::Birefnet => "BiRefNet",
-            Route::Chroma => "Chroma key",
-            Route::Matanyone2 => "MatAnyone2",
-            Route::Videomama => "VideoMaMa",
+            Producer::Sam => "SAM",
+            Producer::Gvm => "GVM",
+            Producer::Birefnet => "BiRefNet",
+            Producer::Chroma => "Chroma key",
+        }
+    }
+    pub fn task(self) -> TaskKind {
+        match self {
+            Producer::Sam => TaskKind::SamTrack,
+            Producer::Gvm => TaskKind::Gvm,
+            Producer::Birefnet => TaskKind::Birefnet,
+            Producer::Chroma => TaskKind::Chroma,
+        }
+    }
+}
+
+/// How the final hint (`AlphaHint`) comes about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Final {
+    /// The producer's mask is the hint (it publishes straight into `AlphaHint`).
+    Direct,
+    /// MatAnyone2 refines the guide (needs it).
+    Matanyone2,
+    /// VideoMaMa refines the guide (needs it).
+    Videomama,
+    /// An alpha the user imported; nothing to generate.
+    Import,
+}
+
+impl Final {
+    pub const ALL: [Final; 4] = [
+        Final::Direct,
+        Final::Matanyone2,
+        Final::Videomama,
+        Final::Import,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Final::Direct => "Generated mask (direct)",
+            Final::Matanyone2 => "MatAnyone2",
+            Final::Videomama => "VideoMaMa",
+            Final::Import => "Imported alpha",
         }
     }
     pub fn task(self) -> Option<TaskKind> {
         match self {
-            Route::Import => None,
-            Route::Gvm => Some(TaskKind::Gvm),
-            Route::Birefnet => Some(TaskKind::Birefnet),
-            Route::Chroma => Some(TaskKind::Chroma),
-            Route::Matanyone2 => Some(TaskKind::Matanyone2),
-            Route::Videomama => Some(TaskKind::Videomama),
+            Final::Matanyone2 => Some(TaskKind::Matanyone2),
+            Final::Videomama => Some(TaskKind::Videomama),
+            _ => None,
         }
     }
-    /// Needs a dense/initial mask hint (`VideoMamaMaskHint`) produced by SAM tracking, paint or import.
-    pub fn needs_mask(self) -> bool {
-        matches!(self, Route::Matanyone2 | Route::Videomama)
+    /// MatAnyone2/VideoMaMa refine an existing guide mask.
+    pub fn needs_guide(self) -> bool {
+        self.task().is_some()
     }
 }
 
@@ -124,76 +207,143 @@ impl Default for Chroma {
 }
 
 /// Generation settings, separate from the consumption mode (`hint_mode` none/full/keyframes in the Key
-/// workflow). `bypass` keeps every other field, so switching back restores the prior route.
+/// workflow). `bypass` keeps every other field, so switching back restores the prior choice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HintCfg {
-    pub route: Route,
+    pub guide: Producer,
+    #[serde(rename = "final")]
+    pub finish: Final,
     pub bypass: bool,
     pub birefnet_variant: String,
     pub sam_model: String,
     pub chroma: Chroma,
     pub videomama_chunk: u32,
+    pub mask_cleanup: MaskCleanup,
+    /// Pre-split key, only ever read (migrated into `guide`/`finish` when those are absent).
+    #[serde(skip_serializing)]
+    route: Option<Route>,
 }
 impl Default for HintCfg {
     fn default() -> Self {
         Self {
-            route: Route::Gvm,
+            guide: Producer::Gvm,
+            finish: Final::Direct,
             bypass: false,
             birefnet_variant: "Matting".into(),
             sam_model: "base_plus".into(),
             chroma: Chroma::default(),
             videomama_chunk: 16,
+            mask_cleanup: MaskCleanup::default(),
+            route: None,
         }
     }
 }
 
 impl HintCfg {
+    /// Stored settings. A config that only has the old `route` keeps its meaning: GVM/BiRefNet/Chroma were
+    /// generated directly into the hint, MatAnyone2/VideoMaMa were refined from a SAM-tracked mask.
+    pub fn from_value(v: &Value) -> Self {
+        let mut c: Self = serde_json::from_value(v.clone()).unwrap_or_default();
+        if v.get("final").is_none() {
+            if let Some(r) = c.route {
+                (c.guide, c.finish) = match r {
+                    Route::Import => (c.guide, Final::Import),
+                    Route::Gvm => (Producer::Gvm, Final::Direct),
+                    Route::Birefnet => (Producer::Birefnet, Final::Direct),
+                    Route::Chroma => (Producer::Chroma, Final::Direct),
+                    Route::Matanyone2 => (Producer::Sam, Final::Matanyone2),
+                    Route::Videomama => (Producer::Sam, Final::Videomama),
+                };
+            }
+        }
+        c.route = None;
+        if let Some(m) = canonical_sam_model(&c.sam_model) {
+            c.sam_model = m.into();
+        }
+        c
+    }
+    /// Like `from_value` but refuses invalid enums/types instead of silently falling back to the default route.
+    pub fn from_value_strict(v: &Value) -> Result<Self, String> {
+        let mut c: Self = serde_json::from_value(v.clone()).map_err(|e| format!("hint: {e}"))?;
+        c.route = None;
+        if let Some(m) = canonical_sam_model(&c.sam_model) {
+            c.sam_model = m.into();
+        }
+        Ok(c)
+    }
     pub fn load(clip: &Clip) -> Self {
         clip.native
             .get("hint")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .map(Self::from_value)
             .unwrap_or_default()
     }
     pub fn save(&self, clip: &Clip) -> Result<(), String> {
-        let v = serde_json::to_value(self).map_err(|e| e.to_string())?;
-        update_native(&clip.meta_path, |n| {
-            // Merge key by key: a newer version's extra keys inside `hint` survive.
-            let e = n.entry("hint").or_insert_with(|| json!({}));
-            if !e.is_object() {
-                *e = json!({});
-            }
-            for (k, x) in v.as_object().unwrap() {
-                e[k] = x.clone();
-            }
-        })
+        update_native(&clip.meta_path, |n| self.write_into(n))
     }
+    /// The same merge as `save`, for a caller that writes more than one thing in one atomic update.
+    pub fn write_into(&self, n: &mut serde_json::Map<String, Value>) {
+        let v = serde_json::to_value(self).unwrap_or_default();
+        // Merge key by key: a newer version's extra keys inside `hint` survive.
+        let e = n.entry("hint").or_insert_with(|| json!({}));
+        if !e.is_object() {
+            *e = json!({});
+        }
+        for (k, x) in v.as_object().into_iter().flatten() {
+            e[k] = x.clone();
+        }
+    }
+    /// Only the settings of the chosen producer/refiner matter: GVM must not depend on a stale SAM value.
     pub fn validate(&self) -> Result<(), String> {
-        if !BIREFNET_VARIANTS.contains(&self.birefnet_variant.as_str()) {
-            return Err(format!(
-                "unknown BiRefNet variant {}",
-                self.birefnet_variant
-            ));
+        self.mask_cleanup.validate()?;
+        match self.guide {
+            Producer::Birefnet if !BIREFNET_VARIANTS.contains(&self.birefnet_variant.as_str()) => {
+                return Err(format!("unknown BiRefNet variant {}", self.birefnet_variant));
+            }
+            Producer::Sam if canonical_sam_model(&self.sam_model).is_none() => {
+                return Err(format!(
+                    "unknown SAM model {:?}: choose Small, Base+ or Large",
+                    self.sam_model
+                ));
+            }
+            Producer::Chroma => {
+                let c = &self.chroma;
+                if !["green", "blue"].contains(&c.screen_type.as_str()) || c.clip_black >= c.clip_white {
+                    return Err("chroma settings are invalid (screen type, black < white)".into());
+                }
+            }
+            _ => {}
         }
-        if !SAM_MODELS.iter().any(|m| m.0 == self.sam_model) {
-            return Err(format!("unknown SAM model {}", self.sam_model));
-        }
-        if !(1..=64).contains(&self.videomama_chunk) {
+        if self.finish == Final::Videomama && !(1..=64).contains(&self.videomama_chunk) {
             return Err("VideoMaMa chunk size must be 1-64".into());
-        }
-        let c = &self.chroma;
-        if !["green", "blue"].contains(&c.screen_type.as_str()) || c.clip_black >= c.clip_white {
-            return Err("chroma settings are invalid (screen type, black < white)".into());
         }
         Ok(())
     }
+
+    /// Short SAM key the worker accepts (validated first).
+    fn sam_key(&self) -> Result<&'static str, String> {
+        canonical_sam_model(&self.sam_model).ok_or_else(|| format!("unknown SAM model {:?}", self.sam_model))
+    }
+
     pub fn params(&self, kind: TaskKind) -> Value {
-        match kind {
+        let mut v = match kind {
             TaskKind::Birefnet => json!({"variant": self.birefnet_variant}),
             TaskKind::Chroma => serde_json::to_value(&self.chroma).unwrap(),
             TaskKind::Videomama => json!({"chunk_size": self.videomama_chunk}),
             _ => json!({}),
+        };
+        if matches!(
+            kind,
+            TaskKind::Gvm
+                | TaskKind::Birefnet
+                | TaskKind::Chroma
+                | TaskKind::Matanyone2
+                | TaskKind::Videomama
+                | TaskKind::PrematteHint
+        ) {
+            v["mask_cleanup"] = json!(self.mask_cleanup);
         }
+        v
     }
 }
 
@@ -513,16 +663,19 @@ impl Ctx<'_> {
     fn stems(&self) -> Vec<String> {
         self.clip.input_files.iter().map(|f| f.0.clone()).collect()
     }
-    fn base(&self, kind: TaskKind, params: Value) -> Result<TaskJob, String> {
+    /// `publish`: `HINT_DIR` or `GUIDE_DIR`. Only the four basic producers may target the guide folder.
+    fn base(&self, kind: TaskKind, params: Value, publish: &str) -> Result<TaskJob, String> {
         let stems = self.stems();
         let range = RangeIdentity::from_inclusive(&stems, self.range.0, self.range.1)
             .map_err(|e| format!("range: {e:?}"))?;
         let root = self.clip.root.clone();
-        let publish = root.join(if kind == TaskKind::SamTrack {
-            "VideoMamaMaskHint"
-        } else {
-            "AlphaHint"
-        });
+        if publish == GUIDE_DIR && matches!(
+            kind,
+            TaskKind::Matanyone2 | TaskKind::Videomama | TaskKind::PrematteHint
+        ) {
+            return Err(format!("{} only writes the final hint", kind.label()));
+        }
+        let publish = root.join(publish);
         Ok(TaskJob {
             job_id: self.job_id.clone(),
             kind,
@@ -587,19 +740,38 @@ impl Ctx<'_> {
         )
     }
 
-    /// Route job. MatAnyone2/VideoMaMa need the mask hint to exist and cover the range (checked by the
-    /// worker too); `mask_stem` defaults to In.
-    pub fn route(&self, cfg: &HintCfg) -> Result<TaskJob, String> {
+    /// The guide producer's job, publishing into `dest` (`GUIDE_DIR`, or `HINT_DIR` for a direct final hint).
+    pub fn producer(
+        &self,
+        cfg: &HintCfg,
+        ann: &Annotations,
+        linear: bool,
+        dest: &str,
+    ) -> Result<TaskJob, String> {
         cfg.validate()?;
-        let kind = cfg
-            .route
-            .task()
-            .ok_or("Import alpha has nothing to generate: use Import alpha on the Hint page")?;
+        match cfg.guide {
+            Producer::Sam => self.sam_track(cfg, ann, linear, dest),
+            p => self.base(p.task(), cfg.params(p.task()), dest),
+        }
+    }
+
+    /// The MatAnyone2/VideoMaMa job refining the guide into `AlphaHint`; the worker checks the guide covers the
+    /// range. `mask_stem` is the first frame of the range.
+    pub fn refine(&self, cfg: &HintCfg) -> Result<TaskJob, String> {
+        cfg.validate()?;
+        let kind = cfg.finish.task().ok_or("this hint choice does not refine a guide")?;
         let mut p = cfg.params(kind);
         if kind == TaskKind::Matanyone2 {
             p["mask_stem"] = json!(self.stems()[self.range.0]);
         }
-        self.base(kind, p)
+        self.base(kind, p, HINT_DIR)
+    }
+
+    /// Promotes the existing guide (`VideoMamaMaskHint`, every frame of the range, already grown/filled) to
+    /// `AlphaHint` on the CPU. Only the configured feather is applied; the worker checks coverage and sizes.
+    pub fn prematte_hint(&self, cfg: &HintCfg) -> Result<TaskJob, String> {
+        cfg.validate()?;
+        self.base(TaskKind::PrematteHint, cfg.params(TaskKind::PrematteHint), HINT_DIR)
     }
 
     pub fn sam_preview(
@@ -615,9 +787,9 @@ impl Ctx<'_> {
             .filter(|f| !f.is_empty())
             .ok_or("no prompt on this frame")?;
         let size = self.clip.sample_size.ok_or("frame size unknown")?;
-        let mut j = self.base(TaskKind::SamPreview, json!({}))?;
+        let mut j = self.base(TaskKind::SamPreview, json!({}), HINT_DIR)?;
         let prompts = frame_prompts(f, stem, j.staging_dir.as_ref().unwrap(), size)?;
-        j.params = json!({"frame_stem": stem, "tracker_model": cfg.sam_model, "prompts": prompts, "input_is_linear": linear});
+        j.params = json!({"frame_stem": stem, "tracker_model": cfg.sam_key()?, "prompts": prompts, "input_is_linear": linear, "mask_cleanup": cfg.mask_cleanup});
         Ok(j)
     }
 
@@ -626,6 +798,7 @@ impl Ctx<'_> {
         cfg: &HintCfg,
         ann: &Annotations,
         linear: bool,
+        dest: &str,
     ) -> Result<TaskJob, String> {
         let stems = self.stems();
         let with = ann.stems_in(&stems, self.range);
@@ -636,7 +809,7 @@ impl Ctx<'_> {
             );
         }
         let size = self.clip.sample_size.ok_or("frame size unknown")?;
-        let mut j = self.base(TaskKind::SamTrack, json!({}))?;
+        let mut j = self.base(TaskKind::SamTrack, json!({}), dest)?;
         let mut frames = serde_json::Map::new();
         for s in with {
             frames.insert(
@@ -645,12 +818,12 @@ impl Ctx<'_> {
             );
         }
         j.params =
-            json!({"tracker_model": cfg.sam_model, "frames": frames, "input_is_linear": linear});
+            json!({"tracker_model": cfg.sam_key()?, "frames": frames, "input_is_linear": linear, "mask_cleanup": cfg.mask_cleanup});
         Ok(j)
     }
 
     pub fn export(&self, p: &ExportCfg) -> Result<TaskJob, String> {
-        self.base(TaskKind::ExportVideo, p.to_params())
+        self.base(TaskKind::ExportVideo, p.to_params(), HINT_DIR)
     }
 }
 
@@ -731,9 +904,138 @@ pub fn covers(dir: &Path, stems: &[String], range: (usize, usize)) -> bool {
     stems[range.0..=range.1].iter().all(|s| have.contains(s))
 }
 
+/// Builds the hint-generation jobs of one clip from a frozen config (the UI passes its live annotations,
+/// the batch/Key planner loads the saved ones).
+pub struct Gen<'a> {
+    pub clip: &'a Clip,
+    pub cfg: &'a HintCfg,
+    pub ann: Option<&'a Annotations>,
+    pub linear: bool,
+    pub staging: &'a Path,
+}
+
+impl Gen<'_> {
+    fn stems(&self) -> Vec<String> {
+        self.clip.input_files.iter().map(|f| f.0.clone()).collect()
+    }
+    fn cx(&self, range: (usize, usize), id: &mut dyn FnMut() -> String) -> Ctx<'_> {
+        Ctx {
+            clip: self.clip,
+            range,
+            job_id: id(),
+            staging: self.staging.to_path_buf(),
+        }
+    }
+    fn produce(
+        &self,
+        range: (usize, usize),
+        dest: &str,
+        id: &mut dyn FnMut() -> String,
+    ) -> Result<TaskJob, String> {
+        let loaded;
+        let ann = match self.ann {
+            Some(a) => a,
+            None => {
+                loaded = Annotations::load(self.clip)?;
+                &loaded
+            }
+        };
+        self.cx(range, id)
+            .producer(self.cfg, ann, self.linear, dest)
+            .map_err(|e| format!("{} guide: {e}", self.cfg.guide.label()))
+    }
+    /// The guide frames this route actually needs for `range`: MatAnyone2 seeds from the In frame only (the
+    /// worker reads `mask_stem`), VideoMaMa refines the whole range. Asking for less than the refiner needs is
+    /// what made a one-frame pre-matte look "not covering".
+    fn guide_needs(&self, range: (usize, usize)) -> Vec<(usize, usize)> {
+        match self.cfg.finish {
+            Final::Matanyone2 => vec![(range.0, range.0)],
+            _ => vec![range],
+        }
+    }
+
+    /// Explicit "generate guide": the producer into `VideoMamaMaskHint`.
+    pub fn guide(
+        &self,
+        range: (usize, usize),
+        id: &mut dyn FnMut() -> String,
+    ) -> Result<TaskJob, String> {
+        self.produce(range, GUIDE_DIR, id)
+    }
+
+    /// "Generate hint". Direct: the producer into `AlphaHint`. MatAnyone2/VideoMaMa: refine the guide; when it
+    /// does not cover `range` this is an error unless `auto_guide` (batch/Key chains) puts the guide step first.
+    pub fn hint(
+        &self,
+        range: (usize, usize),
+        auto_guide: bool,
+        id: &mut dyn FnMut() -> String,
+    ) -> Result<Vec<TaskJob>, String> {
+        self.cfg.validate()?;
+        match self.cfg.finish {
+            Final::Import => {
+                Err("Imported alpha has nothing to generate: import one in Properties".into())
+            }
+            Final::Direct => Ok(vec![self.produce(range, HINT_DIR, id)?]),
+            f => {
+                let mut steps = vec![];
+                let dir = self.clip.root.join(GUIDE_DIR);
+                let stems = self.stems();
+                let missing: Vec<(usize, usize)> = self
+                    .guide_needs(range)
+                    .into_iter()
+                    .filter(|r| !covers(&dir, &stems, *r))
+                    .collect();
+                if !missing.is_empty() {
+                    if !auto_guide {
+                        let what: Vec<String> = missing
+                            .iter()
+                            .map(|r| {
+                                if r.0 == r.1 {
+                                    format!("frame {}", stems[r.0])
+                                } else {
+                                    format!("frames {}-{}", r.0, r.1)
+                                }
+                            })
+                            .collect();
+                        return Err(format!(
+                            "{} needs a guide for {}: generate the guide first",
+                            f.label(),
+                            what.join(", ")
+                        ));
+                    }
+                    for r in missing {
+                        steps.push(self.produce(r, GUIDE_DIR, id)?);
+                    }
+                }
+                steps.push(self.cx(range, id).refine(self.cfg)?);
+                Ok(steps)
+            }
+        }
+    }
+
+    /// Real hints on exactly the marked frames (one single-frame job per mark), so Key's keyframe mode finds
+    /// them in `AlphaHint`. Other frames of the folder are untouched.
+    pub fn keyframes(
+        &self,
+        marks: &[usize],
+        auto_guide: bool,
+        id: &mut dyn FnMut() -> String,
+    ) -> Result<Vec<TaskJob>, String> {
+        if marks.is_empty() {
+            return Err("no keyframe marks inside In/Out: mark frames first".into());
+        }
+        let mut steps = vec![];
+        for &k in marks {
+            steps.extend(self.hint((k, k), auto_guide, id)?);
+        }
+        Ok(steps)
+    }
+}
+
 /// What a Key run on `range` needs before it: the hint-generation steps (possibly none), in order.
-/// `Ok(vec![])` = bypassed, not needed, or the existing hint already covers the range. Mask routes first track
-/// SAM prompts into `VideoMamaMaskHint` unless a mask already covers the range.
+/// `Ok(vec![])` = bypassed, not needed, or the existing hint already covers the range (`keyframes` mode: the
+/// marked frames in the range). A refine choice first generates the guide unless one already covers.
 pub fn plan_steps(
     clip: &Clip,
     cfg: &HintCfg,
@@ -744,7 +1046,7 @@ pub fn plan_steps(
     staging: &Path,
     mut id: impl FnMut() -> String,
 ) -> Result<Vec<TaskJob>, String> {
-    // Only a route the user chose (saved on the Hint page) is ever generated implicitly; otherwise the Key
+    // Only a choice the user saved on the Hint page is ever generated implicitly; otherwise the Key
     // gate reports "Needs hint" and nothing runs behind the user's back.
     if cfg.bypass || hint_mode == "none" || (!force && clip.native.get("hint").is_none()) {
         return Ok(vec![]);
@@ -753,42 +1055,40 @@ pub fn plan_steps(
     if stems.is_empty() {
         return Err("no source frames".into());
     }
-    let hint_ok = covers(&clip.root.join("AlphaHint"), &stems, range);
-    if cfg.route == Route::Import {
-        return if hint_ok {
+    let hint_dir = clip.root.join(HINT_DIR);
+    let g = Gen {
+        clip,
+        cfg,
+        ann: None,
+        linear,
+        staging,
+    };
+    let import = cfg.finish == Final::Import;
+    let force = force && !import;
+    let todo: Vec<(usize, usize)> = if hint_mode == "keyframes" {
+        clip.keyframes
+            .iter()
+            .copied()
+            .filter(|k| (range.0..=range.1).contains(k))
+            .map(|k| (k, k))
+            .filter(|r| force || !covers(&hint_dir, &stems, *r))
+            .collect()
+    } else if force || !covers(&hint_dir, &stems, range) {
+        vec![range]
+    } else {
+        vec![]
+    };
+    if import {
+        return if todo.is_empty() {
             Ok(vec![])
         } else {
-            Err("Import alpha: the imported AlphaHint does not cover In/Out".into())
+            Err("Imported alpha: the imported AlphaHint does not cover In/Out".into())
         };
-    }
-    if hint_ok && !force {
-        return Ok(vec![]);
     }
     let mut steps = vec![];
-    if cfg.route.needs_mask() && !covers(&clip.root.join("VideoMamaMaskHint"), &stems, range) {
-        let ann = Annotations::load(clip)?;
-        let cx = Ctx {
-            clip,
-            range,
-            job_id: id(),
-            staging: staging.to_path_buf(),
-        };
-        steps.push(cx.sam_track(cfg, &ann, linear).map_err(|e| {
-            format!(
-                "{} needs a mask over In/Out: {e} (or import a mask video)",
-                cfg.route.label()
-            )
-        })?);
+    for r in todo {
+        steps.extend(g.hint(r, true, &mut id)?);
     }
-    steps.push(
-        Ctx {
-            clip,
-            range,
-            job_id: id(),
-            staging: staging.to_path_buf(),
-        }
-        .route(cfg)?,
-    );
     Ok(steps)
 }
 
@@ -798,6 +1098,10 @@ pub struct ExportCfg {
     pub manifest_dir: String,
     pub dest: String,
     pub container: String,
+    /// `None` = the worker's default for the container (h264 / prores4444 / vp9).
+    pub codec: Option<String>,
+    /// `None` = the worker's default for the codec (CRF 18, ProRes qscale 9).
+    pub quality: Option<u32>,
     pub fps: f64,
     pub allow_partial: bool,
 }
@@ -808,8 +1112,15 @@ pub const CONTAINERS: [(&str, &str, &str); 3] = [
 ];
 impl ExportCfg {
     pub fn to_params(&self) -> Value {
-        json!({"product": self.product, "manifest_dir": self.manifest_dir, "dest": self.dest,
-               "container": self.container, "fps": self.fps, "allow_partial": self.allow_partial, "audio": "none"})
+        let mut v = json!({"product": self.product, "manifest_dir": self.manifest_dir, "dest": self.dest,
+               "container": self.container, "fps": self.fps, "allow_partial": self.allow_partial, "audio": "none"});
+        if let Some(c) = &self.codec {
+            v["codec"] = json!(c);
+        }
+        if let Some(q) = self.quality {
+            v["quality"] = json!(q);
+        }
+        v
     }
 }
 
@@ -937,18 +1248,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
+    fn clip4(root: &Path) -> Clip {
+        let d = root.join("clips/c1");
+        std::fs::create_dir_all(d.join("Frames")).unwrap();
+        for i in 1..=4 {
+            std::fs::write(d.join(format!("Frames/f{i}.png")), b"x").unwrap();
+        }
+        std::fs::write(d.join("clip.json"), "{}").unwrap();
+        std::fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
+        crate::project::load_project(root, &crate::project::LoadOptions::default())
+            .unwrap()
+            .clips
+            .remove(0)
+    }
+
+    #[test]
+    fn old_route_configs_migrate_and_new_ones_win() {
+        let m = |v: Value| {
+            let c = HintCfg::from_value(&v);
+            (c.guide, c.finish)
+        };
+        assert_eq!(m(json!({"route": "gvm"})), (Producer::Gvm, Final::Direct));
+        assert_eq!(m(json!({"route": "chroma"})), (Producer::Chroma, Final::Direct));
+        assert_eq!(m(json!({"route": "matanyone2"})), (Producer::Sam, Final::Matanyone2));
+        assert_eq!(m(json!({"route": "videomama"})), (Producer::Sam, Final::Videomama));
+        assert_eq!(m(json!({"route": "import"})).1, Final::Import);
+        assert_eq!(
+            m(json!({"route": "gvm", "guide": "birefnet", "final": "videomama"})),
+            (Producer::Birefnet, Final::Videomama)
+        );
+        let v = serde_json::to_value(HintCfg::default()).unwrap();
+        assert!(v.get("route").is_none() && v["final"] == "direct");
+    }
+
+    #[test]
+    fn publish_targets_follow_producer_and_final_choice() {
+        let d = std::env::temp_dir().join(format!("ck-gen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let c = clip4(&d);
+        let stg = d.join("stg");
+        let mut n = 0;
+        let mut id = || {
+            n += 1;
+            format!("j{n}")
+        };
+        let mut cfg = HintCfg::default();
+        fn g<'a>(c: &'a Clip, cfg: &'a HintCfg, stg: &'a Path) -> Gen<'a> {
+            Gen { clip: c, cfg, ann: None, linear: false, staging: stg }
+        }
+        // Basic producer: guide -> VideoMamaMaskHint, direct hint -> AlphaHint.
+        assert!(g(&c, &cfg, &stg).guide((0, 3), &mut id).unwrap().publish_dir.unwrap().ends_with(GUIDE_DIR));
+        assert!(g(&c, &cfg, &stg).hint((0, 3), false, &mut id).unwrap()[0].publish_dir.as_ref().unwrap().ends_with(HINT_DIR));
+        // Refine needs the guide: explicit hint refuses, a chain generates it first.
+        cfg.finish = Final::Videomama;
+        assert!(g(&c, &cfg, &stg).hint((0, 3), false, &mut id).unwrap_err().contains("guide first"));
+        let chain = g(&c, &cfg, &stg).hint((0, 3), true, &mut id).unwrap();
+        assert_eq!(
+            chain.iter().map(|j| (j.kind, j.publish_dir.clone().unwrap().ends_with(GUIDE_DIR))).collect::<Vec<_>>(),
+            vec![(TaskKind::Gvm, true), (TaskKind::Videomama, false)]
+        );
+        // Keyframes: one single-frame job per mark.
+        let k = g(&c, &cfg, &stg).keyframes(&[1, 3], true, &mut id).unwrap();
+        assert_eq!(k.len(), 4);
+        assert_eq!(k[0].range.as_ref().unwrap().in_point, 1);
+        assert_eq!(k[0].range.as_ref().unwrap().out_point, 1);
+        assert!(g(&c, &cfg, &stg).keyframes(&[], true, &mut id).is_err());
+        // The refiner never targets the guide folder.
+        assert!(Ctx { clip: &c, range: (0, 3), job_id: "x".into(), staging: stg.clone() }
+            .base(TaskKind::Videomama, json!({}), GUIDE_DIR)
+            .is_err());
+        let ctx = Ctx { clip: &c, range: (1, 2), job_id: "p".into(), staging: stg.clone() };
+        let pm = ctx.prematte_hint(&cfg).unwrap();
+        assert_eq!(pm.kind, TaskKind::PrematteHint);
+        assert!(pm.publish_dir.as_ref().unwrap().ends_with(HINT_DIR) && pm.staging_dir.is_some());
+        assert_eq!(pm.params, json!({"mask_cleanup": {"grow": 0, "fill_holes": false, "feather": 0.0}}));
+        assert!(pm.validate().is_ok());
+        assert!(ctx.base(TaskKind::PrematteHint, json!({}), GUIDE_DIR).is_err());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn export_params_carry_codec_and_quality_only_when_chosen() {
+        let mut e = ExportCfg {
+            product: "fg".into(),
+            manifest_dir: "/m".into(),
+            dest: "/o/x.mp4".into(),
+            container: "mp4".into(),
+            codec: None,
+            quality: None,
+            fps: 24.0,
+            allow_partial: false,
+        };
+        let v = e.to_params();
+        assert!(v.get("codec").is_none() && v.get("quality").is_none());
+        e.codec = Some("hevc".into());
+        e.quality = Some(23);
+        let v = e.to_params();
+        assert_eq!((v["codec"].as_str(), v["quality"].as_u64()), (Some("hevc"), Some(23)));
+    }
+
     #[test]
     fn cfg_validates_and_round_trips_params() {
         let mut c = HintCfg::default();
         assert!(c.validate().is_ok());
-        assert_eq!(c.params(TaskKind::Birefnet), json!({"variant": "Matting"}));
+        assert_eq!(
+            c.params(TaskKind::Birefnet),
+            json!({"variant": "Matting", "mask_cleanup": {"grow": 0, "fill_holes": false, "feather": 0.0}})
+        );
         c.videomama_chunk = 0;
+        assert!(c.validate().is_ok(), "chunk only matters for VideoMaMa");
+        c.finish = Final::Videomama;
         assert!(c.validate().is_err());
         c = HintCfg {
+            guide: Producer::Birefnet,
             birefnet_variant: "nope".into(),
             ..HintCfg::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn sam_ids_are_canonical_and_validation_is_per_producer() {
+        assert_eq!(canonical_sam_model("facebook/sam2.1-hiera-base-plus"), Some("base_plus"));
+        assert_eq!(canonical_sam_model("large"), Some("large"));
+        assert_eq!(canonical_sam_model("bogus"), None);
+        let c = HintCfg::from_value(&json!({"sam_model": "facebook/sam2.1-hiera-small"}));
+        assert_eq!(c.sam_model, "small");
+        // GVM queues despite an irrelevant bad SAM setting; SAM itself refuses it with a clear error.
+        let mut c = HintCfg { sam_model: "junk".into(), ..HintCfg::default() };
+        assert!(c.validate().is_ok());
+        c.guide = Producer::Sam;
+        assert!(c.validate().unwrap_err().contains("choose Small, Base+ or Large"));
+        c.birefnet_variant = "nope".into();
+        c.guide = Producer::Gvm;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn mask_cleanup_is_frozen_into_jobs_and_validated() {
+        let d = std::env::temp_dir().join(format!("ck-mc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let c = clip4(&d);
+        let stg = d.join("stg");
+        let mc = MaskCleanup { grow: -3, fill_holes: true, feather: 1.5 };
+        let mut cfg = HintCfg { mask_cleanup: mc, sam_model: "facebook/sam2.1-hiera-large".into(), ..HintCfg::default() };
+        let want = json!({"grow": -3, "fill_holes": true, "feather": 1.5});
+        let cx = Ctx { clip: &c, range: (0, 3), job_id: "x".into(), staging: stg.clone() };
+        for g in [Producer::Gvm, Producer::Birefnet, Producer::Chroma] {
+            cfg.guide = g;
+            assert_eq!(cx.producer(&cfg, &Annotations::default(), false, HINT_DIR).unwrap().params["mask_cleanup"], want);
+        }
+        cfg.finish = Final::Videomama;
+        assert_eq!(cx.refine(&cfg).unwrap().params["mask_cleanup"], want);
+        cfg.finish = Final::Matanyone2;
+        assert_eq!(cx.refine(&cfg).unwrap().params["mask_cleanup"], want);
+        // Old configs without the key are neutral; round-trips through serde.
+        let old = HintCfg::from_value(&json!({"guide": "gvm"}));
+        assert_eq!(old.mask_cleanup, MaskCleanup::default());
+        assert_eq!(HintCfg::from_value(&serde_json::to_value(&cfg).unwrap()).mask_cleanup, mc);
+        for bad in [MaskCleanup { grow: 101, ..mc }, MaskCleanup { feather: -1.0, ..mc }, MaskCleanup { feather: f64::NAN, ..mc }] {
+            assert!(HintCfg { mask_cleanup: bad, ..HintCfg::default() }.validate().is_err());
+        }
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

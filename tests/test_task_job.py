@@ -38,8 +38,8 @@ class Env:
             png(self.frames / f"{s}.png")
         self.stg = tmp / "staging" / "j1"
 
-    def job(self, kind, params=None, *, job_id="job-1", rng=True, staging=True, publish=None, **over):
-        dst = {"sam_track": "VideoMamaMaskHint"}.get(kind, "AlphaHint")
+    def job(self, kind, params=None, *, job_id="job-1", rng=True, staging=True, publish=None, dest=None, **over):
+        dst = dest or {"sam_track": "VideoMamaMaskHint"}.get(kind, "AlphaHint")
         hint = kind in task_job.HINT_DST
         d = {"job_id": job_id, "kind": kind, "clip_id": "proj/clip1", "clip_root": str(self.root),
              "range": {"in_point": A, "out_point": B, "in_stem": STEMS[A], "out_stem": STEMS[B]} if rng else None,
@@ -347,9 +347,128 @@ def test_sam_track_publishes_masks_keeps_alpha(env, svc, monkeypatch):
     assert mask_sequence_is_videomama_ready(str(env.root))
 
 
+# ------------------------------------------- producer -> guide -> consumer (central workflow)
+
+@pytest.mark.parametrize("destination", ["AlphaHint", "VideoMamaMaskHint"])
+def test_generated_guide_keeps_gray_values_like_a_direct_hint(env, svc, monkeypatch, destination):
+    ramp = np.tile(np.array([0, 1, 10, 11, 64, 128, 254, 255], dtype=np.uint8), (H, 1))
+
+    def engine(clip, **kwargs):
+        folder = Path(clip.root_path) / "AlphaHint"
+        folder.mkdir()
+        for name in clip.input_asset.get_frame_files():
+            assert cv2.imwrite(str(folder / name), ramp)
+
+    monkeypatch.setattr(svc, "run_gvm", engine)
+    _, done = run(svc, env.job("gvm", {}, dest=destination))
+    assert done["outcome"] == "complete", done
+    expected = ramp  # the guide is published as produced; consumers threshold at 10 when they load it
+    for stem in STEMS[A:B + 1]:
+        actual = cv2.imread(str(env.root / destination / f"{stem}.png"), cv2.IMREAD_GRAYSCALE)
+        np.testing.assert_array_equal(actual, expected)
+
+CHROMA = {"screen_color": [20, 200, 20], "screen_type": "green", "strength": 1.0, "clip_black": 0.0,
+          "clip_white": 1.0, "shrink_grow": 0, "edge_blur": 0}
+
+
+def producer_job(env, svc, monkeypatch, kind, dest, value=200, job_id="prod"):
+    """Run one basic producer (engines faked at the service boundary) publishing to ``dest``."""
+    params = {"gvm": {}, "birefnet": {"variant": "v"}, "chroma": CHROMA,
+              "sam_track": {"tracker_model": "small", "frames": {STEMS[A]: {"points": [{"x": 2, "y": 2, "label": 1}]}}}}[kind]
+    if kind == "gvm":
+        monkeypatch.setattr(svc, "run_gvm", fake_hint(value))
+    elif kind == "birefnet":
+        monkeypatch.setattr(task_job, "birefnet_repos", lambda: {"v": "r"})
+        monkeypatch.setattr(svc, "run_birefnet", lambda clip, **k: fake_hint(value)(clip, **k))
+    elif kind == "sam_track":
+        sam_svc(svc, monkeypatch)
+    return run(svc, env.job(kind, params, dest=dest, job_id=job_id))[1]
+
+
+@pytest.mark.parametrize("kind", ["gvm", "birefnet", "chroma", "sam_track"])
+def test_producer_final_hint_goes_to_alphahint_only(env, svc, monkeypatch, kind):
+    done = producer_job(env, svc, monkeypatch, kind, "AlphaHint")
+    assert done["outcome"] == "complete" and done["result"]["hint_dir"] == str(env.root / "AlphaHint"), done
+    assert len(alpha_files(env.root / "AlphaHint")) == 3
+    assert not (env.root / "VideoMamaMaskHint").exists() and not (env.root / ".corridorkey_mask_manifest.json").exists()
+
+
+@pytest.mark.parametrize("consumer", ["matanyone2", "videomama"])
+@pytest.mark.parametrize("kind", ["gvm", "birefnet", "chroma", "sam_track"])
+def test_producer_guide_feeds_consumer_final_alpha(env, svc, monkeypatch, kind, consumer):
+    from backend.clip_state import mask_sequence_is_videomama_ready
+    alpha = env.old_hint("AlphaHint")
+    before = alpha_files(alpha)
+    done = producer_job(env, svc, monkeypatch, kind, "VideoMamaMaskHint")
+    assert done["outcome"] == "complete", done
+    guide = env.root / "VideoMamaMaskHint"
+    assert sorted(alpha_files(guide)) == [f"{s}.png" for s in STEMS[A:B + 1]]
+    assert alpha_files(alpha) == before  # a guide never touches the final hint
+    man = json.loads((env.root / ".corridorkey_mask_manifest.json").read_text())
+    assert man["source"] == ("sam2" if kind == "sam_track" else kind) and man["frame_stems"] == STEMS[A:B + 1]
+    assert mask_sequence_is_videomama_ready(str(env.root))
+    guide_before, seen = alpha_files(guide), {}
+
+    def eng(clip, **k):  # what the real engines read: first mask file (MatAnyone2) / stem-matched masks (VideoMaMa)
+        seen["masks"] = sorted(clip.mask_asset.get_frame_files())
+        fake_hint(77)(clip)
+    monkeypatch.setattr(svc, "run_" + consumer, eng)
+    params = {"matanyone2": {"mask_stem": STEMS[A]}, "videomama": {"chunk_size": 4}}[consumer]
+    _, done = run(svc, env.job(consumer, params, job_id="cons"))
+    assert done["outcome"] == "complete", done
+    assert seen["masks"] == [f"{s}.png" for s in (STEMS[A:A + 1] if consumer == "matanyone2" else STEMS[A:B + 1])]
+    assert cv2.imread(str(alpha / f"{STEMS[A]}.png"), cv2.IMREAD_UNCHANGED).max() == 77
+    assert cv2.imread(str(alpha / f"{STEMS[0]}.png"), cv2.IMREAD_UNCHANGED).max() == 10  # outside range kept
+    assert alpha_files(guide) == guide_before  # consumers leave the guide alone
+
+
+@pytest.mark.parametrize("consumer", ["matanyone2", "videomama"])
+def test_consumers_without_guide_fail_and_only_make_alphahint(env, svc, monkeypatch, consumer):
+    called = []
+    monkeypatch.setattr(svc, "run_" + consumer, lambda clip, **k: called.append(1))
+    with pytest.raises(TaskRejected) as e:
+        run(svc, env.job(consumer, {}))
+    assert e.value.code == "invalid" and not called and not (env.root / ".corridorkey_hint.lock").exists()
+    with pytest.raises(TaskRejected) as e:
+        run(svc, env.job(consumer, {}, dest="VideoMamaMaskHint", job_id="j2"))
+    assert e.value.code == "paths"
+
+
+@pytest.mark.parametrize("kind", ["gvm", "chroma", "sam_track"])
+def test_producer_destination_is_one_of_the_two_known_folders(env, svc, kind):
+    with pytest.raises(TaskRejected) as e:
+        run(svc, env.job(kind, {} if kind == "gvm" else CHROMA if kind == "chroma" else
+                         {"tracker_model": "small", "frames": {STEMS[A]: {"points": [{"x": 1, "y": 1, "label": 1}]}}},
+                         publish_dir=str(env.root / "Elsewhere")))
+    assert e.value.code == "paths" and not (env.root / ".corridorkey_hint.lock").exists()
+
+
+def test_failed_guide_producer_keeps_old_guide_and_manifest(env, svc, monkeypatch):
+    masks(env, STEMS)
+    before = alpha_files(env.root / "VideoMamaMaskHint")
+    monkeypatch.setattr(svc, "run_gvm", fake_hint(200, drop=STEMS[B]))
+    _, done = run(svc, env.job("gvm", {}, dest="VideoMamaMaskHint"))
+    assert done["outcome"] == "failed"
+    assert alpha_files(env.root / "VideoMamaMaskHint") == before
+    assert not (env.root / ".corridorkey_mask_manifest.json").exists()
+
+
+def test_keyframe_only_guide_seeds_matanyone2(env, svc, monkeypatch):
+    """A one-frame range (a keyframe) is a valid, merged guide for MatAnyone2 seeded at that frame."""
+    monkeypatch.setattr(svc, "run_gvm", fake_hint(200))
+    d = env.job("gvm", {}, dest="VideoMamaMaskHint", rng=False)
+    d["range"] = {"in_point": A, "out_point": A, "in_stem": STEMS[A], "out_stem": STEMS[A]}
+    assert run(svc, d)[1]["outcome"] == "complete"
+    assert sorted(alpha_files(env.root / "VideoMamaMaskHint")) == [f"{STEMS[A]}.png"]
+    monkeypatch.setattr(svc, "run_matanyone2", lambda clip, **k: fake_hint(170)(clip))
+    assert run(svc, env.job("matanyone2", {"mask_stem": STEMS[A]}, job_id="c"))[1]["outcome"] == "complete"
+    with pytest.raises(TaskRejected):  # VideoMaMa needs every range frame
+        run(svc, env.job("videomama", {}, job_id="c2"))
+
+
 # ------------------------------------------------------------------- export
 
-def make_result(env, ext="png", complete=True, skip=None):
+def make_result(env, ext="png", complete=True, skip=None, size=(H, W)):
     out = env.tmp / "out" / "v001"
     files = {}
     for prod in ("fg", "processed"):
@@ -359,7 +478,7 @@ def make_result(env, ext="png", complete=True, skip=None):
             rel = f"{prod.capitalize()}/{STEMS[i]}.{ext}"
             files[prod].append(rel)
             if rel != skip:
-                png(out / rel, 120 + i, (H, W, 4) if prod == "processed" else (H, W, 3))
+                png(out / rel, 120 + i, (*size, 4) if prod == "processed" else (*size, 3))
     m = {"version": 3, "engine": "corridorkey-v2", "clip_id": "proj/clip1", "range": {"in_point": A, "out_point": B,
          "in_stem": STEMS[A], "out_stem": STEMS[B]}, "source_stems": STEMS[A:B + 1], "files": files, "complete": complete}
     (out / ".corridorkey_manifest.json").write_text(json.dumps(m))
@@ -855,7 +974,8 @@ def test_export_real_key_exr_all_products_and_containers(env, svc, product, cont
     dest = env.tmp / "deliver" / f"{product}{CONTAINER_EXT[container]}"
     events, done = run(svc, export_job(env, out, product=product, container=container, dest=str(dest)))
     assert done["outcome"] == "complete", done
-    assert done["result"]["frames"] == 3 and done["result"]["alpha"] is (container != "mp4")
+    assert done["result"]["frames"] == 3
+    assert done["result"]["alpha"] is (container != "mp4" and product == "processed")
     dec = ("-c:v", "libvpx-vp9") if container == "webm_alpha" else ()
     px = decode(dest, "rgba", dec)
     assert px.shape[0] == 3
@@ -995,3 +1115,344 @@ def test_export_ffmpeg_dying_early_reports_its_error(env, svc, monkeypatch):
     _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "d.mp4")))
     assert done["outcome"] == "failed" and "boom: bad filter" in done["message"], done
     assert_cleaned(env, procs, "d.mp4")
+
+
+# ------------------------------------------------------------------ mask cleanup
+
+def _blob():
+    m = np.zeros((H, W), np.uint8)
+    m[2:4, 2:4] = 255
+    return m
+
+
+def test_cleanup_grow_shrink_hole_feather_known_pixels():
+    c = task_job.cleanup_mask
+    m = _blob()
+    assert c(m, {}) is m and c(m, {"grow": 0, "fill_holes": False, "feather": 0.0}) is m
+    g = c(m, {"grow": 1})
+    assert g.shape == m.shape and g[1:5, 1:5].sum() > m.sum() and g[0, 0] == 0 and g[2, 2] == 255
+    assert c(g, {"grow": -1}).tolist() == m.tolist()  # erode undoes dilate on a convex blob
+    assert not c(m, {"grow": -1}).any()
+    ring = np.zeros((H, W), np.uint8)
+    ring[0:5, 1:6] = 200
+    ring[2, 3] = 0  # enclosed hole
+    ring[5, 0] = 0  # exterior stays exterior
+    f = c(ring, {"fill_holes": True})
+    assert f[2, 3] == 255 and f[5, 0] == 0 and f[0, 0] == 0
+    soft = c(m, {"feather": 1.0})
+    assert 0 < soft[1, 2] < 255 and soft.dtype == np.uint8 and soft.shape == m.shape
+    assert c(m.astype(np.uint16) * 257, {"grow": 1}).dtype == np.uint16
+
+
+def _run_gvm_cleanup(env, svc, monkeypatch, cleanup, dest="AlphaHint"):
+    def engine(clip, **k):
+        out = Path(clip.root_path) / "AlphaHint"
+        out.mkdir()
+        for n in clip.input_asset.get_frame_files():
+            assert cv2.imwrite(str(out / n), _blob())
+    monkeypatch.setattr(svc, "run_gvm", engine)
+    p = {} if cleanup is None else {"mask_cleanup": cleanup}
+    return run(svc, env.job("gvm", p, dest=dest))[1]
+
+
+@pytest.mark.parametrize("dest", ["AlphaHint", "VideoMamaMaskHint"])
+def test_cleanup_changes_the_published_mask(env, svc, monkeypatch, dest):
+    done = _run_gvm_cleanup(env, svc, monkeypatch, {"grow": 1, "fill_holes": True, "feather": 0}, dest)
+    assert done["outcome"] == "complete", done
+    got = cv2.imread(str(env.root / dest / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE)
+    assert got.shape == (H, W) and (got > 0).sum() > (_blob() > 0).sum()
+    assert json.loads((env.root / dest / ".corridorkey_hint.json").read_text())["params"]["mask_cleanup"]["grow"] == 1 \
+        if (env.root / dest / ".corridorkey_hint.json").exists() else True
+
+
+def test_neutral_or_absent_cleanup_is_identity(env, svc, monkeypatch):
+    for c in (None, {}):
+        _run_gvm_cleanup(env, svc, monkeypatch, c)
+        got = cv2.imread(str(env.root / "AlphaHint" / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE)
+        np.testing.assert_array_equal(got, _blob())
+        import shutil
+        shutil.rmtree(env.root / "AlphaHint")
+
+
+@pytest.mark.parametrize("bad", [
+    {"grow": 101}, {"grow": 1.5}, {"grow": True}, {"feather": -1}, {"feather": float("nan")}, {"feather": 101},
+    {"fill_holes": 1}, {"x": 1}, [],
+])
+def test_cleanup_rejects_bad_params(env, svc, bad):
+    with pytest.raises(TaskRejected) as e:
+        run(svc, env.job("gvm", {"mask_cleanup": bad}))
+    assert e.value.code == "invalid"
+
+
+def test_cleanup_not_accepted_by_export(env):
+    with pytest.raises(TaskRejected):
+        task_job.TaskJob.from_dict(env.job("prepare_source", {"source_path": "/x.mp4", "mask_cleanup": {}}, rng=False))
+
+
+def test_cleanup_applies_to_sam_track_and_preview(env, svc, monkeypatch):
+    sam_svc(svc, monkeypatch)
+    pr = {"points": [{"x": 2, "y": 2, "label": 1}]}
+    plain = run(svc, env.job("sam_track", {"tracker_model": "small", "frames": {STEMS[A]: pr}}))[1]
+    assert plain["outcome"] == "complete"
+    base = cv2.imread(str(env.root / "VideoMamaMaskHint" / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE)
+    import shutil
+    shutil.rmtree(env.root / "VideoMamaMaskHint")
+    done = run(svc, env.job("sam_track", {"tracker_model": "small", "frames": {STEMS[A]: pr},
+                                          "mask_cleanup": {"grow": -1}}, job_id="job-2"))[1]
+    assert done["outcome"] == "complete"
+    cleaned = cv2.imread(str(env.root / "VideoMamaMaskHint" / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE)
+    assert cleaned.shape == base.shape and (cleaned > 0).sum() <= (base > 0).sum()
+    if base.any() and not base.all():
+        assert (cleaned > 0).sum() < (base > 0).sum()
+    (env.stg / "inputs").mkdir(parents=True, exist_ok=True)
+    ev, d = run(svc, env.job("sam_preview", {"frame_stem": STEMS[A], "tracker_model": "small", "prompts": pr,
+                                             "mask_cleanup": {"grow": -1}}, job_id="job-3"))
+    assert d["outcome"] == "complete" and d["result"]["fill"] <= float((base > 0).mean())
+
+
+def test_cancel_during_cleanup_keeps_old_hint(env, svc, monkeypatch):
+    old = env.old_hint("AlphaHint")
+    before = alpha_files(old)
+    cancel = threading.Event()
+    real = task_job.cleanup_mask
+    monkeypatch.setattr(task_job, "cleanup_mask", lambda *a: (cancel.set(), real(*a))[1])
+    monkeypatch.setattr(svc, "run_gvm", fake_hint(255))
+    _, done = run(svc, env.job("gvm", {"mask_cleanup": {"grow": 1}}), cancel)
+    assert done["outcome"] == "cancelled" and alpha_files(old) == before
+
+
+# ------------------------------------------- stage policy: each cleanup operation applies once along the chain
+
+def test_stage_cleanup_policy():
+    c = {"grow": -2, "fill_holes": True, "feather": 5.0}
+    sc = task_job.stage_cleanup
+    assert sc("gvm", "/x/AlphaHint", c) == c
+    assert sc("gvm", "/x/VideoMamaMaskHint", c) == {**c, "feather": 0.0}
+    assert sc("sam_track", "/x/VideoMamaMaskHint", c) == {**c, "feather": 0.0}
+    assert sc("sam_preview", None, c) == {**c, "feather": 0.0}
+    for k in ("matanyone2", "videomama"):
+        assert sc(k, "/x/AlphaHint", c) == {"grow": 0, "fill_holes": False, "feather": 5.0}
+    assert sc("gvm", "/x/AlphaHint", None) == {}
+    neutral = {"grow": 0, "fill_holes": False, "feather": 0.0}
+    assert sc("matanyone2", "/x/AlphaHint", neutral) == neutral
+
+
+def test_guide_producer_never_feathers_and_does_not_grow_the_guide(env, svc, monkeypatch):
+    done = _run_gvm_cleanup(env, svc, monkeypatch, {"grow": 0, "fill_holes": False, "feather": 5.0}, "VideoMamaMaskHint")
+    assert done["outcome"] == "complete", done
+    got = cv2.imread(str(env.root / "VideoMamaMaskHint" / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE)
+    np.testing.assert_array_equal(got, _blob())  # malformed-stage feather ignored: no softness, no growth
+
+
+def test_direct_hint_keeps_feather_softness(env, svc, monkeypatch):
+    done = _run_gvm_cleanup(env, svc, monkeypatch, {"grow": 0, "fill_holes": False, "feather": 1.0}, "AlphaHint")
+    assert done["outcome"] == "complete", done
+    got = cv2.imread(str(env.root / "AlphaHint" / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE)
+    assert ((got > 0) & (got < 255)).any()
+
+
+@pytest.mark.parametrize("consumer", ["matanyone2", "videomama"])
+def test_refiner_only_feathers_never_shrinks_again(env, svc, monkeypatch, consumer):
+    done = _run_gvm_cleanup(env, svc, monkeypatch, {"grow": 0, "fill_holes": False, "feather": 0.0}, "VideoMamaMaskHint")
+    assert done["outcome"] == "complete", done
+
+    def eng(clip, **k):
+        out = Path(clip.root_path) / "AlphaHint"
+        out.mkdir(exist_ok=True)
+        for n in clip.input_asset.get_frame_files():
+            assert cv2.imwrite(str(out / n), _blob())
+    monkeypatch.setattr(svc, "run_" + consumer, eng)
+    params = {"matanyone2": {"mask_stem": STEMS[A]}, "videomama": {"chunk_size": 4}}[consumer]
+    run(svc, env.job(consumer, {**params, "mask_cleanup": {"grow": -1, "fill_holes": True, "feather": 0.0}}, job_id="r1"))
+    got = cv2.imread(str(env.root / "AlphaHint" / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE)
+    np.testing.assert_array_equal(got, _blob())  # grow/fill belong to the guide stage; the refiner left them alone
+    run(svc, env.job(consumer, {**params, "mask_cleanup": {"grow": -1, "fill_holes": True, "feather": 1.0}}, job_id="r2"))
+    soft = cv2.imread(str(env.root / "AlphaHint" / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE)
+    assert ((soft > 0) & (soft < 255)).any() and soft[2:4, 2:4].min() > 0
+
+
+# ----------------------------------------------------- export codec / quality
+
+def _probe(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                        "stream=codec_name,pix_fmt,profile", "-of", "json", str(path)], capture_output=True, timeout=20)
+    return json.loads(r.stdout)["streams"][0]
+
+
+NEEDS_FFMPEG = pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="needs ffmpeg")
+
+
+@NEEDS_FFMPEG
+@pytest.mark.parametrize("product,container,params,codec,pix,quality", [
+    ("fg", "mp4", {}, "h264", "yuv420p", 18),                                   # legacy defaults
+    ("fg", "mp4", {"codec": "hevc", "quality": 28}, "hevc", "yuv420p", 28),
+    ("fg", "mp4", {"codec": "hevc"}, "hevc", "yuv420p", 23),
+    ("fg", "mp4", {"codec": "h264", "quality": 0}, "h264", "yuv420p", 0),
+    ("fg", "mov_prores4444", {}, "prores", "yuva444p10le", 9),                   # opaque alpha plane for RGB
+    ("fg", "mov_prores4444", {"codec": "prores422", "quality": 4}, "prores", "yuv422p10le", 4),
+    ("processed", "mov_prores4444", {"codec": "prores4444", "quality": 31}, "prores", "yuva444p10le", 31),
+    ("processed", "mov_prores4444", {"codec": "prores422"}, "prores", "yuv422p10le", 9),
+    ("fg", "webm_alpha", {"quality": 63}, "vp9", "yuv420p", 63),                  # ffprobe shows alpha as a tag
+])
+def test_export_codec_matrix_real_ffmpeg(env, svc, product, container, params, codec, pix, quality):
+    out = make_result(env, size=(128, 128))  # libx265 refuses tiny frames
+    dest = env.tmp / "deliver" / f"v{CONTAINER_EXT[container]}"
+    _, done = run(svc, export_job(env, out, product=product, container=container, dest=str(dest), **params))
+    assert done["outcome"] == "complete", done
+    r = done["result"]
+    assert r["quality"] == quality and r["frames"] == 3
+    assert r["codec"] == params.get("codec") or r["codec"] == {"mp4": "h264", "mov_prores4444": "prores4444",
+                                                               "webm_alpha": "vp9"}[container]
+    st = _probe(dest)
+    assert st["codec_name"] == codec and st["pix_fmt"].startswith(pix[:8])  # ProRes decodes as 12-bit
+    if r["codec"] == "prores422":
+        assert st["profile"] == "Standard"
+    # transparency is claimed only for real alpha content in an alpha-capable codec
+    assert r["alpha"] is (product == "processed" and r["codec"] in ("prores4444", "vp9"))
+
+
+@NEEDS_FFMPEG
+@pytest.mark.parametrize("codec,pix", [("prores422", "yuv422p10le"), ("prores4444", "yuva444p10le")])
+def test_export_grayscale_matte_to_mov(env, svc, codec, pix):
+    out = key_style_result(env)
+    dest = env.tmp / "deliver" / "m.mov"
+    _, done = run(svc, export_job(env, out, product="matte", container="mov_prores4444", codec=codec,
+                                  dest=str(dest)))
+    assert done["outcome"] == "complete", done
+    assert _probe(dest)["pix_fmt"].startswith(pix[:8]) and done["result"]["alpha"] is False
+
+
+@pytest.mark.parametrize("over", [
+    {"codec": "vp9"}, {"codec": "prores4444"}, {"codec": "x264"}, {"codec": ""}, {"codec": 1},
+    {"quality": 52}, {"quality": -1}, {"quality": 18.0}, {"quality": True}, {"quality": "18"},
+    {"codec": "hevc", "quality": 52},
+    {"container": "mov_prores4444", "dest": "/o/a.mov", "quality": 0},
+    {"container": "mov_prores4444", "dest": "/o/a.mov", "quality": 32},
+    {"container": "webm_alpha", "dest": "/o/a.webm", "quality": 64},
+    {"container": "webm_alpha", "dest": "/o/a.webm", "codec": "hevc"},
+    {"extra_flag": "-vf x"},
+])
+def test_export_codec_quality_validation(env, over):
+    with pytest.raises(TaskRejected) as e:
+        TaskJob.from_dict(export_job(env, env.tmp, **{"dest": "/o/a.mp4", **over}))
+    assert e.value.code == "invalid"
+
+
+def test_export_params_freeze_codec_and_quality(env):
+    j = TaskJob.from_dict(export_job(env, env.tmp, dest="/o/a.mp4", codec="hevc", quality=20))
+    assert (j.params["codec"], j.params["quality"]) == ("hevc", 20)
+    j = TaskJob.from_dict(export_job(env, env.tmp, dest="/o/a.mp4"))
+    assert (j.params["codec"], j.params["quality"]) == ("h264", 18)
+    j = TaskJob.from_dict(export_job(env, env.tmp, container="mov_prores4444", dest="/o/a.mov", product="fg"))
+    assert (j.params["codec"], j.params["quality"]) == ("prores4444", 9)  # alpha containers take every product
+
+
+# ------------------------------------------------------------ prematte_hint
+
+def guide(env, value=255, stems=STEMS, shape=(H, W)):
+    d = env.root / "VideoMamaMaskHint"
+    d.mkdir(exist_ok=True)
+    for i, s in enumerate(stems):
+        m = np.zeros(shape, np.uint8)
+        m[1:4, 1 + (i % 2):6] = value
+        assert cv2.imwrite(str(d / f"{s}.png"), m)
+    return d
+
+
+def tree(d):
+    return {str(f.relative_to(d)): f.read_bytes() for f in Path(d).rglob("*") if f.is_file()}
+
+
+def test_prematte_capability_needs_neither_gpu_nor_models():
+    caps = task_capabilities(None, gpu=False, ffmpeg=False)
+    assert caps["tasks"]["prematte_hint"] is True and caps["tasks"]["videomama"] is False
+
+
+def test_prematte_promotes_the_guide_range_only_and_keeps_everything_else(env, svc):
+    g = guide(env, 200)
+    env.old_hint(value=10)
+    src, gbefore = tree(env.frames), tree(g)
+    events, done = run(svc, env.job("prematte_hint", {}))
+    assert done["outcome"] == "complete", done
+    assert done["result"]["published"] == B - A + 1 and done["result"]["hint_dir"] == str(env.root / "AlphaHint")
+    for i, s in enumerate(STEMS):
+        got = cv2.imread(str(env.root / "AlphaHint" / f"{s}.png"), cv2.IMREAD_UNCHANGED)
+        if A <= i <= B:
+            np.testing.assert_array_equal(got, cv2.imread(str(g / f"{s}.png"), cv2.IMREAD_UNCHANGED))
+        else:
+            assert (got == 10).all()  # outside In/Out the old hint survives
+    assert tree(env.frames) == src and tree(g) == gbefore  # source and guide untouched
+    prov = json.loads((env.root / "AlphaHint" / ".corridorkey_hint.json").read_text())
+    assert prov["kind"] == "prematte_hint" and prov["range"]["in_stem"] == STEMS[A]
+    assert not (env.root / ".corridorkey_hint.lock").exists()
+    assert not (env.root / "VideoMamaMaskHint" / ".corridorkey_hint.json").exists()
+    assert not (env.root / ".corridorkey_mask_manifest.json").exists()  # a final hint, not a guide
+
+
+def test_prematte_applies_only_feather(env, svc):
+    g = guide(env)
+    gbefore = tree(g)
+    _, done = run(svc, env.job("prematte_hint", {"mask_cleanup": {"grow": 5, "fill_holes": True, "feather": 1.0}}))
+    assert done["outcome"] == "complete", done
+    got = cv2.imread(str(env.root / "AlphaHint" / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE)
+    want = cv2.GaussianBlur(cv2.imread(str(g / f"{STEMS[A]}.png"), cv2.IMREAD_GRAYSCALE), (0, 0), 1.0)
+    np.testing.assert_array_equal(got, want)  # no second grow/fill on an already-cleaned guide
+    assert tree(g) == gbefore
+
+
+def test_prematte_needs_a_dense_guide_and_publishes_nothing(env, svc):
+    guide(env, stems=STEMS[A:B])  # last range frame missing
+    with pytest.raises(TaskRejected) as e:
+        run(svc, env.job("prematte_hint", {}))
+    assert e.value.code == "invalid" and STEMS[B] in e.value.message
+    assert not (env.root / "AlphaHint").exists() and not (env.root / ".corridorkey_hint.lock").exists()
+
+
+def test_prematte_wrong_size_guide_keeps_old_hint(env, svc):
+    guide(env, shape=(H + 2, W))
+    old = env.old_hint()
+    before = tree(old)
+    _, done = run(svc, env.job("prematte_hint", {}))
+    assert done["outcome"] == "failed" and "nothing was published" in done["message"]
+    assert tree(old) == before and not (env.root / ".corridorkey_hint.lock").exists()
+
+
+def test_prematte_cancel_keeps_old_hint(env, svc):
+    guide(env)
+    old = env.old_hint()
+    before = tree(old)
+    cancel = threading.Event()
+    cancel.set()
+    _, done = run(svc, env.job("prematte_hint", {}), cancel)
+    assert done["outcome"] == "cancelled" and tree(old) == before
+    assert not list(env.root.glob("AlphaHint.*")) and not (env.root / ".corridorkey_hint.lock").exists()
+
+
+def test_prematte_rejects_unknown_params_and_other_publish_dir(env, svc):
+    guide(env)
+    with pytest.raises(TaskRejected):
+        TaskJob.from_dict(env.job("prematte_hint", {"mask_stem": "x"}))
+    with pytest.raises(TaskRejected) as e:
+        run(svc, env.job("prematte_hint", {}, dest="VideoMamaMaskHint"))
+    assert e.value.code == "paths"
+
+
+def test_soft_guide_is_promoted_with_intermediate_alpha(env, svc, monkeypatch):
+    """Batch Direct = GVM -> guide -> prematte_hint must end with the same soft alpha as Generate Direct."""
+    ramp = np.tile(np.array([0, 1, 10, 11, 64, 128, 254, 255], dtype=np.uint8), (H, 1))
+
+    def engine(clip, **kwargs):
+        folder = Path(clip.root_path) / "AlphaHint"
+        folder.mkdir()
+        for name in clip.input_asset.get_frame_files():
+            assert cv2.imwrite(str(folder / name), ramp)
+
+    monkeypatch.setattr(svc, "run_gvm", engine)
+    assert run(svc, env.job("gvm", {}, dest="VideoMamaMaskHint"))[1]["outcome"] == "complete"
+    _, done = run(svc, env.job("prematte_hint", {}, job_id="job-2"))
+    assert done["outcome"] == "complete", done
+    for stem in STEMS[A:B + 1]:
+        got = cv2.imread(str(env.root / "AlphaHint" / f"{stem}.png"), cv2.IMREAD_GRAYSCALE)
+        np.testing.assert_array_equal(got, ramp)
+    # the guide stays the one the refiners/loaders read, and readiness is manifest-based, not value-based
+    assert json.loads((env.root / ".corridorkey_mask_manifest.json").read_text())["source"] == "gvm"

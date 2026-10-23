@@ -194,3 +194,10 @@ def tmp_v2_project_dir(sample_frame, sample_mask):
             }, f)
 
         yield project_root
+
+
+@pytest.fixture(autouse=True)
+def _never_query_real_nvml_for_gpu_identity(monkeypatch):
+    """probe_hello (worker hello) must never read the host's NVML in tests; identity tests install their own fakes."""
+    import backend.worker.gpu_identity as gi
+    monkeypatch.setattr(gi, "nvml_uuids", lambda: None)

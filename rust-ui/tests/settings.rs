@@ -105,6 +105,17 @@ fn click_apply(ctx: &egui::Context, app: &mut App) {
         .center();
     click(ctx, app, at);
 }
+
+#[test]
+fn settings_footer_stays_compact_across_pointer_redraws() {
+    let (ctx, mut app, _) = start("footer-size", None, None);
+    open_page(&ctx, &mut app);
+    for i in 0..120 {
+        run(&ctx, &mut app, vec![Event::PointerMoved(egui::pos2(400.0 + i as f32, 600.0))]);
+        let r = app.settings_page().apply_rect().unwrap();
+        assert!(r.height() < 40.0 && r.min.y > 830.0 && r.max.y <= 900.0, "frame {i}: {r:?}");
+    }
+}
 fn back(ctx: &egui::Context, app: &mut App) {
     let at = app.settings_back_rect().expect("Back drawn").center();
     click(ctx, app, at);

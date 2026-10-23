@@ -1,0 +1,44 @@
+[
+  {
+    "name": "CorridorKey-2.2.0-a263fbf35a-linux-x86_64.run",
+    "size": 4816995552,
+    "sha256": "2340b8606a96577b89461ba16c544a7d0e682bc4d5f6fe78ea90fcffcd5aab24",
+    "github_asset": false
+  },
+  {
+    "name": "CorridorKey-2.2.0-a263fbf35a-linux-x86_64.run.part001",
+    "size": 1992294400,
+    "sha256": "3954b2bac6f7e0ed1ca9a15fbbf9f813147a1352e507cf2309a82a25da29aee4",
+    "github_asset": true
+  },
+  {
+    "name": "CorridorKey-2.2.0-a263fbf35a-linux-x86_64.run.part002",
+    "size": 1992294400,
+    "sha256": "99f252c149ef86c6b0ebde816822098ee8580b2372bdb8491639485dc46c74f4",
+    "github_asset": true
+  },
+  {
+    "name": "CorridorKey-2.2.0-a263fbf35a-linux-x86_64.run.part003",
+    "size": 832406752,
+    "sha256": "ec067b6580322bcd03012bca9eea7f350411585352bc036f7b3d24eba47dd35c",
+    "github_asset": true
+  },
+  {
+    "name": "CorridorKey-2.2.0-bcc0720114-windows-x86_64-setup.exe",
+    "size": 5444035,
+    "sha256": "6698885b3f6334709aecb3e4cfaea8617e71e52479a540d09aae2b793a6293e4",
+    "github_asset": true
+  },
+  {
+    "name": "CorridorKey-2.2.0-bcc0720114-windows-x86_64-setup-1.bin",
+    "size": 1986850304,
+    "sha256": "ff11c5ff343c02f16a78df95ce569a2b15c593f843cadf7a822025da17d726ee",
+    "github_asset": true
+  },
+  {
+    "name": "CorridorKey-2.2.0-bcc0720114-windows-x86_64-setup-2.bin",
+    "size": 1346107422,
+    "sha256": "467bcbdcc79de43555fabafea2a0d862fa5b13f19af003655865eb2a5d033191",
+    "github_asset": true
+  }
+]

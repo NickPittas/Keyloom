@@ -94,8 +94,32 @@ def stage_ffmpeg(stage: Path, ffmpeg_dir: Path) -> None:
             raise SystemExit(f"{src} missing: --ffmpeg-dir must hold ffmpeg and ffprobe (static build)")
         shutil.copy2(src, dest / src.name)
     for notice in [*ffmpeg_dir.glob("LICENSE*"), *ffmpeg_dir.glob("GPLv*.txt"), *ffmpeg_dir.glob("readme*.txt"),
-                   *ffmpeg_dir.parent.glob("LICENSE*"), *ffmpeg_dir.parent.glob("README*")]:
+                   *ffmpeg_dir.parent.glob("LICENSE*"), *ffmpeg_dir.parent.glob("README*"),
+                   *ffmpeg_dir.parent.glob("GPLv*.txt"), *ffmpeg_dir.parent.glob("readme*.txt")]:
         shutil.copy2(notice, dest.parent / notice.name)
+    notices = [p for p in dest.parent.iterdir() if p.is_file()]
+    if not any("GNU GENERAL PUBLIC LICENSE" in p.read_text(errors="replace").upper() for p in notices):
+        raise SystemExit(f"no GPL licence text found next to {ffmpeg_dir}; refusing to bundle FFmpeg without it")
+
+
+VC_DLLS = ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+           "msvcp140_codecvt_ids.dll", "vcomp140.dll", "concrt140.dll")
+
+
+def stage_vc_runtime(stage: Path) -> None:
+    """Windows: no host VC++ Redistributable needed. The Rust UI imports VCRUNTIME140 and torch/c10 import MSVCP140;
+    the Microsoft redistributable DLLs ship inside the PySide6 wheel and are placed next to python.exe and the UI."""
+    src = stage / "runtime/python/Lib/site-packages/PySide6"
+    py = stage / "runtime/python"
+    for n in VC_DLLS:
+        f = src / n
+        if not f.is_file():
+            raise SystemExit(f"{f} missing: cannot bundle the Visual C++ runtime")
+        # Reused runtimes are hardlinked: replacing a DLL must not mutate the source runtime.
+        (py / n).unlink(missing_ok=True)
+        shutil.copy2(f, py / n)
+        if n.startswith("vcruntime"):
+            shutil.copy2(f, stage / "bin" / n)
 
 
 PROVENANCE = ".ck-runtime-provenance.json"  # next to the interpreter: lock + build recipe + extension ABI hash
@@ -359,6 +383,8 @@ def build_stage(out: Path, *, ui_binary=None, build_ui=False, ffmpeg_dir: Path, 
         shutil.copytree(runtime_dir, stage / "runtime/python", symlinks=True, copy_function=_link_or_copy)
     else:
         lock_sha = stage_runtime(stage, py_version, uv)
+    if IS_WIN:
+        stage_vc_runtime(stage)
     descriptor(stage, version)
     catalog_sha = sha256_file(REPO / "backend/model_catalog.json")
     log("scanning ELF glibc floor")
@@ -397,6 +423,32 @@ def make_linux_run(stage: Path, out: Path) -> Path:
     return run
 
 
+PART_BYTES = 1900 << 20  # GitHub release assets are limited to 2 GiB each
+
+
+def split_linux_run(run: Path, part_bytes: int = PART_BYTES) -> list[Path]:
+    """Optional distribution form: `<run>.part001..` (each <= part_bytes) + `<run>.parts.sha256` (every part). Reassemble with: cat <run>.part[0-9][0-9][0-9] > <run> && sha256sum -c <run>.sha256 && chmod +x <run>"""
+    parts = []
+    with open(run, "rb") as f:
+        while True:
+            first = f.read(min(1 << 20, part_bytes))
+            if not first:
+                break
+            part = run.with_name(f"{run.name}.part{len(parts) + 1:03d}")
+            with open(part, "wb") as target:
+                target.write(first)
+                left = part_bytes - len(first)
+                while left:
+                    chunk = f.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    left -= len(chunk)
+            parts.append(part)
+    (run.with_name(run.name + ".parts.sha256")).write_text("".join(f"{sha256_file(p)}  {p.name}\n" for p in parts))
+    return parts
+
+
 def find_iscc(explicit: str | None) -> str:
     for c in [explicit, shutil.which("ISCC"), shutil.which("iscc"),
               r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe", r"C:\Program Files\Inno Setup 6\ISCC.exe"]:
@@ -427,7 +479,9 @@ def make_windows_exe(stage: Path, out: Path, iscc: str | None) -> Path:
     built = sorted(out.glob("CorridorKey-*-setup.exe"))
     if not built:
         raise SystemExit("ISCC finished but produced no setup exe")
-    (out / (built[-1].name + ".sha256")).write_text(f"{sha256_file(built[-1])}  {built[-1].name}\n")
+    stem = built[-1].name[:-len(".exe")]  # setup exe + every Inno disk slice (<stem>-1.bin ...), hashed together
+    files = [built[-1], *sorted(out.glob(stem + "-*.bin"))]
+    (out / (built[-1].name + ".sha256")).write_text("".join(f"{sha256_file(f)}  {f.name}\n" for f in files))
     return built[-1]
 
 
@@ -441,6 +495,7 @@ def main(argv=None) -> int:
     ap.add_argument("--python-version", default="3.11.16", help="exact version, e.g. 3.11.16")
     ap.add_argument("--max-glibc", default="2.31", help="fail if the bundle's glibc floor is higher (Linux)")
     ap.add_argument("--iscc")
+    ap.add_argument("--split", action="store_true", help="Linux: also write the .run as <=1900 MiB parts for GitHub release upload")
     ap.add_argument("--no-smoke", action="store_true")
     ap.add_argument("--reuse-runtime", type=Path, help="existing <stage>/runtime/python built by this tool (hardlinked, lock-checked)")
     a = ap.parse_args(argv)
@@ -451,7 +506,10 @@ def main(argv=None) -> int:
                         ffmpeg_dir=a.ffmpeg_dir, py_version=a.python_version, smoke=not a.no_smoke, max_glibc=a.max_glibc,
                         runtime_dir=a.reuse_runtime)
     if a.target == "linux":
-        print(make_linux_run(stage, a.out.resolve()))
+        run = make_linux_run(stage, a.out.resolve())
+        print(run)
+        if a.split:
+            print(*split_linux_run(run), sep="\n")
     elif a.target == "windows":
         print(make_windows_exe(stage, a.out.resolve(), a.iscc))
     else:

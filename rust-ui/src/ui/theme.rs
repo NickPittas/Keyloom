@@ -2,21 +2,41 @@
 //! against the panel; text holds >= 4.5:1. Tests measure the visuals `apply` actually installs.
 use eframe::egui::{self, Color32, CornerRadius, Stroke};
 
-pub const PANEL: Color32 = Color32::from_rgb(44, 44, 46);
-pub const CANVAS: Color32 = Color32::from_rgb(31, 31, 33);
-pub const FIELD: Color32 = Color32::from_rgb(24, 24, 26);
-pub const BUTTON: Color32 = Color32::from_rgb(72, 74, 78);
-pub const BUTTON_HOVER: Color32 = Color32::from_rgb(87, 90, 95);
-pub const BORDER: Color32 = Color32::from_rgb(128, 132, 138);
-pub const BORDER_HOVER: Color32 = Color32::from_rgb(168, 172, 178);
-pub const ACCENT: Color32 = Color32::from_rgb(62, 110, 160);
-pub const CHECKED: Color32 = Color32::from_rgb(76, 139, 208);
+pub const PANEL: Color32 = Color32::from_rgb(38, 46, 40);
+pub const CANVAS: Color32 = Color32::from_rgb(23, 31, 25);
+pub const FIELD: Color32 = Color32::from_rgb(30, 38, 32);
+pub const BUTTON: Color32 = Color32::from_rgb(54, 64, 57);
+pub const BUTTON_HOVER: Color32 = Color32::from_rgb(71, 84, 75);
+pub const BORDER: Color32 = Color32::from_rgb(125, 145, 132);
+pub const BORDER_HOVER: Color32 = Color32::from_rgb(166, 194, 175);
+pub const ACCENT: Color32 = Color32::from_rgb(145, 178, 154);
+pub const CHECKED: Color32 = Color32::from_rgb(145, 178, 154);
 pub const FOCUS: Color32 = Color32::from_rgb(224, 176, 80);
-pub const TEXT: Color32 = Color32::from_rgb(220, 220, 220);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(190, 192, 198);
-pub const CARD: Color32 = Color32::from_rgb(58, 60, 65);
-pub const CARD_HEADER: Color32 = Color32::from_rgb(78, 80, 86);
+pub const TEXT: Color32 = Color32::from_rgb(226, 232, 228);
+pub const TEXT_DIM: Color32 = Color32::from_rgb(169, 187, 175);
+pub const CARD: Color32 = Color32::from_rgb(47, 57, 50);
+pub const CARD_HEADER: Color32 = Color32::from_rgb(65, 81, 69);
+/// The tick on a checked box: dark on the light CHECKED fill (white on it would be under 3:1).
+const CHECK_MARK: Color32 = Color32::from_rgb(21, 36, 26);
 const DISABLED_BORDER: Color32 = Color32::from_rgb(84, 84, 88);
+
+/// A processing action, distinct from settings and secondary controls.
+pub fn primary_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(egui::Button::new(text.into().color(Color32::from_rgb(21, 36, 26))).fill(ACCENT).stroke(Stroke::new(1.0, Color32::from_rgb(174, 204, 183))))
+}
+
+/// Shared raised parameter group; every pane uses the same padding and title alignment.
+pub fn section<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let out = egui::Frame::new().fill(CARD).stroke(Stroke::new(1.0, Color32::from_rgb(77, 94, 82)))
+        .corner_radius(5).inner_margin(12).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(title).size(12.0).color(TEXT_DIM).strong());
+            ui.add_space(8.0);
+            body(ui)
+        }).inner;
+    ui.add_space(10.0);
+    out
+}
 
 fn lin(c: u8) -> f32 {
     let c = c as f32 / 255.0;
@@ -34,7 +54,7 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-/// Checkbox with the brief's states: empty = dark bordered box; checked = CHECKED fill + white 2 px
+/// Checkbox with the brief's states: empty = dark bordered box; checked = CHECKED fill + dark 2 px
 /// mark. Wraps the stock widget (scoped visuals only), so focus, hover, disabled state and
 /// accessibility info (checkbox role + checked flag) are egui's own.
 pub fn checkbox(
@@ -43,16 +63,17 @@ pub fn checkbox(
     label: impl Into<egui::WidgetText>,
 ) -> egui::Response {
     let on = *checked;
+    let label = label.into().color(TEXT);
     ui.scope(|ui| {
         if on {
             let w = &mut ui.visuals_mut().widgets;
             for (s, fill) in [
                 (&mut w.inactive, CHECKED),
-                (&mut w.hovered, Color32::from_rgb(98, 155, 218)),
-                (&mut w.active, Color32::from_rgb(58, 118, 188)),
+                (&mut w.hovered, Color32::from_rgb(168, 200, 178)),
+                (&mut w.active, Color32::from_rgb(126, 160, 136)),
             ] {
                 s.bg_fill = fill;
-                s.fg_stroke = Stroke::new(2.0, Color32::WHITE);
+                s.fg_stroke = Stroke::new(2.0, CHECK_MARK);
             }
         }
         ui.checkbox(checked, label)
@@ -68,12 +89,12 @@ pub fn setup_style(ctx: &egui::Context) {
 pub fn apply(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = PANEL;
-    v.window_fill = Color32::from_rgb(50, 50, 52);
+    v.window_fill = CARD;
     v.extreme_bg_color = FIELD;
-    v.faint_bg_color = Color32::from_rgb(50, 50, 52);
-    v.hyperlink_color = Color32::from_rgb(130, 176, 224);
+    v.faint_bg_color = CARD;
+    v.hyperlink_color = ACCENT;
     v.window_stroke = Stroke::new(1.0, Color32::from_rgb(96, 98, 104));
-    v.selection.bg_fill = ACCENT;
+    v.selection.bg_fill = Color32::from_rgb(65, 88, 74);
     v.selection.stroke = Stroke::new(1.5, Color32::WHITE);
     // Disabled widgets are drawn at disabled_alpha toward the background; keep them legible.
     v.disabled_alpha = 0.65;
@@ -89,11 +110,11 @@ pub fn apply(ctx: &egui::Context) {
     w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
     w.inactive.fg_stroke = Stroke::new(2.0, TEXT); // also the checkmark
     w.hovered.weak_bg_fill = BUTTON_HOVER;
-    w.hovered.bg_fill = Color32::from_rgb(34, 34, 37);
+    w.hovered.bg_fill = Color32::from_rgb(42, 54, 46);
     w.hovered.bg_stroke = Stroke::new(1.0, BORDER_HOVER);
     w.hovered.fg_stroke = Stroke::new(2.0, Color32::WHITE);
-    w.active.weak_bg_fill = ACCENT;
-    w.active.bg_fill = Color32::from_rgb(40, 40, 44);
+    w.active.weak_bg_fill = Color32::from_rgb(65, 88, 74);
+    w.active.bg_fill = Color32::from_rgb(50, 66, 55);
     w.active.bg_stroke = Stroke::new(2.0, FOCUS);
     w.active.fg_stroke = Stroke::new(2.0, Color32::WHITE);
     w.open.weak_bg_fill = BUTTON_HOVER;
@@ -238,7 +259,7 @@ mod tests {
     }
 
     /// Real paint of `theme::checkbox`: empty = dark bordered box, no mark; checked = CHECKED fill +
-    /// extra white mark. Also confirms contrast of what was actually painted.
+    /// dark mark. Also confirms contrast of what was actually painted.
     #[test]
     fn themed_checkbox_paints_distinct_states() {
         let ctx = Context::default();
@@ -272,8 +293,8 @@ mod tests {
             "{b0:?} {m0:?}"
         );
         assert!(b1.iter().any(|(f, _)| *f == CHECKED), "{b1:?}");
-        assert!(m1.contains(&Color32::WHITE), "{m1:?}");
-        assert!(contrast(CHECKED, PANEL) >= 3.0 && contrast(Color32::WHITE, CHECKED) >= 3.0);
+        assert!(m1.contains(&CHECK_MARK), "{m1:?}");
+        assert!(contrast(CHECKED, PANEL) >= 3.0 && contrast(CHECK_MARK, CHECKED) >= 3.0, "the tick must be readable on the fill");
         assert!(contrast(BORDER, FIELD) >= 3.0 && contrast(FIELD, PANEL) > 1.0);
     }
 }

@@ -41,6 +41,53 @@ fn warm(v: &mut Viewer, n: usize) {
 }
 
 #[test]
+fn replacing_a_guide_at_the_same_path_uploads_new_pixels_without_changing_views() {
+    let root = project("replace-guide", 1);
+    let dir = root.join("clips/c/VideoMamaMaskHint");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f_000.png");
+    let write = |value: u8| {
+        let mut encoder = png::Encoder::new(fs::File::create(&path).unwrap(), 4, 4);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&[value; 16]).unwrap();
+    };
+    write(0);
+    let ctx = egui::Context::default();
+    let p = load_project(&root, &LoadOptions::default()).unwrap();
+    let mut viewer = Viewer::new(0, &p.clips[0], 16, &ctx);
+    viewer.view = View::Guide;
+    let upload = |viewer: &mut Viewer| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            viewer.tick();
+            let mut out = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                ..Default::default()
+            }, |ui| viewer.ui(ui));
+            let pixel = out.textures_delta.set.values().flatten().find_map(|delta| {
+                let egui::ImageData::Color(image) = &delta.image;
+                (image.size == [4, 4]).then(|| image.pixels[0].r())
+            });
+            out.textures_delta.clear();
+            if let Some(pixel) = pixel {
+                return pixel;
+            }
+            assert!(Instant::now() < deadline, "the changed guide was not uploaded");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    assert_eq!(upload(&mut viewer), 0);
+    write(255);
+    let p = load_project(&root, &LoadOptions::default()).unwrap();
+    viewer.refresh(&p.clips[0]);
+    assert_eq!(upload(&mut viewer), 255);
+    assert_eq!(viewer.view, View::Guide);
+    drop(viewer);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn playback_keeps_requesting_repaints_and_advances_with_every_frame_cached() {
     let n = 12;
     let root = project("play", n);

@@ -17,6 +17,9 @@ pub enum TaskKind {
     SamTrack,
     Matanyone2,
     Videomama,
+    /// Promotes the existing guide (`VideoMamaMaskHint`) to the final `AlphaHint` on the CPU: only the feather
+    /// cleanup is applied (grow/fill were already applied to the guide). No model, no GPU.
+    PrematteHint,
     ExportVideo,
     /// Whole-movie `Source/` -> validated `Frames/` (no range).
     PrepareSource,
@@ -25,7 +28,7 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    pub const ALL: [TaskKind; 10] = [
+    pub const ALL: [TaskKind; 11] = [
         TaskKind::Gvm,
         TaskKind::Birefnet,
         TaskKind::Chroma,
@@ -33,6 +36,7 @@ impl TaskKind {
         TaskKind::SamTrack,
         TaskKind::Matanyone2,
         TaskKind::Videomama,
+        TaskKind::PrematteHint,
         TaskKind::ExportVideo,
         TaskKind::PrepareSource,
         TaskKind::ImportHint,
@@ -46,6 +50,7 @@ impl TaskKind {
             TaskKind::SamTrack => "sam_track",
             TaskKind::Matanyone2 => "matanyone2",
             TaskKind::Videomama => "videomama",
+            TaskKind::PrematteHint => "prematte_hint",
             TaskKind::ExportVideo => "export_video",
             TaskKind::PrepareSource => "prepare_source",
             TaskKind::ImportHint => "import_hint",
@@ -60,6 +65,7 @@ impl TaskKind {
             TaskKind::SamTrack => "SAM track",
             TaskKind::Matanyone2 => "MatAnyone2 hint",
             TaskKind::Videomama => "VideoMaMa hint",
+            TaskKind::PrematteHint => "Pre-matte hint",
             TaskKind::ExportVideo => "Video export",
             TaskKind::PrepareSource => "Extract frames",
             TaskKind::ImportHint => "Import hint movie",
@@ -250,6 +256,11 @@ mod tests {
         assert!(j.validate().is_err()); // preview has no publish_dir
         j.publish_dir = None;
         assert!(j.validate().is_ok());
+        let j = sample(TaskKind::PrematteHint);
+        assert!(j.validate().is_ok());
+        assert_eq!(j.kind.wire(), "prematte_hint");
+        assert!(j.kind.writes_hint() && j.kind.needs_staging() && j.kind.ranged());
+        assert_eq!(j.fence(), "/p/clip");
         let mut j = sample(TaskKind::PrepareSource);
         assert!(j.validate().is_err()); // whole-movie kinds carry null range/staging/publish
         j.range = None;

@@ -7,6 +7,7 @@ use std::time::Duration;
 fn node_name(n: Node) -> String {
     match n {
         Node::Media => "media".into(),
+        Node::PreMatte => "prematte".into(),
         Node::Hint => "hint".into(),
         Node::Key => "key".into(),
         Node::Out(v) => v.label().to_lowercase(),
@@ -15,10 +16,11 @@ fn node_name(n: Node) -> String {
 fn node_parse(s: &str) -> Option<Node> {
     Some(match s {
         "media" => Node::Media,
+        "prematte" => Node::PreMatte,
         "hint" => Node::Hint,
         "key" => Node::Key,
         other => Node::Out(View::ALL.into_iter().find(|v| {
-            v.label().eq_ignore_ascii_case(other) && !matches!(v, View::Input | View::Hint)
+            v.label().eq_ignore_ascii_case(other) && !matches!(v, View::Input | View::Hint | View::Guide)
         })?),
     })
 }
@@ -64,7 +66,7 @@ impl App {
                     GraphState {
                         pan: [gv.pan.x, gv.pan.y],
                         zoom: gv.zoom,
-                        nodes: g.nodes.iter().map(|n| [n.pos.x, n.pos.y]).collect(),
+                        nodes: g.positions(),
                     },
                 );
             }
@@ -139,12 +141,8 @@ impl App {
             .filter_map(|f| clips.iter().position(|c| c == f))
             .collect();
         for (k, g) in &w.graphs {
-            let mut graph = graph::Graph::corridorkey();
-            if g.nodes.len() == graph.nodes.len() {
-                for (n, p) in graph.nodes.iter_mut().zip(&g.nodes) {
-                    n.pos = egui::pos2(p[0], p[1]);
-                }
-            }
+            let mut graph = graph::Graph::new();
+            graph.restore_positions(&g.nodes);
             self.graphs.insert(
                 k.clone(),
                 (

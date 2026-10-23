@@ -51,6 +51,8 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _JOB_KEYS = ("job_id", "clip_id", "clip_root", "range", "params", "output_config",
              "hint_keyframes_abs", "outputs", "manifest_dir", "mode", "publish", "path_map",
              "require")
+# Optional keys a network receiver adds; absent == the local default (no map, warn-only fixed windows).
+_OPTIONAL_KEYS = ("source_map", "enforce_fixed_window")
 _RANGE_KEYS = ("in_point", "out_point", "in_stem", "out_stem")
 _FORMAT_OF = {"fg": "fg_format", "matte": "matte_format", "comp": "comp_format",
               "processed": "processed_format"}
@@ -136,6 +138,15 @@ def _inside(child: str, parent: str) -> bool:
     return c == q or c.startswith(q.rstrip(_P.sep) + _P.sep)
 
 
+def _check_source_map(m) -> tuple:
+    """``[[recorded, local]]``: at most one entry; ``local`` must be a clean absolute path (the receiver resolved it
+    through its own path mapping). ``recorded`` is only a string to compare with clip.json, never opened."""
+    if not isinstance(m, list) or len(m) > 1 or not all(
+            isinstance(e, list) and len(e) == 2 and all(isinstance(x, str) and x for x in e) for e in m):
+        _rej("invalid", "source_map must be [] or [[recorded_path, local_path]]")
+    return tuple((rec, _clean_abs(loc, "source_map local path")) for rec, loc in m)
+
+
 @dataclass(frozen=True)
 class KeyJob:
     """Immutable snapshot of a submitted Key job (mappings are read-only, lists are tuples)."""
@@ -152,23 +163,36 @@ class KeyJob:
     publish: str
     path_map: tuple
     require: MappingProxyType
+    # ((recorded, local),) at most one: where THIS machine resolved the external source clip.json records.
+    source_map: tuple = ()
+    # A fixed temporal window that does not fit the available GPU memory fails the job instead of only warning.
+    enforce_fixed_window: bool = False
 
     @property
     def frames(self) -> int:
         return self.range["out_point"] - self.range["in_point"] + 1
 
     def to_dict(self) -> dict:
-        return {k: _thaw(getattr(self, k)) for k in _JOB_KEYS}
+        out = {k: _thaw(getattr(self, k)) for k in _JOB_KEYS}
+        if self.source_map:
+            out["source_map"] = [list(e) for e in self.source_map]
+        if self.enforce_fixed_window:
+            out["enforce_fixed_window"] = True
+        return out
 
     @classmethod
     def from_dict(cls, d) -> "KeyJob":
         """Strict structural parse; touches no disk. Raises KeyJobRejected."""
         if not isinstance(d, dict):
             _rej("protocol", "job must be an object")
-        missing, unknown = set(_JOB_KEYS) - set(d), set(d) - set(_JOB_KEYS)
+        missing, unknown = set(_JOB_KEYS) - set(d), set(d) - set(_JOB_KEYS) - set(_OPTIONAL_KEYS)
         if missing or unknown:
             _rej("protocol", f"job keys: missing {sorted(missing)}, unknown {sorted(unknown)}")
         d = _thaw(d)  # private deep copy: later mutation of the caller's dict cannot leak in
+        smap = _check_source_map(d.get("source_map", []))
+        enforce = d.get("enforce_fixed_window", False)
+        if not isinstance(enforce, bool):
+            _rej("invalid", "enforce_fixed_window must be a boolean")
         jid = d["job_id"]
         if not isinstance(jid, str) or not _JOB_ID_RE.match(jid):
             _rej("protocol", "job_id must match [A-Za-z0-9._-]{1,64}")
@@ -233,7 +257,7 @@ class KeyJob:
             _rej("invalid", f"require must be {{protocol: {PROTOCOL}, models: {{name: sha|null}}}}")
         return cls(jid, d["clip_id"], d["clip_root"], _freeze(r), _freeze(d["params"]),
                    _freeze(d["output_config"]), None if marks is None else tuple(marks),
-                   _freeze(outs), mdir, d["mode"], d["publish"], (), _freeze(req))
+                   _freeze(outs), mdir, d["mode"], d["publish"], (), _freeze(req), smap, enforce)
 
 
 # ------------------------------------------------------------------- disk validation
@@ -253,7 +277,7 @@ def _resolve(path: str) -> str:
 
 
 def _open_clip(job: KeyJob) -> tuple[_KeyClip, list[str]]:
-    clip = _KeyClip(name=os.path.basename(job.clip_root), root_path=job.clip_root)
+    clip = _KeyClip(name=os.path.basename(job.clip_root), root_path=job.clip_root, source_map=job.source_map)
     if not os.path.isdir(job.clip_root):
         _rej("paths", f"clip_root does not exist: {job.clip_root}")
     try:
@@ -1043,6 +1067,7 @@ def run_key_job(service, job: KeyJob, *, emit: Callable[[dict], None],
                 os.makedirs(os.path.join(scratch, "tmp"), exist_ok=True)
                 result = engine.run_clip(
                     prepared.input_path, os.path.join(scratch, "out"), params,
+                    enforce_fixed_window=job.enforce_fixed_window,
                     outputs=service._v2_required_products(cfg),
                     temp_dir=os.path.join(scratch, "tmp"), frame_dir_fps=prepared.fps,
                     hint_video_path=prepared.hint_path,

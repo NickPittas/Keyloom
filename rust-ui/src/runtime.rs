@@ -384,6 +384,11 @@ pub const POLLUTING_ENV: [&str; 3] = ["PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP
 /// repo) the caller's environment is left alone on purpose. `-I` is deliberately NOT used: `-m backend...`
 /// needs the app folder on `sys.path`, which isolated mode would drop.
 pub fn prepare_python_command(c: &mut std::process::Command, install: Option<&Install>) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // GUI helpers must not create console windows.
+    }
     if let Some((k, v)) = child_env(install) {
         c.env(k, v);
     }

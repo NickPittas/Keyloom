@@ -1,4 +1,5 @@
 //! Offline status and explicit local model-management actions.
+use super::theme;
 use crate::models::{self, Action, Event as ProcessEvent, Job, Profile, Runtime};
 use eframe::egui::{self, Color32, RichText, Ui};
 use serde_json::Value;
@@ -7,6 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BAD: Color32 = Color32::from_rgb(235, 120, 120);
+const OK: Color32 = Color32::from_rgb(150, 190, 150);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Artifact {
@@ -127,6 +129,9 @@ pub struct Page {
     unresolved_worker_fences: bool,
     check_expected: BTreeSet<String>,
     check_seen: BTreeSet<String>,
+    selected: Option<String>,
+    search: String,
+    confirm_delete: Option<String>,
 }
 
 impl Page {
@@ -161,6 +166,9 @@ impl Page {
             unresolved_worker_fences: false,
             check_expected: BTreeSet::new(),
             check_seen: BTreeSet::new(),
+            selected: None,
+            search: String::new(),
+            confirm_delete: None,
         }
     }
 
@@ -265,7 +273,7 @@ impl Page {
         self.active.as_ref().is_some_and(|r| {
             matches!(
                 r.action,
-                Action::Download(_) | Action::DownloadProfile(_) | Action::Repair(_)
+                Action::Download(_) | Action::DownloadProfile(_) | Action::Repair(_) | Action::Delete(_)
             )
         })
     }
@@ -326,7 +334,7 @@ impl Page {
             self.cancel_target_id = None;
             self.cancel_request_id = None;
             match &action {
-                Action::Download(id) | Action::Repair(id) | Action::Verify(id) => {
+                Action::Download(id) | Action::Repair(id) | Action::Verify(id) | Action::Delete(id) => {
                     if let Some(item) = self.artifacts.get_mut(id) {
                         item.last_error = None;
                     }
@@ -812,6 +820,7 @@ impl Page {
             Action::Download(_)
                 | Action::DownloadProfile(_)
                 | Action::Repair(_)
+                | Action::Delete(_)
                 | Action::VerifyAll
                 | Action::Verify(_)
         ) || matches!(r.action, Action::Catalog) && looks_successful;
@@ -840,12 +849,12 @@ impl Page {
             let error_or_missing =
                 self.startup_error.is_some() || self.required_ready == Some(false);
             ui.label(
-                RichText::new(self.startup_label()).color(if error_or_missing {
+                RichText::new(if error_or_missing { "Models need attention" } else if self.required_ready == Some(true) { "Models ready" } else { "Checking models…" }).size(12.0).color(if error_or_missing {
                     BAD
                 } else {
                     Color32::from_rgb(150, 190, 150)
                 }),
-            );
+            ).on_hover_text(self.startup_label());
             if needs_attention && ui.button("Models…").clicked() {
                 open = true;
             }
@@ -860,21 +869,11 @@ impl Page {
         self.tick(ui.ctx());
         let mut stop_workers = false;
         egui::Panel::bottom("models_actions").show(ui, |ui| {
+            ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 let idle = !self.busy();
                 let can_change = idle && !self.assets_in_use;
-                if self.assets_in_use {
-                    ui.colored_label(BAD, "Install and Repair are disabled until workers have exited and job fences are resolved.");
-                    if self.stop_workers_available && ui.button("Stop workers").clicked() {
-                        stop_workers = true;
-                    }
-                    if self.unresolved_worker_fences {
-                        ui.colored_label(BAD, "Unresolved Key job fences still block model changes. Return to Key to resolve them.");
-                    }
-                } else if !idle {
-                    ui.colored_label(BAD, "One model operation at a time; wait for it to finish before starting another.");
-                }
-                if ui.add_enabled(can_change, egui::Button::new("Install required models")).on_disabled_hover_text("Stop AI workers before changing model files.").clicked() {
+                if ui.add_enabled_ui(can_change, |ui| theme::primary_button(ui, "Install required models")).inner.on_disabled_hover_text("Stop AI workers before changing model files.").clicked() {
                     self.start(Action::DownloadProfile(Profile::Required), ui.ctx());
                 }
                 if ui.add_enabled(can_change, egui::Button::new("Install full profile")).on_disabled_hover_text("Stop AI workers before changing model files.").clicked() {
@@ -891,6 +890,17 @@ impl Page {
                     self.cancel(ui.ctx());
                 }
             });
+            if self.assets_in_use {
+                ui.colored_label(BAD, "Install, Repair and Delete are disabled until workers have exited and job fences are resolved.");
+                if self.stop_workers_available && ui.button("Stop workers").clicked() {
+                    stop_workers = true;
+                }
+                if self.unresolved_worker_fences {
+                    ui.colored_label(BAD, "Unresolved Key job fences still block model changes. Return to Key to resolve them.");
+                }
+            } else if self.busy() {
+                ui.colored_label(BAD, "One model operation at a time; wait for it to finish before starting another.");
+            }
             if let Some(r) = &self.active {
                 ui.label(RichText::new(format!("{} running…", r.action.name())).strong());
                 let activity = r.current_artifact.as_deref().map(|id| format!(" · {id}")).unwrap_or_default();
@@ -910,101 +920,179 @@ impl Page {
             }
             if let Some(note) = &self.cancel_note { ui.label(note); }
             if let Some((outcome, ok)) = &self.last_outcome {
-                ui.colored_label(if *ok { Color32::from_rgb(150, 190, 150) } else { BAD }, outcome);
+                ui.colored_label(if *ok { OK } else { BAD }, outcome);
             }
             if let Some(error) = &self.startup_error { ui.colored_label(BAD, error); }
             if let Some(e) = self.active.as_ref().and_then(|r| r.malformed.as_ref()) { ui.colored_label(BAD, e); }
+            ui.add_space(4.0);
         });
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                ui.heading("Models & runtime");
-                let status_color = if self.startup_error.is_some() || self.required_ready == Some(false) { BAD } else { Color32::from_rgb(150, 190, 150) };
-                ui.label(RichText::new(self.startup_label()).color(status_color));
-                ui.label("Catalog and startup presence checks run offline. Startup does not hash large files or download models; downloads and verification run only when requested.");
-                if self.artifacts.is_empty() {
-                    ui.label("Waiting for the local model catalog…");
-                } else {
-                    ui.label(format!("Catalog version {} · {} assets", self.catalog_version.map_or("unknown".into(), |v| v.to_string()), self.artifacts.len()));
-                    ui.label("Catalog revision, gating, and provenance are shown as recorded; no license approval is inferred.");
-                    if self.artifacts.values().any(|a| a.id == "sam2-package" && a.state.is_some() && a.state.as_deref() != Some("installed")) {
-                        ui.colored_label(BAD, "Runtime repair required: SAM2 checkpoint downloads do not install its pinned Python package. Repair the runtime to supply this dependency.");
-                    }
-                    ui.label("Capability labels describe asset use and do not confirm that a workflow route is integrated.");
-                    let actions_enabled = !self.busy();
-                    let items: Vec<_> = self.artifacts.values().cloned().collect();
-                    for item in items {
-                        ui.separator();
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(&item.label).strong());
-                            if item.required_profile { ui.label("Required profile"); }
-                            if item.default_variant { ui.label("Default variant"); }
-                            ui.label(format!("{} · {}", item.capability, item.kind));
-                        });
-                        let state = match item.state.as_deref() {
-                            Some("installed") => "Complete",
-                            Some("partial") => "Partial",
-                            Some("missing") => "Missing",
-                            _ => "Status not checked",
-                        };
-                        ui.label(format!(
-                            "{state} · present: {} · verified: {} · ready: {}",
-                            bool_status(item.present),
-                            bool_status(item.verified),
-                            bool_status(item.ready)
-                        ));
-                        ui.label(format!("Catalog revision: {} · {}", item.revision_status.as_deref().unwrap_or("status not reported"), item.revision.as_deref().unwrap_or("revision not reported")));
-                        ui.label(format!("Catalog gating: {}", catalog_value(item.gated.as_ref())));
-                        if item.provenance.is_empty() {
-                            ui.label("Catalog provenance and access terms: not reported");
-                        } else {
-                            ui.label("Catalog provenance and access terms:");
-                            for (key, value) in &item.provenance {
-                                ui.label(format!("{key}: {}", catalog_value(Some(value))));
-                            }
-                        }
-                        for note in &item.notes { ui.label(note); }
-                        let size = item.bytes_required.or(item.size_bytes_estimate);
-                        ui.label(size.map_or_else(|| "Expected size unavailable".into(), |n| format!("Expected: {}", format_bytes(n))));
-                        if !item.dependencies.is_empty() {
-                            let deps = item.dependencies.iter().map(|id| self.artifacts.get(id).map_or(id.as_str(), |a| a.label.as_str())).collect::<Vec<_>>().join(", ");
-                            ui.label(format!("Requires: {deps}"));
-                        }
-                        if !item.probe_imports.is_empty() {
-                            ui.label(format!("Runtime import requirements: {}", item.probe_imports.join(", ")));
-                        }
-                        if let Some(path) = &item.path { ui.label(format!("Location: {path}")); }
-                        if let Some(note) = &item.verify_note { ui.label(note); }
-                        if !item.problems.is_empty() { ui.colored_label(BAD, item.problems.join("; ")); }
-                        if let Some(error) = &item.last_error { ui.colored_label(BAD, error); }
-                        if matches!(item.kind.as_str(), "local_package" | "local_code") {
-                            if item.state.is_some() && item.state.as_deref() != Some("installed") {
-                                let message = if item.kind == "local_package" {
-                                    "Runtime repair required; the model helper cannot install this package."
-                                } else {
-                                    "Runtime repair required: restore vendored engine code with the app runtime."
-                                };
-                                ui.colored_label(BAD, message);
-                                if let Some(hint) = &item.install_hint { ui.label(hint); }
-                                for note in &item.notes { ui.label(note); }
-                            }
-                        } else {
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.add_enabled(actions_enabled && !self.assets_in_use, egui::Button::new("Install")).on_disabled_hover_text("Stop AI workers before changing model files.").clicked() {
-                                    self.start(Action::Download(item.id.clone()), ui.ctx());
-                                }
-                                if ui.add_enabled(actions_enabled, egui::Button::new("Verify")).clicked() {
-                                    self.start(Action::Verify(item.id.clone()), ui.ctx());
-                                }
-                                if ui.add_enabled(actions_enabled && !self.assets_in_use, egui::Button::new("Repair")).on_disabled_hover_text("Stop AI workers before replacing model files.").clicked() {
-                                    self.start(Action::Repair(item.id.clone()), ui.ctx());
-                                }
-                            });
-                        }
-                    }
-                }
-            });
+            ui.heading("Models & runtime");
+            let status_color = if self.startup_error.is_some() || self.required_ready == Some(false) { BAD } else { OK };
+            ui.label(RichText::new(self.startup_label()).color(status_color));
+            if self.artifacts.is_empty() {
+                ui.label("Waiting for the local model catalog…");
+                return;
+            }
+            if self.artifacts.values().any(|a| a.id == "sam2-package" && a.state.is_some() && a.state.as_deref() != Some("installed")) {
+                ui.colored_label(BAD, "Runtime repair required: SAM2 checkpoint downloads do not install its pinned Python package. Repair the runtime to supply this dependency.");
+            }
+            if self.selected.as_ref().is_none_or(|id| !self.artifacts.contains_key(id)) {
+                self.selected = self.artifacts.get("corridorkey-weights").map(|a| a.id.clone()).or_else(|| self.artifacts.keys().next().cloned());
+            }
+            ui.add_space(4.0);
+            let wide = ui.available_width() >= 560.0;
+            if wide {
+                egui::Panel::left("model_categories").resizable(false).exact_size(220.0).frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(12)).show(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| self.nav(ui));
+                });
+            } else {
+                egui::CollapsingHeader::new("Choose asset").id_salt("models_nav_narrow").default_open(false).show(ui, |ui| self.nav(ui));
+            }
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| self.detail(ui));
         });
         stop_workers
+    }
+
+    fn nav(&mut self, ui: &mut Ui) {
+        ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search models").desired_width(f32::INFINITY));
+        let q = self.search.trim().to_lowercase();
+        let mut groups: BTreeMap<String, Vec<&Artifact>> = BTreeMap::new();
+        for a in self.artifacts.values() {
+            if q.is_empty() || a.label.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q) || a.capability.to_lowercase().contains(&q) {
+                let family = if a.id.starts_with("birefnet") { "BiRefNet" } else if a.id.starts_with("sam2") { "SAM2" } else if a.id.starts_with("videomama") { "VideoMaMa" } else if a.id.starts_with("matanyone") { "MatAnyone2" } else if a.id == "gvm" { "GVM" } else { "CorridorKey" }.to_string();
+                groups.entry(family).or_default().push(a);
+            }
+        }
+        if groups.is_empty() {
+            ui.label(RichText::new("No matching assets").color(theme::TEXT_DIM));
+        }
+        let mut pick = None;
+        for (family, items) in &groups {
+            egui::CollapsingHeader::new(RichText::new(family).strong()).id_salt(("models_family", family)).default_open(items.iter().any(|a| self.selected.as_deref() == Some(&a.id))).open(if q.is_empty() { None } else { Some(true) }).show(ui, |ui| {
+                for a in items {
+                    let (dot, color) = status_dot(a);
+                    ui.horizontal(|ui| {
+                        let (_, r) = ui.allocate_space(egui::vec2(8.0, 22.0));
+                        ui.painter().circle_filled(r.center(), 3.0, color);
+                        let response = ui.add(egui::Button::selectable(self.selected.as_deref() == Some(&a.id), "").left_text(&a.label).truncate().min_size(egui::vec2(ui.available_width(), 28.0))).on_hover_text(format!("{}: {dot}", a.label));
+                        if response.clicked() {
+                            pick = Some(a.id.clone());
+                        }
+                    });
+                }
+            });
+        }
+        if let Some(id) = pick {
+            self.selected = Some(id);
+            self.confirm_delete = None;
+        }
+    }
+
+    fn detail(&mut self, ui: &mut Ui) {
+        let Some(item) = self.selected.as_ref().and_then(|id| self.artifacts.get(id)).cloned() else { return };
+        let actions_enabled = !self.busy();
+        let (state, color) = status_dot(&item);
+        theme::section(ui, &item.label, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(state.to_string()).color(color).strong());
+                if item.required_profile { ui.label("Required profile"); }
+                if item.default_variant { ui.label("Default variant"); }
+                ui.label(RichText::new(&item.capability).color(theme::TEXT_DIM));
+            });
+            ui.label(if item.ready == Some(true) { "Files installed and verified" } else if item.present == Some(true) { "Installed · verification required" } else { "Model files not installed" });
+            let size = item.bytes_required.or(item.size_bytes_estimate);
+            ui.label(size.map_or_else(|| "Expected size unavailable".into(), |n| format!("Expected: {}", format_bytes(n))));
+            if !item.dependencies.is_empty() {
+                let deps = item.dependencies.iter().map(|id| self.artifacts.get(id).map_or(id.as_str(), |a| a.label.as_str())).collect::<Vec<_>>().join(", ");
+                ui.label(format!("Requires: {deps}"));
+            }
+            if let Some(path) = &item.path { ui.label(RichText::new(format!("Location: {path}")).color(theme::TEXT_DIM)); }
+            if !item.problems.is_empty() {
+                ui.colored_label(BAD, format!("{} file issue(s): {}", item.problems.len(), item.problems[0]));
+                if item.problems.len() > 1 {
+                    egui::CollapsingHeader::new("File issues").show(ui, |ui| { for p in &item.problems { ui.label(p); } });
+                }
+            }
+            if let Some(error) = &item.last_error { ui.colored_label(BAD, error); }
+            if matches!(item.kind.as_str(), "local_package" | "local_code") {
+                if item.state.is_some() && item.state.as_deref() != Some("installed") {
+                    let message = if item.kind == "local_package" {
+                        "Runtime repair required; the model helper cannot install this package."
+                    } else {
+                        "Runtime repair required: restore vendored engine code with the app runtime."
+                    };
+                    ui.colored_label(BAD, message);
+                    if let Some(hint) = &item.install_hint { ui.label(hint); }
+                }
+                ui.label(RichText::new("Local runtime code/packages cannot be installed or deleted here; update or repair the app runtime.").color(theme::TEXT_DIM));
+            } else {
+                ui.add_space(4.0);
+                let can_change = actions_enabled && !self.assets_in_use;
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(can_change, egui::Button::new(RichText::new("Download").color(if item.present != Some(true) { Color32::from_rgb(21, 36, 26) } else { theme::TEXT })).fill(if item.present != Some(true) { theme::ACCENT } else { theme::BUTTON })).on_disabled_hover_text("Stop AI workers before changing model files.").clicked() {
+                        self.start(Action::Download(item.id.clone()), ui.ctx());
+                    }
+                    if ui.add_enabled(actions_enabled, egui::Button::new(RichText::new("Verify").color(if item.present == Some(true) { Color32::from_rgb(21, 36, 26) } else { theme::TEXT })).fill(if item.present == Some(true) { theme::ACCENT } else { theme::BUTTON })).clicked() {
+                        self.start(Action::Verify(item.id.clone()), ui.ctx());
+                    }
+                    if ui.add_enabled(can_change, egui::Button::new("Repair")).on_disabled_hover_text("Stop AI workers before replacing model files.").clicked() {
+                        self.start(Action::Repair(item.id.clone()), ui.ctx());
+                    }
+                    let deletable = can_change && matches!(item.state.as_deref(), Some("installed" | "partial"));
+                    if ui.add_enabled(deletable, egui::Button::new(RichText::new("Delete…").color(BAD))).on_disabled_hover_text("Stop AI workers first; only installed or partial assets can be deleted.").clicked() {
+                        self.confirm_delete = Some(item.id.clone());
+                    }
+                });
+                if self.confirm_delete.as_deref() == Some(item.id.as_str()) {
+                    if !can_change {
+                        self.confirm_delete = None;
+                    } else {
+                        egui::Frame::new().fill(theme::FIELD).stroke(egui::Stroke::new(1.0, BAD)).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
+                            ui.colored_label(BAD, format!("Delete the files of “{}” ({})?", item.label, item.id));
+                            ui.label("Only this asset's catalog files are removed. Dependencies and projects/results are unchanged, and the shared download cache is retained.");
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button(RichText::new("Delete files").color(BAD)).clicked() {
+                                    self.confirm_delete = None;
+                                    self.start(Action::Delete(item.id.clone()), ui.ctx());
+                                }
+                                if ui.button("Keep").clicked() {
+                                    self.confirm_delete = None;
+                                }
+                            });
+                        });
+                    }
+                }
+            }
+        });
+        egui::CollapsingHeader::new("Technical provenance").id_salt(("models_prov", &item.id)).show(ui, |ui| {
+            ui.label(format!("Catalog revision: {} · {}", item.revision_status.as_deref().unwrap_or("status not reported"), item.revision.as_deref().unwrap_or("revision not reported")));
+            ui.label(format!("Catalog gating: {}", catalog_value(item.gated.as_ref())));
+            if item.provenance.is_empty() {
+                ui.label("Catalog provenance and access terms: not reported");
+            } else {
+                ui.label("Catalog provenance and access terms:");
+                for (key, value) in &item.provenance {
+                    ui.label(format!("{key}: {}", catalog_value(Some(value))));
+                }
+            }
+            if !item.probe_imports.is_empty() {
+                ui.label(format!("Runtime import requirements: {}", item.probe_imports.join(", ")));
+            }
+            for note in &item.notes { ui.label(note); }
+            ui.label(RichText::new("Catalog revision, gating and provenance are shown as recorded; no license approval is inferred. Capability labels do not confirm that a workflow route is integrated.").color(theme::TEXT_DIM));
+        });
+    }
+}
+
+/// Short status text plus colour for the nav dot and detail header.
+fn status_dot(a: &Artifact) -> (&'static str, Color32) {
+    match a.state.as_deref() {
+        Some("installed") if a.ready == Some(true) => ("Ready", OK),
+        Some("installed") => ("Installed, unverified", theme::FOCUS),
+        Some("partial") => ("Partial", BAD),
+        Some("missing") => ("Missing", BAD),
+        _ => ("Status not checked", theme::TEXT_DIM),
     }
 }
 
@@ -1053,7 +1141,7 @@ fn terminal_protocol_valid(
 fn is_asset_mutation(action: &Action) -> bool {
     matches!(
         action,
-        Action::Download(_) | Action::DownloadProfile(_) | Action::Repair(_)
+        Action::Download(_) | Action::DownloadProfile(_) | Action::Repair(_) | Action::Delete(_)
     )
 }
 
@@ -1081,14 +1169,6 @@ fn catalog_value(value: Option<&Value>) -> String {
             _ => v.to_string(),
         },
     )
-}
-
-fn bool_status(value: Option<bool>) -> &'static str {
-    match value {
-        Some(true) => "yes",
-        Some(false) => "no",
-        None => "not reported",
-    }
 }
 
 #[cfg(test)]

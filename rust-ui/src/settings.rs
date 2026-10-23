@@ -76,6 +76,10 @@ pub struct Playback {
 #[serde(default)]
 pub struct Interface {
     pub ui_scale: f32,
+    /// Closing the window minimizes it instead of quitting, so the network client stays available.
+    pub background: bool,
+    /// Start minimized when the user signs in (per-user autostart; needs `background`).
+    pub launch_at_login: bool,
     /// Keys this build does not know: carried through saves untouched.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -110,6 +114,20 @@ pub struct Masks {
     pub extra: Map<String, Value>,
 }
 
+/// Connection to a coordinator (no secret here: `credentials` is only the PATH of the private credentials file).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Network {
+    /// Connect to the paired coordinator when the app starts.
+    pub enabled: bool,
+    /// Take work from the network when this computer's GPU is idle (opt-in).
+    pub receive: bool,
+    /// Empty = `<settings folder>/network/credentials.json`.
+    pub credentials: String,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -120,6 +138,10 @@ pub struct Settings {
     pub masks: Masks,
     /// AI worker targets. Empty = one implicit local target (GPU 0).
     pub ai_targets: Vec<crate::worker::Target>,
+    /// This installation's Path Mapping: shared location name -> local root (absent in old files = none).
+    pub shared_roots: Vec<crate::shared_paths::SharedRoot>,
+    /// Network client (coordinator connection, receive opt-in).
+    pub network: Network,
     /// Keys this build does not know (same version): carried through saves untouched.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -139,6 +161,8 @@ impl Default for Interface {
     fn default() -> Self {
         Self {
             ui_scale: 1.0,
+            background: false,
+            launch_at_login: false,
             extra: Map::new(),
         }
     }
@@ -176,13 +200,29 @@ impl Default for Settings {
             ai: Default::default(),
             masks: Default::default(),
             ai_targets: vec![],
+            shared_roots: vec![],
+            network: Network::default(),
             extra: Map::new(),
         }
     }
 }
 
 impl Settings {
+    /// Everything that can be saved: the core settings plus this PC's Path Mapping.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_core()?;
+        self.mapping_problem().map_or(Ok(()), Err)
+    }
+
+    /// Why the Path Mapping rows cannot be used on this PC (host path rules), if they cannot.
+    pub fn mapping_problem(&self) -> Option<String> {
+        crate::shared_paths::validate_roots(&self.shared_roots).err()
+    }
+
+    /// Validation applied when a file is loaded: everything except the host-specific mapping check, so a
+    /// settings file copied from another OS keeps its other settings and its mapping rows (to be fixed in the
+    /// Path mapping page; `validate` still refuses to save them as they are).
+    fn validate_core(&self) -> Result<(), String> {
         let one_of = |name: &str, v: &str, ok: &[&str]| {
             ok.contains(&v)
                 .then_some(())
@@ -194,6 +234,9 @@ impl Settings {
                 .then_some(())
                 .ok_or_else(|| format!("{name} must be in [0, 1], got {v}"))
         };
+        if self.interface.launch_at_login && !self.interface.background {
+            return Err("Start at sign-in needs \"Keep running in the background\"".into());
+        }
         if self.playback.cache_mib != 0 && !CACHE_MIB.contains(&self.playback.cache_mib) {
             return Err(format!(
                 "RAM budget must be Auto (0) or {}–{} MiB",
@@ -249,6 +292,8 @@ impl Settings {
         self.ai.extra = old.ai.extra;
         self.masks.extra = old.masks.extra;
         self.ai_targets = old.ai_targets; // machines are not a preference default
+        self.shared_roots = old.shared_roots; // neither are this PC's mounts
+        self.network = old.network; // nor its coordinator pairing
     }
 
     /// Workers to hand to `frames::Loader`: Auto resolves here.
@@ -370,7 +415,7 @@ impl Store {
             None => return Err("missing settings version".into()),
         }
         let s: Settings = serde_json::from_value(raw).map_err(|e| e.to_string())?;
-        s.validate()?;
+        s.validate_core()?;
         Ok(s)
     }
 

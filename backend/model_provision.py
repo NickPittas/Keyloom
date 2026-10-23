@@ -618,6 +618,51 @@ class ProvisionManager:
     def op_repair(self, targets: list[str]) -> dict:
         return self.op_download(targets, repair=True)
 
+    def op_delete(self, targets: list[str]) -> dict:
+        # Delete only explicitly selected catalog files, never a model root or its dependencies.
+        ids = self._resolve(targets, expand=False)
+        if not ids:
+            raise ArtifactError("target-required", "select a managed model to delete")
+        artifacts = [self.catalog.get(aid) for aid in ids]
+        for art in artifacts:
+            if art.kind in ("local_package", "local_code"):
+                raise ArtifactError("not-deletable", f"{art.label} is part of the installed runtime")
+        owner = self._begin_operation()
+        failed = []
+        self.emit({"event": "op-start", "op": "delete", "targets": ids})
+        try:
+            for art in artifacts:
+                try:
+                    dest = self.checker.artifact_dir(art)
+                    if dest is None:
+                        raise ArtifactError("not-deletable", f"{art.label} has no managed model destination")
+                    root = self._asset_root(art)
+                    with self._artifact_lock(art, dest):
+                        files = set()
+                        for spec in art.download_files():
+                            path = self.checker.file_path(art, spec)
+                            if path is None or path == root:
+                                raise ArtifactError("unsafe-path", "refusing to remove an unmanaged model path")
+                            self._assert_safe_path(path, root, allow_leaf_link=art.kind == "hf_cache_file")
+                            if path.is_dir() and not path.is_symlink():
+                                raise ArtifactError("unsafe-path", f"catalog file is a directory: {path}")
+                            files.add(path)
+                        for path in files:
+                            self._remove_path(path, root, allow_leaf_link=art.kind == "hf_cache_file")
+                    self.emit({"event": "artifact-done", "artifact": art.id,
+                               "present": False, "verified": False, "ready": False,
+                               "note": "Selected managed files deleted; shared download cache retained"})
+                except (ArtifactError, OSError) as exc:
+                    failed.append(art.id)
+                    self.emit({"event": "artifact-error", "artifact": art.id,
+                               "error": getattr(exc, "code", "delete-failed"), "message": str(exc)})
+        finally:
+            self._end_operation(owner)
+        result = {"event": "op-done", "op": "delete", "ok": not failed,
+                  "summary": {"deleted": len(ids) - len(failed), "failed": failed}}
+        self.emit(result)
+        return result
+
     def _resolve(self, targets: list[str] | None, expand: bool = True) -> list[str]:
         if not targets:
             return sorted(self.catalog.artifacts)
@@ -1024,7 +1069,7 @@ class ProvisionManager:
         process = subprocess.Popen(
             command, cwd=Path(__file__).resolve().parent.parent,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
-            text=True, bufsize=1)
+            text=True, bufsize=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         lines: queue.Queue[str | None] = queue.Queue()
 
         def read_output() -> None:

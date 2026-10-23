@@ -20,7 +20,10 @@ pub fn ext_of(p: &Path) -> String {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub enum View {
     Input,
+    /// Final hint (`AlphaHint`).
     Hint,
+    /// Guide mask (`VideoMamaMaskHint`).
+    Guide,
     Fg,
     Matte,
     Comp,
@@ -28,9 +31,10 @@ pub enum View {
 }
 
 impl View {
-    pub const ALL: [View; 6] = [
+    pub const ALL: [View; 7] = [
         View::Input,
         View::Hint,
+        View::Guide,
         View::Fg,
         View::Matte,
         View::Comp,
@@ -40,6 +44,7 @@ impl View {
         match self {
             View::Input => "Input",
             View::Hint => "Hint",
+            View::Guide => "Guide",
             View::Fg => "FG",
             View::Matte => "Matte",
             View::Comp => "Comp",
@@ -480,6 +485,46 @@ pub fn update_json(
     })
 }
 
+/// A new, empty v2 project: the NEW folder `parent/name` (never an existing one, so nothing is overwritten).
+/// `project.json` is renamed into place last, so it is written whole or not at all. Returns the project folder.
+pub fn create_empty_project(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = name.trim();
+    // A single plain component: no separators, no `.`/`..`, no Windows drive/prefix forms like `D:proj`.
+    if name.is_empty() || name.contains(['/', '\\', '\0']) || Path::new(name).file_name() != Some(std::ffi::OsStr::new(name)) {
+        return Err("Enter a project name that is a single folder name".into());
+    }
+    let dir = clean_abs(parent).join(name);
+    // Exclusive mkdir: an existing folder or file, even one made a moment ago, is refused untouched.
+    fs::create_dir(&dir).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => format!("{} already exists; choose another name", dir.display()),
+        _ => format!("cannot create {}: {e}", dir.display()),
+    })?;
+    let meta = serde_json::json!({"version": 2, "display_name": name, "clips": []});
+    let (tmp, clips) = (dir.join(format!(".project.json.tmp{}", std::process::id())), dir.join("clips"));
+    let (mut tmp_made, mut clips_made) = (false, false);
+    let made = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = fs::File::create_new(&tmp)?;
+        tmp_made = true;
+        f.write_all(&serde_json::to_vec_pretty(&meta)?)?;
+        f.sync_all()?;
+        fs::create_dir(&clips)?;
+        clips_made = true;
+        fs::rename(&tmp, dir.join("project.json")) // last step: nothing of ours is left to undo once it lands
+    })();
+    made.map(|()| dir.clone()).map_err(|e| {
+        // Undo only what this call made, non-recursively: anything foreign keeps the folder in place.
+        if tmp_made {
+            let _ = fs::remove_file(&tmp);
+        }
+        if clips_made {
+            let _ = fs::remove_dir(&clips);
+        }
+        let _ = fs::remove_dir(&dir);
+        format!("cannot create the project in {}: {e}", dir.display())
+    })
+}
+
 fn load_clip(
     cr: &Path,
     is_v2: bool,
@@ -878,6 +923,7 @@ impl Clip {
                 _ => None,
             },
             View::Hint => Some(self.root.join("AlphaHint")),
+            View::Guide => Some(self.root.join("VideoMamaMaskHint")),
             v => {
                 if self.v3_files().is_some() {
                     return self.manifest_dir.clone();

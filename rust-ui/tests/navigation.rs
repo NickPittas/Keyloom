@@ -193,7 +193,8 @@ fn narrow_728_header_controls_do_not_overlap_and_graph_clears_fit_button_and_hin
     );
     app.open_clip(&ctx, 0);
     app.switch_tab(Tab::Hint);
-    for (w, h) in [(728.0, 900.0), (1440.0, 900.0)] {
+    // Wide -> narrow -> wide -> narrow: the remembered graph panel height must not leak between modes.
+    for (w, h) in [(1440.0, 900.0), (728.0, 900.0), (1440.0, 900.0), (728.0, 900.0)] {
         run_at(&ctx, &mut app, w, h);
         let hr = app.header_rects().to_vec();
         assert!(
@@ -214,7 +215,7 @@ fn narrow_728_header_controls_do_not_overlap_and_graph_clears_fit_button_and_hin
         }
         let (canvas, nodes) = app.graph_rects().expect("graph drawn");
         let fit = ck::ui::graph::fit_button_rect(canvas);
-        assert_eq!(nodes.len(), 7);
+        assert_eq!(nodes.len(), 8);
         for n in &nodes {
             assert!(
                 !n.intersects(fit),

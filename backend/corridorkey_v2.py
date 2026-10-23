@@ -18,6 +18,10 @@ _PRODUCTS = ("alpha", "fg", "checker", "cutout")
 _ENV_KEYS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
 
 
+class FixedWindowError(CorridorKeyError):
+    """A pinned temporal window does not fit the available GPU memory (network jobs only; local runs warn)."""
+
+
 class V2EngineError(CorridorKeyError):
     """CorridorKey 2.0 engine could not load or run."""
 
@@ -198,7 +202,7 @@ class CorridorKeyV2Engine:
 
     def build_inference_config(self, params, *, outputs, temp_dir, frame_dir_fps=24.0,
                                shape_hw=None, num_frames=None, budget_gb=None,
-                               first_frame_path=None):
+                               first_frame_path=None, enforce_fixed_window=False):
         from CorridorKeyV2.corridorkey.runtime import InferenceConfig
 
         outs = set(outputs)
@@ -235,6 +239,12 @@ class CorridorKeyV2Engine:
                 est = estimate_temporal_window(
                     shape_hw[1], shape_hw[0], num_frames, preset,
                     params.vram_profile, budget_gb)
+                if est.over_budget and enforce_fixed_window:
+                    raise FixedWindowError(
+                        f"Temporal window {preset} ({'low' if cfg.low_vram else 'normal'} VRAM) needs "
+                        f"~{est.required_gib:.1f} GiB (peak {est.peak_gib:.1f} GiB) but only "
+                        f"~{est.budget_gib:.1f} GiB of GPU memory is available on this computer. A fixed window is "
+                        "never downgraded: choose Auto or run it on a GPU with more free memory.")
                 if est.over_budget:
                     msg = (f"Temporal window {preset} ({'low' if cfg.low_vram else 'normal'} "
                            f"VRAM) is estimated to need {est.required_gib:.1f} GiB "
@@ -261,7 +271,9 @@ class CorridorKeyV2Engine:
                 and str(first_frame_path).lower().endswith(".exr")):
             self.last_warnings.append(
                 "EXR input frames are being treated as display-coded and clipped to "
-                "[0, 1]. For scene-linear HDR EXR plates, enable Input is Linear.")
+                "[0, 1]. This is expected for display-coded movie frames extracted by "
+                "the app. Enable Input is Linear only for scene-linear EXR plates; "
+                "the EXR file format alone does not mean the footage is linear.")
         return cfg
 
     def _probe_clip(self, input_path, params, frame_dir_fps):
@@ -291,7 +303,7 @@ class CorridorKeyV2Engine:
                  frame_dir_fps=24.0, hint_video_path=None, ffmpeg_bin="ffmpeg",
                  on_progress=None, check_cancel=None, on_status=None,
                  initial_hint_path=None, initial_hint_index=0,
-                 hint_frame_indices=None) -> V2RunResult:
+                 hint_frame_indices=None, enforce_fixed_window=False) -> V2RunResult:
         eng_initial, eng_index, eng_video, eng_sparse = _resolve_hint_args(
             params, hint_video_path, initial_hint_path, initial_hint_index,
             hint_frame_indices)
@@ -307,7 +319,7 @@ class CorridorKeyV2Engine:
                      "first_frame_path": first}
         cfg = self.build_inference_config(
             params, outputs=outputs, temp_dir=temp_dir,
-            frame_dir_fps=frame_dir_fps, **extra)
+            frame_dir_fps=frame_dir_fps, enforce_fixed_window=enforce_fixed_window, **extra)
         for w in self.last_warnings:
             logger.warning(w)
         cfg.initial_hint_index = eng_index

@@ -13,6 +13,7 @@ Usage: $(basename "$0") [--prefix DIR] [--repair] [--models full|skip] [--model-
   --model-arg   pass one argument to scripts/setup_models.py, repeatable, spaces preserved
                 (e.g. --model-arg --hf-cache --model-arg "/my cache")
 Later: PREFIX/bin/corridorkey-setup {repair|rollback|models|status|uninstall}
+Server mode (opt-in, starts nothing by itself): PREFIX/bin/corridorkey-coordinator {serve|pair|revoke|abandon} ...
 U
 }
 # Rotate args: scalar options are consumed; --model-arg values are re-appended verbatim so "$@" ends up

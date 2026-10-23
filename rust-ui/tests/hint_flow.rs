@@ -1,7 +1,7 @@
 //! Generate hint -> Key chain through the real AiUi/scheduler with the fake worker: saved route, frozen
 //! prerequisites, dependency order, durable queue history and held-after-restart semantics.
 mod common;
-use ck::hints::{plan_steps, staging_root, HintCfg, Route};
+use ck::hints::{plan_steps, staging_root, HintCfg};
 use ck::project::{load_project, LoadOptions};
 use ck::queue;
 use ck::settings::Settings;
@@ -55,11 +55,7 @@ fn saved_route_generates_the_hint_then_keys_and_history_survives_a_restart() {
     )
     .unwrap()
     .is_empty());
-    HintCfg {
-        route: Route::Gvm,
-        ..HintCfg::default()
-    }
-    .save(c)
+    HintCfg::default().save(c)
     .unwrap();
 
     let p = load();
@@ -193,10 +189,7 @@ fn relative_project_path_yields_absolute_clip_paths_for_every_task_job() {
     let cfg = HintCfg::default();
     let steps = plan_steps(
         c,
-        &HintCfg {
-            route: Route::Gvm,
-            ..cfg
-        },
+        &cfg,
         "full",
         (0, 2),
         false,
@@ -227,4 +220,86 @@ fn pathdiff(to: &std::path::Path, from: &std::path::Path) -> std::path::PathBuf 
         out.push(c);
     }
     out
+}
+
+/// MatAnyone2 seeds from the guide's In frame only, so a one-frame pre-matte satisfies it; VideoMaMa refines
+/// the whole range and still needs every frame. The generated guide steps therefore differ in coverage.
+#[test]
+fn matanyone2_requires_only_the_in_guide_while_videomama_needs_the_range() {
+    let base = tmp("guide-coverage");
+    let proj = base.join("proj");
+    let clip_root = proj.join("clips/c1");
+    std::fs::create_dir_all(clip_root.join("Frames")).unwrap();
+    for i in 0..3 {
+        png(&clip_root.join(format!("Frames/f_{}.png", 1101 + i)));
+    }
+    std::fs::write(
+        clip_root.join(".video_metadata.json"),
+        r#"{"fps":24.0,"width":4,"height":4}"#,
+    )
+    .unwrap();
+    std::fs::write(clip_root.join("clip.json"), "{}").unwrap();
+    std::fs::write(proj.join("project.json"), r#"{"version":2}"#).unwrap();
+    let load = || load_project(&proj, &LoadOptions::default()).unwrap();
+
+    // A guide for the In frame only, as the Hint page's "generate pre-matte" on one frame would leave it.
+    std::fs::create_dir_all(clip_root.join("VideoMamaMaskHint")).unwrap();
+    png(&clip_root.join("VideoMamaMaskHint/f_1101.png"));
+
+    let mut cfg = HintCfg::default();
+    // Chroma needs no prompts, so an auto-generated guide step can actually be built here.
+    cfg.guide = ck::hints::Producer::Chroma;
+    cfg.finish = ck::hints::Final::Matanyone2;
+    let p = load();
+    cfg.save(&p.clips[0]).unwrap();
+
+    let p = load();
+    let c = p.clips[0].clone();
+    let stg = staging_root(&p.root, &c.root, &c.folder);
+    // MatAnyone2: nothing left to generate, the existing In guide is enough.
+    let steps = ck::hints::Gen {
+        clip: &c,
+        cfg: &cfg,
+        ann: None,
+        linear: false,
+        staging: &stg,
+    }
+    .hint((0, 2), false, &mut new_id)
+    .expect("one-frame guide satisfies MatAnyone2");
+    assert_eq!(steps.len(), 1, "only the refine step");
+    assert_eq!(steps[0].kind, ck::tasks::TaskKind::Matanyone2);
+
+    // VideoMaMa: the range is not covered, so without auto_guide it refuses and names the gap ...
+    let mut vm = cfg.clone();
+    vm.finish = ck::hints::Final::Videomama;
+    let err = ck::hints::Gen {
+        clip: &c,
+        cfg: &vm,
+        ann: None,
+        linear: false,
+        staging: &stg,
+    }
+    .hint((0, 2), false, &mut new_id)
+    .expect_err("VideoMaMa needs the whole range");
+    assert!(err.contains("frames 0-2"), "names the missing range: {err}");
+
+    // ... and with auto_guide it generates exactly that, then refines.
+    let steps = ck::hints::Gen {
+        clip: &c,
+        cfg: &vm,
+        ann: None,
+        linear: false,
+        staging: &stg,
+    }
+    .hint((0, 2), true, &mut new_id)
+    .unwrap();
+    assert_eq!(steps.len(), 2, "guide then refine");
+    assert_ne!(steps[0].kind, ck::tasks::TaskKind::Videomama, "the guide step comes first");
+    let r = steps[0].range.as_ref().expect("guide step has a range");
+    assert_eq!(
+        (r.in_point, r.out_point),
+        (0, 2),
+        "VideoMaMa's guide covers the whole range"
+    );
+    assert_eq!(steps[1].kind, ck::tasks::TaskKind::Videomama);
 }

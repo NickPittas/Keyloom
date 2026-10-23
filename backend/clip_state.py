@@ -85,7 +85,7 @@ def mask_sequence_is_videomama_ready(root_path: str) -> bool:
             data = json.load(handle)
     except (OSError, json.JSONDecodeError, TypeError):
         return False
-    return data.get("source") in {"sam2", "imported"}
+    return data.get("source") in {"sam2", "imported", "gvm", "birefnet", "chroma"}
 
 
 _HINT_MODES = ("none", "full", "keyframes")
@@ -305,6 +305,9 @@ class ClipEntry:
     custom_output_dir: str = ""       # Per-clip output dir override (from clip.json)
     hint_keyframes: tuple[int, ...] = ()          # sparse hint marks (source indices)
     hint_keyframes_error: Optional[str] = None    # diagnostic if the sidecar is unusable
+    # Network receiver only: ((recorded_path, local_path),) maps the source path recorded in clip.json (the
+    # sender's) onto the folder this machine resolved through its own path mapping. Never read from clip.json.
+    source_map: tuple = ()
     _processing: bool = field(default=False, repr=False)  # lock: watcher must not reclassify
 
     @property
@@ -489,6 +492,17 @@ class ClipEntry:
             logger.debug(f"Failed to read manifest at {manifest_path}: {e}")
             return None
 
+    def _map_source(self, path: str) -> str:
+        """Apply ``source_map`` to a path recorded in clip.json (whole components only)."""
+        for recorded, local in self.source_map:
+            norm = path.replace("\\", "/").rstrip("/")
+            rec = recorded.replace("\\", "/").rstrip("/")
+            if norm == rec:
+                return local
+            if norm.startswith(rec + "/"):
+                return os.path.join(local, *norm[len(rec) + 1:].split("/"))
+        return path
+
     def _resolve_original_path(self) -> Optional[str]:
         """Resolve the original video path from clip.json or project.json."""
         from .project import _read_clip_or_project_json
@@ -497,6 +511,7 @@ class ClipEntry:
             return None
         source = data.get("source", {})
         path = source.get("original_path")
+        path = self._map_source(path) if path else path
         if path and os.path.isfile(path):
             return path
         return None
@@ -521,6 +536,7 @@ class ClipEntry:
         path = source.get("original_path")
         if not path:
             return None
+        path = self._map_source(path)
         if os.path.isdir(path):
             return path
         # External folder is gone — set error state instead of raising
