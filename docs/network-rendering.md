@@ -62,7 +62,7 @@ Today an invitation can only be created **when the coordinator starts**. To add 
 
 An invitation works **once** and for **10 minutes**. If it expires or fails, restart the coordinator for a new file. Do not share one invitation between PCs.
 
-To remove a computer: stop the coordinator, run `corridorkey-coordinator revoke --state-dir <dir> <installation id>`, then start it again. You need that computer's installation id (it starts with `inst_`).
+To remove a computer: stop the coordinator, run `corridorkey-coordinator revoke --state-dir <dir> <installation id>`, then start it again. You need that computer's installation id (it starts with `inst_`). On that PC, find the preferences folder in **Settings → Paths and info**, then read only `installation_id` from `network/credentials.json` beside the preferences file. Never share the token or the whole credentials file. Use the full coordinator command path shown above if it is not on your PATH.
 
 ## 2. Map the shared storage
 
