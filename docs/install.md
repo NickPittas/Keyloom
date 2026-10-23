@@ -13,7 +13,7 @@ CorridorKey installs for your own user account. No administrator rights are need
 | Internet | Needed to download the installer (if hosted privately, you must be signed in to GitHub) and the models |
 | Disk | About 9 GiB for the app (allow roughly 18 GiB during an update), plus room for the **full** model set (large) and your project media. Projects can live on any drive. |
 
-You do **not** need Python, Rust, FFmpeg, the CUDA toolkit or the Visual C++ runtime. They are bundled. A missing NVIDIA driver only produces a warning during install, because models can still be downloaded, but you cannot render without it.
+You do **not** need to install Python, Rust, FFmpeg, the CUDA toolkit or the Visual C++ runtime. The app includes Python, FFmpeg, CUDA user-space libraries and the required Visual C++ runtime; no compiler or toolkit is needed. A missing NVIDIA driver only produces a warning during install, because models can still be downloaded, but you cannot render without it.
 
 The installers are for private use. The licence is non-commercial (CC-BY-NC-SA-4.0) and public redistribution is not cleared.
 
