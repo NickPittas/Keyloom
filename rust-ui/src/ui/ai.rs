@@ -384,6 +384,15 @@ fn network_target(p: &Placement) -> Option<&str> {
     match p { Placement::Target(id) => id.strip_prefix("network:"), Placement::Auto => None }
 }
 
+/// A network PC's picker label: ids are `network id/PC id`; a legacy bare PC id matches only when exactly one network has it.
+fn net_label(targets: &[(String, String)], id: &str) -> Option<String> {
+    if let Some(t) = targets.iter().find(|t| t.0 == id) {
+        return Some(t.1.clone());
+    }
+    let mut legacy = targets.iter().filter(|t| t.0.split_once('/').is_some_and(|(_, i)| i == id));
+    match (legacy.next(), legacy.next()) { (Some(t), None) => Some(t.1.clone()), _ => None }
+}
+
 fn export_block(targets: &[Target], r: &BatchRow) -> Option<String> {
     let x = r.export.as_ref()?;
     if let Some(w) = &x.why {
@@ -912,7 +921,7 @@ impl AiUi {
     fn placement_text(&self, p: &Placement) -> String {
         match p {
             Placement::Auto => "Automatic (scheduler)".into(),
-            Placement::Target(t) => network_target(p).and_then(|id| self.net_targets.iter().find(|t| t.0 == id).map(|t| t.1.clone())).unwrap_or_else(|| t.clone()),
+            Placement::Target(t) => network_target(p).and_then(|id| net_label(&self.net_targets, id)).unwrap_or_else(|| t.clone()),
         }
     }
 
@@ -2971,6 +2980,15 @@ impl AiUi {
             ));
             return;
         }
+        // A PC this computer cannot route to keeps the whole Batch for the user to fix; nothing is consumed.
+        let unroutable: Vec<String> = b.rows.iter().filter(|r| r.plan().is_some()).filter_map(|r| {
+            let t = network_target(&r.placement)?;
+            net_label(&self.net_targets, t).is_none().then(|| format!("{} (assigned PC is not known on any joined network)", r.clip.display_name))
+        }).collect();
+        if !unroutable.is_empty() {
+            self.notice = Some(format!("Nothing queued, the review is kept: pick another client for {}.", unroutable.join("; ")));
+            return;
+        }
         let used_preset = b.preset_name.is_some();
         let Some(b) = self.batch.take() else { return };
         let rows = b.rows;
@@ -3031,6 +3049,9 @@ impl AiUi {
     fn network_row(&mut self, project: &Project, st: &Settings, preset_name: Option<&str>, r: &BatchRow, plan: &Plan, target: Option<String>) -> Result<NetSubmit, String> {
         if !self.net_online { return Err("The coordinator is not connected; nothing was sent".into()); }
         if plan.job.mode != JobMode::New { return Err("Resume/Replace are local only".into()); }
+        if target.as_deref().is_some_and(|t| net_label(&self.net_targets, t).is_none()) {
+            return Err("that PC is not known on any joined network; pick it again".into());
+        }
         let loc = parse_location(r.location.as_ref())?
             .or_else(|| default_location(&r.clip))
             .map(|mut l| {
@@ -3075,11 +3096,15 @@ impl AiUi {
             self.notice = Some("The network client is not connected (Clients page): nothing was sent. Pick \"This computer\" or connect first.".into());
             return;
         }
-        let Some(b) = self.batch.take() else { return };
         let target = match &self.net_choice {
             NetChoice::Install(id) => Some(id.clone()),
             _ => None,
         };
+        if target.as_deref().is_some_and(|t| net_label(&self.net_targets, t).is_none()) {
+            self.notice = Some("That network PC is not known on any joined network: nothing was sent and the review is kept. Pick the PC again.".into());
+            return;
+        }
+        let Some(b) = self.batch.take() else { return };
         let (mut sent, mut errs) = (0, vec![]);
         for r in b.rows {
             let Some(plan) = r.plan().cloned() else { continue };
@@ -3454,8 +3479,8 @@ fn client_picker(
         Placement::Target(id) => tv
             .iter()
             .find(|t| &t.id == id)
-            .map_or_else(|| network.iter().find(|(n, _)| id == &format!("network:{n}"))
-                .map_or_else(|| format!("{id} (unavailable)"), |(_, name)| name.clone()), |t| t.id.clone()),
+            .map_or_else(|| id.strip_prefix("network:").and_then(|n| net_label(network, n))
+                .map_or_else(|| format!("{id} (unavailable)"), |name| name), |t| t.id.clone()),
     };
     egui::ComboBox::from_id_salt(salt)
         .selected_text(text)

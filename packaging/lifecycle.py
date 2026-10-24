@@ -16,6 +16,7 @@ only network use is the explicit model step (scripts/setup_models.py).
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -545,6 +546,7 @@ def activate(prefix: Path, version: str, *, shortcuts: bool = True, selfcheck: b
         raise InstallError("bundle verification failed: " + fmt_problems(problems))
     info = run_selfcheck(vdir) if selfcheck else {}
     receipt = read_receipt(prefix)
+    previous_receipt = copy.deepcopy(receipt)
     old = receipt.get("current")
     try:
         write_shims(prefix)
@@ -570,6 +572,7 @@ def activate(prefix: Path, version: str, *, shortcuts: bool = True, selfcheck: b
         try:
             if old and vpath(prefix, old).is_dir():
                 switch_current(prefix, old)
+                atomic_write_json(prefix / RECEIPT, previous_receipt)
                 if shortcuts:
                     write_shortcuts(vpath(prefix, old), prefix)
             else:  # first install: leave nothing of ours behind
@@ -695,11 +698,23 @@ def cmd_install(a) -> int:
             backup = f"{version}.old-{uuid.uuid4().hex[:6]}"
         atomic_write_json(prefix / TXN, {"version": version, "backup": backup})  # journal BEFORE touching versions/
         if backup:
-            os.rename(dest, prefix / "versions" / backup)
-        os.rename(payload, dest)  # same filesystem by construction (stub stages inside PREFIX)
+            try:
+                os.rename(dest, prefix / "versions" / backup)
+            except OSError as e:
+                (prefix / TXN).unlink(missing_ok=True)
+                raise InstallError(f"cannot replace this build; quit Keyloom and retry ({e})") from None
+        try:
+            os.rename(payload, dest)  # same filesystem by construction (stub stages inside PREFIX)
+        except BaseException:
+            if backup:
+                os.rename(prefix / "versions" / backup, dest)
+            (prefix / TXN).unlink(missing_ok=True)
+            raise
     if not payload:  # files were placed by the Windows installer: journal them so a failure is recoverable
         atomic_write_json(prefix / TXN, {"version": version, "backup": None})
     say(f"Validating Keyloom {version} ...")
+    before = read_receipt(prefix)
+    prior_models, prior_catalog = before.get("models"), before.get("catalog_sha256")
     try:
         activate(prefix, version, shortcuts=not a.no_shortcuts)
     except BaseException:
@@ -722,6 +737,9 @@ def cmd_install(a) -> int:
                 say("MODELS INCOMPLETE: the application is installed, but not every model is verified.\n"
                     f"  Resume with: {prefix / 'bin' / SHIM_NAMES[1]} models")
                 rc = 3
+        elif prior_models and prior_catalog == read_receipt(prefix).get("catalog_sha256"):
+            say("Models unchanged (same model catalog as the previous version).")  # an update never resets verified models
+            rc = 0 if prior_models.get("ready") else 3
         else:
             record_models(prefix, {"profile": "full", "ready": False, "skipped": True})
             say("Models skipped: setup is INCOMPLETE until `corridorkey-setup models` succeeds.")

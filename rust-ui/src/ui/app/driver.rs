@@ -67,7 +67,7 @@ pub struct Driver {
 
 pub struct Parts {
     pub ai: Arc<Mutex<AiUi>>,
-    pub remote: Arc<Mutex<crate::remote::Remote>>,
+    pub remote: Arc<Mutex<crate::remote_set::RemoteSet>>,
     pub metrics: Arc<Mutex<crate::metrics::Supervisor>>,
     pub repo: Option<PathBuf>,
     pub python: Option<PathBuf>,
@@ -103,6 +103,7 @@ impl Driver {
                             repo: p.repo.as_deref(),
                             python: p.python.as_deref(),
                             wake: &wake,
+                            cfg: Default::default(),
                         };
                         remote.tick(now, &mut env);
                         for f in remote.take_finished() {

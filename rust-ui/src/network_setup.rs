@@ -2,8 +2,9 @@
 //! from the UI. It owns its own lazy bridge link (separate from `remote::Remote`, which only runs while paired and
 //! enabled), so setup works unpaired/offline and never touches the client's credentials lock. Nothing runs until the
 //! user presses a button (or opens the page, which only reads the service status). A join writes a NEW credentials
-//! file under `<settings>/network/`; the App switches to it only after success and only when nothing would be
-//! orphaned. Secrets never pass through here: the bridge writes credentials and invitations itself.
+//! file under `<settings>/network/` (or reuses the saved one of the same network); the App adds it to the retained
+//! connections and never switches or resets an existing session. Secrets never pass through here: the bridge writes
+//! credentials and invitations itself.
 use crate::netlink::{Link, Op, Source, State};
 use crate::remote::{err_text, nlog};
 use crate::settings::Settings;
@@ -26,12 +27,17 @@ pub struct Svc {
     pub port: u64,
     pub allow_join: bool,
     pub network_id: Option<String>,
+    /// Addresses the network certificate covers (PCs already joined trust it, so hosting must use one of them).
+    pub cert_addresses: Vec<String>,
+    pub error_code: Option<String>,
+    pub message: String,
 }
 
 enum Pend {
     Status,
     Service(&'static str),
-    Join { creds: PathBuf },
+    /// `name` is the PC name captured when the join was queued.
+    Join { creds: PathBuf, name: String },
 }
 
 /// A finished join waiting for the App to switch to it.
@@ -40,6 +46,17 @@ pub struct Joined {
     pub creds: String,
     /// The bridge reused the existing connection (same network): nothing new was registered.
     pub reused: bool,
+    pub network_id: Option<String>,
+    pub name: String,
+}
+
+/// One saved connection, as the App sees it.
+#[derive(Clone)]
+pub struct ConnectionInfo {
+    pub credentials: String,
+    pub label: String,
+    pub network_id: Option<String>,
+    pub online: bool,
 }
 
 /// What the UI needs from the App each frame.
@@ -47,13 +64,16 @@ pub struct Ctx<'a> {
     pub settings: &'a Settings,
     pub settings_path: Option<&'a Path>,
     pub connected: bool,
-    pub blocker: Option<String>,
+    pub connections: &'a [ConnectionInfo],
     pub invite_note: Option<&'a str>,
 }
 
 /// Work for the App (it owns the picker and the connected client).
 pub enum Cmd {
-    Invite(String),
+    /// Save the global PC name (the App pushes it to every joined host).
+    SaveName(String),
+    /// Write an invitation for the network of the connection with these credentials.
+    Invite { connection: String, path: String },
     Browse(PickKind),
 }
 
@@ -73,9 +93,11 @@ pub struct Setup {
     join_host: String,
     join_port: String,
     name: String,
+    name_loaded: bool,
+    host_loaded: bool,
     invitation: String,
     invite_path: String,
-    confirm: bool,
+    invite_conn: String,
     remove_armed: bool,
     dir: String,
 }
@@ -108,9 +130,11 @@ impl Setup {
             join_host: String::new(),
             join_port: "8443".into(),
             name: crate::remote::default_name(),
+            name_loaded: false,
+            host_loaded: false,
             invitation: String::new(),
             invite_path: String::new(),
-            confirm: false,
+            invite_conn: String::new(),
             remove_armed: false,
             dir: String::new(),
         }
@@ -208,9 +232,17 @@ impl Setup {
                     port: v.get("port").and_then(Value::as_u64).unwrap_or(0),
                     allow_join: g("allow_address_join"),
                     network_id: v.get("network_id").or_else(|| v.get("fingerprint_sha256")).and_then(Value::as_str).map(str::to_owned),
+                    cert_addresses: v.get("certificate_addresses").and_then(Value::as_array).map_or_else(Vec::new, |a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()),
+                    error_code: v.get("error_code").and_then(Value::as_str).map(str::to_owned),
+                    message: v.get("message").and_then(Value::as_str).unwrap_or("").to_owned(),
                 };
-                if svc.installed {
-                    (self.address, self.port, self.allow_join) = (svc.address.clone(), svc.port.to_string(), svc.allow_join);
+                // Prefill the existing host configuration once; later refreshes never overwrite what the user is editing.
+                if !self.host_loaded && svc.installed {
+                    (self.address, self.port, self.allow_join, self.host_loaded) = (svc.address.clone(), svc.port.to_string(), svc.allow_join, true);
+                } else if !self.host_loaded && self.address.is_empty() {
+                    if let Some(a) = svc.cert_addresses.first() {
+                        self.address.clone_from(a);
+                    }
                 }
                 self.svc = Some(svc);
             }
@@ -221,20 +253,21 @@ impl Setup {
                 self.push(Op::ServiceStatus, json!({"state_dir": self.dir}), Pend::Status);
             }
             (Pend::Service(what), Err(e)) => self.note = Some(format!("{what} failed ({})", err_text(&e))),
-            (Pend::Join { creds }, Ok(v)) => {
+            (Pend::Join { creds, name }, Ok(v)) => {
                 nlog("setup join ok");
                 let reused = v.get("reused").and_then(Value::as_bool).unwrap_or(false);
                 let path = v.get("credentials_path").and_then(Value::as_str).map_or_else(|| creds.display().to_string(), str::to_owned);
-                self.note = Some(if reused { "This computer was already on that network; keeping its connection.".into() } else { "Joined the network.".into() });
-                self.joined = Some(Joined { creds: path, reused });
+                self.note = Some(if reused { "This computer was already on that network; keeping its connection.".into() } else { "Joined the network. Your other networks stay connected.".into() });
+                let network_id = v.get("network_id").and_then(Value::as_str).map(str::to_owned);
+                self.joined = Some(Joined { creds: path, reused, network_id, name });
             }
-            (Pend::Join { .. }, Err(e)) => self.note = Some(format!("Join failed; the current connection is unchanged ({})", err_text(&e))),
+            (Pend::Join { .. }, Err(e)) => self.note = Some(format!("Join failed; existing connections are unchanged ({})", err_text(&e))),
         }
     }
 
-    /// Start a join. A fresh credentials file is offered; `existing` (the current connection) lets the bridge reuse
-    /// it when the host is the same network instead of registering this PC again.
-    fn join(&mut self, sp: Option<&Path>, existing: Option<PathBuf>, op: Op, mut args: Value) {
+    /// Start a join. A fresh credentials file is offered; `existing` (every saved connection) lets the bridge reuse the
+    /// one of the same network instead of registering this PC again.
+    fn join(&mut self, sp: Option<&Path>, existing: &[ConnectionInfo], op: Op, mut args: Value) {
         let Some(dir) = sp.and_then(Path::parent).map(|d| d.join("network")) else {
             self.note = Some("Settings location is unknown; cannot save a connection.".into());
             return;
@@ -246,11 +279,35 @@ impl Setup {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
         let creds = dir.join(format!("credentials-{stamp}.json"));
         args["credentials_path"] = json!(creds.display().to_string());
-        if let Some(e) = existing {
-            args["existing_credentials_path"] = json!(e.display().to_string());
+        // Candidates: every saved connection plus any credentials file left in the folder (a removed network keeps its
+        // files), so rejoining reuses that identity instead of registering a second one.
+        let mut cands: Vec<String> = existing.iter().map(|c| c.credentials.clone()).collect();
+        match std::fs::read_dir(&dir) {
+            Ok(rd) => {
+                let mut found: Vec<String> = rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_file())).filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    (n.starts_with("credentials") && n.ends_with(".json") && !n.trim_end_matches(".json").contains(".json")).then(|| e.path().display().to_string())
+                }).collect();
+                found.sort();
+                cands.extend(found);
+            }
+            Err(e) => {
+                self.note = Some(format!("Join not started: the credentials folder could not be listed ({e}), so a saved identity for this network could not be looked for."));
+                return;
+            }
         }
+        let mut seen = std::collections::HashSet::new();
+        cands.retain(|c| !c.trim().is_empty() && seen.insert(c.clone()));
+        if cands.len() > 64 {
+            self.note = Some(format!("Join not started: {} saved identities exceed the supported limit of 64. Existing connections and identity files have been kept.", cands.len()));
+            return;
+        }
+        if !cands.is_empty() {
+            args["existing_credentials_paths"] = json!(cands);
+        }
+        let name = args["name"].as_str().unwrap_or("").to_owned();
         self.note = Some("Joining…".into());
-        self.push(op, args, Pend::Join { creds });
+        self.push(op, args, Pend::Join { creds, name });
     }
 
     pub fn ui(&mut self, ui: &mut Ui, c: &Ctx) -> Vec<Cmd> {
@@ -266,20 +323,35 @@ impl Setup {
         for q in self.queue.iter_mut().filter(|q| matches!(q.2, Pend::Status | Pend::Service(_))) {
             q.1["state_dir"] = json!(dir);
         }
-        let cur = crate::remote::credentials_path(c.settings, sp).filter(|p| p.exists());
-        let paired = cur.is_some();
+        if !self.name_loaded {
+            self.name_loaded = true;
+            if !c.settings.network.name.trim().is_empty() {
+                self.name.clone_from(&c.settings.network.name);
+            }
+        }
+        let saved: Vec<ConnectionInfo> = c.connections.iter().filter(|k| !k.credentials.is_empty()).cloned().collect();
         let idle = !self.busy();
         let port_ok = self.port.trim().parse::<u16>().is_ok_and(|p| p > 0);
         let svc = self.svc.clone().unwrap_or_default();
+        let name_ok = !self.name.trim().is_empty() && self.name.trim().chars().count() <= 64 && !self.name.chars().any(char::is_control);
+        let online: Vec<&ConnectionInfo> = c.connections.iter().filter(|k| k.online).collect();
+        if !online.iter().any(|k| k.credentials == self.invite_conn) {
+            self.invite_conn = online.first().map(|k| k.credentials.clone()).unwrap_or_default();
+        }
         ui.add_space(8.0);
-        egui::CollapsingHeader::new("Network setup").default_open(!paired).show(ui, |ui| {
-            ui.label(RichText::new("Every PC that joins the same host network sees all the others. Hosting, submitting and receiving are independent: one PC can do all three. No command line is needed.").color(DIM).size(11.5));
+        egui::CollapsingHeader::new("Network setup").default_open(saved.is_empty()).show(ui, |ui| {
+            ui.label(RichText::new("Hosting a network on this PC and joining other networks are independent: one PC can host its own network and stay connected to several others at once. No command line is needed.").color(DIM).size(11.5));
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label("This computer’s name");
-                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(180.0));
+                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(180.0).char_limit(64));
+                if ui.add_enabled(name_ok && self.name.trim() != c.settings.network.name, egui::Button::new("Save")).clicked() {
+                    cmds.push(Cmd::SaveName(self.name.trim().to_owned()));
+                }
             });
-            ui.strong("Host a network on this PC");
+            ui.label(RichText::new("The name is shown to every host this PC has joined; saving it updates all of them.").color(DIM).size(11.0));
+            ui.add_space(6.0);
+            ui.strong("Host on THIS PC");
             let line = match (&self.svc, svc.installed, svc.running) {
                 (None, ..) => "Checking the service…".to_owned(),
                 (_, false, _) => "Not installed.".into(),
@@ -290,15 +362,28 @@ impl Setup {
             if let Some(id) = &svc.network_id {
                 ui.label(RichText::new(format!("Network ID: {id}")).color(DIM).size(11.0));
             }
+            let covered = svc.cert_addresses.iter().any(|a| a.eq_ignore_ascii_case(self.address.trim()));
+            let editable = !svc.running;
             ui.horizontal_wrapped(|ui| {
                 ui.label("Address");
-                ui.add_enabled(!svc.installed, egui::TextEdit::singleline(&mut self.address).desired_width(170.0).hint_text("LAN or Tailscale IP"));
+                ui.add_enabled(editable, egui::TextEdit::singleline(&mut self.address).desired_width(170.0).hint_text("LAN or Tailscale IP"));
                 ui.label("Port");
-                ui.add_enabled(!svc.installed, egui::TextEdit::singleline(&mut self.port).desired_width(60.0));
-                ui.add_enabled_ui(!svc.installed, |ui| crate::ui::theme::checkbox(ui, &mut self.allow_join, "Trusted network: allow joining by address"));
+                ui.add_enabled(editable, egui::TextEdit::singleline(&mut self.port).desired_width(60.0));
+                ui.add_enabled_ui(editable, |ui| crate::ui::theme::checkbox(ui, &mut self.allow_join, "Trusted network: allow joining by address"));
             });
+            if svc.error_code.as_deref() == Some("cert_mismatch") || (editable && !svc.cert_addresses.is_empty() && !covered && !self.address.trim().is_empty()) {
+                ui.label(RichText::new("This PC’s network certificate does not cover that address. PCs that already joined trust the certificate, so it is kept; host on one of the addresses it covers:").color(egui::Color32::from_rgb(224, 176, 80)).size(11.5));
+                ui.horizontal_wrapped(|ui| {
+                    for a in &svc.cert_addresses {
+                        if ui.add_enabled(editable, egui::Button::new(format!("Use address {a}"))).clicked() {
+                            self.address.clone_from(a);
+                        }
+                    }
+                });
+            }
             ui.horizontal_wrapped(|ui| {
-                if !svc.installed && ui.add_enabled(idle && port_ok && !self.address.trim().is_empty(), egui::Button::new("Install and start")).clicked() {
+                let changed = svc.installed && (self.address.trim() != svc.address || self.port.trim() != svc.port.to_string() || self.allow_join != svc.allow_join);
+                if (!svc.installed || (editable && changed)) && ui.add_enabled(idle && port_ok && !self.address.trim().is_empty(), egui::Button::new(if svc.installed { "Apply and start" } else { "Install and start" })).clicked() {
                     let a = json!({"address": self.address.trim(), "port": self.port.trim().parse::<u16>().unwrap_or(8443), "allow_address_join": self.allow_join});
                     self.push(Op::ServiceInstall, a, Pend::Service("Install and start"));
                 }
@@ -315,60 +400,59 @@ impl Setup {
                 }
                 if ui.add_enabled(idle, egui::Button::new("Refresh")).clicked() { self.push(Op::ServiceStatus, json!({}), Pend::Status); }
             });
-            let gate = c.blocker.is_none() && (!paired || self.confirm) && !self.joining();
             if svc.running {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Name");
-                    ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(160.0));
-                    if ui.add_enabled(gate && !self.name.trim().is_empty(), egui::Button::new("Join this network on this computer")).clicked() {
+                    if ui.add_enabled(name_ok && !self.joining(), egui::Button::new("Also join this PC’s own network from this PC")).clicked() {
                         let a = json!({"state_dir": dir, "name": self.name.trim()});
-                        self.confirm = false;
-                        self.join(sp, cur.clone(), Op::ServiceLocalJoin, a);
+                        self.join(sp, &saved, Op::ServiceLocalJoin, a);
                     }
                 });
             }
+            ui.label(RichText::new("To use another PC’s network, use “Add network” below; hosting here does not change your connections.").color(DIM).size(11.0));
             ui.add_space(6.0);
-            ui.strong("Join a network");
+            ui.strong("Add network");
             ui.horizontal_wrapped(|ui| {
                 ui.label("Host");
                 ui.add(egui::TextEdit::singleline(&mut self.join_host).desired_width(170.0).hint_text("LAN or Tailscale IP"));
                 ui.label("Port");
                 ui.add(egui::TextEdit::singleline(&mut self.join_port).desired_width(60.0));
-                let ok = !self.join_host.trim().is_empty() && self.join_port.trim().parse::<u16>().is_ok_and(|p| p > 0) && !self.name.trim().is_empty();
-                if ui.add_enabled(gate && ok, egui::Button::new("Join by address")).clicked() {
+                let ok = !self.join_host.trim().is_empty() && self.join_port.trim().parse::<u16>().is_ok_and(|p| p > 0) && name_ok;
+                if ui.add_enabled(!self.joining() && ok, egui::Button::new("Join by address")).clicked() {
                     let (h, p) = (self.join_host.trim().to_owned(), self.join_port.trim().to_owned());
                     let a = json!({"url": url(&h, &p), "name": self.name.trim()});
-                    self.confirm = false;
-                    self.join(sp, cur.clone(), Op::JoinAddress, a);
+                    self.join(sp, &saved, Op::JoinAddress, a);
                 }
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label("Invitation file (optional)");
                 ui.add(egui::TextEdit::singleline(&mut self.invitation).desired_width(240.0));
                 if ui.button("Browse…").clicked() { cmds.push(Cmd::Browse(PickKind::NetInvitationOpen)); }
-                if ui.add_enabled(gate && !self.invitation.trim().is_empty() && !self.name.trim().is_empty(), egui::Button::new("Join with invitation")).clicked() {
+                if ui.add_enabled(!self.joining() && !self.invitation.trim().is_empty() && name_ok, egui::Button::new("Join with invitation")).clicked() {
                     let a = json!({"invitation_path": self.invitation.trim(), "name": self.name.trim()});
-                    self.confirm = false;
-                    self.join(sp, cur.clone(), Op::Pair, a);
+                    self.join(sp, &saved, Op::Pair, a);
                 }
             });
-            if paired {
-                crate::ui::theme::checkbox(ui, &mut self.confirm, "Replace this computer's current network connection (the old network is no longer kept active here)");
-            }
-            if let Some(b) = &c.blocker {
-                ui.label(RichText::new(format!("Cannot change network now: {b}.")).color(egui::Color32::from_rgb(224, 176, 80)).size(11.5));
-            }
+            ui.label(RichText::new("Joining adds a network; every network you already joined stays connected.").color(DIM).size(11.0));
             ui.add_space(6.0);
             ui.strong("Invite other PCs");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Network");
+                let sel = online.iter().find(|k| k.credentials == self.invite_conn).map_or("none connected".to_owned(), |k| k.label.clone());
+                egui::ComboBox::from_id_salt("invite_conn").selected_text(sel).show_ui(ui, |ui| {
+                    for k in &online {
+                        ui.selectable_value(&mut self.invite_conn, k.credentials.clone(), &k.label);
+                    }
+                });
+            });
             ui.horizontal_wrapped(|ui| {
                 ui.label("Save invitation to");
                 ui.add(egui::TextEdit::singleline(&mut self.invite_path).desired_width(240.0));
                 if ui.button("Browse…").clicked() { cmds.push(Cmd::Browse(PickKind::NetInvitationSave)); }
-                if ui.add_enabled(c.connected && !self.invite_path.trim().is_empty(), egui::Button::new("Create invitation")).clicked() {
-                    cmds.push(Cmd::Invite(self.invite_path.trim().to_owned()));
+                if ui.add_enabled(!self.invite_conn.is_empty() && !self.invite_path.trim().is_empty(), egui::Button::new("Create invitation")).clicked() {
+                    cmds.push(Cmd::Invite { connection: self.invite_conn.clone(), path: self.invite_path.trim().to_owned() });
                 }
             });
-            if !c.connected {
+            if online.is_empty() {
                 ui.label(RichText::new("Connect to a network first to create an invitation.").color(DIM).size(11.5));
             }
             if let Some(n) = c.invite_note {

@@ -124,8 +124,46 @@ pub struct Network {
     pub receive: bool,
     /// Empty = `<settings folder>/network/credentials.json`.
     pub credentials: String,
+    /// Every network this PC has joined, each connected independently. Empty (and never migrated) = the legacy
+    /// single connection above.
+    pub connections: Vec<Connection>,
+    /// Credentials path of the connection Auto Batch jobs go to (empty = first online one).
+    pub default_submit: String,
+    /// This PC's name on every joined network (empty = the computer's host name).
+    pub name: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// One joined network (no secret here: `credentials` is only the PATH of its private credentials file).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Connection {
+    pub credentials: String,
+    pub enabled: bool,
+    pub receive: bool,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Network {
+    /// The connections to run: the saved list, or (until the list is first written) the legacy single one when its
+    /// credentials file exists. Writing the list sets `connections_migrated`, so removing the last one sticks.
+    pub fn effective_connections(&self, settings_path: Option<&std::path::Path>) -> Vec<Connection> {
+        if !self.connections.is_empty() || self.extra.get("connections_migrated").and_then(Value::as_bool) == Some(true) {
+            return self.connections.clone();
+        }
+        let path = match self.credentials.trim() {
+            "" => settings_path.and_then(std::path::Path::parent).map(|d| d.join("network").join("credentials.json")),
+            c => Some(std::path::PathBuf::from(c)),
+        };
+        path.filter(|p| p.exists()).map(|p| Connection { credentials: p.display().to_string(), enabled: self.enabled, receive: self.receive, extra: Map::new() }).into_iter().collect()
+    }
+    /// Make the list the source of truth (keeps the legacy fields as they were).
+    pub fn materialize(&mut self, settings_path: Option<&std::path::Path>) {
+        self.connections = self.effective_connections(settings_path);
+        self.extra.insert("connections_migrated".into(), Value::Bool(true));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

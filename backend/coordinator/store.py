@@ -251,6 +251,8 @@ class Store:
             db.execute("INSERT INTO gpu_slots VALUES(?,?,?,?,?,?,1) ON CONFLICT(slot_id) DO UPDATE SET name=excluded.name,"
                        "vram_total_mb=excluded.vram_total_mb, ram_total_mb=excluded.ram_total_mb",
                        (slot, iid, g["uuid"], g["name"], g["vram_total_mb"], g["ram_total_mb"]))
+            if "name" in body:
+                db.execute("UPDATE installations SET name=? WHERE id=?", (body["name"], iid))
             started = cur["started_at"] if cur and cur["session_id"] == body["session_id"] else now
             db.execute("INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?)", (iid, body["session_id"], body["build"], started, now))
         return {"installation_id": iid, "session_id": body["session_id"], "slot_id": slot, "protocol": PROTOCOL}

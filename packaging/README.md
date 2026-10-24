@@ -2,7 +2,7 @@
 
 Private, local-only build pipeline. No publishing or redistribution clearance is implied
 (see `docs/design/rust-ui/standalone-release-plan.md` §8). No listeners, services or firewall
-rules are created; the only network use is the explicit model step.
+rules are created; network use is the explicit model step and, for the online installers only, the large public wheels.
 
 ## What a bundle contains
 `bin/corridorkey-ui` (Rust UI) · `app/` (Python helper tree: backend, engines, `scripts/setup_models.py`,
@@ -73,6 +73,46 @@ and the uninstaller come from Inno. Uninstall deletes only the exact version dir
 versions carrying our own manifest; the running version is removed by a detached `cmd`. The Start Menu shortcut targets
 the exe directly, so it does not scrub PYTHONPATH (the Rust side must). Repair of damaged files on Windows =
 reinstall after uninstall. `/TASKS="!models"` makes a silent app-only install. Native build and installation checks are recorded in the acceptance document below.
+
+## Online installers (smaller .run / .exe, large public wheels downloaded)
+Build host = target OS; the offline targets above are unchanged and stay the complete, self-contained option. The source repo stays private
+and **installation never contacts GitHub**: no sign-in, client id, token or private release manifest. You hand the installer to a user once;
+it carries Keyloom itself (app, Rust UI, FFmpeg, the standalone Python/stdlib, certifi, lifecycle/`online.py`, the custom git-built SAM2 CUDA
+extension and every small dependency). Only wheels that PyPI / `download.pytorch.org` serve publicly are downloaded at install time:
+`torch`, `triton` / `triton-windows` and `nvidia-*` (a first install is several GB; an update reuses files and downloads nothing the
+installed versions already hold). Models are never installed by the wrapper: download them from the app. Nothing is installed that needs a
+compiler or an NVIDIA display driver on the PC.
+```
+python packaging/bundle.py online-linux   --out DIR [--stage DIR/stage] [--wheel-cache DIR]   # Keyloom-online-<id>-linux-x86_64.run
+python packaging/bundle.py online-windows --out DIR [--stage DIR/stage] [--wheel-cache DIR]   # Keyloom-online-<id>-windows-x86_64.exe (+ -N.bin slices)
+```
+Without `--stage` a full stage is built first (add `--ffmpeg-dir`, `--ui-binary`, ... as for the offline targets). The online and offline
+installers of one build carry the **same `version_id`, install manifest and installed content**.
+
+Build step `wheel_sources(stage, cache)`: for every installed distribution named `torch`, `triton`, `triton-windows` or `nvidia-*` whose
+RECORD lists regular stage files >= 1 MiB, it resolves the exact public wheel (PyPI simple index first, then the PyTorch cu128 index; name,
+version and every platform tag must equal the installed `METADATA`/`WHEEL`, and the index-advertised hash must be one of the pinned
+`packaging/locks/<os>-x86_64.txt` hashes), downloads it into the cache with sha256 verification, maps each such file to its zip entry (`*.data/purelib|platlib`
+adjusted) and checks the entry's size + sha256 against the stage's `install-manifest.json`. A big file that cannot be mapped
+byte-for-byte fails the build with the list. `make_slim` then copies (hardlinks) the stage keeping symlinks and omitting only those mapped regular files.
+Result wrapper (embedded in the installer; the sources file is outside `payload/`):
+```
+keyloom-online/payload/...                 slim complete stage minus mapped heavy files, original install-manifest.json
+keyloom-online/wheel-sources.json          {"schema":1,"version_id":ID,"wheels":[{"url":https wheel URL,"sha256":64hex,"size":N,"files":{"<stage path>":"<zip entry>"}}]}
+```
+The installer runs `payload/runtime/python/{bin/python3|python.exe} -I -B payload/app/packaging/online.py --payload-dir PATH --sources PATH [--prefix DIR] [--repair]`.
+`online.py` verifies, reuses byte-identical files of the current/previous installed versions, downloads only the wheels still needed
+and hands the assembled complete payload to `lifecycle.py` (same transaction, rollback, shims, receipt). The exact build already installed is a no-op
+without network; settings, models, credentials, certificates and jobs are untouched. The install manifest records no mode bits, so
+executables extracted from wheels get their mode from the zip entry (done by `online.py`); copied payload files keep theirs. Exit 0 = installed/up to date, 2 failed (old install
+intact), 4 Keyloom running (quit it with File > Quit), 130 cancelled.
+
+Linux: `X.run [--prefix DIR] [--repair]` (default `~/.local/opt/CorridorKey`; needs only sh/tar/gzip/awk/sha256sum). The payload is extracted
+into `PREFIX/.staging.*` (same filesystem, not a small `/tmp`).
+Windows: per-user Inno exe (1900 MiB slices like the full installer: keep the exe and every `-N.bin` together; `.sha256` lists all); unpacks to `{tmp}`
+with a visible console. `/PREFIX=DIR` and `/REPAIR=1` are accepted; otherwise an existing full-installer location is read from its Inno
+registry key (`Inno Setup: App Path`), else `%LOCALAPPDATA%\Programs\CorridorKey`. It has its own AppId, `Uninstallable=no` and no Add/Remove Programs
+entry, so it never touches the full installer's entry; remove an online-only install with `<prefix>\bin\corridorkey-setup.cmd uninstall`.
 
 ## Background autostart contract (written by the app, removed by uninstall)
 Linux launches the stable shim `PREFIX/bin/corridorkey`. Windows launches the GUI exe directly; activation and rollback rewrite an existing owned entry. Linux:

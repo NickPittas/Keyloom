@@ -27,6 +27,8 @@ its own peers; accepted on a LAN).
 `POST /v1/pair` · `/v1/session` · `/v1/jobs` (submit) · `/v1/claim` · `/v1/attempts/{id}/(reject|start|events)` ·
 `/v1/jobs/{id}/cancel` · `/v1/stats` · `GET /v1/jobs/{id}` · `/v1/jobs/{id}/events?after=&limit=` · `/v1/installations`.
 No long-poll: clients poll. Claim/start/reject/events/stats need the installation's current `session_id`.
+`/v1/session` accepts an optional `name` (1-64 characters, no control characters) that renames the same installation row; it never creates an identity or token, and callers that omit it keep their stored name. A PC joined to several networks sends its one name to each host.
+The service status (`netlink service_status`) lists `certificate_addresses`; an existing certificate is never regenerated (joined PCs pin it), so a `cert_mismatch` is fixed by hosting on a covered address.
 
 - **Submit**: `submission_id` + frozen `spec` + `target` (installation id or null=automatic). Same id+same canonical
   payload → original response; different payload → 409. Spec is an exact schema (`schema.validate_spec`): kind `key` (Key only, the

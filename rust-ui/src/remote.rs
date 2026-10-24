@@ -179,10 +179,24 @@ enum Rx {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Pair { invitation: String, name: String },
-    Enable(bool),
-    Receive(bool),
-    CancelJob(String),
-    ForgetAttempt,
+    Enable { creds: String, on: bool },
+    Receive { creds: String, on: bool },
+    DefaultSubmit(String),
+    Remove(String),
+    CancelJob { creds: String, job_id: String },
+    ForgetAttempt(String),
+}
+
+/// One connection's settings for a tick (`Settings::network` lists many; each `Remote` runs exactly one).
+#[derive(Clone, Debug, Default)]
+pub struct Conn {
+    pub creds: Option<PathBuf>,
+    pub enabled: bool,
+    pub receive: bool,
+    /// This PC's name on the network.
+    pub name: String,
+    /// The set's round robin allows this connection to claim now (offers are serialized across networks).
+    pub may_claim: bool,
 }
 
 pub struct Env<'a> {
@@ -193,9 +207,13 @@ pub struct Env<'a> {
     pub repo: Option<&'a Path>,
     pub python: Option<&'a Path>,
     pub wake: &'a Arc<dyn Fn() + Send + Sync>,
+    /// The connection being ticked (set by `RemoteSet` before each `Remote::tick`).
+    pub cfg: Conn,
 }
 
 pub struct Remote {
+    /// Stable identity: the credentials path (also the namespace of this connection's GPU-slot keys).
+    pub(crate) key: String,
     source: Source,
     link: Option<Link>,
     pub phase: Phase,
@@ -205,6 +223,14 @@ pub struct Remote {
     network_url: Option<String>,
     network_id: Option<String>,
     registered: bool,
+    /// Name sent with the last registration, whether the bridge/host rejected a name, and the user-facing note.
+    reg_name: String,
+    reg_sent_name: bool,
+    name_unsupported: bool,
+    name_note: Option<String>,
+    jobs_loaded: bool,
+    /// The network id remembered from an earlier connect (a PC's assignments stay valid while offline).
+    cached_ns: Option<String>,
     register_note: Option<String>,
     reg_inflight: bool,
     stats_seq: u64,
@@ -382,8 +408,19 @@ pub(crate) fn err_text(e: &LinkError) -> String {
 }
 
 impl Remote {
-    pub fn new(source: Source) -> Self {
+    /// Labels are meaningful before the first connection: the URL comes from the private credentials file (read for that
+    /// one field only, never logged) and the network id from the persisted side file.
+    pub fn new(source: Source, key: String) -> Self {
+        let mut r = Self::blank(source, key);
+        let creds = PathBuf::from(&r.key);
+        r.network_url = std::fs::read(&creds).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v["url"].as_str().map(str::to_owned));
+        r.cached_ns = std::fs::read(side_file(&creds, ".network.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v["network_id"].as_str().map(str::to_owned));
+        r
+    }
+
+    fn blank(source: Source, key: String) -> Self {
         Self {
+            key,
             source,
             link: None,
             phase: Phase::Off,
@@ -393,6 +430,12 @@ impl Remote {
             network_url: None,
             network_id: None,
             registered: false,
+            reg_name: String::new(),
+            reg_sent_name: false,
+            name_unsupported: false,
+            name_note: None,
+            jobs_loaded: false,
+            cached_ns: None,
             register_note: None,
             reg_inflight: false,
             stats_seq: 0,
@@ -446,20 +489,20 @@ impl Remote {
     pub fn invite(&mut self, path: String) {
         self.invite_note = Some(if self.online() && self.req(Op::NetworkInvite, json!({"path": path}), Pend::Invite) { "Creating the invitation…".into() } else { "Connect to a network first.".into() });
     }
-    /// Why this computer may not leave its current network now (`None` = nothing would be orphaned).
-    pub fn switch_blocker(&self, s: &Settings, settings_path: Option<&Path>) -> Option<String> {
+    /// Why this computer may not drop this connection now (`None` = nothing would be orphaned).
+    pub fn remove_blocker(&self, creds: Option<&Path>) -> Option<String> {
         if self.jobs.iter().any(|j| !j.terminal() || j.submission.is_some()) {
             return Some("jobs sent to the current network are still running".into());
         }
-        if !matches!(self.rx, Rx::Idle) || !self.held.is_empty() || self.claim_inflight {
+        if !matches!(self.rx, Rx::Idle) || !self.held.is_empty() {
             return Some("this computer is working on, or holding, a network job".into());
         }
-        if let Some(c) = credentials_path(s, settings_path) {
-            if side_file(&c, ".attempt.json").exists() {
+        if let Some(c) = creds {
+            if side_file(c, ".attempt.json").exists() {
                 return Some("an unresolved network attempt is recorded on this computer".into());
             }
             if self.jobs.is_empty() {
-                match std::fs::read(side_file(&c, ".jobs.json")) {
+                match std::fs::read(side_file(c, ".jobs.json")) {
                     Ok(bytes) => match serde_json::from_slice::<Vec<Value>>(&bytes) {
                         Ok(jobs) if jobs.iter().any(|j| !matches!(j["state"].as_str(), Some("succeeded" | "failed" | "cancelled" | "not sent")) || j.get("submission").is_some_and(|v| !v.is_null())) => {
                             return Some("saved jobs on the current network need to be reconnected and finished first".into());
@@ -474,25 +517,15 @@ impl Remote {
         }
         None
     }
-    /// Leave the current network (caller checked `switch_blocker`): its saved state files stay untouched.
-    pub fn switch_network(&mut self) {
-        self.stop();
-        self.jobs.clear();
-        self.installs.clear();
-        self.network_url = None;
-        self.network_id = None;
-        (self.paired, self.want_pair, self.status, self.invite_note, self.retry_at) = (None, None, None, None, None);
-        self.phase = Phase::Off;
-    }
-    pub fn forget_attempt(&mut self, env: &Env) {
-        if let Some(c) = credentials_path(env.settings, env.settings_path) {
-            let _ = std::fs::remove_file(side_file(&c, ".attempt.json"));
+    pub fn forget_attempt(&mut self, creds: Option<&Path>) {
+        if let Some(c) = creds {
+            let _ = std::fs::remove_file(side_file(c, ".attempt.json"));
         }
         self.rx = Rx::Idle; // the next tick releases the GPU slot
     }
     fn forget_file(env: &Env, yes: bool) {
-        if let (true, Some(c)) = (yes, credentials_path(env.settings, env.settings_path)) {
-            let _ = std::fs::remove_file(side_file(&c, ".attempt.json"));
+        if let (true, Some(c)) = (yes, &env.cfg.creds) {
+            let _ = std::fs::remove_file(side_file(c, ".attempt.json"));
         }
     }
     /// Begin shutdown: no further offers are claimed.
@@ -502,6 +535,30 @@ impl Remote {
     /// A held attempt has no local work; its durable ownership survives closing.
     pub fn quiescent(&self) -> bool {
         matches!(self.rx, Rx::Idle | Rx::Owned(_)) || (self.closing && !self.online() && matches!(&self.rx, Rx::Running(r) if r.terminal && r.report_saved))
+    }
+    /// Another claim/offer/attempt is in progress on this connection (the set never overlaps two networks' work).
+    pub(crate) fn claim_busy(&self) -> bool {
+        self.claim_inflight || !matches!(self.rx, Rx::Idle) || !self.held.is_empty()
+    }
+    pub(crate) fn claim_ready(&self, now: Instant, cfg: &Conn) -> bool {
+        cfg.receive && self.registered && self.online() && !self.closing && !self.claim_busy() && self.last_claim.is_none_or(|t| now.saturating_duration_since(t) >= CLAIM_EVERY)
+    }
+    pub(crate) fn claiming(&self) -> bool {
+        self.claim_inflight
+    }
+    /// The coordinator's network id (remembered across restarts), the namespace of this connection's PCs.
+    pub fn ns(&self) -> Option<String> {
+        self.network_id.clone().or_else(|| self.cached_ns.clone())
+    }
+    /// The GPU-slot key of an attempt: namespaced by connection, so two networks' attempt ids can never alias.
+    fn slot(&self, attempt: &str) -> String {
+        format!("{}/{attempt}", self.key)
+    }
+    pub fn has_install(&self, id: &str) -> bool {
+        self.installs.iter().any(|i| i.id == id)
+    }
+    pub fn label(&self) -> String {
+        self.network_url.as_deref().map(|u| u.trim_start_matches("https://").trim_start_matches("http://").to_owned()).or_else(|| self.ns()).unwrap_or_else(|| Path::new(&self.key).parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "network".into()))
     }
     pub fn cancel_job(&mut self, job_id: &str) {
         if let Some(l) = &mut self.link {
@@ -523,6 +580,12 @@ impl Remote {
         }
     }
 
+    /// Accept a Batch submission for this network now (kept and sent when it is online).
+    pub(crate) fn enqueue(&mut self, n: NetSubmit, env: &Env) {
+        self.load_jobs(env.cfg.creds.as_deref());
+        self.send(n, env);
+    }
+
     fn stop(&mut self) {
         if let Rx::Running(r) = &mut self.rx {
             r.inflight = false; // the request died with the link; the outbox replays after reconnect
@@ -542,6 +605,7 @@ impl Remote {
         }
         self.registered = false;
         self.reg_inflight = false;
+        self.name_unsupported = false;
         self.claim_inflight = false;
         self.stats_inflight = false;
         self.installs_inflight = false;
@@ -569,22 +633,21 @@ impl Remote {
             env.ai.release_network_slot(&self.held);
             self.held.clear();
         }
-        let creds = credentials_path(env.settings, env.settings_path);
+        let creds = env.cfg.creds.clone();
+        self.load_jobs(creds.as_deref());
         if !self.online() && matches!(self.rx, Rx::Running(_)) {
             self.run_attempt(now, env, creds.as_deref());
         }
-        let enabled = env.settings.network.enabled && creds.as_ref().is_some_and(|c| c.exists());
+        let enabled = env.cfg.enabled && creds.as_ref().is_some_and(|c| c.exists());
         if !(enabled || self.want_pair.is_some()) {
             if self.link.is_some() || self.phase != Phase::Off {
                 self.stop();
-                self.phase = if env.settings.network.enabled { Phase::Failed("not paired yet: pair this computer on the Clients page".into()) } else { Phase::Off };
+                self.phase = if env.cfg.enabled { Phase::Failed("not paired yet: pair this computer on the Clients page".into()) } else { Phase::Off };
             }
-            env.ai.net_online = false;
             return;
         }
         if self.link.is_none() {
             if self.retry_at.is_some_and(|t| now < t) {
-                env.ai.net_online = false;
                 return;
             }
             match self.source.command(env.repo, env.python) {
@@ -600,7 +663,6 @@ impl Remote {
                 Err(e) => self.fail(now, e),
             }
             if self.link.is_none() {
-                env.ai.net_online = false;
                 return;
             }
         }
@@ -609,7 +671,6 @@ impl Remote {
             Some(State::Ended(why)) => {
                 self.stop();
                 self.fail(now, why);
-                env.ai.net_online = false;
                 return;
             }
             Some(State::Starting) | None => return,
@@ -654,7 +715,6 @@ impl Remote {
             Phase::Online => self.drive(now, env, creds.as_deref()),
             _ => {}
         }
-        env.ai.net_online = self.phase == Phase::Online;
     }
 
     fn fail(&mut self, now: Instant, why: String) {
@@ -679,7 +739,7 @@ impl Remote {
                 });
             }
             (Pend::Pair, Ok(v)) => {
-                let c = credentials_path(env.settings, env.settings_path).map(|c| c.display().to_string());
+                let c = env.cfg.creds.clone().map(|c| c.display().to_string());
                 self.paired = c;
                 self.want_pair = None;
                 self.status = Some(format!("Paired as {}.", v.get("installation_id").and_then(Value::as_str).unwrap_or("this installation")));
@@ -698,6 +758,12 @@ impl Remote {
                 self.me = v.get("installation_id").and_then(Value::as_str).map(str::to_owned);
                 self.phase = Phase::Online;
                 self.retry_at = None;
+                if let (Some(c), Some(n)) = (&env.cfg.creds, &self.network_id) {
+                    if self.cached_ns.as_ref() != Some(n) {
+                        self.cached_ns = Some(n.clone());
+                        let _ = write_private(&side_file(c, ".network.json"), &json!({"network_id": n}));
+                    }
+                }
                 self.load_state(env);
             }
             (Pend::Connect, Err(e)) => {
@@ -710,6 +776,12 @@ impl Remote {
                     Ok(_) => {
                         self.registered = true;
                         self.register_note = None;
+                        self.name_note = (self.name_unsupported).then(|| "This network's host is too old to sync the PC name: update Keyloom on the host.".into());
+                    }
+                    // An older host may reject the name field: register again without it (the next tick), rendering unchanged.
+                    Err(e) if self.reg_sent_name && e.code == "invalid" && e.message.contains("unknown keys") && e.message.contains("'name'") => {
+                        self.name_unsupported = true;
+                        self.register_note = Some(format!("registering without the PC name ({})", err_text(&e)));
                     }
                     Err(e) => self.register_note = Some(format!("not registered ({})", err_text(&e))),
                 }
@@ -722,14 +794,13 @@ impl Remote {
             (Pend::Stats, Err(_)) => self.stats_inflight = false,
             (Pend::Installs, Ok(v)) => {
                 self.installs_inflight = false;
-                self.set_installs(&v, env);
+                self.set_installs(&v);
             }
             (Pend::Installs, Err(e)) => {
                 self.installs_inflight = false;
                 // A failed membership refresh cannot establish a healthy connection (including TLS or revoked credentials).
                 self.stop();
                 self.fail(now, format!("connection lost ({})", err_text(&e)));
-                env.ai.net_online = false;
             }
             (Pend::Claim, r) => {
                 self.claim_inflight = false;
@@ -856,7 +927,7 @@ impl Remote {
         }
     }
 
-    fn set_installs(&mut self, v: &Value, env: &mut Env) {
+    fn set_installs(&mut self, v: &Value) {
         self.installs = v
             .get("installations")
             .and_then(Value::as_array)
@@ -874,7 +945,11 @@ impl Remote {
                 })
             })
             .collect();
-        env.ai.net_targets = self.installs.iter().filter(|i| i.gpu.is_some()).map(|i| (i.id.clone(), format!("{}{}", i.name, if i.connected { "" } else { " (offline)" }))).collect();
+    }
+    /// This network's PCs with a GPU, as picker entries `network id/PC id` (stable across hosts and restarts).
+    pub fn targets(&self, label: Option<&str>) -> Vec<(String, String)> {
+        let Some(ns) = self.ns() else { return vec![] };
+        self.installs.iter().filter(|i| i.gpu.is_some()).map(|i| (format!("{ns}/{}", i.id), format!("{}{}{}", i.name, if i.connected && self.online() { "" } else { " (offline)" }, label.map_or(String::new(), |l| format!(" · {l}"))))).collect()
     }
 
     // ---- driving ---------------------------------------------------------------------------------------------------
@@ -889,13 +964,23 @@ impl Remote {
             self.last_probe = Some(now);
             env.ai.probe_workers(); // start the local client so its GPU identity is known
         }
+        // A renamed PC registers again right away; a host that cannot take names keeps the old registration.
+        if self.registered && !self.reg_inflight && !self.name_unsupported && self.reg_name != truncate(env.cfg.name.trim(), 64) {
+            self.registered = false;
+        }
         if !self.registered && !self.reg_inflight {
             match (&hello_gpu, &sample) {
                 (Some(g), Some(s)) => match g.verified_uuid() {
                     Ok(u) => {
                         let ram_mb = s.ram_total.map(|b| b / (1 << 20));
                         if let Some(ram) = ram_mb.filter(|r| *r > 0) {
-                            let args = json!({"build": format!("corridorkey-ui {}", env!("CARGO_PKG_VERSION")), "gpu": {"uuid": u, "name": truncate(&g.name, 120), "vram_total_mb": ((g.vram_gb * 1024.0) as u64).max(1), "ram_total_mb": ram}});
+                            let mut args = json!({"build": format!("corridorkey-ui {}", env!("CARGO_PKG_VERSION")), "gpu": {"uuid": u, "name": truncate(&g.name, 120), "vram_total_mb": ((g.vram_gb * 1024.0) as u64).max(1), "ram_total_mb": ram}});
+                            let name = truncate(env.cfg.name.trim(), 64); // the host accepts 1-64 characters
+                            self.reg_sent_name = !name.is_empty() && !self.name_unsupported;
+                            if self.reg_sent_name {
+                                args["name"] = json!(name);
+                            }
+                            self.reg_name = if self.reg_sent_name { name } else { String::new() };
                             self.reg_inflight = self.req(Op::Register, args, Pend::Register);
                         }
                     }
@@ -950,9 +1035,6 @@ impl Remote {
             self.installs_inflight = self.req(Op::Installations, json!({}), Pend::Installs);
         }
         // 3. Submitter: send what the Batch confirmed, follow what was sent.
-        for n in env.ai.take_net_outbox() {
-            self.send(n, env);
-        }
         self.poll_jobs(now);
         // 4. Receiver.
         self.receive(now, env, creds, local.as_ref().map(|t| (t.status.clone(), t.busy_with.is_some())), hello_gpu.as_ref().and_then(|g| g.verified_uuid().ok().map(str::to_owned)), sample.as_ref());
@@ -1060,7 +1142,7 @@ impl Remote {
         }
         // Claim only when opted in, registered, nothing is in progress, the verified local GPU is idle and the app is not closing.
         let idle = local.as_ref().is_some_and(|(st, busy)| *st == crate::scheduler::TargetStatus::Ready && !busy) && !env.ai.scheduler().running() && !env.ai.targets_pending();
-        let ok = env.settings.network.receive && !self.closing && self.registered && matches!(self.rx, Rx::Idle) && self.held.is_empty() && uuid.is_some() && idle;
+        let ok = env.cfg.receive && env.cfg.may_claim && !self.closing && self.registered && matches!(self.rx, Rx::Idle) && self.held.is_empty() && uuid.is_some() && idle;
         if ok && !self.claim_inflight && self.last_claim.is_none_or(|t| now.saturating_duration_since(t) >= CLAIM_EVERY) {
             self.last_claim = Some(now);
             let maps: Vec<String> = env.settings.shared_roots.iter().map(|r| r.name.clone()).collect();
@@ -1106,12 +1188,12 @@ impl Remote {
             }
         };
         // The GPU slot is reserved BEFORE anything else is acknowledged, so a local Queue cannot race the start.
-        if !env.ai.reserve_network_slot(&attempt) {
+        if !env.ai.reserve_network_slot(&self.slot(&attempt)) {
             self.req(Op::Reject, json!({"attempt_id": attempt, "code": "busy", "message": "this computer's GPU has local work"}), Pend::Reject);
             self.receive_note = Some(format!("offer {attempt} declined: local work holds the GPU"));
             return;
         }
-        self.held = attempt.clone();
+        self.held = self.slot(&attempt);
         let roots: Vec<SharedRoot> = env.settings.shared_roots.clone();
         let (tx, rx) = channel();
         let (a2, wake) = (attempt.clone(), env.wake.clone());
@@ -1129,7 +1211,7 @@ impl Remote {
     /// Ownership is written BEFORE the start is requested, then the coordinator is asked to start the attempt.
     fn send_start(&mut self, attempt: String, pf: Preflight, plan: Value, env: &mut Env) {
         let stages: Vec<(String, &'static str)> = pf.stages.iter().map(|s| (s.job_id().to_owned(), s.label())).collect();
-        let saved = match credentials_path(env.settings, env.settings_path) {
+        let saved = match env.cfg.creds.clone() {
             Some(c) => write_private(&side_file(&c, ".attempt.json"), &attempt_file(&attempt, &pf.job.job_id, 0, &stages, &attempt_meta(&pf))),
             None => Err("no credentials folder to keep ownership in".into()),
         };
@@ -1197,7 +1279,7 @@ impl Remote {
         // Ownership is durable BEFORE anything runs. If it cannot be written the attempt stays fenced (the coordinator
         // already considers it started): nothing is launched and the operator resolves it.
         let meta = attempt_meta(&pf);
-        let persisted = match credentials_path(env.settings, env.settings_path) {
+        let persisted = match env.cfg.creds.clone() {
             Some(c) => write_private(&side_file(&c, ".attempt.json"), &attempt_file(&attempt, &job_id, 0, &stages, &meta)),
             None => Err("no credentials folder to keep ownership in".into()),
         };
@@ -1209,7 +1291,7 @@ impl Remote {
         }
         let mut rv = Recv { attempt: attempt.clone(), job_id: job_id.clone(), meta: meta.clone(), stages: stages.clone(), announced: 0, outbox: vec![], seq: 0, last_done: 0, last_total: 0, last_report: Instant::now(), last_progress: Instant::now(), inflight: false, retry_at: None, cancel_sent: false, terminal: false, report_saved: false };
         nlog(&format!("attempt {attempt} started; running {} stage(s) for {job_id} on the local client", stages.len()));
-        match env.ai.submit_network_plan(&attempt, pf.stages) {
+        match env.ai.submit_network_plan(&self.slot(&attempt), pf.stages) {
             Ok(()) => {
                 self.receive_note = Some(format!("running network job {job_id}"));
                 if v.get("cancel_requested").and_then(Value::as_bool) == Some(true) {
@@ -1247,7 +1329,7 @@ impl Remote {
                 self.rx = Rx::Running(rv);
             }
             Err(e) if e.code == "attempt_terminal" || e.code == "unknown_attempt" || e.code == "attempt_not_started" => {
-                if let Some(c) = credentials_path(env.settings, env.settings_path) {
+                if let Some(c) = env.cfg.creds.clone() {
                     let _ = std::fs::remove_file(side_file(&c, ".attempt.json"));
                 }
                 self.receive_note = Some(format!("attempt {attempt} was already resolved by the coordinator operator ({}); local ownership cleared", e.code));
@@ -1372,7 +1454,7 @@ impl Remote {
                 }
                 if rv.terminal && rv.outbox.is_empty() {
                     let job_id = rv.job_id.clone();
-                    if let Some(c) = credentials_path(env.settings, env.settings_path) {
+                    if let Some(c) = env.cfg.creds.clone() {
                         let _ = std::fs::remove_file(side_file(&c, ".attempt.json"));
                     }
                     self.receive_note = Some(format!("network job {job_id} finished and reported"));
@@ -1396,11 +1478,11 @@ impl Remote {
     // ---- durable state ---------------------------------------------------------------------------------------------
 
     fn load_state(&mut self, env: &Env) {
-        let Some(c) = credentials_path(env.settings, env.settings_path) else { return };
+        let Some(c) = env.cfg.creds.clone() else { return };
         let idle = matches!(self.rx, Rx::Idle);
         if let Some(v) = std::fs::read(side_file(&c, ".attempt.json")).ok().filter(|_| idle).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
             let attempt = v.get("attempt_id").and_then(Value::as_str).unwrap_or("?").to_owned();
-            self.held = attempt.clone();
+            self.held = self.slot(&attempt);
             let meta = v.get("meta").cloned().unwrap_or(Value::Null);
             let owned = |why: &str| Rx::Owned(format!("attempt {attempt} (job {}) was started by an earlier run of this app and is still owned by this installation: {why} Nothing new is claimed. Check this computer and the storage; the server operator resolves it with `abandon`.", v.get("job_id").and_then(Value::as_str).unwrap_or("?")));
             self.rx = if meta.get("manifest_dir").is_some() {
@@ -1417,8 +1499,19 @@ impl Remote {
                 owned("it predates restart reconciliation.")
             };
         }
-        if self.jobs.is_empty() {
-            if let Some(a) = std::fs::read(side_file(&c, ".jobs.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+    }
+
+    /// Read the saved list of sent jobs once (before anything is added to it, so a save can never drop them).
+    fn load_jobs(&mut self, creds: Option<&Path>) {
+        let Some(c) = creds else { return };
+        if std::mem::replace(&mut self.jobs_loaded, true) {
+            return;
+        }
+        if let Some(n) = std::fs::read(side_file(c, ".network.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v["network_id"].as_str().map(str::to_owned)) {
+            self.cached_ns.get_or_insert(n);
+        }
+        {
+            if let Some(a) = std::fs::read(side_file(c, ".jobs.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
                 for j in a.as_array().into_iter().flatten() {
                     self.jobs.push(NetJob {
                         submission_id: j["submission_id"].as_str().unwrap_or("").into(),
@@ -1448,7 +1541,7 @@ impl Remote {
     }
 
     fn save_jobs(&mut self, env: &Env) {
-        if let Some(c) = credentials_path(env.settings, env.settings_path) {
+        if let Some(c) = env.cfg.creds.clone() {
             let mut finished = 0;
             let mut live: Vec<Value> = self.jobs.iter().rev().filter(|j| {
                 if j.terminal() { finished += 1; finished <= 12 } else { true }
@@ -1462,11 +1555,11 @@ impl Remote {
 
     // ---- UI --------------------------------------------------------------------------------------------------------
 
-    pub fn status_line(&self, s: &Settings) -> (String, bool) {
+    pub fn status_line(&self, cfg: &Conn) -> (String, bool) {
         match &self.phase {
-            Phase::Online if self.registered => (format!("Connected{}", if s.network.receive { ", taking network work when the GPU is idle" } else { "" }), true),
+            Phase::Online if self.registered => (format!("Connected{}", if cfg.receive { ", taking network work when the GPU is idle" } else { "" }), true),
             Phase::Online => (format!("Connected; {}", self.register_note.clone().unwrap_or_else(|| "registering this computer…".into())), true),
-            Phase::Off if s.network.enabled => ("Not connected".into(), false),
+            Phase::Off if cfg.enabled => ("Not connected".into(), false),
             Phase::Off => ("Network client is off".into(), false),
             Phase::Starting | Phase::Connecting => ("Connecting…".into(), false),
             Phase::Pairing => ("Pairing…".into(), false),
@@ -1474,8 +1567,12 @@ impl Remote {
         }
     }
 
-    pub fn other_installations(&self) -> Vec<Install> {
-        self.installs.iter().filter(|i| Some(&i.id) != self.me.as_ref()).cloned().map(|mut i| { i.connected &= self.online(); i }).collect()
+    pub fn other_installations(&self, label: Option<&str>) -> Vec<Install> {
+        self.installs.iter().filter(|i| Some(&i.id) != self.me.as_ref()).cloned().map(|mut i| {
+            i.connected &= self.online();
+            if let Some(l) = label { i.name = format!("{} · {l}", i.name); }
+            i
+        }).collect()
     }
 
     pub fn has_queue(&self) -> bool { !self.jobs.is_empty() }
@@ -1491,7 +1588,7 @@ impl Remote {
     }
 
     /// Submitted work belongs in Batch, grouped by the PC that owns it.
-    pub fn queue_ui(&mut self, ui: &mut Ui) -> Vec<Action> {
+    pub fn queue_ui(&mut self, ui: &mut Ui, net_label: Option<&str>) -> Vec<Action> {
         let mut actions = vec![];
         let mut groups: Vec<Option<String>> = vec![];
         for j in &self.jobs {
@@ -1507,6 +1604,7 @@ impl Remote {
                     let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 3.0, if connected { crate::ui::theme::ACCENT } else { DIM });
                     ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
+                    if let Some(l) = net_label { ui.label(RichText::new(l).color(DIM).size(11.0)); }
                     if !connected { ui.label(RichText::new("Offline").color(DIM).size(11.0)); }
                 });
                 if let Some(id) = group.as_deref() {
@@ -1522,7 +1620,7 @@ impl Remote {
                         ui.add(egui::Label::new(RichText::new(&j.name).strong().size(12.0)).truncate()).on_hover_text(&j.name);
                         ui.colored_label(if j.state == "failed" { egui::Color32::from_rgb(225, 110, 110) } else { DIM }, RichText::new(&j.state).size(11.0));
                         if let (Some(id), false) = (&j.job_id, j.terminal()) {
-                            if ui.add_enabled(!j.cancel_requested, egui::Button::new(if j.cancel_requested { "Stopping" } else { "Cancel" }).small()).clicked() { actions.push(Action::CancelJob(id.clone())); }
+                            if ui.add_enabled(!j.cancel_requested, egui::Button::new(if j.cancel_requested { "Stopping" } else { "Cancel" }).small()).clicked() { actions.push(Action::CancelJob { creds: self.key.clone(), job_id: id.clone() }); }
                         }
                     });
                     if j.stages.is_empty() { ui.label(RichText::new(&j.state).color(DIM)); }
@@ -1556,43 +1654,54 @@ impl Remote {
         actions
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, s: &Settings) -> Vec<Action> {
+    /// One connection's card: its own Connect / Receive / Default Batch / Remove controls and state.
+    pub fn card(&self, ui: &mut Ui, cfg: &Conn, is_default: bool, blocker: Option<String>) -> Vec<Action> {
         let mut acts = vec![];
-        if !self.available() {
-            ui.label(RichText::new("Network rendering is not available in this build.").color(DIM));
-            return acts;
-        }
-        let (line, up) = self.status_line(s);
-        ui.colored_label(if up { egui::Color32::from_rgb(150, 190, 150) } else { egui::Color32::from_rgb(224, 176, 80) }, line);
-        if let Some(m) = &self.status {
-            ui.label(RichText::new(m).color(DIM).size(12.0));
-        }
-        if let Some(url) = &self.network_url {
-            ui.label(RichText::new(format!("Network: {url} · ID {}", self.network_id.as_deref().unwrap_or("unreported"))).color(DIM).size(11.5));
-        }
-        let paired = self.me.is_some() || credentials_path(s, None).is_some_and(|c| c.exists()) || !s.network.credentials.is_empty();
-        egui::CollapsingHeader::new("Connection").default_open(!paired).show(ui, |ui| {
+        let creds = self.key.clone();
+        egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let (line, up) = self.status_line(cfg);
+            ui.label(RichText::new(self.label()).strong());
+            ui.colored_label(if up { egui::Color32::from_rgb(150, 190, 150) } else { egui::Color32::from_rgb(224, 176, 80) }, line);
+            if let Some(m) = &self.status {
+                ui.label(RichText::new(m).color(DIM).size(12.0));
+            }
+            if let Some(m) = &self.name_note {
+                ui.label(RichText::new(m).color(DIM).size(11.5));
+            }
+            if let Some(n) = self.network_id.as_deref() {
+                ui.label(RichText::new(format!("ID {n}")).color(DIM).size(11.5));
+            }
             ui.horizontal_wrapped(|ui| {
-                let mut en = s.network.enabled;
-                if crate::ui::theme::checkbox(ui, &mut en, "Connect to network").changed() {
-                    acts.push(Action::Enable(en));
+                let mut en = cfg.enabled;
+                if crate::ui::theme::checkbox(ui, &mut en, "Connect").changed() {
+                    acts.push(Action::Enable { creds: creds.clone(), on: en });
                 }
-                let mut rc = s.network.receive;
+                let mut rc = cfg.receive;
                 if crate::ui::theme::checkbox(ui, &mut rc, "Accept work when GPU idle").changed() {
-                    acts.push(Action::Receive(rc));
+                    acts.push(Action::Receive { creds: creds.clone(), on: rc });
+                }
+                let mut def = is_default;
+                if crate::ui::theme::checkbox(ui, &mut def, "Default for Batch").changed() && def {
+                    acts.push(Action::DefaultSubmit(creds.clone()));
+                }
+                let remove = ui.add_enabled(blocker.is_none(), egui::Button::new("Remove"));
+                let remove = match &blocker { Some(b) => remove.on_disabled_hover_text(format!("Cannot remove now: {b}")), None => remove };
+                if remove.clicked() {
+                    acts.push(Action::Remove(creds.clone()));
                 }
             });
-            ui.label(RichText::new("Pairing credentials are stored in a private file next to your preferences; they are never shown here or in any project.").color(DIM).size(11.5));
-            if s.network.receive {
-                ui.label(RichText::new("Receiving: a network job runs on this computer's own local client, only when it is idle and its shared locations resolve here. Hint, Key and Deliver run on this computer's own local client; movie/external sources and Resume/Replace are not part of the first network release.").color(DIM).size(11.5));
+            if cfg.receive {
+                ui.label(RichText::new("Receiving: a network job runs on this computer's own local client, only when it is idle and its shared locations resolve here. Only one network's job runs at a time.").color(DIM).size(11.5));
+            }
+            if let Rx::Owned(m) = &self.rx {
+                ui.colored_label(egui::Color32::from_rgb(225, 110, 110), m);
+                if ui.button("I checked this computer: forget this attempt locally").clicked() {
+                    acts.push(Action::ForgetAttempt(creds.clone()));
+                }
             }
         });
-        if let Rx::Owned(m) = &self.rx {
-            ui.colored_label(egui::Color32::from_rgb(225, 110, 110), m);
-            if ui.button("I checked this computer: forget this attempt locally").clicked() {
-                acts.push(Action::ForgetAttempt);
-            }
-        }
+        ui.add_space(6.0);
         acts
     }
 }

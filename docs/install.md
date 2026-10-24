@@ -10,7 +10,7 @@ Keyloom installs for your own user account. Installing the app does not enable n
 | Linux | 64-bit, glibc 2.30 or newer. Linux Mint 22.x is the expected target; it has not been tested on a clean machine. |
 | GPU | NVIDIA GPU with the vendor driver installed in the operating system |
 | Linux libraries | OpenGL/EGL, X11 or Wayland client libraries, xkbcommon, fontconfig, freetype, glib, dbus, libstdc++. The installer checks these first and prints an `apt` hint on Debian/Ubuntu/Mint if something is missing. |
-| Internet | Needed to download the installer (if hosted privately, you must be signed in to GitHub) and the models |
+| Internet | Needed to obtain the installer from its owner (the source repository is private; no GitHub sign-in is needed to run it), for the online installer's wheel downloads (PyPI / PyTorch / NVIDIA), and for the models |
 | Disk | About 9 GiB for the app (allow roughly 18 GiB during an update), plus room for the **full** model set (large) and your project media. Projects can live on any drive. |
 
 You do **not** need to install Python, Rust, FFmpeg, the CUDA toolkit or the Visual C++ runtime. The app includes Python, FFmpeg, CUDA user-space libraries and the required Visual C++ runtime; no compiler or toolkit is needed. A missing NVIDIA driver only produces a warning during install, because models can still be downloaded, but you cannot render without it.
@@ -104,6 +104,32 @@ Later commands:
 ~/.local/opt/CorridorKey/bin/corridorkey-setup rollback
 ~/.local/opt/CorridorKey/bin/corridorkey-setup uninstall
 ```
+
+## Online installer (smaller download, installs or updates only what changed)
+
+Besides the offline installers above, an **online installer** exists for Linux and Windows. It **contains Keyloom itself** (the application, its own Python runtime and FFmpeg) and leaves out only the very large public dependencies, mainly PyTorch and the NVIDIA CUDA user-space libraries. Those are downloaded during installation, each as a hash-pinned wheel from the public PyPI / PyTorch / NVIDIA package servers. The result is byte-for-byte the same version (`version_id`) and the same installed files as the full offline installer.
+
+**Getting it vs. installing it.** The source repository is private, so you receive the online installer from the owner **once, manually** (the same way as the offline installer). Running it needs **no GitHub access, sign-in, token, client id or release lookup**: the only connections are anonymous HTTPS downloads of the pinned public wheels, over HTTPS only. If everything is already installed and unchanged, it works completely offline.
+
+- **Every file is verified.** Each file of the finished install is checked against the install manifest (SHA-256 and size) before anything is activated; every downloaded wheel is checked against its pinned size and SHA-256, and only the entries the manifest names are extracted. The normal installer step then runs (OS-library check, validation, shortcuts, receipt, rollback).
+- **First install:** downloads only the wheels (several GiB; the size is printed before it starts), assembles a complete copy under the install folder and installs it.
+- **Update:** finds the existing install from its `receipt.json`. Files identical to the current or previous version are copied from the installed copy, the rest comes from the installer, and a wheel is downloaded only if a file it provides is still missing. If this exact build is already installed and every file verifies, it says so and exits without any network access.
+- **Repair:** `--repair` rebuilds the current version the same way and restores damaged files.
+- **Resume:** an interrupted download resumes from `.staging.dl` in the install folder (kept up to 6 hours, removed after a successful install).
+- **Keep:** projects, settings, credentials, network identities and certificates, jobs and models live outside the install folder and are never touched. Models and the NVIDIA display driver are **not** installed by the installer; the app offers models in **Settings → Models & runtime…**. A previously verified model state is kept on update. No compiler is needed on the PC.
+- **Quit Keyloom first.** The installer holds the same per-user instance lock as the app for the whole run. If Keyloom (even hidden) is running, it stops with exit code 4; choose **File → Quit** and run it again. It never launches Keyloom.
+- **Install folder:** the default (see above), or `--prefix`. On Windows the wrapper detects an existing install, including one in a custom folder chosen in the Inno Setup dialog, and updates that one.
+
+Options of the shared client (`packaging/online.py`), normally supplied by the wrapper:
+
+| Option | Meaning |
+|---|---|
+| `--payload-dir PATH` | The bundled slim stage (with the original `install-manifest.json`) |
+| `--sources PATH` | `wheel-sources.json`: version, and the public wheel URLs with size, SHA-256 and the files each provides |
+| `--prefix DIR` | Install somewhere else (default as above); an existing install there is detected by its receipt |
+| `--repair` | Rebuild and verify the current version |
+
+Exit codes: `0` installed or already up to date, `2` failed (the previous install is untouched), `4` Keyloom is running, `130` interrupted. Allow free space for the new version plus the wheels being downloaded, and room for the activation step: about three times the size of the app on first install (see *What you need*).
 
 ## Models
 

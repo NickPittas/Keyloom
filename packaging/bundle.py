@@ -3,6 +3,9 @@
     python packaging/bundle.py bundle   --out dist/            # stage dir (runtime + app + UI + FFmpeg)
     python packaging/bundle.py linux    --out dist/            # stage + self-extracting .run installer
     python packaging/bundle.py windows  --out dist/            # stage + Inno Setup .exe (build on Windows)
+    python packaging/bundle.py online-linux|online-windows --out dist/ [--stage S] [--wheel-cache DIR]
+        (online installer: bundles Keyloom itself, leaves out only torch/triton/nvidia-* files that the public PyPI /
+         PyTorch wheels reproduce byte for byte; S = a finished stage, else one is built first)
 
 Build host = target OS: the runtime is installed with `uv` from the pinned per-OS lock
 (packaging/locks/*.txt), and git is needed for the two git-pinned dependencies. No model
@@ -12,9 +15,13 @@ Stdlib only (plus the external tools above); each function is importable for tes
 from __future__ import annotations
 
 import argparse
+import csv
+import email.parser
 import hashlib
+import html
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -22,6 +29,10 @@ import sys
 import tarfile
 import time
 import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -485,11 +496,265 @@ def make_windows_exe(stage: Path, out: Path, iscc: str | None) -> Path:
     return built[-1]
 
 
+# ---- online installers: Keyloom itself is bundled; only the large public wheels are fetched at install time ----
+
+HEAVY_MIN = 1 << 20  # stage files at least this big that belong to a heavy wheel are omitted from the slim payload
+INDEXES = ["https://pypi.org/simple/", "https://download.pytorch.org/whl/cu128/"]  # same order as PY_INDEXES
+HREF_RE = re.compile(r"""<a\s[^>]*?href\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _heavy(name: str) -> bool:
+    # torchvision is small enough to stay bundled. sam-2's git-built CUDA extension is never a wheel: it stays in the payload.
+    return name in ("torch", "triton", "triton-windows") or name.startswith("nvidia-")
+
+
+def lock_pins() -> dict:
+    """{normalized name: (version, {sha256, ...})} from the pinned per-OS lock."""
+    pins = {}
+    text = (REPO / "packaging/locks" / f"{PLATFORM}.txt").read_text().replace("\\\n", " ")
+    for line in text.splitlines():
+        m = re.match(r"([A-Za-z0-9][\w.-]*)==([^\s;]+)(.*)$", line)
+        if m:
+            pins[_norm(m[1])] = (m[2], set(re.findall(r"--hash=sha256:([0-9a-f]{64})", m[3])))
+    return pins
+
+
+def _get(url: str, tries: int = 3) -> bytes | None:
+    """Page bytes, None for 404 (project not on this index)."""
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "keyloom-build"}), timeout=60) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            err = e
+        except OSError as e:
+            err = e
+        if i == tries - 1:
+            raise SystemExit(f"cannot fetch {url}: {err}")
+        time.sleep(2 ** i)
+
+
+def _wheel_id(filename: str):
+    """(normalized name, version, {py-abi-platform tags}) from a wheel file name (PEP 427)."""
+    parts = filename[:-len(".whl")].split("-")
+    if len(parts) not in (5, 6):
+        raise ValueError(filename)
+    tags = {f"{p}-{a}-{pl}" for p in parts[-3].split(".") for a in parts[-2].split(".") for pl in parts[-1].split(".")}
+    return _norm(parts[0]), parts[1], tags
+
+
+def find_wheel(name: str, version: str, tags: set, hashes: set) -> tuple[str, str]:
+    """Exact public wheel URL + sha256: name, version and every platform tag must match what is installed, and the
+    index-advertised hash must be one of the lock's pinned hashes (a hash only the index states is never trusted)."""
+    for index in INDEXES:
+        page = _get(index + name + "/")
+        if page is None:
+            continue
+        for m in HREF_RE.finditer(page.decode("utf-8", "replace")):
+            url, frag = urllib.parse.urldefrag(urllib.parse.urljoin(index + name + "/", html.unescape(m[1] if m[1] is not None else m[2])))
+            fn = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1])
+            if not fn.endswith(".whl"):
+                continue
+            try:
+                n, v, t = _wheel_id(fn)
+            except ValueError:
+                continue
+            sha = dict(urllib.parse.parse_qsl(frag)).get("sha256")
+            if n == name and v.lower() == version.lower() and t == tags and sha in hashes and url.startswith("https://"):
+                return url, sha
+    raise SystemExit(f"no public wheel for {name}=={version} {sorted(tags)} matches a hash in {PLATFORM}.txt on {INDEXES}")
+
+
+def fetch_wheel(url: str, sha: str, cache: Path) -> Path:
+    cache.mkdir(parents=True, exist_ok=True)
+    dest = cache / f"{sha}.whl"
+    if dest.is_file() and sha256_file(dest) == sha:
+        return dest
+    part = dest.with_suffix(".part")
+    for i in range(3):
+        h = hashlib.sha256()
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "keyloom-build"}), timeout=60) as r, \
+                    open(part, "wb") as f:
+                for c in iter(lambda: r.read(1 << 20), b""):
+                    h.update(c)
+                    f.write(c)
+            break
+        except OSError as e:
+            if i == 2:
+                raise SystemExit(f"cannot download {url}: {e}")
+            time.sleep(2 ** i)
+    if h.hexdigest() != sha:
+        part.unlink()
+        raise SystemExit(f"{url}: sha256 differs from the lock's pinned hash")
+    part.replace(dest)
+    return dest
+
+
+def _site_packages(stage: Path) -> Path:
+    sites = [*stage.glob("runtime/python/Lib/site-packages"), *stage.glob("runtime/python/lib/python3.*/site-packages")]
+    if len(sites) != 1:
+        raise SystemExit(f"expected exactly one site-packages in {stage}/runtime/python, found {len(sites)}")
+    return sites[0]
+
+
+def wheel_sources(stage: Path, cache: Path) -> tuple[dict, set]:
+    """Plan the online install: map every >=1 MiB regular stage file of the heavy wheels (torch, triton, nvidia-*)
+    to its entry in the exact public wheel. Returns (wheel-sources.json content, mapped stage-relative paths).
+    Fails listing any such file that is not mapped byte-for-byte (size + sha256 from the stage's install manifest)."""
+    manifest = json.loads((stage / "install-manifest.json").read_text())
+    files = manifest["files"]
+    site = _site_packages(stage)
+    site_rel = site.relative_to(stage).as_posix()
+    pins = lock_pins()
+    wheels, mapped, problems = [], set(), []
+    for di in sorted(site.glob("*.dist-info")):
+        meta = email.parser.Parser().parsestr((di / "METADATA").read_text(encoding="utf-8", errors="replace"), headersonly=True)
+        name, version = _norm(meta["Name"] or ""), meta["Version"] or ""
+        if not _heavy(name):
+            continue
+        big = []  # stage-relative regular files of this distribution, as RECORD lists them
+        with open(di / "RECORD", newline="", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                rel = posixpath.normpath(posixpath.join(site_rel, row[0])) if row else ".."
+                if rel.startswith(".."):
+                    continue
+                p = stage / rel
+                if p.is_relative_to(di):
+                    continue  # Installer-generated metadata (notably RECORD) stays bundled verbatim.
+                if p.is_file() and not p.is_symlink() and p.stat().st_size >= HEAVY_MIN:
+                    big.append(rel)
+        if not big:
+            continue  # e.g. nvidia-ml-py: stays in the payload
+        tags = {l.split(":", 1)[1].strip() for l in (di / "WHEEL").read_text().splitlines() if l.startswith("Tag:")}
+        pin = pins.get(name)
+        if not pin or pin[0].lower() != version.lower():
+            raise SystemExit(f"{name} {version} is not pinned with that version in {PLATFORM}.txt")
+        url, sha = find_wheel(name, version, tags, pin[1])
+        whl = fetch_wheel(url, sha, cache)
+        with zipfile.ZipFile(whl) as z:
+            zmap = {}
+            for info in z.infolist():
+                n = info.filename
+                if n.split("/", 1)[0].endswith(".data"):
+                    sub = n.split("/", 2)
+                    if len(sub) < 3 or sub[1] not in ("purelib", "platlib"):
+                        continue  # scripts/headers/data land outside site-packages
+                    n_site = sub[2]
+                else:
+                    n_site = n
+                if not info.is_dir() and ".." not in n_site.split("/"):
+                    zmap[posixpath.join(site_rel, n_site)] = info
+            entries = {}
+            for rel in big:
+                info, want = zmap.get(rel), files.get(rel)
+                if rel in mapped:
+                    problems.append(f"{rel}: claimed by two wheels")
+                elif info is None:
+                    problems.append(f"{rel}: not in {whl.name}")
+                elif not want or "sha256" not in want:
+                    problems.append(f"{rel}: not a regular file in the install manifest")
+                else:
+                    h, size = hashlib.sha256(), 0
+                    with z.open(info) as src:
+                        for c in iter(lambda: src.read(1 << 20), b""):
+                            h.update(c)
+                            size += len(c)
+                    if (h.hexdigest(), size) != (want["sha256"], want["size"]):
+                        problems.append(f"{rel}: bytes differ from {whl.name}:{info.filename}")
+                    else:
+                        entries[rel] = info.filename
+        mapped.update(entries)
+        wheels.append({"url": url, "sha256": sha, "size": whl.stat().st_size, "files": entries})
+    if problems:
+        raise SystemExit("heavy files not reproducible from public wheels:\n  " + "\n  ".join(problems))
+    return {"schema": 1, "version_id": manifest["version_id"], "wheels": wheels}, mapped
+
+
+def make_slim(stage: Path, dest: Path, mapped: set) -> Path:
+    """Copy (hardlink where possible) the stage keeping symlinks, omitting ONLY the mapped regular files."""
+    def ignore(d, names):
+        return {n for n in names if (Path(d) / n).relative_to(stage).as_posix() in mapped}
+    shutil.copytree(stage, dest, symlinks=True, ignore=ignore, copy_function=_link_or_copy)
+    files = json.loads((stage / "install-manifest.json").read_text())["files"]
+    gone = [r for r in files if r not in mapped and not os.path.lexists(dest / r)]
+    if gone or any(os.path.lexists(dest / r) for r in mapped):
+        raise SystemExit(f"slim payload differs from the plan: missing {gone[:5]}")
+    return dest
+
+
+def make_wrapper(stage: Path, out: Path, cache: Path, smoke: bool) -> Path:
+    """<out>/online-boot/keyloom-online/{payload/, wheel-sources.json}; the sources are never inside the payload."""
+    wrap = out / "online-boot" / "keyloom-online"
+    shutil.rmtree(wrap.parent, ignore_errors=True)
+    wrap.mkdir(parents=True)
+    sources, mapped = wheel_sources(stage, cache)
+    make_slim(stage, wrap / "payload", mapped)
+    (wrap / "wheel-sources.json").write_text(json.dumps(sources, indent=1))
+    if smoke:
+        py = wrap / "payload/runtime/python" / ("python.exe" if IS_WIN else "bin/python3")
+        subprocess.run([str(py), "-I", "-B", str(wrap / "payload/app/packaging/online.py"), "--help"], check=True,
+                       stdout=subprocess.DEVNULL)
+    return wrap
+
+
+def make_online_run(stage: Path, out: Path, cache: Path, smoke: bool) -> Path:
+    vid = json.loads((stage / "install-manifest.json").read_text())["version_id"]
+    wrap = make_wrapper(stage, out, cache, smoke)
+    print("compressing online payload", flush=True)
+    tgz = out / "online-payload.tar.gz"
+    with tarfile.open(tgz, "w:gz", compresslevel=3) as t:
+        t.add(wrap, arcname="keyloom-online")
+    shutil.rmtree(wrap.parent)
+    sha = sha256_file(tgz)
+    stub = (REPO / "packaging/linux/online-stub.sh").read_text().replace("@PAYLOAD_SHA256@", sha).replace("@VERSION_ID@", vid)
+    run = out / f"Keyloom-online-{vid}-linux-x86_64.run"
+    with open(run, "wb") as f:
+        f.write(stub.encode())
+        with open(tgz, "rb") as p:
+            shutil.copyfileobj(p, f, 1 << 20)
+    run.chmod(0o755)
+    tgz.unlink()
+    (out / (run.name + ".sha256")).write_text(f"{sha256_file(run)}  {run.name}\n")
+    return run
+
+
+def make_online_exe(stage: Path, out: Path, cache: Path, smoke: bool, iscc: str | None) -> Path:
+    if not IS_WIN:
+        raise SystemExit("The Windows online installer must be built on Windows (it carries the stage's Windows "
+                         "interpreter and needs Inno Setup). Nothing was built.")
+    exe = find_iscc(iscc)
+    m = json.loads((stage / "install-manifest.json").read_text())
+    wrap = make_wrapper(stage, out, cache, smoke)
+    text = (REPO / "packaging/windows/keyloom-online.iss.in").read_text()
+    for k, v in {"@VERSION_ID@": m["version_id"], "@APP_VERSION@": m["app_version"], "@WRAP@": str(wrap), "@OUT@": str(out)}.items():
+        text = text.replace(k, v)
+    iss = out / "keyloom-online.iss"
+    iss.write_text(text, encoding="utf-8-sig")
+    subprocess.run([exe, str(iss)], check=True)
+    stem = f"Keyloom-online-{m['version_id']}-windows-x86_64"  # no "-setup": make_windows_exe globs Keyloom-*-setup.exe
+    built = out / (stem + ".exe")
+    if not built.is_file():
+        raise SystemExit("ISCC finished but produced no online setup exe")
+    shutil.rmtree(wrap.parent)
+    files = [built, *sorted(out.glob(stem + "-*.bin"))]
+    (out / (built.name + ".sha256")).write_text("".join(f"{sha256_file(f)}  {f.name}\n" for f in files))
+    return built
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("target", choices=["bundle", "linux", "windows"])
+    ap.add_argument("target", choices=["bundle", "linux", "windows", "online-linux", "online-windows"])
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--ffmpeg-dir", required=True, type=Path, help="dir with static ffmpeg + ffprobe")
+    ap.add_argument("--ffmpeg-dir", type=Path, help="dir with static ffmpeg + ffprobe (needed whenever a stage is built)")
+    ap.add_argument("--stage", type=Path, help="online-*: use this finished stage instead of building one")
+    ap.add_argument("--wheel-cache", type=Path, help="online-*: where the heavy public wheels are downloaded/verified (default OUT/wheel-cache)")
     ap.add_argument("--ui-binary", type=Path)
     ap.add_argument("--build-ui", action="store_true", help="cargo build --release first")
     ap.add_argument("--python-version", default="3.11.16", help="exact version, e.g. 3.11.16")
@@ -499,19 +764,30 @@ def main(argv=None) -> int:
     ap.add_argument("--no-smoke", action="store_true")
     ap.add_argument("--reuse-runtime", type=Path, help="existing <stage>/runtime/python built by this tool (hardlinked, lock-checked)")
     a = ap.parse_args(argv)
-    if a.target == "linux" and IS_WIN or a.target == "windows" and not IS_WIN:
-        raise SystemExit(f"build the {a.target} installer on a {a.target} host")
+    if a.target in ("linux", "online-linux") and IS_WIN or a.target in ("windows", "online-windows") and not IS_WIN:
+        raise SystemExit(f"build the {a.target} installer on a {a.target.split('-')[-1]} host")
     a.out.mkdir(parents=True, exist_ok=True)
-    stage = build_stage(a.out.resolve(), ui_binary=a.ui_binary, build_ui=a.build_ui,
-                        ffmpeg_dir=a.ffmpeg_dir, py_version=a.python_version, smoke=not a.no_smoke, max_glibc=a.max_glibc,
-                        runtime_dir=a.reuse_runtime)
-    if a.target == "linux":
-        run = make_linux_run(stage, a.out.resolve())
+    out = a.out.resolve()
+    if a.stage and a.target.startswith("online-"):
+        stage = a.stage.resolve()
+    else:
+        if not a.ffmpeg_dir:
+            raise SystemExit("--ffmpeg-dir is required to build a stage (or pass a finished --stage to online-*)")
+        stage = build_stage(out, ui_binary=a.ui_binary, build_ui=a.build_ui,
+                            ffmpeg_dir=a.ffmpeg_dir, py_version=a.python_version, smoke=not a.no_smoke, max_glibc=a.max_glibc,
+                            runtime_dir=a.reuse_runtime)
+    cache = (a.wheel_cache or out / "wheel-cache").resolve()
+    if a.target == "online-linux":
+        print(make_online_run(stage, out, cache, not a.no_smoke))
+    elif a.target == "online-windows":
+        print(make_online_exe(stage, out, cache, not a.no_smoke, a.iscc))
+    elif a.target == "linux":
+        run = make_linux_run(stage, out)
         print(run)
         if a.split:
             print(*split_linux_run(run), sep="\n")
     elif a.target == "windows":
-        print(make_windows_exe(stage, a.out.resolve(), a.iscc))
+        print(make_windows_exe(stage, out, a.iscc))
     else:
         print(stage)
     return 0

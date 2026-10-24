@@ -11,11 +11,11 @@ Protocol v1 — one JSON object per line on stdin (UTF-8, <= 1 MiB incl. newline
   startup : {"event": "ready", "protocol": 1}      EOF on stdin or op "close" ends the process (exit 0).
 stdout carries nothing else; stderr gets at most a few bounded diagnostics. Requests are served in order.
 Ops (args are exact; unknown keys are refused; bodies are validated by the coordinator):
-  pair          invitation_path, credentials_path, name   -> installation_id   (credentials written 0600, never echoed;
+  pair          invitation_path, credentials_path, name, [existing_credentials_path, existing_credentials_paths[]]   -> installation_id   (credentials written 0600, never echoed;
                 the destination is reserved before the one-use code is redeemed)
   connect       credentials_path                           -> installation_id   (session id kept beside it, 0600; takes an exclusive
                 lock on <credentials>.lock until close/EOF/exit, so a second bridge on the same credentials gets `busy`)
-  register      build, gpu{uuid,name,vram_total_mb,ram_total_mb}
+  register      build, gpu{uuid,name,vram_total_mb,ram_total_mb}, [name]   (name = this PC's display name; updates the same installation)
   submit        submission_id, spec, target
   claim         claim_id, capabilities, resources
   start         attempt_id, effective_plan
@@ -24,10 +24,12 @@ Ops (args are exact; unknown keys are refused; bodies are validated by the coord
   stats         seq, measured_age_ms, [cpu_percent, ram_used_bytes, ram_total_bytes, gpus]   (README stats schema)
   cancel | job  job_id          job_events  job_id, [after, limit]          installations      close
   service_status|service_start|service_stop|service_remove  state_dir        service_install  state_dir, address, port, allow_address_join
-  join_address  url, name, credentials_path, [existing_credentials_path]       service_local_join  state_dir, credentials_path, name, [existing_credentials_path]
+  join_address  url, name, credentials_path, [existing_credentials_path, existing_credentials_paths[]]
+  service_local_join  state_dir, credentials_path, name, [existing_credentials_path, existing_credentials_paths[]]
   network_invite  path (needs a connected link; writes a reusable 7-day non-admin invitation file, reply never carries the code)
   pair/join_address/service_local_join reply {installation_id, credentials_path, reused[, url, fingerprint_sha256, network_id]}: with
-  existing_credentials_path pinning the SAME certificate nothing is redeemed and the existing identity is reused.
+  an existing candidate pinning the SAME certificate nothing is redeemed and that identity is reused (credentials_path = the saved one);
+  unreadable unrelated candidates are skipped. Status adds certificate_addresses[].
   Extra error codes: service_unavailable, permission, port_in_use, service_conflict, not_installed, not_configured, cert_mismatch,
   start_failed, start_timeout. Service ops use no coordinator connection and work with nothing paired.
 Errors: codes from the coordinator are passed through; bridge codes are bad_request, too_large, unknown_op,
@@ -81,6 +83,26 @@ def _path(v, what):
     if not isinstance(v, str) or not v or len(v) > 4096 or "\0" in v:
         raise BridgeError("bad_request", f"{what} must be a path string")
     return v
+
+
+_EXISTING = ("existing_credentials_path", "existing_credentials_paths")
+
+
+def _same_network(a, fingerprint):
+    """(path, credentials) of the first saved identity pinning this certificate, else None. Candidates are read only:
+    an unreadable/missing unrelated one is skipped so it cannot block joining a different network."""
+    paths = [] if "existing_credentials_path" not in a else [a["existing_credentials_path"]]
+    extra = a.get("existing_credentials_paths", [])
+    if not isinstance(extra, list) or len(extra) > 64:
+        raise BridgeError("bad_request", "existing_credentials_paths must be a list of at most 64 paths")
+    for p in dict.fromkeys(_path(p, "existing credentials path") for p in paths + extra):  # validate (type) before dedupe
+        try:
+            have = pki.read_credentials(p)
+        except (OSError, ValueError, pki.SecurityError):
+            continue
+        if hmac.compare_digest(have["fingerprint_sha256"].lower(), fingerprint.lower()):
+            return p, have
+    return None
 
 
 class _Net:
@@ -148,14 +170,13 @@ class Bridge:
     # ---- operations -------------------------------------------------------------------------------
 
     def op_pair(self, a):
-        _need(a, ("invitation_path", "credentials_path", "name"), ("existing_credentials_path",))
+        _need(a, ("invitation_path", "credentials_path", "name"), _EXISTING)
         inv = pki.read_invitation(_path(a["invitation_path"], "invitation_path"))
         self._secret(inv["code"])
         dest = _path(a["credentials_path"], "credentials_path")
-        if "existing_credentials_path" in a:  # same network (pinned certificate) as the existing identity: reuse it, redeem nothing
-            have = pki.read_credentials(_path(a["existing_credentials_path"], "existing_credentials_path"))
-            if hmac.compare_digest(have["fingerprint_sha256"].lower(), inv["fingerprint_sha256"].lower()):
-                return {"installation_id": have["installation_id"], "credentials_path": a["existing_credentials_path"], "reused": True}
+        have = _same_network(a, inv["fingerprint_sha256"])  # same network (pinned certificate) as a saved identity: reuse it, redeem nothing
+        if have:
+            return {"installation_id": have[1]["installation_id"], "credentials_path": have[0], "reused": True}
         # Same routine as the CLI: reserves the private destination BEFORE the one-use code is redeemed.
         return {"installation_id": redeem_to_file(inv, dest, a["name"]), "credentials_path": dest, "reused": False}
 
@@ -183,20 +204,28 @@ class Bridge:
 
     def _joined(self, a, url, **kw):
         dest = _path(a["credentials_path"], "credentials_path")
-        ex = a.get("existing_credentials_path")
-        iid, fp, reused = join_to_file(url, dest, a["name"], existing=None if ex is None else _path(ex, "existing_credentials_path"),
-                                       timeout=self.timeout, **kw)
-        return {"installation_id": iid, "credentials_path": ex if reused else dest, "reused": reused,
+        pem = kw.pop("pem", None)
+        if pem is None:  # fetch ONCE (trust on first use, as join_to_file does) so the matching saved identity can be chosen first
+            host, port = pki.endpoint(url)
+            try:
+                pem = ssl.get_server_certificate((host, port), timeout=self.timeout)  # handshake only: nothing is sent
+            except (OSError, ValueError) as e:
+                raise CoordinatorError(0, "transport", f"could not reach {host}:{port} ({type(e).__name__})") from None
+            if not pki.cert_covers_host(pem, host):
+                raise pki.SecurityError(f"the certificate presented by {host} does not cover that address; not trusting it")
+        have = _same_network(a, pki.fingerprint(pem))
+        iid, fp, reused = join_to_file(url, dest, a["name"], existing=have and have[0], timeout=self.timeout, pem=pem, **kw)
+        return {"installation_id": iid, "credentials_path": have[0] if reused else dest, "reused": reused,
                 "fingerprint_sha256": fp, "network_id": pki.network_id(fp)}
 
     def op_join_address(self, a):
-        _need(a, ("url", "name", "credentials_path"), ("existing_credentials_path",))
+        _need(a, ("url", "name", "credentials_path"), _EXISTING)
         url = _path(a["url"], "url")
         host, port = pki.endpoint(url)
         return {**self._joined(a, url), "url": f"https://{host if ':' not in host else '[' + host + ']'}:{port}"}
 
     def op_service_local_join(self, a):
-        sd = _svc.state_path(self._state_dir(a, ("state_dir", "credentials_path", "name"), ("existing_credentials_path",)))
+        sd = _svc.state_path(self._state_dir(a, ("state_dir", "credentials_path", "name"), _EXISTING))
         cfg = _svc.read_config(sd) if sd.is_dir() else None
         if not cfg or not _svc.lock_busy(sd):
             raise BridgeError("service_unavailable", "the network service is not running on this PC")
@@ -256,9 +285,10 @@ class Bridge:
                 "url": creds["url"], "network_id": pki.network_id(creds["fingerprint_sha256"])}
 
     def op_register(self, a):
-        _need(a, ("build", "gpu"))
+        _need(a, ("build", "gpu"), ("name",))
         c = self._live()
-        return c.register({"protocol": _c.PROTOCOL, "session_id": self.session_id, "build": a["build"], "gpus": [a["gpu"]]})
+        name = {"name": a["name"]} if "name" in a else {}  # the coordinator validates it (<= 64 chars)
+        return c.register({"protocol": _c.PROTOCOL, "session_id": self.session_id, "build": a["build"], "gpus": [a["gpu"]], **name})
 
     def op_submit(self, a):
         _need(a, ("submission_id", "spec", "target"))

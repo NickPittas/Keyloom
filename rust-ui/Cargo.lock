@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "corridorkey-ui"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "eframe",
  "exr",

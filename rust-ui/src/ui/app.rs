@@ -218,7 +218,7 @@ pub struct App {
     metrics: driver::Held<crate::metrics::Supervisor>,
     metrics_wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     metrics_rect: Option<egui::Rect>,
-    remote: driver::Held<crate::remote::Remote>,
+    remote: driver::Held<crate::remote_set::RemoteSet>,
     setup: crate::network_setup::Setup,
     /// The runtime driver thread (set by `App::new`, the window path); `None` = this host ticks inline from `frame`.
     driver: Option<driver::Driver>,
@@ -375,7 +375,7 @@ impl App {
             metrics: driver::Held::new(opts.metrics.supervisor(opts.repo.as_deref().or(launch.repo.as_deref()), launch.python.clone())),
             metrics_wake: None,
             metrics_rect: None,
-            remote: driver::Held::new(crate::remote::Remote::new(opts.net.clone())),
+            remote: driver::Held::new(crate::remote_set::RemoteSet::new(opts.net.clone())),
             setup: crate::network_setup::Setup::new(opts.net.clone()),
             driver: None,
             net_repo: opts.repo.clone().or(launch.repo.clone()),
@@ -910,7 +910,7 @@ impl App {
         for action in queue_actions { self.net_action(action); }
     }
 
-    fn batch_queue(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote::Remote, local: &crate::metrics::View, active: &[u32], telemetry: &std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>) -> Vec<crate::remote::Action> {
+    fn batch_queue(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote_set::RemoteSet, local: &crate::metrics::View, active: &[u32], telemetry: &std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>) -> Vec<crate::remote::Action> {
         ui.heading("Queue");
         let mut actions = vec![];
         egui::ScrollArea::vertical().id_salt("batch_work_queue").auto_shrink([false; 2]).show(ui, |ui| {
@@ -2591,6 +2591,7 @@ impl App {
                 repo: self.net_repo.as_deref(),
                 python: self.net_python.as_deref(),
                 wake,
+                cfg: Default::default(),
             };
             self.remote.tick(now, &mut env);
             for f in self.remote.take_finished() {
@@ -2599,66 +2600,78 @@ impl App {
                 }
             }
         }
-        if let Some(c) = self.remote.take_paired() {
-            self.settings.open();
-            let n = &mut self.settings.draft_mut().network;
-            (n.enabled, n.credentials) = (true, c);
-            if !self.settings.apply() {
-                self.ai.notice = Some("Paired, but the connection settings could not be saved.".into());
-            }
-        }
     }
 
-    /// A join finished: switch to its connection only when nothing on the current network would be orphaned.
-    fn net_joined(&mut self, j: crate::network_setup::Joined) {
-        let (s, sp) = (self.settings.saved(), self.settings.store_path());
-        let same = crate::remote::credentials_path(s, sp).is_some_and(|c| c == std::path::Path::new(&j.creds));
-        if !same {
-            if let Some(why) = self.remote.switch_blocker(s, sp) {
-                self.setup.set_note(format!("Joined, but this computer stays on its current network: {why}. Try again when that is finished."));
-                return;
-            }
-            self.remote.switch_network();
-        }
-        self.settings.open();
-        let n = &mut self.settings.draft_mut().network;
-        (n.enabled, n.credentials) = (true, j.creds);
+    /// Save the edited network settings and hand them to the driver.
+    fn net_save(&mut self, what: &str) {
         if self.settings.apply() {
             if let Some(d) = &self.driver {
                 d.publish(self.settings.saved(), self.settings.store_path());
             }
         } else {
-            self.ai.notice = Some("Joined, but the connection settings could not be saved.".into());
+            self.ai.notice = Some(format!("{what}, but the connection settings could not be saved."));
         }
+    }
+
+    /// Open the settings draft with the connection list as the source of truth (a legacy single connection becomes
+    /// its first entry), so edits never touch the other networks.
+    fn net_draft(&mut self) -> &mut crate::settings::Network {
+        let sp = self.settings.store_path().map(std::path::PathBuf::from);
+        self.settings.open();
+        let n = &mut self.settings.draft_mut().network;
+        if n.extra.get("connections_migrated").and_then(serde_json::Value::as_bool) != Some(true) {
+            n.materialize(sp.as_deref());
+        }
+        n
+    }
+
+    /// A join finished: keep every existing connection and session; only an explicit Save changes the global name.
+    fn net_joined(&mut self, j: crate::network_setup::Joined) {
+        let known = self.remote.infos().into_iter().any(|c| c.credentials == j.creds || (j.network_id.is_some() && c.network_id == j.network_id));
+        let n = self.net_draft();
+        match n.connections.iter_mut().find(|c| c.credentials == j.creds) {
+            Some(c) => c.enabled = true, // rejoining a saved (possibly unticked) connection connects it
+            None if !known => n.connections.push(crate::settings::Connection { credentials: j.creds, enabled: true, ..Default::default() }),
+            None => {}
+        }
+        self.net_save("Joined");
     }
 
     fn net_action(&mut self, a: crate::remote::Action) {
         use crate::remote::Action;
         match a {
-            Action::Pair { invitation, name } => self.remote.pair(invitation, name),
-            Action::Enable(on) => {
-                self.settings.open();
-                self.settings.draft_mut().network.enabled = on;
-                self.settings.apply();
+            Action::Pair { .. } => {}
+            Action::Enable { creds, on } => {
+                if let Some(c) = self.net_draft().connections.iter_mut().find(|c| c.credentials == creds) {
+                    c.enabled = on;
+                }
+                self.net_save("Updated");
             }
-            Action::Receive(on) => {
-                self.settings.open();
-                self.settings.draft_mut().network.receive = on;
-                self.settings.apply();
+            Action::Receive { creds, on } => {
+                if let Some(c) = self.net_draft().connections.iter_mut().find(|c| c.credentials == creds) {
+                    c.receive = on;
+                }
+                self.net_save("Updated");
             }
-            Action::CancelJob(id) => self.remote.cancel_job(&id),
-            Action::ForgetAttempt => {
-                let env = crate::remote::Env {
-                    settings: self.settings.saved(),
-                    settings_path: self.settings.store_path(),
-                    ai: &mut self.ai,
-                    metrics: &crate::metrics::View::Starting,
-                    repo: None,
-                    python: None,
-                    wake: &(std::sync::Arc::new(|| {}) as std::sync::Arc<dyn Fn() + Send + Sync>),
-                };
-                self.remote.forget_attempt(&env);
+            Action::DefaultSubmit(creds) => {
+                self.net_draft().default_submit = creds;
+                self.net_save("Updated");
             }
+            Action::Remove(creds) => {
+                if let Some(why) = self.remote.remove_blocker(&creds) {
+                    self.ai.notice = Some(format!("Connection not removed: {why}."));
+                    return;
+                }
+                let n = self.net_draft();
+                n.connections.retain(|c| c.credentials != creds);
+                if n.default_submit == creds {
+                    n.default_submit.clear();
+                }
+                self.remote.remove(&creds);
+                self.net_save("Removed");
+            }
+            Action::CancelJob { creds, job_id } => self.remote.cancel_job(&creds, &job_id),
+            Action::ForgetAttempt(creds) => self.remote.forget_attempt(&creds),
         }
     }
 
@@ -2959,14 +2972,15 @@ impl App {
                             if let Some(p) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.client_telemetry, &paired) {
                                 self.ai.placement = p;
                             }
-                            net_actions = self.remote.ui(ui, self.settings.saved());
+                            net_actions = self.remote.ui(ui, self.settings.saved(), self.settings.store_path());
                             if self.remote.available() {
+                                let infos = self.remote.infos();
                                 let cx = crate::network_setup::Ctx {
                                     settings: self.settings.saved(),
                                     settings_path: self.settings.store_path(),
                                     connected: self.remote.online(),
-                                    blocker: self.remote.switch_blocker(self.settings.saved(), self.settings.store_path()),
-                                    invite_note: self.remote.invite_note.as_deref(),
+                                    connections: &infos,
+                                    invite_note: self.remote.invite_note(),
                                 };
                                 setup_cmds = self.setup.ui(ui, &cx);
                             }
@@ -2977,7 +2991,15 @@ impl App {
                 }
                 for c in setup_cmds {
                     match c {
-                        crate::network_setup::Cmd::Invite(p) => self.remote.invite(p),
+                        crate::network_setup::Cmd::Invite { connection, path } => {
+                            if !self.remote.invite(&connection, path) {
+                                self.ai.notice = Some("Invitation not created: that network is no longer connected on this computer.".into());
+                            }
+                        }
+                        crate::network_setup::Cmd::SaveName(n) => {
+                            self.net_draft().name = n;
+                            self.net_save("Name changed");
+                        }
                         crate::network_setup::Cmd::Browse(k) => {
                             let w = ctx.clone();
                             self.picker.start(k, None, move || w.request_repaint());

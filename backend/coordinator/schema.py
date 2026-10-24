@@ -354,7 +354,9 @@ def validate_target(v):
 # ---- session / claim / events --------------------------------------------------------------------
 
 def validate_session(b):
-    obj(b, "session", ("protocol", "session_id", "build", "gpus"))
+    obj(b, "session", ("protocol", "session_id", "build", "gpus"), ("name",))
+    if "name" in b:  # the PC's display name; updates the same installation row, never creates identity
+        text(b["name"], "name", 64)
     if b["protocol"] != PROTOCOL or isinstance(b["protocol"], bool):
         bad("unsupported protocol", "unsupported_protocol")
     ident(b["session_id"], "session_id")

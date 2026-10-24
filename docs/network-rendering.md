@@ -4,14 +4,18 @@ Keyloom — powered by CorridorKey can send work to other Windows and Linux PCs 
 
 Every installation can submit work, receive work, and host a network. One PC hosts each network's shared machine list and queue. All PCs that join that network see all its members. The host can render too. Creating a separate host creates a separate network; it does not merge two queues.
 
+Hosting is independent of the networks a PC joins. A PC can host its own network **and** stay connected to other hosts' networks at the same time: **Add network** adds a connection and never replaces or disconnects the ones you already have. Each saved network keeps its own credentials, session and controls (connect, receive work), and joining the same network again reuses the saved identity instead of registering the PC twice.
+
+**This computer's name** is a single setting. Press **Save** and the new name is sent to every connected host; disconnected hosts receive it when they reconnect. Older hosts must update Keyloom to accept name changes. Existing names are kept until you explicitly save a name.
+
 ## 1. Choose the host
 
-Use a PC that will normally stay on. Normal setup needs no terminal. In **Clients → Network setup → Host a network on this PC**:
+Use a PC that will normally stay on. Normal setup needs no terminal. In **Clients → Network setup → Host on THIS PC**:
 
-1. Enter an **Address** that **every PC can actually reach**, and a **Port** (normally `8443`). Use the LAN IPv4 address if all PCs can route to it; if they cannot (different subnets, VPN, remote sites), use the host's Tailscale IP instead. The host's certificate is pinned to this address, so changing the address later means a new identity: choose it deliberately.
+1. Enter an **Address** that **every PC can actually reach**, and a **Port** (normally `8443`). Use the LAN IPv4 address if all PCs can route to it; if they cannot (different subnets, VPN, remote sites), use the host's Tailscale IP instead. The host's certificate is created for this address and PCs that join pin it, so Keyloom never regenerates it: if you later need another address, only addresses the certificate already covers work (see Troubleshooting).
 2. Tick **Trusted network: allow joining by address** if joining by IP and port is acceptable on your trusted LAN/Tailscale network. Leave it off to require an invitation file.
 3. Press **Install and start**.
-4. On the host PC, press **Join this network on this computer** (give it a **Name**), then tick **Accept work when GPU idle** if the host should render too.
+4. On the host PC, press **Also join this PC’s own network from this PC**, then tick **Accept work when GPU idle** if the host should render too. This only adds the connection; joining another PC's network is done separately under **Add network**.
 
 **Host service and client are different processes.** Installing the service creates a per-user service: a `systemd --user` unit on Linux, or a per-user logon task on Windows (with an HKCU Run entry as fallback if Windows refuses the task without elevation). It starts when you sign in, needs no administrator rights, and runs separately from the Keyloom window, so quitting the GUI does not stop it. Use **Stop** to stop it or **Remove** (click twice) to remove its sign-in entry; its local database keeps the network's identity and members. The service only coordinates the machine list and queue; it does not render. Rendering is done by that PC's Keyloom client, which must be running. Turn on [background running](user-guide.md#background-running) to keep the client alive when its window is closed.
 
@@ -19,9 +23,19 @@ The first run may bring up an OS firewall prompt: allow it on your trusted/priva
 
 ![Clients and network setup](screenshots/native/13-pairing.png)
 
+## 2. Add connections to other hosts
+
+On each PC, open **Clients → Network setup → Add network**. Enter the host's address and port, then press **Join by address**. The host must allow joining by address; otherwise use an invitation as described below. Repeat for each host you want this PC to use. Hosting on this PC does not disconnect these connections.
+
+Each joined network has its own **Connect** and receive-work controls. **Default for Batch** chooses the preferred network for automatic placement; if it is disconnected, automatic placement uses a connected network. Assigning a particular PC keeps that network and PC as the destination. Keyloom accepts work from one network at a time so separate hosts cannot reserve the same GPU concurrently.
+
+**Remove** disconnects a network from this PC's list and preserves its saved identity and history for rejoining. It is unavailable while that connection has unfinished work or an unresolved attempt. Removing a connection does not remove the host service.
+
+The setup screenshot above predates the multiple-connection controls; the written steps describe the updated interface.
+
 ## 3. Use an invitation instead (optional)
 
-A connected member opens **Invite other PCs**, chooses **Save invitation to**, and presses **Create invitation**. Give that **same file** to each PC you want to add; on each PC pick it under **Invitation file (optional)** and press **Join with invitation**.
+A connected member opens **Invite other PCs**, picks which of their connected networks the invitation is for, chooses **Save invitation to**, and presses **Create invitation**. Give that **same file** to each PC you want to add; on each PC pick it under **Invitation file (optional)** and press **Join with invitation**.
 
 The invitation points to the same network and includes its certificate identity. It is reusable for seven days. Every joining PC receives its own private credentials and sees the shared machine list. It is not a connection only to the PC that saved the file. Keep the invitation private while it is valid.
 
@@ -76,6 +90,6 @@ Cancelling is cooperative and keeps frames already written. An offline PC keeps 
 | Different or incomplete machine list | Check that every PC joined the same host/network, rather than creating separate networks. |
 | PC visible but not receiving | Enable receiving work, keep its client running, and confirm its GPU is idle and models are ready. |
 | Shared files unavailable | Open the share as the desktop user and test the mapping in Keyloom. |
-| Certificate identity error | Check the host/address. Keep the existing network state; recreating it creates a different identity. |
+| Certificate does not cover the address (`cert_mismatch`) | The host's existing certificate is kept because joined PCs trust it. Under **Host on THIS PC** press one of the **Use address** buttons (the addresses the certificate covers), then **Apply and start**. Do not delete the service folder; that would create a different network and orphan every joined PC. |
 
 Pairing credentials and the service database stay on local disk, outside projects. Keep their tokens private. Renaming the app preserves the existing settings and model locations.

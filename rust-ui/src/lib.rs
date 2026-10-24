@@ -18,6 +18,7 @@ pub mod project;
 pub mod queue;
 pub mod relink;
 pub mod remote;
+pub mod remote_set;
 pub mod runtime;
 pub mod scheduler;
 pub mod settings;

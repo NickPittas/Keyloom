@@ -1,0 +1,97 @@
+; Keyloom (powered by CorridorKey) Windows ONLINE installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
+; Per-user, no admin, no service, no firewall rule, no listener, no account or sign-in. This exe carries Keyloom itself
+; (app, UI, FFmpeg, bundled Python and every small dependency) unpacked into {tmp} (deleted when Setup exits); online.py
+; then downloads only the large public wheels (torch, triton, NVIDIA CUDA libraries) from PyPI / download.pytorch.org,
+; reusing files of the installed versions, and hands the assembled payload to lifecycle.py (same transactional install as
+; the full installer). No models here: download them from the app. Projects, settings, network identities and models are
+; never touched. It is NOT uninstallable and registers no Add/Remove Programs entry (Uninstallable=no) with its own AppId,
+; so it never replaces or breaks the full installer's entry; uninstall with "<prefix>\bin\corridorkey-setup.cmd uninstall".
+#define VID "@VERSION_ID@"
+
+[Setup]
+AppId={{E4A7B1C3-6D2F-4B8A-9C15-3F0D7A52E964}
+AppName=Keyloom Online Setup
+AppVersion=@APP_VERSION@
+AppPublisher=Keyloom (powered by CorridorKey)
+CreateAppDir=no
+Uninstallable=no
+PrivilegesRequired=lowest
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+OutputDir=@OUT@
+OutputBaseFilename=Keyloom-online-{#VID}-windows-x86_64
+Compression=lzma2/fast
+SolidCompression=no
+DiskSpanning=yes
+; 1900 MiB slices like the full installer: the exe and every -N.bin must sit in one folder.
+DiskSliceSize=1992294400
+DisableWelcomePage=yes
+DisableDirPage=yes
+DisableProgramGroupPage=yes
+DisableReadyPage=yes
+DisableFinishedPage=yes
+SetupMutex=KeyloomOnlineSetupMutex
+CloseApplications=no
+
+[Files]
+Source: "@WRAP@\*"; DestDir: "{tmp}\keyloom-online"; Flags: recursesubdirs createallsubdirs ignoreversion
+
+[Code]
+var
+  FailCode: Integer;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  Result := FailCode;  { nonzero => the setup process itself reports failure }
+end;
+
+{ Where the install lives: /PREFIX=DIR wins, else the folder the full Inno installer recorded (a custom location chosen
+  there), else the default %LOCALAPPDATA%\Programs\CorridorKey. Never ends in a backslash (it goes into a quoted command line). }
+function ExistingPrefix: String;
+var
+  Key, S: String;
+begin
+  Result := ExpandConstant('{param:PREFIX|}');
+  if Result = '' then
+  begin
+    Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{7C1E6C52-3B0F-4D5A-9E57-2D6C7A0B7E21}_is1';
+    if RegQueryStringValue(HKCU, Key, 'Inno Setup: App Path', S) or RegQueryStringValue(HKLM, Key, 'Inno Setup: App Path', S) then
+      if DirExists(S) then Result := S;
+  end;
+  if Result = '' then Result := ExpandConstant('{localappdata}\Programs\CorridorKey');
+  Result := RemoveBackslashUnlessRoot(Result);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Boot, Prefix, Args: String;
+  Rc: Integer;
+begin
+  if CurStep = ssInstall then
+  begin
+    if Length(ExistingPrefix) <= 3 then
+    begin
+      SuppressibleMsgBox('The install folder cannot be a drive root (for example use D:\Apps\CorridorKey).', mbError, MB_OK, IDOK);
+      FailCode := 5;
+      Abort;
+    end;
+    exit;
+  end;
+  if CurStep <> ssPostInstall then exit;
+  Boot := ExpandConstant('{tmp}\keyloom-online');
+  Prefix := ExistingPrefix;
+  Args := '-I -B "' + Boot + '\payload\app\packaging\online.py" --payload-dir "' + Boot + '\payload" --sources "' +
+          Boot + '\wheel-sources.json" --prefix "' + Prefix + '"';
+  if ExpandConstant('{param:REPAIR|0}') = '1' then Args := Args + ' --repair';
+  { Visible console: the client prints its real download/verify progress. }
+  if not Exec(Boot + '\payload\runtime\python\python.exe', Args, '', SW_SHOW, ewWaitUntilTerminated, Rc) then
+    Rc := 2;
+  if Rc = 0 then exit;
+  FailCode := Rc;
+  if Rc = 4 then
+    SuppressibleMsgBox('Keyloom is running. Quit it with File > Quit (a background network service does not need to be stopped) and run setup again. Nothing was changed.', mbError, MB_OK, IDOK)
+  else if Rc = 130 then
+    SuppressibleMsgBox('Setup was cancelled. The previous Keyloom install (if any) is unchanged.', mbInformation, MB_OK, IDOK)
+  else
+    SuppressibleMsgBox('Keyloom setup FAILED (code ' + IntToStr(Rc) + '). The previous install (if any) is unchanged. Run setup from a Command Prompt to keep the console output, then try again.', mbError, MB_OK, IDOK);
+end;

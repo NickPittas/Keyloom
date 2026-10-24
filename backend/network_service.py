@@ -369,6 +369,13 @@ def _port_free(port):
         s.close()
 
 
+def cert_addresses(pem):
+    """Host names / IPs the network certificate covers (what clients may be told to connect to)."""
+    from backend.coordinator import pki
+    san = pki.x509.load_pem_x509_certificate(pem.encode()).extensions.get_extension_for_class(pki.x509.SubjectAlternativeName).value
+    return [str(a) for a in san.get_values_for_type(pki.x509.IPAddress)] + list(san.get_values_for_type(pki.x509.DNSName))
+
+
 def _cert_ok(sd, address):
     """Keep existing networks, including older certificates without loopback names."""
     from backend.coordinator import pki
@@ -377,11 +384,11 @@ def _cert_ok(sd, address):
         raise ServiceError("cert_mismatch", "the certificate and key files are inconsistent; they were not regenerated")
     if cert.exists():
         pem = cert.read_text(encoding="utf-8")
-        bad = [] if pki.cert_covers_host(pem, address) else [address]
-        if bad:
-            raise ServiceError("cert_mismatch", f"the existing network certificate does not cover {', '.join(bad)}; it was not "
-                               "regenerated (that would create a different network). Use the original address, or remove the "
-                               "service state folder yourself to start a new network")
+        if not pki.cert_covers_host(pem, address):
+            usable = [a for a in cert_addresses(pem) if a.lower() not in LOCALHOSTS]
+            raise ServiceError("cert_mismatch", f"the existing network certificate does not cover {address}; it was not regenerated "
+                               "because PCs already joined trust it. Host on one of its covered addresses"
+                               + (f": {', '.join(usable)}." if usable else "."))
 
 
 # ---- public operations ---------------------------------------------------------------------------
@@ -402,6 +409,7 @@ def status(state_dir):
         from backend.coordinator import pki
         out["fingerprint_sha256"] = pki.fingerprint(cert.read_text(encoding="utf-8"))
         out["network_id"] = pki.network_id(out["fingerprint_sha256"])
+        out["certificate_addresses"] = [a for a in cert_addresses(cert.read_text(encoding="utf-8")) if a.lower() not in LOCALHOSTS]
     st = (_read_json(sd / "service-state.json") or {}) if exists else {}
     if st.get("state") == "failed" and not out["running"]:
         out["message"], out["error_code"] = st.get("message", ""), st.get("code", "start_failed")
