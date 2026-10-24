@@ -12,7 +12,7 @@ Build installers ONLY with the canonical command, on the target OS:
 
 ### Windows build workflow (Kamino3 only)
 - Edit on Endor, commit and push to the private `origin`, then `git pull` in the ONE persistent Kamino3 checkout. That is the only way source reaches Windows: no source archives, snapshots, scp/rsync/SSH file pipes, fallback copies or duplicate checkout folders, and no copy of any runtime/model/artifact over 100 MB.
-- Build dependencies (pinned Python, wheels, FFmpeg, toolchains) are downloaded once into ONE persistent git-ignored build folder outside Git and only re-downloaded when their pinned version changes. They are never committed and never copied from an installed app.
+- Build dependencies (pinned Python runtime, original wheels, FFmpeg, toolchains) are downloaded once into the ONE persistent git-ignored `.build` folder of that checkout (`build_release.py` creates and reuses it; see `packaging/README.md`), outside Git and only re-downloaded when their pinned version changes. They are never committed and never copied from an installed app.
 - Windows builds and tests never run on Kamino1; a build never installs, launches or modifies an installed app.
 - The staged self-check at build time uses `bundle.BUILD_SELFCHECK_TIMEOUT` (finite, 300 s); installer phase limits (`lifecycle.PHASE_TIMEOUT`, 10 s / 30 s total) are unchanged.
 

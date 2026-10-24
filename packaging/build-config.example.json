@@ -1,10 +1,8 @@
 {
-  "runtime_dir": "~/.cache/keyloom-release-linux-2.3.0-candidate/stage/runtime/python",
   "ffmpeg_dir": "~/.cache/ck-ffmpeg-pinned/bin",
-  "wheel_cache": "~/.cache/ck-toolchain/public-wheels-linux",
   "out_root": "~/keyloom-builds",
   "python_version": "3.11.16",
   "split": true,
   "deadline_seconds": 14400,
-  "timeouts": {"ui": 1800, "stage": 7200, "offline": 7200, "online": 7200}
+  "timeouts": {"ui": 1800, "runtime": 7200, "stage": 7200, "offline": 7200, "online": 7200}
 }

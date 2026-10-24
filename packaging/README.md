@@ -29,7 +29,7 @@ failure and success for inspection or reuse; delete when done), the installers a
 child process tree is killed.
 
 One-time machine config (optional on Linux; required keys on Windows): `~/.config/keyloom-build.json` (or `--config FILE`), see
-`packaging/build-config.example.json`. Keys: `runtime_dir` (a validated `<stage>/runtime/python`; omit to build with `uv`), `ffmpeg_dir`
+`packaging/build-config.example.json`. Keys: `build_cache`, `runtime_dir` (a validated `<stage>/runtime/python`; default `<build_cache>/runtime/python`, built once if missing), `ffmpeg_dir`
 (Linux default `~/.cache/ck-ffmpeg-pinned/bin`, create with `sh packaging/linux/fetch-ffmpeg.sh`), `wheel_cache` (Linux default
 `~/.cache/ck-toolchain/public-wheels-linux`), `iscc`, `cargo_target_dir` (Windows warmed target), `out_root`, `python_version`, `split`
 (Linux `.run` also written as <=1900 MiB parts), `timeouts`, `deadline_seconds`. Unknown keys fail the build.
@@ -42,8 +42,19 @@ The build-time staged self-check (`bundle.BUILD_SELFCHECK_TIMEOUT`, 300 s) is de
 
 **Windows workflow (Kamino3 only).** Commit and push on the dev machine, then `git pull` in the single persistent Kamino3 checkout; never ship source by archive,
 snapshot, scp/rsync/SSH pipe or a second checkout, and never copy a runtime, model or artifact over 100 MB. Pinned build dependencies (Python, wheels, FFmpeg,
-Rust/Inno) are downloaded once into one persistent git-ignored build folder outside Git (`runtime_dir`, `wheel_cache`, `iscc`, `cargo_target_dir` in the build config) and
-updated only when a pin changes. No Windows build or test on Kamino1, and the build never installs, launches or alters an installed app.
+Rust/Inno) are downloaded once into one persistent git-ignored build folder outside Git and updated only when a pin changes. No Windows build or test on Kamino1,
+and the build never installs, launches or alters an installed app.
+
+**Persistent build cache (`build_cache`, default `<checkout>/.build`, git-ignored).** The canonical build owns it; later builds after a `git pull` reuse it and do not
+reinstall, re-download or rebuild unchanged dependencies:
+- `runtime/python`: the Python runtime + locked packages. If it does not exist, the `runtime` phase builds it ONCE (`bundle.provision_runtime`: private `runtime.work` dir, moved
+  into place only after `.ck-runtime-provenance.json` is written, so a failed build never leaves a half-valid cache). If it exists, only its provenance (lock hash + recipe) is
+  checked and every stage hardlinks it. A changed lock/recipe fails with an explicit message: move the old runtime away (it is never auto-deleted) or point `runtime_dir` at a new path.
+- `wheels`: the ONE shared cache of the ORIGINAL pinned public wheels (torch, triton, nvidia-*), stored under their real wheel file names with a `.ok` marker written after the sha256
+  (lock-pinned hash) was verified. The runtime install (`uv`, via `name @ file://<cached wheel> --hash=...`) and the online installer plan (`wheel_sources`) use the same cached bytes, so each
+  wheel is downloaded once. Git-pinned `sam-2`/`utils3d` stay pinned git sources.
+- `uv-cache`, `cargo-target` (Windows) and `ffmpeg/bin` (Windows; place the pinned FFmpeg here, or set `ffmpeg_dir`). Config keys `runtime_dir`, `wheel_cache`, `ffmpeg_dir`, `cargo_target_dir`
+  override individual locations; `timeouts.runtime` (7200 s) bounds the one-time runtime phase.
 
 ### Internal: `packaging/bundle.py`
 The low-level toolbox that `build_release.py` calls (`build_stage`, `make_linux_run`, `split_linux_run`, `make_windows_exe`, `make_online_*`, `validate_reused_runtime`).

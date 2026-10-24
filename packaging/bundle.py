@@ -254,8 +254,11 @@ def _link_or_copy(src, dst):
         shutil.copy2(src, dst)
 
 
-def stage_runtime(stage: Path, py_version: str, uv: str = "uv") -> str:
+def stage_runtime(stage: Path, py_version: str, uv: str = "uv", wheel_cache: Path | None = None) -> str:
     """Managed standalone CPython (relocatable) + hashed lock install. Returns lock sha256.
+
+    With `wheel_cache`, the heavy pinned wheels (torch, triton, nvidia-*) are downloaded ONCE into that shared cache under
+    their original names and installed by uv from those files (same bytes the online installer plan later reuses).
 
     py_version must be exact (e.g. 3.11.16): uv>=0.8 also creates a minor-version symlink next to
     the real directory, which must never end up in the bundle.
@@ -274,7 +277,12 @@ def stage_runtime(stage: Path, py_version: str, uv: str = "uv") -> str:
     py = target / ("python.exe" if IS_WIN else "bin/python3")
     # Wheels are installed for an explicit old-glibc platform tag so cryptography & co. do not pick their
     # newest-glibc wheel; the two git-pinned sdists (sam-2, utils3d) are built in a second step.
-    text = lock.read_text()
+    text = lock.read_text().replace("\\\n", " ")  # one logical requirement per line
+    if wheel_cache:
+        local = prefetch_heavy_wheels(py_version.split(".")[1], wheel_cache)
+        text = "\n".join(
+            f"{m[1]} @ {local[_norm(m[1])][0].resolve().as_uri()} --hash=sha256:{local[_norm(m[1])][1]}"
+            if (m := re.match(r"([A-Za-z0-9][\w.-]*)==", l)) and _norm(m[1]) in local else l for l in text.splitlines()) + "\n"
     git = [l for l in text.splitlines() if " @ git+" in l]
     wheels = Path(tmp.parent / "wheels.lock.txt")
     wheels.write_text("\n".join(l for l in text.splitlines() if l not in git) + "\n")
@@ -375,7 +383,8 @@ def validate_reused_runtime(runtime_dir: Path) -> str:
     prov = json.loads(mark.read_text())
     lock_sha = prov.get("lock_sha256")
     if prov.get("recipe") != RUNTIME_RECIPE or lock_sha != sha256_file(REPO / "packaging/locks" / f"{PLATFORM}.txt"):
-        raise SystemExit("reused runtime was built with a different recipe/lock; rebuild it (stage_runtime)")
+        raise SystemExit(f"runtime {runtime_dir} was built with a different recipe/lock (a pin changed). It is never deleted automatically: "
+                         "move it away or set runtime_dir to a new path, then rerun the build to create the new runtime once")
     if prov.get("sam2_c_sha256"):
         c = sorted(runtime_dir.glob("lib/python*/site-packages/sam2/_C*.so"))
         if len(c) != 1 or sha256_file(c[0]) != prov["sam2_c_sha256"]:
@@ -383,8 +392,24 @@ def validate_reused_runtime(runtime_dir: Path) -> str:
     return lock_sha
 
 
+def provision_runtime(runtime_dir: Path, py_version: str, wheel_cache: Path, uv: str = "uv") -> str:
+    """The persistent runtime cache: an existing `runtime_dir` is only validated (never touched, hashed beyond its provenance,
+    or rebuilt); a missing one is built ONCE in a private sibling work dir and moved into place only after stage_runtime
+    wrote its provenance, so a failed build leaves no half-valid cache. Returns the lock sha256."""
+    if runtime_dir.exists():
+        return validate_reused_runtime(runtime_dir)
+    work = runtime_dir.parent / f"{runtime_dir.name}.work"  # ours alone; a leftover is an unfinished earlier attempt
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    stage_runtime(work, py_version, uv, wheel_cache)
+    (work / "runtime/python").rename(runtime_dir)
+    shutil.rmtree(work, ignore_errors=True)
+    return validate_reused_runtime(runtime_dir)
+
+
 def build_stage(out: Path, *, ui_binary=None, build_ui=False, ffmpeg_dir: Path, py_version="3.11.16",
-                runtime_dir: Path | None = None, uv="uv", smoke=True, max_glibc: str | None = "2.31") -> Path:
+                runtime_dir: Path | None = None, uv="uv", smoke=True, max_glibc: str | None = "2.31",
+                wheel_cache: Path | None = None) -> Path:
     """Returns the finished stage dir. `runtime_dir` (tests/offline) substitutes the uv install."""
     reused_lock = validate_reused_runtime(runtime_dir) if runtime_dir else None
     stage = out / "stage"
@@ -403,7 +428,7 @@ def build_stage(out: Path, *, ui_binary=None, build_ui=False, ffmpeg_dir: Path, 
         # Hardlink copy: the multi-GB runtime is reused without duplicating bytes (same filesystem).
         shutil.copytree(runtime_dir, stage / "runtime/python", symlinks=True, copy_function=_link_or_copy)
     else:
-        lock_sha = stage_runtime(stage, py_version, uv)
+        lock_sha = stage_runtime(stage, py_version, uv, wheel_cache)
     if IS_WIN:
         stage_vc_runtime(stage)
     descriptor(stage, version)
@@ -735,9 +760,8 @@ def _wheel_id(filename: str):
     return _norm(parts[0]), parts[1], tags
 
 
-def find_wheel(name: str, version: str, tags: set, hashes: set) -> tuple[str, str]:
-    """Exact public wheel URL + sha256: name, version and every platform tag must match what is installed, and the
-    index-advertised hash must be one of the lock's pinned hashes (a hash only the index states is never trusted)."""
+def _index_wheels(name: str):
+    """(url, sha256 the index states, tags, version) of every wheel file of `name` on the indexes (hash NOT yet trusted)."""
     for index in INDEXES:
         page = _get(index + name + "/")
         if page is None:
@@ -751,10 +775,45 @@ def find_wheel(name: str, version: str, tags: set, hashes: set) -> tuple[str, st
                 n, v, t = _wheel_id(fn)
             except ValueError:
                 continue
-            sha = dict(urllib.parse.parse_qsl(frag)).get("sha256")
-            if n == name and v.lower() == version.lower() and t == tags and sha in hashes and url.startswith("https://"):
-                return url, sha
+            if n == name and url.startswith("https://"):
+                yield url, dict(urllib.parse.parse_qsl(frag)).get("sha256"), t, v
+
+
+def find_wheel(name: str, version: str, tags: set, hashes: set) -> tuple[str, str]:
+    """Exact public wheel URL + sha256: name, version and every platform tag must match what is installed, and the
+    index-advertised hash must be one of the lock's pinned hashes (a hash only the index states is never trusted)."""
+    for url, sha, t, v in _index_wheels(name):
+        if v.lower() == version.lower() and t == tags and sha in hashes:
+            return url, sha
     raise SystemExit(f"no public wheel for {name}=={version} {sorted(tags)} matches a hash in {PLATFORM}.txt on {INDEXES}")
+
+
+def _tag_ok(tag: str, minor: str) -> bool:
+    py, abi, plat = tag.split("-")
+    if py not in (f"cp3{minor}", f"py3{minor}", "py3", "cp3") or abi not in (f"cp3{minor}", "abi3", "none"):
+        return False
+    if IS_WIN:
+        return plat in ("win_amd64", "any")
+    m = re.fullmatch(r"manylinux_2_(\d+)_x86_64", plat)  # the runtime is installed for x86_64-manylinux_2_28
+    return plat in ("any", "manylinux2014_x86_64", "manylinux2010_x86_64", "manylinux1_x86_64") or bool(m and int(m[1]) <= 28)
+
+
+def prefetch_heavy_wheels(minor: str, cache: Path) -> dict:
+    """Download (once, into the shared `cache`) the ORIGINAL pinned public wheel of every heavy distribution (torch, triton,
+    nvidia-*) that fits this target; the runtime install and the online installer plan then use these same cached bytes.
+    Returns {normalized name: (path, sha256)}. A wheel is chosen only if the lock pins its hash."""
+    jobs = [(n, v, hs) for n, (v, hs) in lock_pins().items() if _heavy(n)]
+
+    def one(job):
+        name, version, hashes = job
+        cands = sorted({(url, sha) for url, sha, t, v in _index_wheels(name)
+                        if v.lower() == version.lower() and sha in hashes and any(_tag_ok(x, minor) for x in t)})
+        if not cands:
+            raise SystemExit(f"no public wheel for {name}=={version} fits {PLATFORM} with a hash in {PLATFORM}.txt on {INDEXES}")
+        url, sha = max(cands, key=lambda c: c[0].rsplit("/", 1)[-1])
+        return name, (fetch_wheel(url, sha, cache), sha)
+    with ThreadPoolExecutor(max_workers=min(4, max(len(jobs), 1))) as pool:
+        return dict(pool.map(one, jobs))
 
 
 _FETCH_GUARD = threading.Lock()
@@ -771,18 +830,42 @@ def fetch_wheel(url: str, sha: str, cache: Path) -> Path:
 
 def _fetch_wheel(url: str, sha: str, cache: Path) -> Path:
     cache.mkdir(parents=True, exist_ok=True)
-    dest = cache / f"{sha}.whl"
-    if dest.is_file() and sha256_file(dest) == sha:
+    fn = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1])  # original wheel basename: uv/pip need a valid one
+    if Path(fn).name != fn or not fn.endswith(".whl"):
+        raise SystemExit(f"{url}: not a plain wheel file name")
+    dest = cache / fn
+    mark = cache / (fn + ".ok")  # written only after the sha256 was verified; unchanged size+mtime means no re-hash of a multi-GB wheel
+
+    def trusted() -> bool:
+        try:
+            st, m = dest.stat(), json.loads(mark.read_text())
+            return m == {"sha256": sha, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        except (OSError, ValueError):
+            return False
+
+    def stamp() -> Path:
+        st = dest.stat()
+        mark.write_text(json.dumps({"sha256": sha, "size": st.st_size, "mtime_ns": st.st_mtime_ns}))
         return dest
+    if trusted():
+        return dest
+    if dest.is_file() and sha256_file(dest) == sha:
+        return stamp()
+    print(f"downloading {fn}", flush=True)
     part = dest.with_suffix(".part")
     for i in range(3):
-        h = hashlib.sha256()
+        h, got, t0, last = hashlib.sha256(), 0, time.monotonic(), 0.0
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "keyloom-build"}), timeout=60) as r, \
                     open(part, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0)
                 for c in iter(lambda: r.read(1 << 20), b""):
                     h.update(c)
                     f.write(c)
+                    got += len(c)
+                    if (now := time.monotonic()) - last >= 1:  # real bytes, once a second (the 60 s socket timeout is the stall limit)
+                        last = now
+                        print(f"  {fn}: {got >> 20}/{total >> 20} MiB, {got / max(now - t0, 1e-6) / 1e6:.1f} MB/s, {now - t0:.0f}s", flush=True)
             break
         except OSError as e:
             if i == 2:
@@ -792,7 +875,8 @@ def _fetch_wheel(url: str, sha: str, cache: Path) -> Path:
         part.unlink()
         raise SystemExit(f"{url}: sha256 differs from the lock's pinned hash")
     part.replace(dest)
-    return dest
+    print(f"downloaded {fn} ({dest.stat().st_size >> 20} MiB, sha256 verified)", flush=True)
+    return stamp()
 
 
 def _site_packages(stage: Path) -> Path:
@@ -1019,6 +1103,7 @@ def main(argv=None) -> int:
         raise SystemExit(f"build the {a.target} installer on a {a.target.split('-')[-1]} host")
     a.out.mkdir(parents=True, exist_ok=True)
     out = a.out.resolve()
+    cache = (a.wheel_cache or out / "wheel-cache").resolve()
     if a.stage and a.target.startswith("online-"):
         stage = a.stage.resolve()
     else:
@@ -1026,8 +1111,7 @@ def main(argv=None) -> int:
             raise SystemExit("--ffmpeg-dir is required to build a stage (or pass a finished --stage to online-*)")
         stage = build_stage(out, ui_binary=a.ui_binary, build_ui=a.build_ui,
                             ffmpeg_dir=a.ffmpeg_dir, py_version=a.python_version, smoke=not a.no_smoke, max_glibc=a.max_glibc,
-                            runtime_dir=a.reuse_runtime)
-    cache = (a.wheel_cache or out / "wheel-cache").resolve()
+                            runtime_dir=a.reuse_runtime, wheel_cache=cache)
     if a.target == "online-linux":
         print(make_online_run(stage, out, cache, not a.no_smoke))
     elif a.target == "online-windows":

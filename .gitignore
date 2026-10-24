@@ -16,3 +16,4 @@ VideoMaMaInferenceModule/checkpoints/
 rust-ui/target-oldglibc/
 rust-ui/target/
 packaging/dist/
+.build/

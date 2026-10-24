@@ -32,11 +32,11 @@ import run_monitored  # noqa: E402
 REPO, IS_WIN, PLATFORM = bundle.REPO, bundle.IS_WIN, bundle.PLATFORM
 DEFAULT_CONFIG = Path.home() / ".config" / "keyloom-build.json"  # outside the repo: never staged into a payload
 SLICE = 1992294400  # DiskSliceSize in both .iss templates (1900 MiB)
-TIMEOUTS = {"helper-load": 120, "ui": 1800, "stage": 7200, "offline": 7200, "online": 7200}  # seconds per phase
-KEYS = {"out_root", "ffmpeg_dir", "runtime_dir", "wheel_cache", "cargo_target_dir", "iscc", "python_version",
+TIMEOUTS = {"helper-load": 120, "ui": 1800, "runtime": 7200, "stage": 7200, "offline": 7200, "online": 7200}  # seconds per phase
+KEYS = {"out_root", "build_cache", "ffmpeg_dir", "runtime_dir", "wheel_cache", "cargo_target_dir", "iscc", "python_version",
         "split", "deadline_seconds", "timeouts"}
 FP_ROOTS = [*bundle.APP_DIRS, *bundle.APP_FILES, "ui/theme", "rust-ui/src", "rust-ui/tools", "rust-ui/Cargo.toml", "rust-ui/Cargo.lock"]
-FP_SKIP = {"__pycache__", ".git", "target", "target-oldglibc", "dist", "checkpoints", "weights", "tests"}
+FP_SKIP = {"__pycache__", ".git", "target", "target-oldglibc", "dist", ".build", "checkpoints", "weights", "tests"}
 
 
 class BuildError(Exception):
@@ -91,7 +91,8 @@ def git_state() -> dict:
 def load_config(path: Path | None, explicit: bool) -> dict:
     home = Path.home()
     cfg = {"out_root": REPO / "packaging/dist", "python_version": "3.11.16", "split": True, "deadline_seconds": 14400,
-           "timeouts": dict(TIMEOUTS), "runtime_dir": None, "iscc": None, "cargo_target_dir": None}
+           "timeouts": dict(TIMEOUTS), "runtime_dir": None, "iscc": None, "cargo_target_dir": None,
+           "build_cache": REPO / ".build"}
     if not IS_WIN:
         cfg["ffmpeg_dir"] = home / ".cache/ck-ffmpeg-pinned/bin"
         cfg["wheel_cache"] = home / ".cache/ck-toolchain/public-wheels-linux"
@@ -105,6 +106,15 @@ def load_config(path: Path | None, explicit: bool) -> dict:
                              f"allowed: {sorted(KEYS)}")
         for k, v in raw.items():
             cfg[k] = {**cfg["timeouts"], **v} if k == "timeouts" else v
+    # Persistent, git-ignored dependency cache inside the ONE checkout: downloaded/built once, reused by every later build
+    # (a `git pull` changes only code). Each key can still point elsewhere.
+    cfg["build_cache"] = Path(cfg["build_cache"]).expanduser().resolve()
+    bc = cfg["build_cache"]
+    cfg["runtime_dir"] = cfg["runtime_dir"] or bc / "runtime/python"
+    cfg["wheel_cache"] = cfg.get("wheel_cache") or bc / "wheels"
+    if IS_WIN:
+        cfg["ffmpeg_dir"] = cfg.get("ffmpeg_dir") or bc / "ffmpeg/bin"
+        cfg["cargo_target_dir"] = cfg["cargo_target_dir"] or bc / "cargo-target"
     for k in ("out_root", "ffmpeg_dir", "runtime_dir", "wheel_cache", "cargo_target_dir", "iscc"):
         if cfg.get(k):
             cfg[k] = Path(cfg[k]).expanduser()
@@ -239,10 +249,10 @@ def preflight(cfg: dict, b: Build, res: dict) -> None:
             raise BuildError(f"{tool} not found in ffmpeg_dir {cfg['ffmpeg_dir']} (Linux: sh packaging/linux/fetch-ffmpeg.sh)")
     if IS_WIN:
         res["tools"]["iscc"] = bundle.find_iscc(str(cfg["iscc"]) if cfg["iscc"] else None)  # SystemExit -> handled by caller
-    if cfg["runtime_dir"]:
+    if cfg["runtime_dir"].exists():  # the persistent runtime cache: validated, never rebuilt or deleted here
         res["inputs"]["runtime_lock_sha256"] = bundle.validate_reused_runtime(cfg["runtime_dir"])
     elif not shutil.which("uv"):
-        raise BuildError("no runtime_dir configured and `uv` not found: cannot build the Python runtime")
+        raise BuildError(f"runtime cache {cfg['runtime_dir']} does not exist yet and `uv` was not found: cannot create it")
     cfg["wheel_cache"].mkdir(parents=True, exist_ok=True)
     b.note("preflight ok")
 
@@ -297,10 +307,13 @@ def run_build(cfg: dict, b: Build, res: dict, preflight_only: bool) -> None:
         b.run("ui", ["sh", str(REPO / "packaging/linux/build-ui-old-glibc.sh")], t["ui"], REPO,
               {"PATH": "/usr/bin:/bin", "RUSTC": "/usr/bin/rustc", "CK_CARGO_FLAGS": "--locked --offline"})
     check_binary(ui)
+    if not cfg["runtime_dir"].exists():  # first build only: create the persistent runtime ONCE (heavy wheels via the shared wheel cache)
+        b.run("runtime", [py, str(Path(__file__).resolve()), "--_step", "runtime", "--runtime-dir", str(cfg["runtime_dir"]),
+                          "--python-version", cfg["python_version"], "--wheel-cache", str(cfg["wheel_cache"])],
+              t["runtime"], REPO, {"UV_CACHE_DIR": str(cfg["build_cache"] / "uv-cache")})
+        res["inputs"]["runtime_lock_sha256"] = bundle.validate_reused_runtime(cfg["runtime_dir"])
     cmd = [py, str(REPO / "packaging/bundle.py"), "bundle", "--out", str(out), "--ffmpeg-dir", str(cfg["ffmpeg_dir"]),
-           "--ui-binary", str(ui), "--python-version", cfg["python_version"]]
-    if cfg["runtime_dir"]:
-        cmd += ["--reuse-runtime", str(cfg["runtime_dir"])]
+           "--ui-binary", str(ui), "--python-version", cfg["python_version"], "--reuse-runtime", str(cfg["runtime_dir"])]
     b.run("stage", cmd, t["stage"], REPO)  # the single manifest + launch self-check (Python + UI)
     stage = out / "stage"
     man = json.loads((stage / "install-manifest.json").read_text())
@@ -329,6 +342,9 @@ def run_build(cfg: dict, b: Build, res: dict, preflight_only: bool) -> None:
 
 def worker(a) -> int:
     """Child process for the offline/online phases: existing bundle.py functions on the already-built stage."""
+    if a._step == "runtime":
+        bundle.provision_runtime(a.runtime_dir.resolve(), a.python_version, a.wheel_cache.resolve())
+        return 0
     stage, out, cache, iscc = a.stage.resolve(), a.out.resolve(), a.wheel_cache.resolve(), a.iscc
     if a._step == "offline":
         if IS_WIN:
@@ -347,7 +363,9 @@ def main(argv=None) -> int:
     ap.add_argument("--config", type=Path, help=f"JSON config (default {DEFAULT_CONFIG} if present)")
     ap.add_argument("--out-root", type=Path, help="parent of the per-run directory (default packaging/dist)")
     ap.add_argument("--preflight-only", action="store_true", help="validate config/tools/inputs, build nothing")
-    ap.add_argument("--_step", choices=["offline", "online"], help=argparse.SUPPRESS)
+    ap.add_argument("--_step", choices=["runtime", "offline", "online"], help=argparse.SUPPRESS)
+    ap.add_argument("--runtime-dir", type=Path, help=argparse.SUPPRESS)
+    ap.add_argument("--python-version", help=argparse.SUPPRESS)
     ap.add_argument("--stage", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--out", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--wheel-cache", type=Path, help=argparse.SUPPRESS)
