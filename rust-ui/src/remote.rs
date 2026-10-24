@@ -57,6 +57,8 @@ enum Pend {
     /// An empty event batch: asks the coordinator for the attempt's last accepted sequence.
     Resync,
     Estimate(String),
+    /// Writes a reusable invitation file (the bridge never returns its secret).
+    Invite,
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +202,8 @@ pub struct Remote {
     pend: HashMap<String, Pend>,
     retry_at: Option<Instant>,
     me: Option<String>,
+    network_url: Option<String>,
+    network_id: Option<String>,
     registered: bool,
     register_note: Option<String>,
     reg_inflight: bool,
@@ -209,6 +213,8 @@ pub struct Remote {
     last_claim: Option<Instant>,
     last_probe: Option<Instant>,
     claim_inflight: bool,
+    stats_inflight: bool,
+    installs_inflight: bool,
     pub installs: Vec<Install>,
     pub jobs: Vec<NetJob>,
     rx: Rx,
@@ -221,13 +227,14 @@ pub struct Remote {
     pub pair_invitation: String,
     pub pair_name: String,
     pub status: Option<String>,
+    pub invite_note: Option<String>,
     /// Shutdown began: nothing new is claimed.
     closing: bool,
     wake_hint: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-fn default_name() -> String {
-    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "CorridorKey PC".into())
+pub(crate) fn default_name() -> String {
+    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "Keyloom PC".into())
 }
 
 pub fn credentials_path(s: &Settings, settings_path: Option<&Path>) -> Option<PathBuf> {
@@ -286,7 +293,7 @@ fn protect_private(_path: &Path, _dir: bool) -> Result<(), String> {
 
 /// The folder credentials live in: created owner-only (0700 / a current-user-only ACL that new files inherit). An
 /// existing folder is left as the user made it.
-fn private_dir(d: &Path) -> Result<(), String> {
+pub(crate) fn private_dir(d: &Path) -> Result<(), String> {
     if d.exists() {
         return Ok(());
     }
@@ -300,7 +307,7 @@ fn private_dir(d: &Path) -> Result<(), String> {
 }
 
 /// Durable private write: temp file, fsync, rename. Every failure is returned; ownership is never assumed written.
-fn write_private(path: &Path, v: &Value) -> Result<(), String> {
+pub(crate) fn write_private(path: &Path, v: &Value) -> Result<(), String> {
     use std::io::Write;
     let tmp = side_file(path, ".tmp");
     if let Some(d) = path.parent() {
@@ -360,7 +367,7 @@ fn reconcile(meta: &Value) -> Recon {
 }
 
 /// Bounded, secret-free diagnostics on stderr (phase changes and every claim/offer/start/report step).
-fn nlog(msg: &str) {
+pub(crate) fn nlog(msg: &str) {
     static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let t = T0.get_or_init(Instant::now).elapsed().as_secs_f32();
     eprintln!("[net {t:7.1}s] {}", truncate(msg, 240));
@@ -370,7 +377,7 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().filter(|c| !c.is_control()).take(n).collect()
 }
 
-fn err_text(e: &LinkError) -> String {
+pub(crate) fn err_text(e: &LinkError) -> String {
     format!("{}: {}", e.code, truncate(&e.message, 300))
 }
 
@@ -383,6 +390,8 @@ impl Remote {
             pend: HashMap::new(),
             retry_at: None,
             me: None,
+            network_url: None,
+            network_id: None,
             registered: false,
             register_note: None,
             reg_inflight: false,
@@ -392,6 +401,8 @@ impl Remote {
             last_claim: None,
             last_probe: None,
             claim_inflight: false,
+            stats_inflight: false,
+            installs_inflight: false,
             installs: vec![],
             jobs: vec![],
             rx: Rx::Idle,
@@ -403,6 +414,7 @@ impl Remote {
             pair_invitation: String::new(),
             pair_name: default_name(),
             status: None,
+            invite_note: None,
             closing: false,
             wake_hint: None,
         }
@@ -429,6 +441,48 @@ impl Remote {
     /// Shots whose outputs just finished (the App re-reads them).
     pub fn take_finished(&mut self) -> Vec<String> {
         std::mem::take(&mut self.finished)
+    }
+    /// Ask the connected bridge for a reusable invitation file at `path`.
+    pub fn invite(&mut self, path: String) {
+        self.invite_note = Some(if self.online() && self.req(Op::NetworkInvite, json!({"path": path}), Pend::Invite) { "Creating the invitation…".into() } else { "Connect to a network first.".into() });
+    }
+    /// Why this computer may not leave its current network now (`None` = nothing would be orphaned).
+    pub fn switch_blocker(&self, s: &Settings, settings_path: Option<&Path>) -> Option<String> {
+        if self.jobs.iter().any(|j| !j.terminal() || j.submission.is_some()) {
+            return Some("jobs sent to the current network are still running".into());
+        }
+        if !matches!(self.rx, Rx::Idle) || !self.held.is_empty() || self.claim_inflight {
+            return Some("this computer is working on, or holding, a network job".into());
+        }
+        if let Some(c) = credentials_path(s, settings_path) {
+            if side_file(&c, ".attempt.json").exists() {
+                return Some("an unresolved network attempt is recorded on this computer".into());
+            }
+            if self.jobs.is_empty() {
+                match std::fs::read(side_file(&c, ".jobs.json")) {
+                    Ok(bytes) => match serde_json::from_slice::<Vec<Value>>(&bytes) {
+                        Ok(jobs) if jobs.iter().any(|j| !matches!(j["state"].as_str(), Some("succeeded" | "failed" | "cancelled" | "not sent")) || j.get("submission").is_some_and(|v| !v.is_null())) => {
+                            return Some("saved jobs on the current network need to be reconnected and finished first".into());
+                        }
+                        Err(_) => return Some("the saved network job list cannot be read".into()),
+                        _ => {}
+                    },
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Some("the saved network job list cannot be read".into()),
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+    /// Leave the current network (caller checked `switch_blocker`): its saved state files stay untouched.
+    pub fn switch_network(&mut self) {
+        self.stop();
+        self.jobs.clear();
+        self.installs.clear();
+        self.network_url = None;
+        self.network_id = None;
+        (self.paired, self.want_pair, self.status, self.invite_note, self.retry_at) = (None, None, None, None, None);
+        self.phase = Phase::Off;
     }
     pub fn forget_attempt(&mut self, env: &Env) {
         if let Some(c) = credentials_path(env.settings, env.settings_path) {
@@ -489,6 +543,8 @@ impl Remote {
         self.registered = false;
         self.reg_inflight = false;
         self.claim_inflight = false;
+        self.stats_inflight = false;
+        self.installs_inflight = false;
         self.me = None;
         self.last_stats = None;
         self.last_installs = None;
@@ -611,11 +667,17 @@ impl Remote {
 
     fn on_reply(&mut self, p: Pend, out: Result<Value, LinkError>, now: Instant, env: &mut Env) {
         match (&p, &out) {
-            (Pend::Stats | Pend::Installs | Pend::Job(_) | Pend::JobEvents(_), Ok(_)) => {}
+            (Pend::Stats | Pend::Installs | Pend::Job(_) | Pend::JobEvents(_) | Pend::Invite, Ok(_)) => {}
             (_, Ok(v)) => nlog(&format!("{} ok {}", Self::pname(&p), v.to_string().chars().take(120).collect::<String>())),
             (_, Err(e)) => nlog(&format!("{} ERR {}", Self::pname(&p), err_text(e))),
         }
         match (p, out) {
+            (Pend::Invite, r) => {
+                self.invite_note = Some(match r {
+                    Ok(_) => "Invitation saved. It can be reused for 7 days by any PC; keep the file private.".into(),
+                    Err(e) => format!("Invitation not created ({})", err_text(&e)),
+                });
+            }
             (Pend::Pair, Ok(v)) => {
                 let c = credentials_path(env.settings, env.settings_path).map(|c| c.display().to_string());
                 self.paired = c;
@@ -631,6 +693,8 @@ impl Remote {
                 self.phase = Phase::Off;
             }
             (Pend::Connect, Ok(v)) => {
+                self.network_url = v.get("url").and_then(Value::as_str).map(str::to_owned);
+                self.network_id = v.get("network_id").and_then(Value::as_str).map(str::to_owned);
                 self.me = v.get("installation_id").and_then(Value::as_str).map(str::to_owned);
                 self.phase = Phase::Online;
                 self.retry_at = None;
@@ -651,12 +715,22 @@ impl Remote {
                 }
             }
             (Pend::Stats, Ok(v)) => {
+                self.stats_inflight = false;
                 // Reopening keeps the session, so resume after its last accepted sample.
                 self.stats_seq = self.stats_seq.max(v.get("seq").and_then(Value::as_u64).unwrap_or(0));
             }
-            (Pend::Stats, Err(_)) => {}
-            (Pend::Installs, Ok(v)) => self.set_installs(&v, env),
-            (Pend::Installs, Err(_)) => {}
+            (Pend::Stats, Err(_)) => self.stats_inflight = false,
+            (Pend::Installs, Ok(v)) => {
+                self.installs_inflight = false;
+                self.set_installs(&v, env);
+            }
+            (Pend::Installs, Err(e)) => {
+                self.installs_inflight = false;
+                // A failed membership refresh cannot establish a healthy connection (including TLS or revoked credentials).
+                self.stop();
+                self.fail(now, format!("connection lost ({})", err_text(&e)));
+                env.ai.net_online = false;
+            }
             (Pend::Claim, r) => {
                 self.claim_inflight = false;
                 match r {
@@ -764,6 +838,7 @@ impl Remote {
     fn pname(p: &Pend) -> &'static str {
         match p {
             Pend::Pair => "pair",
+            Pend::Invite => "invite",
             Pend::Connect => "connect",
             Pend::Register => "register",
             Pend::Stats => "stats",
@@ -831,7 +906,7 @@ impl Remote {
             }
         }
         // 2. Stats / clients.
-        if self.registered && due(self.last_stats, STATS_EVERY) {
+        if self.registered && !self.stats_inflight && due(self.last_stats, STATS_EVERY) {
             if let Some(s) = &sample {
                 self.last_stats = Some(now);
                 self.stats_seq += 1;
@@ -867,12 +942,12 @@ impl Remote {
                         .collect();
                     o.insert("gpus".into(), json!(list));
                 }
-                self.req(Op::Stats, Value::Object(o), Pend::Stats);
+                self.stats_inflight = self.req(Op::Stats, Value::Object(o), Pend::Stats);
             }
         }
-        if due(self.last_installs, INSTALLS_EVERY) {
+        if !self.installs_inflight && due(self.last_installs, INSTALLS_EVERY) {
             self.last_installs = Some(now);
-            self.req(Op::Installations, json!({}), Pend::Installs);
+            self.installs_inflight = self.req(Op::Installations, json!({}), Pend::Installs);
         }
         // 3. Submitter: send what the Batch confirmed, follow what was sent.
         for n in env.ai.take_net_outbox() {
@@ -1492,30 +1567,21 @@ impl Remote {
         if let Some(m) = &self.status {
             ui.label(RichText::new(m).color(DIM).size(12.0));
         }
+        if let Some(url) = &self.network_url {
+            ui.label(RichText::new(format!("Network: {url} · ID {}", self.network_id.as_deref().unwrap_or("unreported"))).color(DIM).size(11.5));
+        }
         let paired = self.me.is_some() || credentials_path(s, None).is_some_and(|c| c.exists()) || !s.network.credentials.is_empty();
-        egui::CollapsingHeader::new("Connection setup").default_open(!paired).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Invitation file");
-                ui.add(egui::TextEdit::singleline(&mut self.pair_invitation).desired_width(280.0).hint_text("path to the file the coordinator operator gave you"));
-                ui.label("Name");
-                ui.add(egui::TextEdit::singleline(&mut self.pair_name).desired_width(160.0));
-                if ui.add_enabled(!self.pair_invitation.trim().is_empty() && !self.pair_name.trim().is_empty(), egui::Button::new("Pair this computer")).clicked() {
-                    acts.push(Action::Pair { invitation: self.pair_invitation.trim().to_owned(), name: self.pair_name.trim().to_owned() });
-                }
-            });
+        egui::CollapsingHeader::new("Connection").default_open(!paired).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let mut en = s.network.enabled;
-                if crate::ui::theme::checkbox(ui, &mut en, "Connect to the coordinator").changed() {
+                if crate::ui::theme::checkbox(ui, &mut en, "Connect to network").changed() {
                     acts.push(Action::Enable(en));
                 }
                 let mut rc = s.network.receive;
-                if crate::ui::theme::checkbox(ui, &mut rc, "Take network work when this computer's GPU is idle").changed() {
+                if crate::ui::theme::checkbox(ui, &mut rc, "Accept work when GPU idle").changed() {
                     acts.push(Action::Receive(rc));
                 }
             });
-            if !paired {
-                ui.label(RichText::new("Not paired yet: choose the invitation file and press Pair.").color(DIM).size(11.5));
-            }
             ui.label(RichText::new("Pairing credentials are stored in a private file next to your preferences; they are never shown here or in any project.").color(DIM).size(11.5));
             if s.network.receive {
                 ui.label(RichText::new("Receiving: a network job runs on this computer's own local client, only when it is idle and its shared locations resolve here. Hint, Key and Deliver run on this computer's own local client; movie/external sources and Resume/Replace are not part of the first network release.").color(DIM).size(11.5));

@@ -23,6 +23,13 @@ Ops (args are exact; unknown keys are refused; bodies are validated by the coord
   events        attempt_id, events[]
   stats         seq, measured_age_ms, [cpu_percent, ram_used_bytes, ram_total_bytes, gpus]   (README stats schema)
   cancel | job  job_id          job_events  job_id, [after, limit]          installations      close
+  service_status|service_start|service_stop|service_remove  state_dir        service_install  state_dir, address, port, allow_address_join
+  join_address  url, name, credentials_path, [existing_credentials_path]       service_local_join  state_dir, credentials_path, name, [existing_credentials_path]
+  network_invite  path (needs a connected link; writes a reusable 7-day non-admin invitation file, reply never carries the code)
+  pair/join_address/service_local_join reply {installation_id, credentials_path, reused[, url, fingerprint_sha256, network_id]}: with
+  existing_credentials_path pinning the SAME certificate nothing is redeemed and the existing identity is reused.
+  Extra error codes: service_unavailable, permission, port_in_use, service_conflict, not_installed, not_configured, cert_mismatch,
+  start_failed, start_timeout. Service ops use no coordinator connection and work with nothing paired.
 Errors: codes from the coordinator are passed through; bridge codes are bad_request, too_large, unknown_op,
 not_connected, busy (a running link already holds these credentials), security (incl. rejected server certificate), io (local file), transport (network/DNS/timeout; nothing is
 retried, cancelled or reassigned), paired_not_saved (code spent, credentials lost: revoke + new invitation) and
@@ -30,6 +37,7 @@ pair_uncertain (transport failure while pairing: the code MAY be spent).
 Token and invitation code are redacted from every message. The bridge holds no work: a started attempt stays
 owned by the coordinator whatever happens to this process."""
 import argparse
+import hmac
 import http.client
 import json
 import os
@@ -40,8 +48,9 @@ import sys
 import time
 
 from . import coordinator as _c
+from . import network_service as _svc
 from .coordinator import pki
-from .coordinator.client import BadReply, Client, CoordinatorError, redeem_to_file
+from .coordinator.client import BadReply, Client, CoordinatorError, join_to_file, redeem_to_file
 from .coordinator.schema import MAX_BODY, ApiError, parse_json
 
 _ID = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
@@ -97,7 +106,7 @@ class _Net:
 class Bridge:
     def __init__(self, timeout=15, client_cls=Client):
         self.timeout, self.client_cls = timeout, client_cls
-        self.client = self.session_id = None
+        self.client = self.session_id = self.creds = None
         self.lock = None  # pki.OwnerLock on <credentials>.lock, held while connected
         self.secrets = set()
         self.diags = 0
@@ -139,11 +148,81 @@ class Bridge:
     # ---- operations -------------------------------------------------------------------------------
 
     def op_pair(self, a):
-        _need(a, ("invitation_path", "credentials_path", "name"))
+        _need(a, ("invitation_path", "credentials_path", "name"), ("existing_credentials_path",))
         inv = pki.read_invitation(_path(a["invitation_path"], "invitation_path"))
         self._secret(inv["code"])
+        dest = _path(a["credentials_path"], "credentials_path")
+        if "existing_credentials_path" in a:  # same network (pinned certificate) as the existing identity: reuse it, redeem nothing
+            have = pki.read_credentials(_path(a["existing_credentials_path"], "existing_credentials_path"))
+            if hmac.compare_digest(have["fingerprint_sha256"].lower(), inv["fingerprint_sha256"].lower()):
+                return {"installation_id": have["installation_id"], "credentials_path": a["existing_credentials_path"], "reused": True}
         # Same routine as the CLI: reserves the private destination BEFORE the one-use code is redeemed.
-        return {"installation_id": redeem_to_file(inv, _path(a["credentials_path"], "credentials_path"), a["name"])}
+        return {"installation_id": redeem_to_file(inv, dest, a["name"]), "credentials_path": dest, "reused": False}
+
+    # ---- network service / address join / invitations (no coordinator connection needed except network_invite) ----
+
+    def _state_dir(self, a, required=("state_dir",), optional=()):
+        _need(a, required, optional)
+        return _path(a["state_dir"], "state_dir")
+
+    def op_service_status(self, a):
+        return _svc.status(self._state_dir(a))
+
+    def op_service_install(self, a):
+        sd = self._state_dir(a, ("state_dir", "address", "port", "allow_address_join"))
+        return _svc.install(sd, a["address"], a["port"], a["allow_address_join"])
+
+    def op_service_start(self, a):
+        return _svc.start(self._state_dir(a))
+
+    def op_service_stop(self, a):
+        return _svc.stop(self._state_dir(a))
+
+    def op_service_remove(self, a):
+        return _svc.remove(self._state_dir(a))
+
+    def _joined(self, a, url, **kw):
+        dest = _path(a["credentials_path"], "credentials_path")
+        ex = a.get("existing_credentials_path")
+        iid, fp, reused = join_to_file(url, dest, a["name"], existing=None if ex is None else _path(ex, "existing_credentials_path"),
+                                       timeout=self.timeout, **kw)
+        return {"installation_id": iid, "credentials_path": ex if reused else dest, "reused": reused,
+                "fingerprint_sha256": fp, "network_id": pki.network_id(fp)}
+
+    def op_join_address(self, a):
+        _need(a, ("url", "name", "credentials_path"), ("existing_credentials_path",))
+        url = _path(a["url"], "url")
+        host, port = pki.endpoint(url)
+        return {**self._joined(a, url), "url": f"https://{host if ':' not in host else '[' + host + ']'}:{port}"}
+
+    def op_service_local_join(self, a):
+        sd = _svc.state_path(self._state_dir(a, ("state_dir", "credentials_path", "name"), ("existing_credentials_path",)))
+        cfg = _svc.read_config(sd) if sd.is_dir() else None
+        if not cfg or not _svc.lock_busy(sd):
+            raise BridgeError("service_unavailable", "the network service is not running on this PC")
+        token = pki.read_private(str(sd / "local-join.token")).strip()
+        self._secret(token)
+        pem = (sd / "server-cert.pem").read_text(encoding="utf-8")
+        host = "127.0.0.1" if pki.cert_covers_host(pem, "127.0.0.1") else cfg["address"]
+        url = f"https://{host}:{cfg['port']}"
+        return {**self._joined(a, url, path="/v1/local-join", extra={"token": token}, pem=pem, loopback=True), "url": url}
+
+    def op_network_invite(self, a):
+        """Reusable 7-day NON-ADMIN invitation for the network this bridge is connected to. The code goes only into the new
+        private file (never overwritten); it is not part of the reply."""
+        _need(a, ("path",))
+        path = _path(a["path"], "path")
+        if os.path.lexists(path):
+            raise BridgeError("io", "that invitation filename already exists; choose a new filename")
+        out = self._live().invite()
+        code, exp, url = out.get("code"), out.get("expires_at"), out.get("url") or self.creds["url"]
+        if not isinstance(code, str) or not 8 <= len(code) <= 64 or isinstance(exp, bool) or not isinstance(exp, (int, float)) \
+                or not isinstance(url, str):
+            raise BridgeError("transport", "the invitation reply was malformed")
+        self._secret(code)
+        pki.write_invitation(path, url, self.creds["certificate_pem"], code, exp)
+        fp = self.creds["fingerprint_sha256"]
+        return {"path": path, "expires_at": exp, "url": url, "fingerprint_sha256": fp, "network_id": pki.network_id(fp)}
 
     def release(self):
         if self.lock:
@@ -172,8 +251,9 @@ class Bridge:
             raise
         if not keep:
             self.release()
-        self.lock, self.client, self.session_id = new, client, session_id
-        return {"installation_id": creds["installation_id"], "session_id": session_id}
+        self.lock, self.client, self.session_id, self.creds = new, client, session_id, creds
+        return {"installation_id": creds["installation_id"], "session_id": session_id,
+                "url": creds["url"], "network_id": pki.network_id(creds["fingerprint_sha256"])}
 
     def op_register(self, a):
         _need(a, ("build", "gpu"))
@@ -260,7 +340,7 @@ class Bridge:
                 raise BridgeError("bad_request", "request needs id (1-64 of A-Za-z0-9_.-), op and optional args only")
             if msg["op"] == "close":
                 return {"id": rid, "ok": True, "result": {}}, True
-            fn = getattr(self, "op_" + msg["op"], None) if re.fullmatch(r"[a-z_]{1,20}", msg["op"]) and msg["op"] != "close" else None
+            fn = getattr(self, "op_" + msg["op"], None) if re.fullmatch(r"[a-z_]{1,24}", msg["op"]) and msg["op"] != "close" else None
             if fn is None:
                 raise BridgeError("unknown_op", "unsupported op")
             return {"id": rid, "ok": True, "result": fn(msg.get("args", {}))}, False
@@ -268,6 +348,8 @@ class Bridge:
             err = (e.code, e.message)
         except CoordinatorError as e:
             err = (e.code, str(e))
+        except _svc.ServiceError as e:
+            err = (e.code, e.message)
         except pki.OwnerBusy as e:
             err = ("busy", str(e))
         except pki.PairedNotSaved as e:

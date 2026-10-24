@@ -1,6 +1,6 @@
-# CorridorKey
+# Keyloom — powered by CorridorKey
 
-CorridorKey is a desktop app for pulling clean keys (green or blue screen) from video footage. You bring in clips, build a rough matte (the **hint**), run the keyer, check the result and deliver image sequences or video files. Several computers can share the rendering.
+Keyloom is a desktop app for pulling clean keys (green or blue screen) from video footage. You bring in clips, build a rough matte (the **hint**), run the keyer, check the result and deliver image sequences or video files. Several computers can share the rendering.
 
 This is the current native app (Windows 10/11 x64 and Linux x64, NVIDIA GPU). The text of the earlier upstream README is kept in [docs/upstream-readme.md](docs/upstream-readme.md).
 
@@ -20,14 +20,15 @@ The current application has its own native Rust interface, project workflow, net
 - **Key** with temporal awareness, VRAM and despill controls. Results are never overwritten unless you confirm.
 - **Review** Input, Hint, FG, Matte, Comp and Processed in one viewer with an A/B wipe.
 - **Deliver** FG, Matte, Comp and Processed as EXR/PNG sequences and/or MP4, MOV or WebM videos.
+- **Network setup** from the Clients page: host a network service, join by address and port, or share one optional reusable invitation. Every member sees the other PCs.
 - **Batch** many shots at once with a saved workflow preset, and spread them over several PCs on your network.
 
-Download: [Windows installer](https://github.com/NickPittas/EZ-CorridorKey2/releases/tag/v2.2.0-windows) · [Linux installer](https://github.com/NickPittas/EZ-CorridorKey2/releases/tag/v2.2.0-linux). Download every part listed in your OS release.
+Download: [Windows installer](https://github.com/NickPittas/Keyloom/releases/tag/v2.2.0-windows) · [Linux installer](https://github.com/NickPittas/Keyloom/releases/tag/v2.2.0-linux). Download every part listed in your OS release.
 
 ## Quick start
 
 1. [Install](docs/install.md) the app and let it download the models.
-2. Start CorridorKey, choose **New project…**, then **Import clips…**.
+2. Start Keyloom, choose **New project…**, then **Import clips…**.
 3. Work through each clip: **Media → Hint → Key → Review → Deliver**.
 
 Full walkthrough: [User guide](docs/user-guide.md). Rendering on several computers: [Network rendering](docs/network-rendering.md).
@@ -40,4 +41,4 @@ Full walkthrough: [User guide](docs/user-guide.md). Rendering on several compute
 
 ## Licence and sharing
 
-CorridorKey is licensed CC-BY-NC-SA-4.0 (non-commercial). The installers and the repository are private: GitHub downloads need you to be signed in with access. Public redistribution of the installers has not been cleared, so please do not share them.
+Keyloom (powered by CorridorKey) is licensed CC-BY-NC-SA-4.0 (non-commercial). The installers and the repository are private: GitHub downloads need you to be signed in with access. Public redistribution of the installers has not been cleared, so please do not share them.

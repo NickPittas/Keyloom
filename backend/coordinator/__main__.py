@@ -38,7 +38,8 @@ def serve(a):
     pki.check_private(key)
     cert_pem = open(cert, encoding="utf-8").read()
     store = Store(os.path.join(a.state_dir, "coordinator.sqlite3"))
-    server = CoordinatorServer((a.host, a.port), pki.server_context(cert, key), store)
+    server = CoordinatorServer((a.host, a.port), pki.server_context(cert, key), store,
+                               advertise_url=f"https://{hosts[0]}:{a.port}" if hosts and a.port else None)
     port = server.server_address[1]
     if a.invite_out:
         if not hosts:

@@ -107,10 +107,10 @@ fn main() -> eframe::Result {
             Ok(ck::background::Instance::Other) => return Ok(()),
             Ok(ck::background::Instance::Primary(f)) => _lock = Some(f),
             Err(e) => {
-                eprintln!("CorridorKey did not start: cannot take the single-instance lock ({e})");
+                eprintln!("Keyloom did not start: cannot take the single-instance lock ({e})");
                 #[cfg(windows)]
                 rfd::MessageDialog::new()
-                    .set_title("CorridorKey could not start")
+                    .set_title("Keyloom could not start")
                     .set_description(format!("Cannot take the single-instance lock: {e}"))
                     .set_level(rfd::MessageLevel::Error)
                     .show();
@@ -131,7 +131,7 @@ fn main() -> eframe::Result {
     o.instance_dir = instance_dir.clone().filter(|_| !cfg!(windows));
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("CorridorKey")
+            .with_title("Keyloom — powered by CorridorKey")
             .with_inner_size([size.0, size.1])
             .with_min_inner_size([700.0, 660.0]),
         ..Default::default()

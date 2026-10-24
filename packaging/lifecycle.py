@@ -1,4 +1,4 @@
-"""Install lifecycle for a packaged CorridorKey bundle (stdlib only, Linux + Windows).
+"""Install lifecycle for a packaged Keyloom (powered by CorridorKey) bundle (stdlib only, Linux + Windows).
 
 Runs with the bundle's own interpreter (`python -I`), both from the freshly
 extracted payload (install) and from the installed tree (repair/rollback/
@@ -190,7 +190,7 @@ def check_system_libs() -> None:
     if missing:
         raise InstallError("missing OS libraries: " + ", ".join(missing) + f"\n  Debian/Ubuntu/Mint: {APT_HINT}")
     if not loads("nvcuda.dll" if IS_WIN else "libcuda.so.1"):  # advisory: app and models install; GPU workflows need the driver
-        say("WARNING: NVIDIA driver (CUDA) not found. CorridorKey needs an NVIDIA GPU + driver to run; install the "
+        say("WARNING: NVIDIA driver (CUDA) not found. Keyloom needs an NVIDIA GPU + driver to run; install the "
             "current NVIDIA driver (Linux Mint: Driver Manager) before use.")
 
 
@@ -241,7 +241,7 @@ def desktop_entry(exec_path: Path, icon: Path | None, prefix: Path | None = None
     for ch in ('\\', '"', '`', '$'):
         q = q.replace(ch, "\\" + ch)
     q = q.replace("%", "%%").replace("\\", "\\\\")
-    lines = ["[Desktop Entry]", "Type=Application", "Name=CorridorKey", "Comment=AI chroma keyer",
+    lines = ["[Desktop Entry]", "Type=Application", "Name=Keyloom", "GenericName=powered by CorridorKey", "Comment=Keyloom — powered by CorridorKey: AI chroma keyer",
              f'Exec=env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV PYTHONNOUSERSITE=1 "{q}" %F',
              "Terminal=false", "Categories=AudioVideo;Video;Graphics;"]
     if icon:
@@ -267,8 +267,9 @@ def windows_shortcut_script(lnk: Path, target: Path, workdir: Path, icon: Path |
 
 def shortcut_paths() -> dict:
     if IS_WIN:
-        start = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/CorridorKey"
-        return {"start_menu_dir": start, "lnk": start / "CorridorKey.lnk"}
+        start = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Keyloom"
+        old = start.with_name("CorridorKey")  # pre-rename shortcut, removed on upgrade/uninstall
+        return {"start_menu_dir": start, "lnk": start / "Keyloom.lnk", "old_dir": old, "old_lnk": old / "CorridorKey.lnk"}
     data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
     return {"desktop": data / "applications/corridorkey.desktop"}
 
@@ -289,6 +290,8 @@ def write_shortcuts(version_dir: Path, prefix: Path) -> None:
                            check=True, capture_output=True, timeout=60)
         finally:
             os.unlink(f.name)
+        _unlink_owned(sp["old_lnk"])
+        _unlink_owned(sp["old_dir"])
         update_windows_autostart(version_dir, prefix)
         return
     sp["desktop"].parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +309,8 @@ def remove_shortcuts(prefix: Path) -> None:
     if IS_WIN:
         _unlink_owned(sp["lnk"])
         _unlink_owned(sp["start_menu_dir"])
+        _unlink_owned(sp["old_lnk"])
+        _unlink_owned(sp["old_dir"])
     remove_autostart(prefix)
 
 
@@ -354,6 +359,41 @@ def remove_autostart(prefix: Path) -> None:
     if d.is_file() and not d.is_symlink() and \
             f"X-CorridorKey-Owner={owner_id(prefix)}" in d.read_text(encoding="utf-8", errors="replace"):
         d.unlink()
+
+
+def _network_service(version_dir: Path):
+    """The version's own stdlib-only service manager, loaded by path (no sys.path or cwd involvement)."""
+    import importlib.util
+    f = version_dir / "app/backend/network_service.py"
+    spec = importlib.util.spec_from_file_location("ck_network_service", f)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def refresh_network_service(version_dir: Path, prefix: Path) -> None:
+    """Activation/rollback: an optional per-user network service this prefix owns follows the active version.
+    Absent registry = nothing to do; any failure is reported but never fails the activation."""
+    if not (prefix / "network-service.json").is_file():
+        return
+    try:
+        msg = _network_service(version_dir).refresh(descriptor_python(version_dir), version_dir / "app", prefix)
+        if msg:
+            say(msg)
+    except Exception as e:
+        say(f"WARNING: the network service was not updated ({getattr(e, 'message', type(e).__name__)}); open the app and use Network > Service.")
+
+
+def remove_network_service(prefix: Path, version: str | None) -> None:
+    """Uninstall: unregister only the service this prefix owns (state, certificate and database are left in place)."""
+    if not (prefix / "network-service.json").is_file():
+        return
+    try:
+        msg = _network_service(vpath(prefix, version)).remove_owned(prefix)
+        if msg:
+            say(msg)
+    except Exception as e:
+        raise InstallError(f"the network service could not be stopped and removed ({getattr(e, 'message', type(e).__name__)}); the app was kept installed so you can stop the service from Clients and retry") from e
 
 
 # Order matters: SHIM_NAMES[1] is the setup shim (install's "Resume with" hint).
@@ -525,6 +565,7 @@ def activate(prefix: Path, version: str, *, shortcuts: bool = True, selfcheck: b
             receipt["versions"].append(version)
         prune_versions(prefix, receipt)
         atomic_write_json(prefix / RECEIPT, receipt)
+        refresh_network_service(vdir, prefix)  # last step: nothing after it can fail and leave the service on a rolled-back tree
     except BaseException:
         try:
             if old and vpath(prefix, old).is_dir():
@@ -658,7 +699,7 @@ def cmd_install(a) -> int:
         os.rename(payload, dest)  # same filesystem by construction (stub stages inside PREFIX)
     if not payload:  # files were placed by the Windows installer: journal them so a failure is recoverable
         atomic_write_json(prefix / TXN, {"version": version, "backup": None})
-    say(f"Validating CorridorKey {version} ...")
+    say(f"Validating Keyloom {version} ...")
     try:
         activate(prefix, version, shortcuts=not a.no_shortcuts)
     except BaseException:
@@ -782,6 +823,7 @@ def cmd_uninstall(a) -> int:
         d = prefix / "versions" / v
         if d.exists() and not owned_dir(d):
             raise InstallError(f"{d} is listed in the receipt but is not a CorridorKey bundle; refusing to uninstall")
+    remove_network_service(prefix, receipt.get("current"))
     remove_shortcuts(prefix)
     for name in SHIM_NAMES:
         _unlink_owned(prefix / "bin" / name)
@@ -813,7 +855,7 @@ def cmd_uninstall(a) -> int:
     if deferred and IS_WIN:
         subprocess.Popen(deferred_delete_command(deferred, prefix), creationflags=0x00000008 | 0x08000000,
                          close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    say("CorridorKey removed. Projects, outputs, models and settings were left untouched.")
+    say("Keyloom removed. Projects, outputs, models and settings were left untouched.")
     return 0
 
 

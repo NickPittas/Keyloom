@@ -1,4 +1,6 @@
-# CorridorKey user guide
+# Keyloom user guide
+
+Screenshots show the real native app. Some workflow captures predate the Keyloom rename and retain the CorridorKey title; the illustrated controls are unchanged.
 
 This guide follows one shot from import to delivery, then covers batches, settings and models. For rendering on several computers see [Network rendering](network-rendering.md).
 
@@ -71,7 +73,7 @@ The viewer is shared by all pages: mode chips in the top right (**Input, Hint, G
 On the Media page:
 
 - **In/Out range:** press `I` and `O` (or use Set In / Set Out) on the frame you want. Everything that follows (hint, Key, delivery) is confined to this range. If you set nothing, the whole clip is used.
-- **Input colour** (in Properties): tell CorridorKey whether the frames are **Linear** or **sRGB**. Check it; it changes the result.
+- **Input colour** (in Properties): tell Keyloom whether the frames are **Linear** or **sRGB**. Check it; it changes the result.
 - **Extract frames from this movie** if extraction has not finished.
 - **Relink movie…** or **Relink missing footage…** if the source moved. The size, rate and frame count are checked first; a partial match needs your confirmation.
 - **Import alpha or mask image sequence…** brings in a companion matte as **Alpha hint (AlphaHint)** or **Mask (VideoMamaMaskHint)** (PNG/EXR, same names as the frames).
@@ -197,7 +199,7 @@ In the **Queue** panel each clip has its own section with ordered rows: **Pre-ma
 - **Playback:** decoded-frame RAM budget (0 = Auto), decode workers, default looping.
 - **Interface:** UI scale, and [background running](#background-running).
 - **AI defaults:** starting values for new clips (VRAM profile, hint mode, temporal awareness, hint and despill strength, linear input). Choices already made on a project or clip are not replaced.
-- **Path mapping:** how shared storage is named on this computer, for network rendering ([details](network-rendering.md#2-map-the-shared-storage)).
+- **Path mapping:** how shared storage is named on this computer, for network rendering ([details](network-rendering.md#4-map-shared-storage-on-each-pc)).
 
   ![Path mapping](screenshots/native/10-path-mapping.png)
 - **AI worker targets:** extra workers launched over SSH, or a local checkout. Normal installs need nothing here.
@@ -211,8 +213,8 @@ In the **Queue** panel each clip has its own section with ordered rows: **Pre-ma
 
 Under **Settings → Interface**:
 
-- **Keep running when the window is closed** – closing the window hides CorridorKey so the network client stays available. Starting CorridorKey again just shows the running window (only one copy runs). **File → Quit** really quits.
-- **Start in the background when I sign in to this computer** – starts hidden when *you* sign in (not at boot, no system service), so your mapped drives (for example `R:` or `Y:`) exist for the same user. Turning it off removes only the entry CorridorKey created.
+- **Keep running when the window is closed** – closing the window hides Keyloom so the network client stays available. Starting Keyloom again just shows the running window (only one copy runs). **File → Quit** really quits.
+- **Start in the background when I sign in to this computer** – starts hidden when *you* sign in (not at boot, no system service), so your mapped drives (for example `R:` or `Y:`) exist for the same user. Turning it off removes only the entry Keyloom created.
 
 ## Models
 

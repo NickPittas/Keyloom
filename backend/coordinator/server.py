@@ -1,5 +1,7 @@
 """HTTPS API (protocol v1) on stdlib http.server: bounded bodies, exact Content-Length framing, one request per
 connection, finite timeouts, bounded concurrent handlers, throttled bad auth. No long-polling: every call returns."""
+import hmac
+import ipaddress
 import json
 import re
 import socket
@@ -39,8 +41,23 @@ class Limiter:
                 self.hits = {k: v for k, v in self.hits.items() if self._recent(k)}
 
 
+_TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
+
+
+def trusted_peer(ip, loopback_only=False):
+    """Unauthenticated joins are limited to this machine, private/link-local LAN ranges and Tailscale (100.64/10, fd7a::/48 is ULA)."""
+    try:
+        a = ipaddress.ip_address(str(ip).split("%")[0])
+    except ValueError:
+        return False
+    a = getattr(a, "ipv4_mapped", None) or a
+    if a.is_loopback:
+        return True
+    return not loopback_only and (a.is_private or a.is_link_local or a in _TAILSCALE_V4)
+
+
 _POST = {
-    r"/v1/pair": "pair", r"/v1/session": "session", r"/v1/stats": "stats", r"/v1/claim": "claim", r"/v1/jobs": "submit",
+    r"/v1/pair": "pair", r"/v1/join": "join", r"/v1/local-join": "local_join", r"/v1/invitations": "invite", r"/v1/session": "session", r"/v1/stats": "stats", r"/v1/claim": "claim", r"/v1/jobs": "submit",
     r"/v1/attempts/([\w-]{1,80})/(reject|start|events)": "attempt", r"/v1/jobs/([\w-]{1,80})/cancel": "cancel",
 }
 _GET = {r"/v1/installations": "installations", r"/v1/jobs/([\w-]{1,80})": "job", r"/v1/jobs/([\w-]{1,80})/events": "job_events"}
@@ -49,11 +66,15 @@ _GET = {r"/v1/installations": "installations", r"/v1/jobs/([\w-]{1,80})": "job",
 class Api:
     """Transport-independent routing so the HTTP layer stays dumb."""
 
-    def __init__(self, store, throttle=None):
+    def __init__(self, store, throttle=None, join_enabled=False, local_token=None, advertise_url=None):
         self.store = store
         self.auth_fail = throttle or Limiter(10, 60)
         self.pair_fail = Limiter(10, 60)
         self.pair_global = Limiter(30, 300)
+        self.join_enabled, self.local_token, self.advertise_url = join_enabled, local_token, advertise_url
+        self.join_try = Limiter(10, 300)  # every attempt counts, successful or not
+        self.join_global = Limiter(30, 300)
+        self.invite_try = Limiter(6, 3600)
 
     def handle(self, method, target, bearer, body, peer):
         u = urlsplit(target)
@@ -66,6 +87,8 @@ class Api:
             raise ApiError(404, "not_found", "no such endpoint")
         if name == "pair":
             return self._pair(parse_json(body), peer)
+        if name in ("join", "local_join"):
+            return self._join(name, parse_json(body), peer)
         if self.auth_fail.blocked(peer):
             raise ApiError(429, "throttled", "too many failed authentication attempts")
         try:
@@ -90,6 +113,13 @@ class Api:
                 bad("unknown query parameter")
             return s.job_events(inst, m[1], after, limit)
         b = parse_json(body)
+        if name == "invite":  # any paired (non-admin) member of this network; throttled per installation
+            obj(b, "invitations", ())
+            if self.invite_try.blocked(inst["id"]):
+                raise ApiError(429, "throttled", "too many invitations requested")
+            self.invite_try.fail(inst["id"])
+            code, exp = s.create_shared_invitation(inst)
+            return {"code": code, "expires_at": exp, "url": self.advertise_url}
         if name == "session":
             return s.register(inst, b)
         if name == "stats":
@@ -102,6 +132,27 @@ class Api:
             obj(b, "cancel", ())
             return s.cancel(inst, m[1])
         return {"reject": s.reject, "start": s.start, "events": s.report}[m[2]](inst, m[1], b)
+
+    def _join(self, name, b, peer):
+        """/v1/join (explicitly enabled) or /v1/local-join (loopback + the service's private token). Both mint a unique
+        non-admin installation; neither gives access to jobs without the token they return."""
+        local = name == "local_join"
+        if not (self.local_token if local else self.join_enabled):
+            raise ApiError(404, "not_found", "no such endpoint")  # disabled unless configured
+        if not trusted_peer(peer, loopback_only=local):
+            raise ApiError(403, "join_refused", "joining is limited to local, private-network and Tailscale peers")
+        if self.join_try.blocked(peer) or (not local and self.join_global.blocked("*")):
+            raise ApiError(429, "throttled", "too many join attempts")
+        self.join_try.fail(peer)
+        if not local:
+            self.join_global.fail("*")
+        obj(b, "join", ("protocol", "name", "token") if local else ("protocol", "name"))
+        if b["protocol"] != PROTOCOL or isinstance(b["protocol"], bool):
+            bad("unsupported protocol", "unsupported_protocol")
+        if local and not (isinstance(b["token"], str) and hmac.compare_digest(b["token"].encode(), self.local_token.encode())):
+            raise ApiError(403, "join_refused", "local join token rejected")
+        iid, token = self.store.join(b["name"])
+        return {"installation_id": iid, "token": token}
 
     def _pair(self, b, peer):
         if self.pair_fail.blocked(peer) or self.pair_global.blocked("*"):
@@ -217,8 +268,8 @@ class CoordinatorServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
 
-    def __init__(self, addr, ssl_context, store: Store, conn_deadline=CONN_DEADLINE, max_connections=MAX_CONNECTIONS):
-        self.api = Api(store)
+    def __init__(self, addr, ssl_context, store: Store, conn_deadline=CONN_DEADLINE, max_connections=MAX_CONNECTIONS, **api_opts):
+        self.api = Api(store, **api_opts)
         self.conn_deadline = conn_deadline
         self.slots = threading.BoundedSemaphore(max_connections)
         self._guards = {}

@@ -219,6 +219,7 @@ pub struct App {
     metrics_wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     metrics_rect: Option<egui::Rect>,
     remote: driver::Held<crate::remote::Remote>,
+    setup: crate::network_setup::Setup,
     /// The runtime driver thread (set by `App::new`, the window path); `None` = this host ticks inline from `frame`.
     driver: Option<driver::Driver>,
     net_repo: Option<PathBuf>,
@@ -375,6 +376,7 @@ impl App {
             metrics_wake: None,
             metrics_rect: None,
             remote: driver::Held::new(crate::remote::Remote::new(opts.net.clone())),
+            setup: crate::network_setup::Setup::new(opts.net.clone()),
             driver: None,
             net_repo: opts.repo.clone().or(launch.repo.clone()),
             net_python: launch.python.clone(),
@@ -2324,7 +2326,9 @@ impl App {
             self.pending_reload = Some(p);
         }
         if let Some(r) = self.picker.poll() {
-            if r.0 == PickKind::MappingRoot {
+            if matches!(r.0, PickKind::NetInvitationOpen | PickKind::NetInvitationSave) {
+                self.setup.browse_done(r.0, r.1.into_iter().next());
+            } else if r.0 == PickKind::MappingRoot {
                 self.settings.browse_done(r.1.into_iter().next());
             } else {
                 self.held_pick = Some(r);
@@ -2568,6 +2572,12 @@ impl App {
 
     /// Per frame: drive the network client (connect, stats, Batch submissions, receiving) without blocking.
     fn net_tick(&mut self, now: std::time::Instant, wake: &std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.setup.tick(self.net_repo.as_deref(), self.net_python.as_deref(), wake);
+        if !self.settings_open {
+            if let Some(j) = self.setup.take_joined() {
+                self.net_joined(j);
+            }
+        }
         if !self.remote.available() {
             return;
         }
@@ -2596,6 +2606,29 @@ impl App {
             if !self.settings.apply() {
                 self.ai.notice = Some("Paired, but the connection settings could not be saved.".into());
             }
+        }
+    }
+
+    /// A join finished: switch to its connection only when nothing on the current network would be orphaned.
+    fn net_joined(&mut self, j: crate::network_setup::Joined) {
+        let (s, sp) = (self.settings.saved(), self.settings.store_path());
+        let same = crate::remote::credentials_path(s, sp).is_some_and(|c| c == std::path::Path::new(&j.creds));
+        if !same {
+            if let Some(why) = self.remote.switch_blocker(s, sp) {
+                self.setup.set_note(format!("Joined, but this computer stays on its current network: {why}. Try again when that is finished."));
+                return;
+            }
+            self.remote.switch_network();
+        }
+        self.settings.open();
+        let n = &mut self.settings.draft_mut().network;
+        (n.enabled, n.credentials) = (true, j.creds);
+        if self.settings.apply() {
+            if let Some(d) = &self.driver {
+                d.publish(self.settings.saved(), self.settings.store_path());
+            }
+        } else {
+            self.ai.notice = Some("Joined, but the connection settings could not be saved.".into());
         }
     }
 
@@ -2720,6 +2753,7 @@ impl App {
             PickKind::Relink => self.relink_picked(ctx, paths[0].clone()),
             PickKind::RelinkMovie => self.movie_picked(paths[0].clone()),
             PickKind::HintSequence => self.sequence_picked(paths[0].clone()),
+            PickKind::NetInvitationOpen | PickKind::NetInvitationSave => {}
             PickKind::MappingRoot => {} // answered inside Settings (see import_tick)
         }
     }
@@ -2914,6 +2948,7 @@ impl App {
             if self.clients_open {
                 let default = self.ai.placement.clone();
                 let mut net_actions = vec![];
+                let mut setup_cmds = vec![];
                 let local_view = self.metrics.view(std::time::Instant::now());
                 let active_now = self.active_gpus();
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -2925,10 +2960,29 @@ impl App {
                                 self.ai.placement = p;
                             }
                             net_actions = self.remote.ui(ui, self.settings.saved());
+                            if self.remote.available() {
+                                let cx = crate::network_setup::Ctx {
+                                    settings: self.settings.saved(),
+                                    settings_path: self.settings.store_path(),
+                                    connected: self.remote.online(),
+                                    blocker: self.remote.switch_blocker(self.settings.saved(), self.settings.store_path()),
+                                    invite_note: self.remote.invite_note.as_deref(),
+                                };
+                                setup_cmds = self.setup.ui(ui, &cx);
+                            }
                         });
                 });
                 for a in net_actions {
                     self.net_action(a);
+                }
+                for c in setup_cmds {
+                    match c {
+                        crate::network_setup::Cmd::Invite(p) => self.remote.invite(p),
+                        crate::network_setup::Cmd::Browse(k) => {
+                            let w = ctx.clone();
+                            self.picker.start(k, None, move || w.request_repaint());
+                        }
+                    }
                 }
             }
         } else if self.viewer.is_some() && self.open.is_some() {

@@ -1,6 +1,8 @@
 # Network coordinator (protocol v1) — control-plane foundation
 
-**Not wired to the Rust app/UI yet.** Python stdlib `ssl`/`http.server`/`sqlite3` plus `cryptography`; no new dependency.
+**User setup is in Keyloom → Clients:** install/start/stop the per-user host service, join by IP/port, or create/use an optional reusable invitation. See [the network guide](../../docs/network-rendering.md). The sections below document the developer CLI and protocol.
+
+Python stdlib `ssl`/`http.server`/`sqlite3` plus `cryptography`; no new dependency.
 The coordinator records who owns which attempt. It never runs a worker, never resolves a client path and never
 reuses `Storage::Transfer`. The Rust `Scheduler` stays the only executor (integration later).
 
@@ -8,7 +10,7 @@ Run (opt-in, loopback by default, explicit paths only — see `python -m backend
 `serve --state-dir D [--host --port --advertise-host H --invite-out F --invite-admin]`,
 `pair --invitation F --credentials F --name N` (the destination is reserved — new, private, verified — *before* the one-use code is redeemed),
 and the operator commands below. One process owns a state dir (lock file). State dir must be
-**local disk** (SQLite WAL), not a NAS. Creating further invitations currently requires restarting `serve`.
+**local disk** (SQLite WAL), not a NAS. The UI creates reusable 7-day invitations without restarting the host; CLI one-use invitations retain their original behavior.
 
 ## Trust and credentials
 Trust note: the certificate and fingerprint inside an invitation only prove each other are consistent; they do not authenticate the server. Trust comes from delivering the invitation file over a channel you trust, optionally comparing the fingerprint `serve` prints (and `pair` prints) with the one you expect. The certificate is valid 365 days; there is no renewal/rotation yet (regenerate by hand and re-pair).

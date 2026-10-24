@@ -1,4 +1,4 @@
-"""Build a CorridorKey standalone bundle and its OS installer.
+"""Build a Keyloom (powered by CorridorKey) standalone bundle and its OS installer.
 
     python packaging/bundle.py bundle   --out dist/            # stage dir (runtime + app + UI + FFmpeg)
     python packaging/bundle.py linux    --out dist/            # stage + self-extracting .run installer
@@ -315,7 +315,7 @@ def min_glibc(stage: Path) -> str | None:
 def descriptor(stage: Path, version: str) -> None:
     py = "runtime/python/python.exe" if IS_WIN else "runtime/python/bin/python3"
     (stage / "corridorkey-install.json").write_text(json.dumps({
-        "schema": 1, "app_name": "CorridorKey", "app_version": version,
+        "schema": 1, "app_name": "Keyloom", "app_version": version,
         # models/cache/scratch/user_data null => platform defaults, shared across versions and
         # untouched by uninstall; the app root itself may be read-only.
         "roots": {"python": py, "helper": "app", "models": None, "cache": None,
@@ -412,7 +412,7 @@ def make_linux_run(stage: Path, out: Path) -> Path:
     sha = sha256_file(tgz)
     stub = (REPO / "packaging/linux/installer-stub.sh").read_text().replace("@PAYLOAD_SHA256@", sha) \
         .replace("@VERSION_ID@", vid)
-    run = out / f"CorridorKey-{vid}-linux-x86_64.run"
+    run = out / f"Keyloom-{vid}-linux-x86_64.run"
     with open(run, "wb") as f:
         f.write(stub.encode())
         with open(tgz, "rb") as p:
@@ -476,7 +476,7 @@ def make_windows_exe(stage: Path, out: Path, iscc: str | None) -> Path:
     exe = find_iscc(iscc)
     iss = render_iss(stage, out)
     subprocess.run([exe, str(iss)], check=True)
-    built = sorted(out.glob("CorridorKey-*-setup.exe"))
+    built = sorted(out.glob("Keyloom-*-setup.exe"))
     if not built:
         raise SystemExit("ISCC finished but produced no setup exe")
     stem = built[-1].name[:-len(".exe")]  # setup exe + every Inno disk slice (<stem>-1.bin ...), hashed together

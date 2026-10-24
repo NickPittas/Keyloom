@@ -15,7 +15,10 @@ from . import PROTOCOL
 from .schema import (ApiError, MAX_BATCH, canonical, digest, validate_claim, validate_event, validate_session,
                      validate_spec, validate_stats, validate_target, ident, obj, text, choice, bad, REJECT_CODES)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+MAX_INSTALLATIONS = 64  # joins by address / reusable invitation stop here; one-use pairings are unaffected
+MAX_SHARED_INVITATIONS = 16
+SHARED_TTL = 7 * 86400
 SESSION_TTL = 120  # s without any call before another session id may take over the installation
 MAX_ACTIVE_JOBS = 2000
 _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -45,6 +48,10 @@ CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NU
   type TEXT NOT NULL, payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at REAL NOT NULL, UNIQUE(attempt_id, seq));
 CREATE INDEX events_job ON events(job_id, id);
 CREATE TABLE job_rejections(job_id TEXT NOT NULL, installation_id TEXT NOT NULL, PRIMARY KEY(job_id, installation_id));
+"""
+# Schema 2 only adds reusable (non-admin, multi-use, expiring) invitations; the one-use `pairings` table is untouched.
+_DDL_V2 = """
+CREATE TABLE shared_invitations(code_hash TEXT PRIMARY KEY, created_by TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL);
 """
 
 
@@ -80,9 +87,13 @@ class Store:
             if self.db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
                 raise RuntimeError("coordinator database has tables but no schema version; refusing to touch it")
             with self._tx():
-                for stmt in _DDL.split(";\n"):
+                for stmt in (_DDL + _DDL_V2).split(";\n"):
                     if stmt.strip():
                         self.db.execute(stmt)
+                self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        elif ver == 1:  # in-place, additive, one transaction: existing installations, jobs and unused one-use codes are kept
+            with self._tx():
+                self.db.execute(_DDL_V2.strip().rstrip(";"))
                 self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._ready = True
 
@@ -126,20 +137,50 @@ class Store:
             db.execute("INSERT INTO pairings VALUES(?,?,?,NULL,NULL)", (_code_hash(code), int(is_admin), self.clock() + ttl))
         return f"{code[:5]}-{code[5:]}"
 
+    def create_shared_invitation(self, creator, ttl=SHARED_TTL):
+        """Reusable code for any number of NON-ADMIN installations until it expires (7 days). Returns (code, expires_at)."""
+        code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(20))
+        with self._tx() as db:
+            now = self.clock()
+            db.execute("DELETE FROM shared_invitations WHERE expires_at<?", (now,))
+            if db.execute("SELECT count(*) FROM shared_invitations").fetchone()[0] >= MAX_SHARED_INVITATIONS:
+                raise ApiError(409, "too_many_invitations", "too many active invitations; wait for one to expire")
+            db.execute("INSERT INTO shared_invitations VALUES(?,?,?,?)", (_code_hash(code), creator["id"], now, now + ttl))
+        return "-".join(code[i:i + 5] for i in range(0, 20, 5)), now + ttl
+
+    def _issue(self, db, name, is_admin, now):
+        token, iid = secrets.token_urlsafe(32), new_id("inst")
+        db.execute("INSERT INTO installations VALUES(?,?,?,?,?,NULL)", (iid, name, int(is_admin), token_hash(token), now))
+        return iid, token
+
+    def _room(self, db):
+        if db.execute("SELECT count(*) FROM installations WHERE revoked_at IS NULL").fetchone()[0] >= MAX_INSTALLATIONS:
+            raise ApiError(409, "network_full", "this network already has the maximum number of installations")
+
+    def join(self, name):
+        """Open join (the caller has already authorised the transport path): a unique non-admin installation + token."""
+        text(name, "name", 64)
+        with self._tx() as db:
+            self._room(db)
+            return self._issue(db, name, False, self.clock())
+
     def pair(self, code, name):
-        """One-use: the same transaction consumes the code and creates the installation. Token is returned once."""
+        """One-use code (or a reusable invitation): the same transaction creates the installation. Token is returned once."""
         text(name, "name", 64)
         if not isinstance(code, str) or len(code) > 32:
             bad("code must be the pairing code")
-        now, token, iid = self.clock(), secrets.token_urlsafe(32), new_id("inst")
+        now = self.clock()
         with self._tx() as db:
-            row = db.execute("SELECT * FROM pairings WHERE code_hash=?", (_code_hash(code),)).fetchone()
-            if not row or row["used_at"] is not None or row["expires_at"] < now:
-                raise ApiError(403, "pairing_rejected", "pairing code is unknown, used or expired")
-            db.execute("UPDATE pairings SET used_at=?, installation_id=? WHERE code_hash=? AND used_at IS NULL",
-                       (now, iid, row["code_hash"]))
-            db.execute("INSERT INTO installations VALUES(?,?,?,?,?,NULL)", (iid, name, row["is_admin"], token_hash(token), now))
-        return iid, token
+            h = _code_hash(code)
+            row = db.execute("SELECT * FROM pairings WHERE code_hash=?", (h,)).fetchone()
+            if row and row["used_at"] is None and row["expires_at"] >= now:
+                iid, token = self._issue(db, name, row["is_admin"], now)
+                db.execute("UPDATE pairings SET used_at=?, installation_id=? WHERE code_hash=? AND used_at IS NULL", (now, iid, h))
+                return iid, token
+            if not row and db.execute("SELECT 1 FROM shared_invitations WHERE code_hash=? AND expires_at>=?", (h, now)).fetchone():
+                self._room(db)
+                return self._issue(db, name, False, now)
+            raise ApiError(403, "pairing_rejected", "pairing code is unknown, used or expired")
 
     def authenticate(self, bearer):
         """`<installation_id>.<token>` -> installation row, constant-time hash compare, revoked refused."""

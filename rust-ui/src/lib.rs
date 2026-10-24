@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod models;
 pub mod natural_sort;
 pub mod netlink;
+pub mod network_setup;
 pub mod persist;
 pub mod pipeline;
 pub mod presets;

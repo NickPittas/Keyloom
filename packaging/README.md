@@ -37,7 +37,7 @@ The build ends with a real launch validation of the staged tree (`selfcheck.py` 
 Regenerate a lock after editing `runtime.in`:
 `uv pip compile packaging/runtime.in --python-version 3.11 --python-platform x86_64-unknown-linux-gnu|x86_64-pc-windows-msvc --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match --generate-hashes --emit-index-url -o packaging/locks/<os>-x86_64.txt`
 
-## Linux: `CorridorKey-<id>-linux-x86_64.run`
+## Linux: `Keyloom-<id>-linux-x86_64.run`
 Needs only sh/tar/gzip/awk/sha256sum. `./X.run [--prefix DIR] [--models full|skip] [--model-arg ARG]... [--repair]`
 (default prefix `~/.local/opt/CorridorKey`). Each `--model-arg` takes ONE argument, forwarded verbatim (spaces/globs
 preserved) to `scripts/setup_models.py`, e.g. `--model-arg --hf-cache --model-arg "/my cache"`. Those are the manager's
@@ -61,7 +61,7 @@ server mode: `PREFIX/bin/corridorkey-coordinator {serve|pair|revoke|abandon} ...
 `X.run --repair` restores damaged files from the payload (models re-verified only with `--models full`).
 Two versions are kept (active + previous). Concurrent installers on one prefix are not supported.
 
-## Windows: `CorridorKey-<id>-windows-x86_64-setup.exe` (Inno Setup, per-user by default)
+## Windows: `Keyloom-<id>-windows-x86_64-setup.exe` (Inno Setup, per-user by default)
 Installs to `%LOCALAPPDATA%\Programs\CorridorKey\versions\<id>`, then runs the same `lifecycle.py`
 (validation, Start Menu shortcut, receipt, optional full models task with a visible console). Drive-root folders and an
 already-installed identical build are refused; a failed launch validation sets a nonzero setup exit code

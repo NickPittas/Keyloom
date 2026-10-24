@@ -1,150 +1,81 @@
-# Network rendering
+# Keyloom network rendering
 
-You can spread a batch over several computers, Windows and Linux mixed. Each computer runs its own CorridorKey and its own GPU; one computer also acts as the **coordinator** that hands out work. The footage and results live on **shared storage** (a NAS or file server) that every computer can reach.
+Keyloom — powered by CorridorKey can send work to other Windows and Linux PCs on your LAN or Tailscale network. Network setup is in **Clients**; no terminal commands are needed.
 
-What this is and is not:
+Every installation can submit work, receive work, and host a network. One PC hosts each network's shared machine list and queue. All PCs that join that network see all its members. The host can render too. Creating a separate host creates a separate network; it does not merge two queues.
 
-- **One GPU per installation.** Computers do not pool GPUs into one bigger one.
-- Whole shots are sent to a PC. A single shot is not split across PCs.
-- Only **new** results are sent over the network. **Resume** and **Replace** stay on the computer that owns the shot, and movies or external sources are not supported for network jobs.
-- Hint, Key and Deliver for a network shot run on the receiving PC. Each receiving PC checks that its models match before it accepts work.
+## 1. Choose the host
 
-## Before you start
+Use a PC that will normally stay on. Normal setup needs no terminal. In **Clients → Network setup → Host a network on this PC**:
 
-On **every** computer:
+1. Enter an **Address** that **every PC can actually reach**, and a **Port** (normally `8443`). Use the LAN IPv4 address if all PCs can route to it; if they cannot (different subnets, VPN, remote sites), use the host's Tailscale IP instead. The host's certificate is pinned to this address, so changing the address later means a new identity: choose it deliberately.
+2. Tick **Trusted network: allow joining by address** if joining by IP and port is acceptable on your trusted LAN/Tailscale network. Leave it off to require an invitation file.
+3. Press **Install and start**.
+4. On the host PC, press **Join this network on this computer** (give it a **Name**), then tick **Accept work when GPU idle** if the host should render too.
 
-1. CorridorKey [installed](install.md), models Ready (see **Settings → Models & runtime…**).
-2. A real, interactive sign-in to the same user account you run CorridorKey with. Sign in at the desktop or via remote desktop; SSH alone does not give you your mapped drives.
-3. The shared storage reachable: a Linux mount (for example `/mnt/Kessel`), a Windows mapped drive (for example `R:\` or `Y:\`), or a UNC share (`\\server\share`).
+**Host service and client are different processes.** Installing the service creates a per-user service: a `systemd --user` unit on Linux, or a per-user logon task on Windows (with an HKCU Run entry as fallback if Windows refuses the task without elevation). It starts when you sign in, needs no administrator rights, and runs separately from the Keyloom window, so quitting the GUI does not stop it. Use **Stop** to stop it or **Remove** (click twice) to remove its sign-in entry; its local database keeps the network's identity and members. The service only coordinates the machine list and queue; it does not render. Rendering is done by that PC's Keyloom client, which must be running. Turn on [background running](user-guide.md#background-running) to keep the client alive when its window is closed.
 
-On the coordinator computer, one that is normally on, pick a stable address (a DNS name or fixed IP) that all other computers can reach, and allow the coordinator's TCP port (default `8443`) through the firewall yourself; CorridorKey creates no firewall rules.
+The first run may bring up an OS firewall prompt: allow it on your trusted/private network only. On Linux Keyloom does not open the firewall for you; if a firewall blocks the port, permit it for your LAN/Tailscale peers yourself.
 
-## 1. Run the coordinator
+![Clients and network setup](screenshots/native/13-pairing.png)
 
-The coordinator is started from a terminal with the `corridorkey-coordinator` command from the install:
+## 3. Use an invitation instead (optional)
 
-- Linux: `~/.local/opt/CorridorKey/bin/corridorkey-coordinator`
-- Windows: `%LOCALAPPDATA%\Programs\CorridorKey\bin\corridorkey-coordinator.cmd`
+A connected member opens **Invite other PCs**, chooses **Save invitation to**, and presses **Create invitation**. Give that **same file** to each PC you want to add; on each PC pick it under **Invitation file (optional)** and press **Join with invitation**.
 
-Start it with:
+The invitation points to the same network and includes its certificate identity. It is reusable for seven days. Every joining PC receives its own private credentials and sees the shared machine list. It is not a connection only to the PC that saved the file. Keep the invitation private while it is valid.
 
-```sh
-~/.local/opt/CorridorKey/bin/corridorkey-coordinator serve \
-  --state-dir ~/corridorkey-coordinator \
-  --host 0.0.0.0 --port 8443 \
-  --advertise-host kessel.lan \
-  --invite-out ~/invites/invite-edit-bay-2.json
-```
+Previously created one-use invitations still keep their original expiry and one-use rule.
 
-On Windows, use PowerShell (replace `kessel.lan` with your coordinator's stable reachable address):
+## 4. Map shared storage on each PC
 
-```powershell
-& "$env:LOCALAPPDATA\Programs\CorridorKey\bin\corridorkey-coordinator.cmd" serve `
-  --state-dir "$env:LOCALAPPDATA\CorridorKey-Coordinator" `
-  --host 0.0.0.0 --port 8443 `
-  --advertise-host kessel.lan `
-  --invite-out "$env:USERPROFILE\invite-edit-bay-2.json"
-```
+Footage and outputs live on shared storage that each receiving user can access. Keyloom sends a shared location name plus a relative path; each PC resolves that name under its own local drive or mount.
 
-- `--state-dir` is where the coordinator keeps its database and its certificate. **Always use the same folder on a local disk, never on the NAS.** It keeps previously paired computers working.
-- `--advertise-host` is the name or address other computers will use. It is built into the certificate, so keep it stable. If it changes, clients cannot verify the server.
-- Without `--invite-out` it listens but cannot pair anyone new. Without `--host` it only listens on the machine itself (loopback).
-- The command prints `invitation written to … (expires in 10 minutes)`, then `listening on https://…`. Leave it running.
-
-### One invitation per computer
-
-Today an invitation can only be created **when the coordinator starts**. To add a computer:
-
-1. Make sure nothing important is running through the coordinator (stopping it interrupts network jobs; do this when it is idle).
-2. Stop the coordinator (`Ctrl+C`).
-3. Start it again with the **same** `--state-dir` and `--advertise-host`, and a **new unique file** after `--invite-out`, for example `invite-pc2.json`.
-4. Move that file to the new computer over a channel you trust (USB stick, or a copy you can verify). It is a private file; it is created readable only by you.
-
-An invitation works **once** and for **10 minutes**. If it expires or fails, restart the coordinator for a new file. Do not share one invitation between PCs.
-
-To remove a computer: stop the coordinator, run `corridorkey-coordinator revoke --state-dir <dir> <installation id>`, then start it again. You need that computer's installation id (it starts with `inst_`). On that PC, find the preferences folder in **Settings → Paths and info**, then read only `installation_id` from `network/credentials.json` beside the preferences file. Never share the token or the whole credentials file. Use the full coordinator command path shown above if it is not on your PATH.
-
-## 2. Map the shared storage
-
-Different computers see the same storage under different paths. CorridorKey sends jobs using a **logical name** plus a relative path, and each PC turns that into its own local path.
-
-On each PC open **Settings → Path mapping** and add a shared location:
+Open **Settings → Path mapping** on every PC:
 
 ![Path mapping](screenshots/native/10-path-mapping.png)
 
-| Field | Example on Linux | Example on Windows |
+| Field | Linux example | Windows example |
 |---|---|---|
-| **Shared location name** | `SharedStorage` | `SharedStorage` |
-| **Folder on this PC** | `/mnt/Kessel` | `R:\` or `\\kessel\media` |
+| Shared location name | `Kessel` | `Kessel` |
+| Folder on this PC | `/mnt/Kessel` | `R:\` |
 
-- The **name must be identical** on every PC. Use the same logical name everywhere.
-- Press **Test read and write**. It must report *Read: OK* and *Write: OK*.
-- **Apply settings** to save. Invalid names or non-absolute paths block Apply. A saved mapping can still be unavailable: check the read/write result before sending work and reconnect the share in this user session if needed.
+Map the shared **root** (here `R:\` on Windows is the same storage as `/mnt/Kessel` on Linux). Use the **same logical name on every PC**; only the local folder differs. Projects under that root then resolve everywhere. Production footage can sit on a read-only share, but any location where a receiver writes (new results, and hint assets for steps that build them) must be writable: **Test read and write** shows what this PC can do. Then press **Apply settings**. Invalid names or non-absolute paths block Apply. Saving a mapping does not prove the drive is currently reachable; check the access result before rendering.
 
-The mapped root must cover both your **project source** and your **outputs**. If your project is in `/mnt/Kessel/Shows/A` and renders go to `/mnt/Kessel/Renders`, the one `/mnt/Kessel` mapping covers both. If sources and outputs live on different shares, add a location for each.
+The mappings must cover both project source and output folders. If they are on different shares, add both locations. Windows mapped drives belong to the signed-in user. Connect them in that user's desktop session; a system account or SSH session may not see them.
 
-## 3. Pair each computer
+## 5. Choose where each shot runs
 
-On the computer you are adding, put the invitation file somewhere private, then open **Clients**:
+On the Batch page:
 
-![Clients](screenshots/native/12-clients.png)
+1. Tick clips and use **Assign selected to → Apply to N**, or choose the PC directly on each clip card.
+2. Choose a workflow preset and press **Key selected N clips…**.
+3. Review the range, stages, outputs and **Render client** for each shot.
+4. Leave **Run on** as **Each shot's assigned client**, or choose a network PC for this entire batch.
+5. Press **Queue N clips**.
 
-Under **Connection setup**:
+![Batch confirmation](screenshots/native/14-batch-confirm.png)
 
-![Pairing](screenshots/native/13-pairing.png)
+A shot's own In/Out, input colour and hint prompts are retained. Each whole shot runs on one receiving PC through its reviewed Hint, Key and Deliver stages; a shot is not split across PCs. Network work writes new results. Resume and Replace stay local.
 
-1. **Invitation file** – the full path to the file you copied.
-2. **Name** – a clear name, for example `Edit bay 2`.
-3. Press **Pair this computer**. The status line changes to *Pairing…*.
-4. Tick **Connect to the coordinator**. The status should read *Connected*.
-5. To let this computer **work** for others, also tick **Take network work when this computer's GPU is idle**. Leave it off on a PC you only use to send work.
+## 6. Watch the Batch queue
 
-The pairing credentials are stored in a private file next to your preferences and are not shown in the app or saved in projects.
+![Queue with machine meters and stages](screenshots/native/15-batch-progress.png)
 
-The **Clients** page also shows availability only: each computer, its GPU, and *Connected* or *Offline*. **Check workers** re-tests the workers on this computer. Progress and load are shown in the Batch queue, not here.
+The queue groups work by PC and shows its CPU, RAM, GPU and VRAM bars alongside stage progress. Monitor and cancel work here; **Clients** is for availability and setup. The example above is from the earlier real two-PC run, reused without repeating a render.
 
-Keep CorridorKey running for a PC to take work. Use [background running](user-guide.md#background-running) (**Keep running when the window is closed** and **Start in the background when I sign in**), so a closed window or a reboot does not take the PC out of the pool. It starts at **sign-in**, not at boot, and for the same user whose drives are mapped.
-
-## 4. Send work
-
-### Pick a PC for each shot
-
-On the batch board, tick the clips and choose **Assign selected to** a computer (or *Automatic*) and press **Apply to N**. You can also choose a **Render client** per shot on the clip's Key or Deliver page. A shot assigned to a PC that is currently offline keeps that assignment; it is not silently moved elsewhere.
-
-### Review and confirm
-
-Select clips, choose a **Preset** and press **Key selected N clips…**. On **Review batch**:
-
-![Batch confirm](screenshots/native/14-batch-confirm.png)
-
-- Only **new** results can be sent. Resume or Replace shots must use the local computer.
-- Each shot shows its **Render client**.
-- **Run on** chooses for the whole batch: **Each shot's assigned client**, **Network: any available client**, or **Network: <PC name>** for one named PC. This overrides the per-shot choice for this batch only.
-- Each shot is sent whole (Hint → Key → Deliver as reviewed).
-- **Queue N clips** starts the work.
-
-Per-shot settings carry over from your preset, but **a shot's own In/Out, source colour and hint prompts are not copied from the preset**; each shot keeps its own.
-
-### Watch progress
-
-![Queue](screenshots/native/15-batch-progress.png)
-
-This queue screenshot is from the earlier real two-PC run, reused here without submitting another render.
-
-The **Queue** panel groups jobs by the PC that owns them. Each job shows its stages (**Pre-matte, Hint, Keying, Export**), progress per stage, and the PC's **CPU, RAM, GPU and VRAM** bars. **Cancel** is cooperative: the worker stops at a safe point and keeps frames already written. A PC that is not connected shows **Offline**.
-
-![Background](screenshots/native/11-background.png)
+Cancelling is cooperative and keeps frames already written. An offline PC keeps its assignment. When the host is unavailable, new network work waits; local work can continue. A job already running remains owned by its receiver and is not reassigned to another PC.
 
 ## Troubleshooting
 
-| Symptom | What to check |
+| Symptom | Check |
 |---|---|
-| *Not connected* after pairing | Coordinator running? Firewall open for its port? `--advertise-host` still the same name? |
-| Pairing fails | The invitation expired (10 minutes) or was already used. Restart the coordinator with a new `--invite-out` file. |
-| *Connect to the coordinator in Clients first* | The PC is not connected. Open **Clients** and tick **Connect to the coordinator**. |
-| A shot is refused on the receiving PC | Path mapping missing or not identical, or the shared drive is not mounted for that signed-in user. Use **Test read and write**. |
-| Models differ | The receiving PC refuses work if its models do not match this PC's. Run **Verify all** or `corridorkey-setup status --verify`. |
-| Nothing picks up work | **Take network work when this computer's GPU is idle** must be ticked on that PC, and its GPU must be idle. |
-| Mapped drive missing | Background running only works for the same user who maps the drive. Sign in interactively first; SSH does not provide it. |
+| Service will not start | Read the UI error: address/port in use, unavailable user service manager, or permissions. Do not start a second host on the same port. |
+| Cannot join by address | The host service must be running, permit address joining, and be reachable through the firewall. |
+| Invitation rejected | Check expiry. Older invitations may be single-use. Create a new reusable invitation from the UI. |
+| Different or incomplete machine list | Check that every PC joined the same host/network, rather than creating separate networks. |
+| PC visible but not receiving | Enable receiving work, keep its client running, and confirm its GPU is idle and models are ready. |
+| Shared files unavailable | Open the share as the desktop user and test the mapping in Keyloom. |
+| Certificate identity error | Check the host/address. Keep the existing network state; recreating it creates a different identity. |
 
-To release a job from a PC that died, stop the coordinator and use `corridorkey-coordinator abandon --state-dir <dir> --reason "…" --i-understand-writer-not-stopped <attempt id>` only after checking that machine; it marks the job failed and does **not** stop the process or unlock anything.
+Pairing credentials and the service database stay on local disk, outside projects. Keep their tokens private. Renaming the app preserves the existing settings and model locations.

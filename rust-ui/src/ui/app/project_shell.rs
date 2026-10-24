@@ -381,7 +381,8 @@ impl App {
                 }
             }
             ui.separator();
-            ui.label(RichText::new("CorridorKey").strong());
+            ui.label(RichText::new("Keyloom").strong());
+            ui.label(RichText::new("powered by CorridorKey").weak());
             ui.add_space(20.0);
             self.clients_button(ui);
             self.settings_button(ui);

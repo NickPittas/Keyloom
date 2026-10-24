@@ -1,7 +1,9 @@
 """Reusable authenticated protocol-v1 client (the future bundled link process builds on this)."""
+import hmac
 import http.client
 import json
 import os
+import socket
 import ssl
 import time
 
@@ -20,14 +22,18 @@ class CoordinatorError(Exception):
 
 
 class Client:
-    def __init__(self, creds, timeout=15):
+    def __init__(self, creds, timeout=15, *, loopback=False):
         """`creds` is a dict from pki.read_credentials. Trust is re-verified on construction."""
         self.host, self.port, self.ctx = pki.verified_trust(creds["url"], creds["certificate_pem"], creds["fingerprint_sha256"])
         self.bearer = f"{creds['installation_id']}.{creds['token']}"
         self.timeout = timeout
+        self.loopback = loopback
 
     def _call(self, method, path, body=None, auth=True):
         conn = http.client.HTTPSConnection(self.host, self.port, context=self.ctx, timeout=self.timeout)
+        if self.loopback:
+            # Route local joining over loopback while TLS still verifies the certificate's advertised name.
+            conn._create_connection = lambda addr, timeout, source_address=None: socket.create_connection(("127.0.0.1", addr[1]), timeout, source_address)
         try:
             data = canonical(body).encode() if body is not None else None
             headers = {"Connection": "close"}
@@ -77,19 +83,16 @@ class Client:
     def job(self, job_id): return self._call("GET", f"/v1/jobs/{job_id}")
     def job_events(self, job_id, after=0, limit=100): return self._call("GET", f"/v1/jobs/{job_id}/events?after={after}&limit={limit}")
     def stats(self, body): return self._call("POST", "/v1/stats", body)
+    def invite(self): return self._call("POST", "/v1/invitations", {})
     def installations(self): return self._call("GET", "/v1/installations")
 
 
-def redeem_to_file(inv, credentials_path, name):
-    """The one pairing routine (CLI and bridge). Order matters: reserve a private destination first (exclusive, protected,
-    verified), redeem the one-use code, then store. Returns installation_id. Raises SecurityError subclasses:
-    PairedNotSaved (code spent, token lost) and PairingUncertain (transport failure; code MAY be spent). Never retries."""
-    if inv["expires_at"] < time.time():
-        raise pki.SecurityError("invitation has expired; ask the server owner for a new one")
+def _store_new(credentials_path, issue):
+    """Reserve a private destination, run `issue()` -> credentials dict, then store. Order matters (see redeem_to_file)."""
     pki.reserve_private(credentials_path)
     try:
-        creds = Client.pair(inv, name)
-    except ssl.SSLCertVerificationError as e:  # failed in the handshake: the code was never sent
+        creds = issue()
+    except ssl.SSLCertVerificationError as e:  # failed in the handshake: nothing was sent
         pki.release_reserved(credentials_path)
         raise pki.SecurityError(f"server certificate rejected ({e.verify_message}); nothing was sent") from None
     except (OSError, http.client.HTTPException, ValueError) as e:  # SSLError/timeouts/resets/garbled reply
@@ -108,3 +111,43 @@ def redeem_to_file(inv, credentials_path, name):
             pass
         raise pki.PairedNotSaved(creds["installation_id"], type(e).__name__) from None
     return creds["installation_id"]
+
+
+def redeem_to_file(inv, credentials_path, name):
+    """The one pairing routine (CLI and bridge). Order matters: reserve a private destination first (exclusive, protected,
+    verified), redeem the one-use code, then store. Returns installation_id. Raises SecurityError subclasses:
+    PairedNotSaved (code spent, token lost) and PairingUncertain (transport failure; code MAY be spent). Never retries."""
+    if inv["expires_at"] < time.time():
+        raise pki.SecurityError("invitation has expired; ask the server owner for a new one")
+    return _store_new(credentials_path, lambda: Client.pair(inv, name))
+
+
+def join_to_file(url, credentials_path, name, path="/v1/join", extra=None, pem=None, timeout=15, existing=None, loopback=False):
+    """Join by address without an invitation. With `pem=None` the certificate is fetched ONCE from the address the user
+    typed (trust on first use) and pinned: it must cover that address, and the join call itself, like every later call, is a
+    fully verified TLS connection to exactly that certificate. Verification is never disabled for any request that carries
+    data. With `pem` (the local service's own certificate file) nothing is fetched. `existing` is a credentials file: if it
+    pins the SAME certificate (same network) nothing is redeemed and its installation is reused. Returns
+    (installation_id, fingerprint, reused)."""
+    host, port = pki.endpoint(url)
+    if pem is None:
+        try:
+            pem = ssl.get_server_certificate((host, port), timeout=timeout)  # handshake only: no request, no secret is sent
+        except (OSError, ValueError) as e:
+            raise CoordinatorError(0, "transport", f"could not reach {host}:{port} ({type(e).__name__})") from None
+        if not pki.cert_covers_host(pem, host):
+            raise pki.SecurityError(f"the certificate presented by {host} does not cover that address; not trusting it")
+    fp = pki.fingerprint(pem)
+    if existing is not None:
+        have = pki.read_credentials(existing)
+        if hmac.compare_digest(have["fingerprint_sha256"].lower(), fp):
+            return have["installation_id"], fp, True
+    base = {"url": f"https://{host if ':' not in host else '[' + host + ']'}:{port}", "certificate_pem": pem, "fingerprint_sha256": fp}
+
+    def issue():
+        c = Client({**base, "installation_id": "-", "token": "-"}, timeout, loopback=loopback)
+        out = c._call("POST", path, {"protocol": PROTOCOL, "name": name, **(extra or {})}, auth=False)
+        if not pki.valid_installation_id(out.get("installation_id")) or not pki.valid_token(out.get("token")):
+            raise BadReply("join reply carries unusable credentials")
+        return {**base, "installation_id": out["installation_id"], "token": out["token"]}
+    return _store_new(credentials_path, issue), fp, False

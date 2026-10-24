@@ -1,4 +1,4 @@
-; CorridorKey Windows installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
+; Keyloom (powered by CorridorKey) Windows installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
 ; Per-user by default (no admin, no service, no firewall rule, no listener). Each version lands in
 ; {app}\versions\<id>; lifecycle.py validates it, switches the active version, writes the Start Menu
 ; shortcut + receipt and (optionally) runs the shared model manager. User data lives outside {app}.
@@ -6,9 +6,9 @@
 
 [Setup]
 AppId={{7C1E6C52-3B0F-4D5A-9E57-2D6C7A0B7E21}
-AppName=CorridorKey
+AppName=Keyloom
 AppVersion=@APP_VERSION@
-AppPublisher=EZ-CorridorKey fork (private build)
+AppPublisher=Keyloom (powered by CorridorKey; private build)
 DefaultDirName={localappdata}\Programs\CorridorKey
 DisableProgramGroupPage=yes
 DisableDirPage=no
@@ -16,7 +16,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=@OUT@
-OutputBaseFilename=CorridorKey-{#VID}-windows-x86_64-setup
+OutputBaseFilename=Keyloom-{#VID}-windows-x86_64-setup
 Compression=lzma2/fast
 SolidCompression=no
 DiskSpanning=yes
@@ -103,7 +103,7 @@ begin
   if not Exec(Py, Args, '', SW_SHOW, ewWaitUntilTerminated, Rc) then
     Rc := 2;
   if Rc = 3 then
-    SuppressibleMsgBox('CorridorKey is installed but model setup is INCOMPLETE. Run "corridorkey-setup models" (or repair) to finish; affected workflows stay unavailable until then.', mbInformation, MB_OK, IDOK)
+    SuppressibleMsgBox('Keyloom is installed but model setup is INCOMPLETE. Run "corridorkey-setup models" (or repair) to finish; affected workflows stay unavailable until then.', mbInformation, MB_OK, IDOK)
   else if Rc <> 0 then
   begin
     FailCode := Rc;

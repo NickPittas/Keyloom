@@ -1,5 +1,5 @@
 #!/bin/sh
-# CorridorKey @VERSION_ID@ self-extracting Linux user installer (needs only sh, tar, gzip, awk, sha256sum).
+# Keyloom (powered by CorridorKey) @VERSION_ID@ self-extracting Linux user installer (needs only sh, tar, gzip, awk, sha256sum).
 # No root, no services, no listeners. Installs under PREFIX; user data stays outside it.
 set -eu
 PAYLOAD_SHA256="@PAYLOAD_SHA256@"
@@ -13,7 +13,7 @@ Usage: $(basename "$0") [--prefix DIR] [--repair] [--models full|skip] [--model-
   --model-arg   pass one argument to scripts/setup_models.py, repeatable, spaces preserved
                 (e.g. --model-arg --hf-cache --model-arg "/my cache")
 Later: PREFIX/bin/corridorkey-setup {repair|rollback|models|status|uninstall}
-Server mode (opt-in, starts nothing by itself): PREFIX/bin/corridorkey-coordinator {serve|pair|revoke|abandon} ...
+Network setup: open Keyloom > Clients to host or join a render network.
 U
 }
 # Rotate args: scalar options are consumed; --model-arg values are re-appended verbatim so "$@" ends up

@@ -193,6 +193,11 @@ def fingerprint(cert_pem):
     return hashlib.sha256(der).hexdigest()
 
 
+def network_id(fp):
+    """A network IS its pinned certificate: the id is derived, so it needs no storage and cannot drift from the trust anchor."""
+    return fp.lower()[:16]
+
+
 def cert_covers_host(cert_pem, host):
     san = x509.load_pem_x509_certificate(cert_pem.encode()).extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     try:

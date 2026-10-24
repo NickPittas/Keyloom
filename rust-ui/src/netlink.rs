@@ -52,6 +52,14 @@ pub enum Op {
     JobEvents,
     Installations,
     Estimate,
+    ServiceStatus,
+    ServiceInstall,
+    ServiceStart,
+    ServiceStop,
+    ServiceRemove,
+    JoinAddress,
+    NetworkInvite,
+    ServiceLocalJoin,
 }
 
 impl Op {
@@ -71,6 +79,14 @@ impl Op {
             Op::JobEvents => "job_events",
             Op::Installations => "installations",
             Op::Estimate => "estimate",
+            Op::ServiceStatus => "service_status",
+            Op::ServiceInstall => "service_install",
+            Op::ServiceStart => "service_start",
+            Op::ServiceStop => "service_stop",
+            Op::ServiceRemove => "service_remove",
+            Op::JoinAddress => "join_address",
+            Op::NetworkInvite => "network_invite",
+            Op::ServiceLocalJoin => "service_local_join",
         }
     }
 }
