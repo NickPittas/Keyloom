@@ -23,11 +23,11 @@ The current application has its own native Rust interface, project workflow, net
 - **Network setup** from the Clients page: host a network service, join by address and port, or share one optional reusable invitation. Every member sees the other PCs.
 - **Batch** many shots at once with a saved workflow preset, and spread them over several PCs on your network.
 
-Download: [Windows installer](https://github.com/NickPittas/Keyloom/releases/tag/v2.2.0-windows) · [Linux installer](https://github.com/NickPittas/Keyloom/releases/tag/v2.2.0-linux). Download every part listed in your OS release.
+Download: [Windows installer](https://github.com/NickPittas/Keyloom/releases/tag/v2.3.0-windows) · [Linux installer](https://github.com/NickPittas/Keyloom/releases/tag/v2.3.0-linux). Each release offers online and full offline installers; follow the [installation guide](docs/install.md).
 
 ## Quick start
 
-1. [Install](docs/install.md) the app and let it download the models.
+1. [Install](docs/install.md) the app, then download models from **Models & runtime…**.
 2. Start Keyloom, choose **New project…**, then **Import clips…**.
 3. Work through each clip: **Media → Hint → Key → Review → Deliver**.
 

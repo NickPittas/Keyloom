@@ -17,22 +17,37 @@ You do **not** need to install Python, Rust, FFmpeg, the CUDA toolkit or the Vis
 
 The installers are for private use. The licence is non-commercial (CC-BY-NC-SA-4.0) and public redistribution is not cleared.
 
-## Windows
+## Choose an installer
+
+Use the **online installer** for a smaller download and to reuse unchanged dependencies on existing PCs. Use the **offline installer** when the target PC cannot download dependencies. Both install the same Keyloom build. Quit Keyloom with **File → Quit** before updating; install over the existing folder without uninstalling.
+
+- [Windows 2.3.0 downloads](https://github.com/NickPittas/Keyloom/releases/tag/v2.3.0-windows): `Keyloom-online-2.3.0-662dcec4eb-windows-x86_64.exe` and its checksum file. Keep any online `.bin` slices listed in that release beside the exe, then double-click it.
+- [Linux 2.3.0 downloads](https://github.com/NickPittas/Keyloom/releases/tag/v2.3.0-linux): `Keyloom-online-2.3.0-1b3b546391-linux-x86_64.run` and its checksum file. In the download folder:
+
+  ```sh
+  sha256sum -c Keyloom-online-2.3.0-1b3b546391-linux-x86_64.run.sha256
+  chmod +x Keyloom-online-2.3.0-1b3b546391-linux-x86_64.run
+  ./Keyloom-online-2.3.0-1b3b546391-linux-x86_64.run
+  ```
+
+The online installer leaves models to the app. Its first installation may download several GiB of public dependencies; an update downloads a wheel only when required files cannot be reused.
+
+## Windows offline installer
 
 GitHub limits file size, so the installer comes in slices: one `.exe` plus several `.bin` files (each up to 1900 MiB), and a `.sha256` file.
 
-The Windows payload is `2.2.0-8f144ac0b0`; the Linux payload is `2.2.0-56885597c1`. These suffixes identify the bundled contents.
+The Windows payload is `2.3.0-662dcec4eb`; the Linux payload is `2.3.0-1b3b546391`. These suffixes identify the bundled contents.
 
-Download the [Windows release](https://github.com/NickPittas/Keyloom/releases/tag/v2.2.0-windows).
+Download the [Windows release](https://github.com/NickPittas/Keyloom/releases/tag/v2.3.0-windows).
 
 1. Download **all** of these into the **same folder**:
-   - `Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup.exe`
-   - every `Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup-1.bin`, `-2.bin`, … (all of them)
-   - `Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup.exe.sha256`
+   - `Keyloom-2.3.0-662dcec4eb-windows-x86_64-setup.exe`
+   - every `Keyloom-2.3.0-662dcec4eb-windows-x86_64-setup-1.bin`, `-2.bin`, … (all of them)
+   - `Keyloom-2.3.0-662dcec4eb-windows-x86_64-setup.exe.sha256`
 2. Check the files. In PowerShell, inside that folder:
 
    ```powershell
-   Get-Content .\Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup.exe.sha256 | ForEach-Object {
+   Get-Content .\Keyloom-2.3.0-662dcec4eb-windows-x86_64-setup.exe.sha256 | ForEach-Object {
      $hash, $name = $_ -split '\s+', 2
      $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $name).Hash
      if ($got -ine $hash) { throw "SHA256 mismatch: $name" }
@@ -41,8 +56,8 @@ Download the [Windows release](https://github.com/NickPittas/Keyloom/releases/ta
    ```
 
    Every line must say `OK`. Stop if PowerShell reports an error; re-download the missing or mismatched file.
-3. Double-click the `.exe`. Keep the "Download and verify ALL models now" option ticked unless you want to do the models later.
-4. Setup installs to `%LOCALAPPDATA%\Programs\CorridorKey`, checks that the app starts, adds a Start Menu shortcut and then opens a console window that downloads and verifies the models. Leave that window open until it finishes.
+3. Double-click the `.exe`. Untick **Download and verify ALL models now**; download models from the app after installation.
+4. Setup installs to `%LOCALAPPDATA%\Programs\CorridorKey`, checks the bundled runtime and adds a Start Menu shortcut. Open Keyloom and download the models you need from **Models & runtime…**.
 
 If a problem appears, the **previous** version is restored, or on a first install everything is removed.
 
@@ -53,9 +68,9 @@ Command-line helpers (PowerShell):
 & "$env:LOCALAPPDATA\Programs\CorridorKey\bin\corridorkey-setup.cmd" models
 ```
 
-## Linux
+## Linux offline installer
 
-Download the [Linux release](https://github.com/NickPittas/Keyloom/releases/tag/v2.2.0-linux).
+Download the [Linux release](https://github.com/NickPittas/Keyloom/releases/tag/v2.3.0-linux).
 
 The release is a single self-extracting `.run` file. If it is hosted on GitHub it is split into parts of up to 1900 MiB. Where a complete `.run` is already available (for example on a local file share), skip the reassembly steps and go straight to *Run the installer*.
 
@@ -63,16 +78,16 @@ The release is a single self-extracting `.run` file. If it is hosted on GitHub i
 
 Put these files in one folder:
 
-- `Keyloom-2.2.0-56885597c1-linux-x86_64.run.part001`, `.part002`, `.part003` (every part)
-- `Keyloom-2.2.0-56885597c1-linux-x86_64.run.parts.sha256` (checksums of the parts)
-- `Keyloom-2.2.0-56885597c1-linux-x86_64.run.sha256` (checksum of the whole file)
+- `Keyloom-2.3.0-1b3b546391-linux-x86_64.run.part001`, `.part002`, `.part003` (every part)
+- `Keyloom-2.3.0-1b3b546391-linux-x86_64.run.parts.sha256` (checksums of the parts)
+- `Keyloom-2.3.0-1b3b546391-linux-x86_64.run.sha256` (checksum of the whole file)
 
 ```sh
 cd ~/Downloads/keyloom
-sha256sum -c Keyloom-2.2.0-56885597c1-linux-x86_64.run.parts.sha256
-cat Keyloom-2.2.0-56885597c1-linux-x86_64.run.part[0-9][0-9][0-9] > Keyloom-2.2.0-56885597c1-linux-x86_64.run
-sha256sum -c Keyloom-2.2.0-56885597c1-linux-x86_64.run.sha256
-chmod +x Keyloom-2.2.0-56885597c1-linux-x86_64.run
+sha256sum -c Keyloom-2.3.0-1b3b546391-linux-x86_64.run.parts.sha256
+cat Keyloom-2.3.0-1b3b546391-linux-x86_64.run.part[0-9][0-9][0-9] > Keyloom-2.3.0-1b3b546391-linux-x86_64.run
+sha256sum -c Keyloom-2.3.0-1b3b546391-linux-x86_64.run.sha256
+chmod +x Keyloom-2.3.0-1b3b546391-linux-x86_64.run
 ```
 
 Use the numeric pattern `part[0-9][0-9][0-9]`. A plain `part*` would also match the `.parts.sha256` file and corrupt the result. Each check must print `OK`.
@@ -80,10 +95,10 @@ Use the numeric pattern `part[0-9][0-9][0-9]`. A plain `part*` would also match 
 ### Run the installer
 
 ```sh
-./Keyloom-2.2.0-56885597c1-linux-x86_64.run
+./Keyloom-2.3.0-1b3b546391-linux-x86_64.run --models skip
 ```
 
-It installs to `~/.local/opt/CorridorKey` by default, adds a desktop entry, installs the `corridorkey`, `corridorkey-setup` and `corridorkey-coordinator` commands under `~/.local/opt/CorridorKey/bin`, then downloads and verifies the full model set.
+It installs to `~/.local/opt/CorridorKey` by default, adds a desktop entry, installs the `corridorkey`, `corridorkey-setup` and `corridorkey-coordinator` commands under `~/.local/opt/CorridorKey/bin`, and leaves model downloads to the app when run with `--models skip`.
 
 Options:
 
@@ -105,9 +120,9 @@ Later commands:
 ~/.local/opt/CorridorKey/bin/corridorkey-setup uninstall
 ```
 
-## Online installer (smaller download, installs or updates only what changed)
+## Online installer
 
-Besides the offline installers above, an **online installer** exists for Linux and Windows. It **contains Keyloom itself** (the application, its own Python runtime and FFmpeg) and leaves out only the very large public dependencies, mainly PyTorch and the NVIDIA CUDA user-space libraries. Those are downloaded during installation, each as a hash-pinned wheel from the public PyPI / PyTorch / NVIDIA package servers. The result is byte-for-byte the same version (`version_id`) and the same installed files as the full offline installer.
+Recommended when internet access is available. Alongside the offline installers above, an **online installer** exists for Linux and Windows. It **contains Keyloom itself** (the application, its own Python runtime and FFmpeg) and leaves out only the very large public dependencies, mainly PyTorch and the NVIDIA CUDA user-space libraries. Those are downloaded during installation, each as a hash-pinned wheel from the public PyPI / PyTorch / NVIDIA package servers. The result is byte-for-byte the same version (`version_id`) and the same installed files as the full offline installer.
 
 **Getting it vs. installing it.** The source repository is private, so you receive the online installer from the owner **once, manually** (the same way as the offline installer). Running it needs **no GitHub access, sign-in, token, client id or release lookup**: the only connections are anonymous HTTPS downloads of the pinned public wheels, over HTTPS only. If everything is already installed and unchanged, it works completely offline.
 

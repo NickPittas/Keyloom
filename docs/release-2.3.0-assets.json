@@ -1,0 +1,96 @@
+{
+  "version": "2.3.0",
+  "source_commit": "e7da0e28ba7d72a912bb3f915dc2149eff9cbf54",
+  "assets": [
+    {
+      "platform": "linux-x86_64",
+      "name": "Keyloom-2.3.0-1b3b546391-linux-x86_64.run.part001",
+      "size": 1992294400,
+      "sha256": "32c47444da13582996ee6861a466930b3dd148a41cc6a289609f545d06e2e353"
+    },
+    {
+      "platform": "linux-x86_64",
+      "name": "Keyloom-2.3.0-1b3b546391-linux-x86_64.run.part002",
+      "size": 1992294400,
+      "sha256": "29bef48847e78fc1724eec7082f771d128ad55ac5391e18a50097a2ddf1647d5"
+    },
+    {
+      "platform": "linux-x86_64",
+      "name": "Keyloom-2.3.0-1b3b546391-linux-x86_64.run.part003",
+      "size": 832545914,
+      "sha256": "c40e974833ab41049b3c92de1121e982935eb85beb969c7242c312b1136852e1"
+    },
+    {
+      "platform": "linux-x86_64",
+      "name": "Keyloom-2.3.0-1b3b546391-linux-x86_64.run.parts.sha256",
+      "size": 348,
+      "sha256": "715da5ffb20f9f469372c3e921109a86a1776a9180ec4de08978a926bbc9f0e2"
+    },
+    {
+      "platform": "linux-x86_64",
+      "name": "Keyloom-2.3.0-1b3b546391-linux-x86_64.run.sha256",
+      "size": 108,
+      "sha256": "e79aecc50e8b2b2fc1f811239d8ef2a8b6c068abb0ade17768d81f3fd51fe238"
+    },
+    {
+      "platform": "linux-x86_64",
+      "name": "Keyloom-online-2.3.0-1b3b546391-linux-x86_64.run",
+      "size": 677215230,
+      "sha256": "93890680182373eea08907b7d308f8b4cf3add03d9c2d60f2b3a07ca01f3cce4"
+    },
+    {
+      "platform": "linux-x86_64",
+      "name": "Keyloom-online-2.3.0-1b3b546391-linux-x86_64.run.sha256",
+      "size": 115,
+      "sha256": "1a3df386727de06b0ee9ed6fb925e066a2d1e5a5a8c358e5154977acac25a70b"
+    },
+    {
+      "platform": "windows-x86_64",
+      "name": "Keyloom-2.3.0-662dcec4eb-windows-x86_64-setup-1.bin",
+      "size": 1986849280,
+      "sha256": "4050fcc231d8fc93cf6dbc1c6c8710247c5488772b8fa7c88aef95bfce0d0a0a"
+    },
+    {
+      "platform": "windows-x86_64",
+      "name": "Keyloom-2.3.0-662dcec4eb-windows-x86_64-setup-2.bin",
+      "size": 1346198008,
+      "sha256": "57929b7d5cb2cc478fbad1e0b1cffee09bd3c1190276f15842143d3b25a6d0f6"
+    },
+    {
+      "platform": "windows-x86_64",
+      "name": "Keyloom-2.3.0-662dcec4eb-windows-x86_64-setup.exe",
+      "size": 5444678,
+      "sha256": "c9bcb0607bc4f4ab6a66e40573714ef83e63452e2effab40a87ae079d90f5599"
+    },
+    {
+      "platform": "windows-x86_64",
+      "name": "Keyloom-2.3.0-662dcec4eb-windows-x86_64-setup.exe.sha256",
+      "size": 355,
+      "sha256": "72796f47735cea4f6c78fd774312a1e3a12db495e189fc5cfc371c3db89aab19"
+    },
+    {
+      "platform": "windows-x86_64",
+      "name": "Keyloom-online-2.3.0-662dcec4eb-windows-x86_64-1.bin",
+      "size": 610329943,
+      "sha256": "835d45fb7ae8902274b8b89b565c26da231dab5e78519eb8da821b400ddc1000"
+    },
+    {
+      "platform": "windows-x86_64",
+      "name": "Keyloom-online-2.3.0-662dcec4eb-windows-x86_64.exe",
+      "size": 5437051,
+      "sha256": "b307308860a07c7a7013eb7982206dfc6ceaea4573b92ccdbca7d20d8ab39e69"
+    },
+    {
+      "platform": "windows-x86_64",
+      "name": "Keyloom-online-2.3.0-662dcec4eb-windows-x86_64.exe.sha256",
+      "size": 238,
+      "sha256": "48cfc6af8a14b914589b85902cf4e4e6893ec85d3a02aa00da8ef957503be718"
+    },
+    {
+      "platform": "documentation",
+      "name": "Keyloom-2.3.0-Documentation.zip",
+      "size": 15636560,
+      "sha256": "82240d0f6b81fae9c1308236a1751b4f3cc0f6fd2e921b8d6aadf4a271e3bc1e"
+    }
+  ]
+}
