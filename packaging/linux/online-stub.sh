@@ -14,20 +14,22 @@ ONLINE_OFFSET=@ONLINE_OFFSET@; ONLINE_LEN=@ONLINE_LEN@; ONLINE_SHA256="@ONLINE_S
 # A pre-rename install (~/.local/opt/CorridorKey) is taken over: Keyloom installs into ~/.local/opt/Keyloom, reuses the installed
 # files, moves the startup entry/launcher/network service across and leaves the old folder as the rollback holder.
 OLD="$HOME/.local/opt/CorridorKey"; ADOPT=""; PREFIX_SET=0
-PREFIX="${KEYLOOM_PREFIX:-${CORRIDORKEY_PREFIX:-$HOME/.local/opt/Keyloom}}"; REPAIR=""; FIREWALL=ask
+PREFIX="${KEYLOOM_PREFIX:-${CORRIDORKEY_PREFIX:-$HOME/.local/opt/Keyloom}}"; REPAIR=""; FIREWALL=yes
 usage() { cat <<U
-Usage: $(basename "$0") [--prefix DIR] [--repair] [--firewall ask|skip]
+Usage: $(basename "$0") [--prefix DIR] [--repair] [--firewall yes|skip | --no-firewall]
   default       install or update Keyloom @VERSION_ID@ into PREFIX ($PREFIX); files of the installed versions
                 are reused, only the wheels still needed are downloaded (several GB on a first install)
   --repair      re-verify and restore damaged files of @VERSION_ID@
-  --firewall    ask (default): if UFW is active, ask once before using sudo to allow this PC's trusted networks
-                (TCP 8443-8452, UDP 44554); without a terminal the step is left pending. skip: never ask
+  --firewall    yes (default): if UFW is active, use sudo (a password prompt follows) to allow this PC's trusted networks
+                (TCP 8443-8452, UDP 44554); without a terminal the step is left pending. skip: do not touch the firewall
+  --no-firewall same as --firewall skip
 Quit Keyloom first (File > Quit).
 U
 }
 while [ $# -gt 0 ]; do
   case "$1" in
     --repair) REPAIR=1; shift;;
+    --no-firewall) FIREWALL=skip; shift;;
     --prefix) [ $# -ge 2 ] || { echo "--prefix needs a value" >&2; exit 64; }; PREFIX="$2"; PREFIX_SET=1; shift 2;;
     --firewall) [ $# -ge 2 ] || { echo "--firewall needs a value" >&2; exit 64; }; FIREWALL="$2"; shift 2;;
     -h|--help) usage; exit 0;;
@@ -35,7 +37,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ "$PREFIX_SET" = 0 ] && [ -z "${KEYLOOM_PREFIX:-}${CORRIDORKEY_PREFIX:-}" ] && [ -f "$OLD/receipt.json" ] && [ ! -f "$PREFIX/receipt.json" ]; then ADOPT="$OLD"; fi
-case "$FIREWALL" in ask|skip) ;; *) echo "--firewall must be ask or skip" >&2; exit 64;; esac
+case "$FIREWALL" in yes|skip|ask) ;; *) echo "--firewall must be yes or skip" >&2; exit 64;; esac
 [ "$(uname -m)" = x86_64 ] || { echo "ERROR: x86_64 Linux only" >&2; exit 1; }
 SELF=$(readlink -f "$0")
 mkdir -p "$PREFIX"
@@ -120,7 +122,7 @@ set -- --payload-dir "$W/payload" --sources "$W/wheel-sources.json" --prefix "$P
 # through $KEYLOOM_WAIT_FILE.
 KEYLOOM_WAIT_FILE="$STAGE/waiting-for-user"; export KEYLOOM_WAIT_FILE
 set +e
-"$PY" -I -B "$IP" run --label online --wait-file "$KEYLOOM_WAIT_FILE" -- "$PY" -I -B "$W/payload/app/packaging/online.py" "$@"
+"$PY" -I -B "$IP" run --label online --log "$PREFIX/install.log" --log-title "Keyloom linux-online installer" --wait-file "$KEYLOOM_WAIT_FILE" -- "$PY" -I -B "$W/payload/app/packaging/online.py" "$@"
 RC=$?
 [ "$RC" -ne 4 ] || echo "Keyloom is running: quit it (File > Quit), then run this installer again." >&2
 exit $RC

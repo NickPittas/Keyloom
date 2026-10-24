@@ -14,9 +14,9 @@ RUNTIME_OFFSET=@RUNTIME_OFFSET@; RUNTIME_LEN=@RUNTIME_LEN@; RUNTIME_SHA256="@RUN
 OLD="$HOME/.local/opt/CorridorKey"; ADOPT=""
 PREFIX="${KEYLOOM_PREFIX:-${CORRIDORKEY_PREFIX:-$HOME/.local/opt/Keyloom}}"
 PREFIX_SET=0
-VERB=install; FIREWALL=ask; MODELS=skip; MODELS_SET=0; EXTRACT=""
+VERB=install; FIREWALL=yes; MODELS=skip; MODELS_SET=0; EXTRACT=""
 usage() { cat <<U
-Usage: $(basename "$0") [--prefix DIR] [--repair] [--models full|skip] [--model-arg ARG]... [--firewall ask|skip] [--extract-only DIR]
+Usage: $(basename "$0") [--prefix DIR] [--repair] [--models full|skip] [--model-arg ARG]... [--firewall yes|skip | --no-firewall] [--extract-only DIR]
   default       install/update into PREFIX ($PREFIX); previous version kept for rollback. Installing the build that is
                 already installed and verified changes nothing. Settings, models and network identity are never touched
   --repair      restore damaged bundle files from this payload; models are re-verified only with --models full
@@ -24,8 +24,9 @@ Usage: $(basename "$0") [--prefix DIR] [--repair] [--models full|skip] [--model-
                 install, update or repair; use the app's Models page or: keyloom-setup models)
   --model-arg   pass one argument to scripts/setup_models.py, repeatable, spaces preserved
                 (e.g. --model-arg --hf-cache --model-arg "/my cache")
-  --firewall    ask (default): if UFW is active, ask once before using sudo to allow this PC's trusted networks
-                (TCP 8443-8452, UDP 44554); without a terminal the step is left pending. skip: never ask
+  --firewall    yes (default): if UFW is active, use sudo (a password prompt follows) to allow this PC's trusted networks
+                (TCP 8443-8452, UDP 44554); without a terminal the step is left pending. skip: do not touch the firewall
+  --no-firewall same as --firewall skip
 Later: PREFIX/bin/keyloom-setup {repair|rollback|models|status|uninstall}
 Network setup: open Keyloom > Clients to host or join a render network.
 U
@@ -37,6 +38,7 @@ while [ "$I" -lt "$N" ]; do
   A=$1; shift; I=$((I+1))
   case "$A" in
     --repair) VERB=repair;;
+    --no-firewall) FIREWALL=skip;;
     -h|--help) usage; exit 0;;
     --prefix|--models|--model-arg|--firewall|--extract-only)
       [ "$I" -lt "$N" ] || { echo "$A needs a value" >&2; exit 64; }
@@ -53,7 +55,7 @@ while [ "$I" -lt "$N" ]; do
 done
 if [ "$PREFIX_SET" = 0 ] && [ -z "${KEYLOOM_PREFIX:-}${CORRIDORKEY_PREFIX:-}" ] && [ -f "$OLD/receipt.json" ] && [ ! -f "$PREFIX/receipt.json" ]; then ADOPT="$OLD"; fi
 case "$MODELS" in full|skip) ;; *) echo "--models must be full or skip" >&2; exit 64;; esac
-case "$FIREWALL" in ask|skip) ;; *) echo "--firewall must be ask or skip" >&2; exit 64;; esac
+case "$FIREWALL" in yes|skip|ask) ;; *) echo "--firewall must be yes or skip" >&2; exit 64;; esac
 [ "$(uname -m)" = x86_64 ] || { echo "ERROR: x86_64 Linux only" >&2; exit 1; }
 SELF=$(readlink -f "$0")
 if [ "$VERB" = install ] && [ -x "$PREFIX/current/runtime/python/bin/python3" ] && [ -z "$EXTRACT" ] && \
@@ -205,7 +207,7 @@ else
   [ "$NEEDRT" = 1 ] || set -- --attach-runtime ${ADOPT:+--runtime-src "$ADOPT"} "$@"  # whole-directory attach; fails if unavailable
   set -- install --payload "$STAGE/payload" --models "$MODELS" --firewall "$FIREWALL" ${ADOPT:+--adopt-from "$ADOPT"} ${NONCE:+--payload-attested "$NONCE"} "$@"
 fi
-"$PY" -I -B "$IP" run --label "$VERB" --wait-file "$KEYLOOM_WAIT_FILE" -- "$PY" -I -B "$LC" --prefix "$PREFIX" "$@"
+"$PY" -I -B "$IP" run --label "$VERB" --log "$PREFIX/install.log" --log-title "Keyloom @VERSION_ID@ linux-offline installer" --wait-file "$KEYLOOM_WAIT_FILE" -- "$PY" -I -B "$LC" --prefix "$PREFIX" "$@"
 RC=$?
 exit $RC
 __PAYLOAD_BELOW__

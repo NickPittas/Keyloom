@@ -957,7 +957,7 @@ def inspect_prefix(prefix: Path):
             L.recover(prefix)
         return L.read_receipt(prefix)
     if prefix.is_dir():
-        foreign = [e.name for e in prefix.iterdir() if not (e.name.startswith(".staging.") or e.name in (L.TXN, "install-result.json")
+        foreign = [e.name for e in prefix.iterdir() if not (e.name.startswith(".staging.") or e.name in (L.TXN, "install-result.json", "install.log")
                    or (e.name in ("versions", "bin") and e.is_dir() and not any(e.iterdir())))]
         if foreign:
             raise Fail(f"{prefix} is not empty and not a Keyloom install ({', '.join(foreign[:4])}...); "
@@ -1058,7 +1058,7 @@ def migrate_settings_folder(pdir: Path, prefix: Path, adopt: Path | None) -> Non
     # deferred / pending (or an informative dict with no flag set) continue: settings stay where they are and every resolver finds them
 
 
-def run_lifecycle(prefix: Path, tree: Path, verb: str, firewall: str = "ask", adopt: Path | None = None,
+def run_lifecycle(prefix: Path, tree: Path, verb: str, firewall: str = "yes", adopt: Path | None = None,
                   attach: bool = False, nonce: str | None = None, script: Path | None = None) -> int:
     """The staged lifecycle.py runs under the separate bootstrap, outside the version being activated.
     attach=True passes `install --attach-runtime` (payload has no runtime/). nonce passes `install --payload-attested NONCE`
@@ -1191,7 +1191,7 @@ def build_parser():
     p.add_argument("--prefix")
     p.add_argument("--repair", action="store_true")
     p.add_argument("--adopt-from", help="pre-rename prefix to take over (Linux stub / Windows installer pass it)")
-    p.add_argument("--firewall", choices=["ask", "skip"], default="ask", help="Linux UFW rules: ask (default; needs a terminal) or skip")
+    p.add_argument("--firewall", choices=["yes", "skip", "ask"], default="yes", help="firewall rules: yes (default) or skip; ask is accepted and means yes")
     return p
 
 

@@ -411,7 +411,33 @@ fn reconcile(meta: &Value) -> Recon {
 pub(crate) fn nlog(msg: &str) {
     static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let t = T0.get_or_init(Instant::now).elapsed().as_secs_f32();
-    eprintln!("[net {t:7.1}s] {}", truncate(msg, 240));
+    let line = format!("[net {t:7.1}s] {}", truncate(msg, 240));
+    eprintln!("{line}");
+    if let Some(p) = LOG_FILE.get() {
+        use std::io::Write;
+        // Best effort, bounded: past 1 MiB the file is moved to .old (one generation) and started again.
+        if std::fs::metadata(p).map_or(false, |m| m.len() > 1 << 20) {
+            let _ = std::fs::rename(p, p.with_extension("log.old"));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{} {line}", chrono_free_stamp());
+        }
+    }
+}
+
+static LOG_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Persist `nlog` lines to this file (first call wins; the parent folder is created).
+pub(crate) fn set_log_file(p: PathBuf) {
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = LOG_FILE.set(p);
+}
+
+/// Seconds since the Unix epoch: enough to order log lines without a date crate.
+fn chrono_free_stamp() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 fn truncate(s: &str, n: usize) -> String {

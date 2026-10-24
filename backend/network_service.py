@@ -27,6 +27,7 @@ import html
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -357,7 +358,51 @@ def _spawn(mode, cmd, sd):
                          stderr=subprocess.DEVNULL, creationflags=0x00000008 | 0x00000200 | 0x08000000)
 
 
-def _stop(mode, sd, wait=15):
+def _retire_legacy(sd):
+    """Stop and unregister a pre-rename (CorridorKey) definition that serves THIS state folder. Only the definition goes;
+    the state folder, certificate, database and settings are never touched. True if one was found."""
+    with _legacy_names():
+        d = _definition()
+        if not d or not d["state_dir"] or not _same_dir(d["state_dir"], sd):
+            return False
+        try:
+            _stop(d["mode"], sd, fallback=False)
+        except ServiceError:
+            pass  # the caller falls back to _kill_holder
+        try:
+            _remove_definition(d["mode"])
+        except ServiceError:
+            pass
+    return True
+
+
+def _kill_holder(sd):
+    """Last resort for a service that ignores stop.request and has no definition we can stop: end the pid its state file names,
+    but only if that process's command line mentions this state folder (guards against pid reuse)."""
+    pid = (_read_json(sd / "service-state.json") or {}).get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    if IS_WIN:
+        r = _run(["powershell", "-NoProfile", "-Command", f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"])
+        cmdline = r.stdout.decode("utf-8", "replace")
+    else:
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace").replace("\0", " ")
+        except OSError:
+            return
+    if str(sd) not in cmdline:
+        return
+    if IS_WIN:
+        _run(["taskkill", "/PID", str(pid), "/F"])
+    else:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+    end = time.monotonic() + 10
+    while lock_busy(sd) and time.monotonic() < end:
+        time.sleep(0.25)
+
+
+def _stop(mode, sd, wait=15, fallback=True):
     if not lock_busy(sd):
         return
     (sd / "stop.request").write_text("stop", encoding="utf-8")  # graceful on every platform; the service polls for it
@@ -369,6 +414,10 @@ def _stop(mode, sd, wait=15):
         end = time.monotonic() + 10
         while lock_busy(sd) and time.monotonic() < end:
             time.sleep(0.25)
+    if fallback and lock_busy(sd):  # a pre-rename service may hold the lock under the old names
+        _retire_legacy(sd)
+        if lock_busy(sd):
+            _kill_holder(sd)
     (sd / "stop.request").unlink(missing_ok=True)
     if lock_busy(sd):
         raise ServiceError("busy", "the service did not stop; close it from Task Manager / systemctl and retry")
@@ -572,6 +621,7 @@ def _install(sd, py, root, owner, prefix, address=None, port=None, allow=None, n
     if allow is not None and not isinstance(allow, bool):
         raise ServiceError("bad_request", "allow_address_join must be true or false")
     ensure_dir(sd, True)
+    _retire_legacy(sd)  # take over a pre-rename service of this state folder
     existing = _definition()
     if existing and (not existing["state_dir"] or os.path.normcase(existing["state_dir"]) != os.path.normcase(str(sd))):
         raise ServiceError("service_conflict", "a different network service is already registered for this user; remove it first")
@@ -698,7 +748,7 @@ def settings_dir(base):
     return old if old.is_dir() and not (Path(base) / "keyloom").exists() else Path(base) / "keyloom"
 
 
-def _migrate_legacy(python, root, owner, adopt_owner=None):
+def _migrate_legacy(python, root, owner):
     """Replace a pre-rename definition this installation owns with one under the Keyloom names (stop old, write new, remove
     old). The state directory, certificate, database and service identity are untouched. Foreign definitions are left alone."""
     with _legacy_names():
@@ -707,7 +757,7 @@ def _migrate_legacy(python, root, owner, adopt_owner=None):
         return None
     sd = Path(d["state_dir"])
     inst = _read_json(sd / "service-install.json") if sd.is_dir() else None
-    if not inst or inst.get("owner") not in (owner, adopt_owner):
+    if not inst:  # same user's per-user definition: the owner id of an older install location no longer blocks the takeover
         return None
     was = lock_busy(sd)
     if was:
@@ -720,7 +770,7 @@ def _migrate_legacy(python, root, owner, adopt_owner=None):
             _remove_definition(d["mode"])
         except ServiceError:
             pass
-    _write_plain(sd / "service-install.json", inst | {"mode": mode, "root": str(root), "python": str(service_python(python))})
+    _write_plain(sd / "service-install.json", inst | {"owner": owner, "mode": mode, "root": str(root), "python": str(service_python(python))})
     if was:
         _begin_start(mode, cmd, sd)
     return "network service moved to the Keyloom name"
@@ -961,7 +1011,7 @@ def _ensure_default(python, root, prefix, adopt, mig_out):
         return {"installed": False, "running": False, "action": "none", "message": "no settings location is available for this user; open Clients and press Start"}
     if net is None:
         return {"installed": False, "running": False, "action": "none", "message": "settings could not be read; open Clients and press Start"}
-    _migrate_legacy(python, root, owner, owner_id(adopt) if adopt else None)
+    _migrate_legacy(python, root, owner)
     d = _owned(sd) if sd.is_dir() else None
     if d:
         if d["install"].get("owner") not in owners:

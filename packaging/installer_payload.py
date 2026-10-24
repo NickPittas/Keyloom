@@ -311,6 +311,19 @@ def write_attestation(lifecycle, payload, producer: str) -> str:
     return lc.write_attestation(root, lc.read_manifest(root), producer)
 
 
+LOG = None  # open install.log (append, line-buffered) when --log is given; set by main()
+LOG_TITLE = ""
+WAIT_REPEAT = 20  # seconds between repeats of an unchanged wait reason
+
+
+def log_write(text: str) -> None:
+    if LOG:
+        try:
+            LOG.write(text)
+        except (OSError, ValueError):
+            pass
+
+
 def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: float = 1.0,
               wait_file=None, grace: float = 3.0, stall: float = STALL_SECONDS, **popen) -> int:
     """Run argv as the leader of its OWN session/process group, relay its output live and print a heartbeat every `poll` s
@@ -318,6 +331,11 @@ def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: floa
     or any error, SIGTERM the group (so a lifecycle can unwind its transaction), then SIGKILL it after `grace` s, and reap it.
     Returns the child's exit code or 124. While `wait_file` exists the child has declared an explicit wait for the user (or a
     visible transfer): that counts as progress and the heartbeat says so. Automatic work never creates it."""
+    log_write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S %z')} {LOG_TITLE} step={label} =====\n")
+
+    def note(msg: str) -> None:
+        print(msg, file=out, flush=True)
+        log_write(msg + "\n")
     env = dict(popen.get("env") or os.environ)
     if wait_file:  # the child (lifecycle) creates this file only while it waits for the user / runs a visible transfer
         env["KEYLOOM_WAIT_FILE"] = str(wait_file)
@@ -332,8 +350,10 @@ def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: floa
         fd, dec = p.stdout.fileno(), codecs.getincrementaldecoder("utf-8")("replace")  # keeps a split multibyte char whole
         while chunk := os.read(fd, 65536):  # raw chunks, not lines: a prompt without a newline must show at once
             last = clock()
-            out.write(dec.decode(chunk))
+            text = dec.decode(chunk)
+            out.write(text)
             out.flush()
+            log_write(text)
     rt = threading.Thread(target=relay, daemon=True)
     rt.start()
 
@@ -363,12 +383,14 @@ def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: floa
             old[s] = signal.signal(s, on_signal)
         except ValueError:  # not the main thread
             pass
+    shown_why, shown_at = None, 0.0
     try:
         while True:
             try:
                 rc = p.wait(timeout=poll)
                 reap()  # stray grandchildren of a finished child die with its group
                 rt.join(5)  # the rest of its output
+                log_write(f"[{label}] exit code {rc} after {clock() - t0:.0f}s\n")
                 return rc
             except subprocess.TimeoutExpired:
                 pass
@@ -378,15 +400,21 @@ def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: floa
                 last = now
             if now - last >= stall:
                 reap()
-                print(f"FAILED: {label}: no progress for {stall:g}s; stopped and reaped", file=out, flush=True)
+                note(f"FAILED: {label}: no progress for {stall:g}s; stopped and reaped")
                 return 124
             if waiting:
                 try:
                     why = open(wait_file).read().strip()[:200]
                 except OSError:
                     why = ""
-                print(f"[{label}] WAITING FOR USER/TRANSFER ({why or 'no reason given'})", file=out, flush=True)
+                why = why or "no reason given"
+                if why != shown_why or now - shown_at >= WAIT_REPEAT:  # said once, then every WAIT_REPEAT s: it must not drown in heartbeats
+                    note(f"[{label}] WAITING FOR USER/TRANSFER ({why})")
+                    shown_why, shown_at = why, now
             else:
+                if shown_why is not None:
+                    note(f"[{label}] wait finished ({shown_why})")
+                    shown_why = None
                 print(f"[{label}] supervisor heartbeat: running {now - t0:.0f}s, last output {now - last:.0f}s ago (liveness only)",
                       file=out, flush=True)
     except BaseException:
@@ -417,8 +445,17 @@ def main(argv=None) -> int:
     ap.add_argument("--require")
     ap.add_argument("--forbid")
     ap.add_argument("--wait-file")
+    ap.add_argument("--log")
+    ap.add_argument("--log-title", default="")
     ap.add_argument("rest", nargs="*")
     a, extra = ap.parse_known_args(argv)
+    if a.log:
+        global LOG, LOG_TITLE
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.log)), exist_ok=True)
+            LOG, LOG_TITLE = open(a.log, "a", encoding="utf-8", buffering=1), a.log_title
+        except OSError as e:  # a log that cannot be written never blocks the install
+            print(f"WARNING: install log {a.log} not writable ({type(e).__name__})", file=sys.stderr)
     if a.cmd == "run":  # run -- CMD ...: stall-guarded, heartbeat-supervised foreign command (exit code passed through)
         cmd = a.rest + extra  # everything after `--` lands in the positional list (argparse version dependent)
         cmd = cmd[1:] if cmd[:1] == ["--"] else cmd

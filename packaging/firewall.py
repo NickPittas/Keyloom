@@ -1,7 +1,7 @@
 """Linux installer step: let this PC's trusted networks reach the Keyloom network service through an ACTIVE UFW.
 
 Stdlib only; used by lifecycle.py for the offline and the online installer alike (one common path).
-Only UFW is managed. It is never installed, enabled or reconfigured, and no rule is added without the user's yes.
+Only UFW is managed. It is never installed, enabled or reconfigured, and no rule is added unless the installer's firewall choice is yes.
 Only the `ufw` command is elevated (sudo asks for the password on the real terminal; it is never captured or logged).
 Rules added here carry the comment `Keyloom installer ...` and are recorded in the receipt; only those are ever removed.
 Rules the user added themselves are read, counted as coverage, and never changed.
@@ -276,14 +276,13 @@ def run(mode: str, prior: dict | None) -> dict | None:
     if mode == "skip":
         return done("pending", "firewall setup was skipped (--firewall skip); network access from other PCs is not confirmed", cmds)
     if not interactive():
-        return done("pending", "no terminal to ask for permission; network access from other PCs is not confirmed", cmds)
+        return done("pending", "no terminal for the sudo password; network access from other PCs is not confirmed", cmds)
     say("\nNetwork firewall (UFW is active)\n"
         "  Keyloom lets other PCs find and use this one over TCP 8443-8452 and UDP 44554.\n"
         "  The installer can allow exactly that, only from these networks of this PC:\n    " + "\n    ".join(nets) + "\n"
         "  It needs sudo to read UFW and add what is missing; nothing else runs as root. UFW stays enabled; existing rules\n"
         "  are never changed. Rules added are commented 'Keyloom installer ...' and removed again on uninstall.")
-    if not ask("Check UFW and add the missing rules (sudo password prompt follows)?"):
-        return done("pending", "firewall setup was declined; network access from other PCs is not confirmed", cmds)
+    say("  A sudo password prompt follows.")
     rc, out = sudo_ufw(ufw, ["status"], capture=True)
     if rc != 0:
         return done("pending", "UFW could not be read with sudo" + (" (timed out)" if rc is None else ""), cmds)
@@ -370,11 +369,13 @@ def win_remove_script(owned: list[dict]) -> str:
 
 def win_elevated(script: str) -> bool:
     """One UAC prompt (the user sees exactly the rules) -> run the script elevated and wait. False if declined/failed."""
-    ps = ("$p=Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command',"
+    ps = ("$p=Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-Command',"
           + _ps(script) + "; exit $p.ExitCode")
     try:
         with user_wait("Windows administrator (UAC) approval for firewall rules"):
-            return win_ps(ps, timeout=600)[0] == 0
+            ok = win_ps(ps, timeout=600)[0] == 0
+        say("Windows administrator step finished; checking the rules ...")
+        return ok
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -405,15 +406,13 @@ def run_windows(mode: str, prior: dict | None) -> dict | None:
         return done("ok", "Windows Firewall already allows this version's pythonw.exe; nothing was added or changed")
     if allowed is None:
         return done("pending", "Windows Firewall could not be read", manual)
-    if mode == "skip" or not sys.stdin or not sys.stdin.isatty():
-        return done("pending", "Windows Firewall has no Allow rule for this version's pythonw.exe (setup skipped or no terminal); "
+    if mode == "skip":
+        return done("pending", "Windows Firewall has no Allow rule for this version's pythonw.exe (setup not selected); "
                     "other PCs may be blocked until it is added, and Windows may show a 'Python' prompt", manual)
     say("\nWindows Firewall\n  This version of Keyloom runs its network service as\n    " + program + "\n"
         "  Windows only allows incoming connections per program path, so the new path needs its own rules:\n"
         "  TCP 8443-8452 and UDP 44554, Private and Public networks, from the local subnet, Tailscale and ZeroTier only.\n"
-        "  Windows will ask for administrator approval once. Nothing else is changed; rules from older versions stay.")
-    if not win_ask("Add these rules now?"):
-        return done("pending", "firewall setup was declined", manual)
+        "  A Windows administrator (UAC) prompt follows now; approve it to add the rules. Nothing else is changed; rules from older versions stay.")
     if not win_elevated(win_add_script(specs)):
         return done("pending", "the elevated step was cancelled or failed", manual)
     if win_allowed(program) is not True:
@@ -472,7 +471,7 @@ def main(argv=None) -> int:
     """`firewall.py MODE PRIOR_JSON OUT`: run() in this interpreter; the record goes to OUT (lifecycle.firewall_step)."""
     import json
     mode, prior, out = (argv if argv is not None else sys.argv[1:])
-    if mode not in ("ask", "skip"):
+    if mode not in ("yes", "ask", "skip"):
         return 64
     rec = run(mode, json.loads(prior) or None)
     with open(out, "w", encoding="utf-8") as f:

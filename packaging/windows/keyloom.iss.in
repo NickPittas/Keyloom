@@ -30,6 +30,7 @@ DirExistsWarning=no
 
 [Tasks]
 Name: models; Description: "Download and verify ALL models now (very large; resumable). Off by default: updates and reinstalls never download models; use the app's Models page or keyloom-setup models later."; Flags: unchecked
+Name: firewall; Description: "Configure Windows Firewall rules for the network service (a Windows administrator prompt follows during setup)"
 
 [Files]
 ; 1) The supervisor script is extractable before the wizard starts (same-build check); 2) the minimal bundled Python closure goes
@@ -92,17 +93,27 @@ var
   AdoptDir, SourceDir: String;   { AdoptDir: pre-rename install this one takes over; SourceDir: install whose runtime may be reused }
   RuntimeChecked: Boolean;
 
+var
+  LogFile: String;  { <prefix>\install.log once the install folder is known (ssInstall) }
+
+procedure LogLine(Msg: String);
+begin
+  if LogFile <> '' then SaveStringToFile(LogFile, GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + ' ' + Msg + #13#10, True);
+end;
+
 { One supervised Python step: a VISIBLE console runs installer_payload.py, which starts the real command as its own process tree,
   prints a heartbeat every second, kills and reaps the tree after 300 s without any output (exit 124) and never turns a stall
   into success. There is no install-time budget. The lifecycle creates the tmp waiting-for-user file only while it waits for the
   user (firewall consent) or runs a visible model transfer; that counts as progress. }
 function RunPyV(Interp, Verb, StepName, Extra: String; var Rc: Integer): Boolean;
 var
-  IP: String;
+  IP, LogArg: String;
 begin
+  LogArg := '';
+  if LogFile <> '' then LogArg := ' --log "' + LogFile + '" --log-title "Keyloom {#VID} windows-offline installer"';
   IP := ExpandConstant('{tmp}\installer_payload.py');  { extracted early for the same-build check; later the bootstrap folder has it }
   if not FileExists(IP) then IP := ExpandConstant('{tmp}\kb\installer_payload.py');
-  Result := Exec(Interp, '-I -B "' + IP + '" ' + Verb + ' --label ' + StepName + Extra, '', SW_SHOW, ewWaitUntilTerminated, Rc);
+  Result := Exec(Interp, '-I -B "' + IP + '" ' + Verb + ' --label ' + StepName + LogArg + Extra, '', SW_SHOW, ewWaitUntilTerminated, Rc);
   if not Result then Rc := 2;
 end;
 
@@ -130,6 +141,7 @@ end;
 
 procedure FailSetup(Code: Integer; Msg: String);
 begin
+  LogLine('FAILED (' + IntToStr(Code) + '): ' + Msg);
   SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
   FailCode := Code;
   Abort;  { Inno rolls back only what this setup created; the previous version and all user data stay }
@@ -356,6 +368,7 @@ begin
       FailCode := 5;
       Abort;
     end;
+    LogFile := AppDir + '\install.log';
     { the target is classified/prepared by PlaceFiles (first Check of the version-folder files), not here: the bundled bootstrap
       is only extracted once Inno starts copying }
   end;
@@ -370,7 +383,7 @@ begin
   if WizardIsTaskSelected('models') then Models := 'full' else Models := 'skip';
   Args := '"' + Bpy + '" -I -B "' + Lc + '" --prefix "' + AppDir + '" install --version {#VID} --models ' + Models;
   if (AdoptDir <> '') and (CompareText(AdoptDir, AppDir) <> 0) then Args := Args + ' --adopt-from "' + AdoptDir + '"';
-  if WizardSilent then Args := Args + ' --firewall skip';
+  if WizardIsTaskSelected('firewall') then Args := Args + ' --firewall yes' else Args := Args + ' --firewall skip';
   { Attestation only after the runtime shards were authenticated and extracted here. The lifecycle's one writer binds manifest sha,
     runtime id, resolved versions\<id> root and a fresh nonce; app files are still hashed by the lifecycle. An attached runtime
     (core trusts it through runtime_trusted and skips the hash) and an in-place target need no attestation. Without one after an
@@ -397,6 +410,7 @@ begin
     { The failed version could not be deleted by the interpreter that ran from it; the previous version's
       setup shim (if any) finishes that cleanup now. }
     { the failed transaction is settled by DeinitializeSetup (core `recover`, bounded, from the stable bootstrap) }
+    LogLine('Installation failed with code ' + IntToStr(Rc));
     if Rc = 124 then
       SuppressibleMsgBox('Installation STOPPED: a step showed no progress for 5 minutes and was ended. The previous version (if any) stays active; nothing was reported as installed.', mbError, MB_OK, IDOK)
     else

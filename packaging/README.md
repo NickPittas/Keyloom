@@ -130,7 +130,7 @@ Add/Remove Programs
 and the uninstaller come from Inno. Uninstall removes only the individual files Inno copied (no recursive directory entry, so an attached runtime link is never
 traversed) plus, through the lifecycle's safe-unlink logic, the receipt-validated versions carrying our own manifest; the running version is removed by a detached `cmd`. The Start Menu shortcut targets
 the exe directly, so it does not scrub PYTHONPATH (the Rust side must). Repair of damaged files on Windows =
-reinstall after uninstall. `/TASKS="!models"` makes a silent app-only install. Native build and installation checks are recorded in the acceptance document below.
+reinstall after uninstall. `/TASKS="!models"` makes a silent app-only install; the checked-by-default `firewall` task adds the Windows Firewall rules (one UAC prompt), so unattended installs that must not prompt use `/MERGETASKS="!firewall"` (or `/TASKS="!models,!firewall"`). Linux `.run` installers configure UFW by default; `--no-firewall` skips it. Every install appends to `<prefix>/install.log` (a header per step: installer kind, version, time; all supervised output, wait lines and failure reasons); the app writes service errors to `<settings>/network/service.log`. The supervisor prints a declared wait reason once and then every 20 s (plus `wait finished`); the one-second heartbeat only runs outside waits. Native build and installation checks are recorded in the acceptance document below.
 
 ## Online installers (smaller .run / .exe, large public wheels downloaded)
 Build host = target OS; the offline targets above are unchanged and stay the complete, self-contained option. The source repo stays private

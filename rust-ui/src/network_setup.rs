@@ -417,6 +417,9 @@ impl Setup {
             self.dir = d.display().to_string();
         }
         self.net_dir = sp.and_then(Path::parent).map(|d| d.join("network"));
+        if let Some(d) = &self.net_dir {
+            crate::remote::set_log_file(d.join("service.log"));
+        }
     }
 
     /// Every frame (also while Clients is closed): mirror the settings, and once per run make sure this PC hosts its
@@ -453,6 +456,7 @@ impl Setup {
             if self.installed_once {
                 self.ensure = Ensure::Done;
                 self.note = Some("This PC's host service could not be installed; press Start to try again.".into());
+                nlog("host service could not be installed");
                 return;
             }
             self.installed_once = true;
@@ -582,7 +586,10 @@ impl Setup {
                 self.updates = scan.pcs.iter().filter(|p| !p.is_self).map(|p| ScanUpdate { network_id: p.network_id.clone(), host_iid: p.host_iid.clone(), name: p.name.clone(), endpoints: p.urls() }).collect();
                 self.scan = Some(scan);
             }
-            Err(e) => self.note = Some(format!("Scan failed ({})", err_text(&e))),
+            Err(e) => {
+                nlog(&format!("scan failed: {} ({})", e.code, err_text(&e)));
+                self.note = Some(format!("Scan failed ({})", err_text(&e)));
+            }
         }
     }
 
@@ -656,6 +663,7 @@ impl Setup {
                 }
             }
             (Pend::Status { ensure }, Err(e)) => {
+                nlog(&format!("status failed: {} ({})", e.code, err_text(&e)));
                 self.note = Some(format!("Could not read the service status ({})", err_text(&e)));
                 if ensure {
                     self.ensure = Ensure::Done;
@@ -679,6 +687,7 @@ impl Setup {
                 }
             }
             (Pend::Service(what), Err(e)) => {
+                nlog(&format!("{what} failed: {} ({})", e.code, err_text(&e)));
                 self.note = Some(format!("{what} failed ({})", err_text(&e)));
                 if what == "Settings" {
                     self.inv_dirty = self.pend_allow.is_some();
@@ -710,6 +719,7 @@ impl Setup {
             }
             (Pend::Join(_), Err(e)) => {
                 let why = if e.code == "paired_not_saved" || e.code == "pair_uncertain" { "the result is uncertain; check Other PCs before trying again" } else { "existing connections are unchanged" };
+                nlog(&format!("join failed: {} ({})", e.code, err_text(&e)));
                 self.note = Some(format!("Join failed; {why} ({})", err_text(&e)));
             }
         }
@@ -1013,7 +1023,7 @@ impl Setup {
             self.join_pc(&pc);
         }
         if self.busy() { ui.label(RichText::new("Working…").color(DIM)); }
-        if let Some(n) = &self.note { ui.label(RichText::new(n).color(DIM).size(12.0)); }
+        if let Some(n) = &self.note { ui.add(egui::Label::new(RichText::new(n).color(DIM).size(12.0)).selectable(true)); }
         cmds
     }
 }

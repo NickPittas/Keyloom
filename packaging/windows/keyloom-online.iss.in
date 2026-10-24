@@ -33,6 +33,9 @@ DisableFinishedPage=yes
 SetupMutex=KeyloomOnlineSetupMutex
 CloseApplications=no
 
+[Tasks]
+Name: firewall; Description: "Configure Windows Firewall rules for the network service (a Windows administrator prompt follows during setup)"
+
 [Files]
 ; The minimal bundled Python (and the supervisor script) live in {tmp}\kb, OUTSIDE the payload that online.py assembles and
 ; moves; every Python step below runs from there. {tmp} is private to this Setup run and deleted when it exits.
@@ -52,9 +55,12 @@ end;
 { One supervised Python step in a VISIBLE console: installer_payload.py runs the command as its own process tree, prints a
   heartbeat every second, kills and reaps the tree after 300 s without any output (exit 124) and exports the private wait file path to it as
   KEYLOOM_WAIT_FILE (online.py creates it only around real downloads/consent). The path is inside Setup's private tmp folder. }
+var
+  LogArg: String;  { --log <prefix>\install.log, known once the install folder is discovered }
+
 function RunPy(Interp, StepName, Cmd: String; var Rc: Integer): Boolean;
 begin
-  Result := Exec(Interp, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" run --label ' + StepName +
+  Result := Exec(Interp, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" run --label ' + StepName + LogArg +
                  ' --wait-file "' + ExpandConstant('{tmp}\waiting-for-user') + '" -- ' + Cmd, '', SW_SHOW, ewWaitUntilTerminated, Rc);
   if not Result then Rc := 2;
 end;
@@ -136,15 +142,18 @@ begin
     SuppressibleMsgBox('The install folder cannot be a drive root (for example use D:\Apps\Keyloom).', mbError, MB_OK, IDOK);
     exit;
   end;
+  LogArg := ' --log "' + Prefix + '\install.log" --log-title "Keyloom {#VID} windows-online installer"';
   Args := '"' + Bpy + '" -I -B "' + Boot + '\payload\app\packaging\online.py" --payload-dir "' + Boot + '\payload" --sources "' +
           Boot + '\wheel-sources.json" --prefix "' + Prefix + '"';
   if ExpandConstant('{param:REPAIR|0}') = '1' then Args := Args + ' --repair';
   if AdoptDir <> '' then Args := Args + ' --adopt-from "' + AdoptDir + '"';
+  if WizardIsTaskSelected('firewall') then Args := Args + ' --firewall yes' else Args := Args + ' --firewall skip';
   { online.py owns the reuse/attach decision and passes --attach-runtime/--runtime-src through the lifecycle itself. Visible,
     supervised console: heartbeat each second plus the client's real download/verify progress. }
   RunPy(Bpy, 'online', Args, Rc);
   if Rc = 0 then exit;
   FailCode := Rc;
+  SaveStringToFile(Prefix + '\install.log', GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + ' Setup failed with code ' + IntToStr(Rc) + #13#10, True);
   if Rc = 124 then
     SuppressibleMsgBox('Keyloom setup STOPPED: a step showed no progress for 5 minutes and was ended. The previous install (if any) is unchanged.', mbError, MB_OK, IDOK)
   else if Rc = 4 then

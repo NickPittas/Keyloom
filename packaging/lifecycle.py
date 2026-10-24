@@ -11,7 +11,7 @@ uninstall/models/status). Layout under PREFIX:
 
 User data (projects, settings, models) lives OUTSIDE PREFIX and is never touched.
 Activation configures the per-user network host unless it was explicitly removed.
-On Linux the install/repair step may ask (and only then use sudo) to let trusted networks reach an active UFW; see firewall.py.
+On Linux the install/repair step uses sudo (unless --firewall skip) to let trusted networks reach an active UFW; see firewall.py.
 Projects and network identities are preserved.
 """
 from __future__ import annotations
@@ -773,7 +773,7 @@ def refresh_network_service(version_dir: Path, prefix: Path, receipt: dict | Non
             env=clean_env(), capture_output=True, text=True, timeout=INNER_TIMEOUT,  # hang guard; a timeout is reported below, never success
         )
         if result.returncode:
-            raise InstallError(f"network setup exited with code {result.returncode}; open Clients for details")
+            raise InstallError(f"network setup exited with code {result.returncode}: {(result.stderr or '').strip()[-300:]}")
         status = json.loads(result.stdout.strip().splitlines()[-1])
         if status.get("message"):
             say(str(status["message"])[:300])
@@ -818,8 +818,7 @@ def _firewall_run(version_dir: Path, mode: str, prior: dict | None) -> dict | No
     try:
         cmd = [str(descriptor_python(version_dir)), "-I", "-B", str(version_dir / "app/packaging/firewall.py"),
                mode, json.dumps(prior or {}), str(out)]
-        # The helper itself declares the wait (user_wait in firewall.py) around the consent question and sudo/UAC. Its own
-        # consent deadlines (120 s answer, 180 s sudo) bound the human wait.
+        # The helper itself declares the wait (user_wait in firewall.py) around sudo/UAC; its 180 s sudo deadline bounds it.
         rc = subprocess.run(cmd, env=clean_env(), timeout=1200).returncode
         if rc:
             raise InstallError(f"firewall helper exited with code {rc}")
@@ -829,7 +828,7 @@ def _firewall_run(version_dir: Path, mode: str, prior: dict | None) -> dict | No
 
 
 def firewall_step(prefix: Path, mode: str) -> str | None:
-    """Linux: allow trusted networks through an active UFW (asks first). Never fails the install; the outcome is
+    """Linux: allow trusted networks through an active UFW (runs unless the firewall choice is skip). Never fails the install; the outcome is
     recorded in the receipt as `firewall` and printed. Returns its status, None when not applicable."""
     try:
         receipt = read_receipt(prefix)
@@ -1049,6 +1048,8 @@ def activate(prefix: Path, version: str, *, shortcuts: bool = True, selfcheck: b
         # gate (run_selfcheck, called by bundle.py), not an install step.
         prior = receipt.get("runtime") or (read_receipt(runtime_src).get("runtime") if runtime_src else None) or {}
         say("Checking the runtime (first start can take a few minutes) ...")  # the one step that may stay silent
+        ff = vdir / "app/tools/ffmpeg/bin"  # an adopted tree's record would point at the OLD version's FFmpeg
+        prior = dict(prior, ffmpeg=str(ff)) if ff.is_dir() else {k: v for k, v in prior.items() if k != "ffmpeg"}
         info = dict(prior, **run_light_check(vdir, shared))
     previous_receipt = copy.deepcopy(receipt)
     old = receipt.get("current")
@@ -1493,7 +1494,7 @@ def cmd_install(a) -> int:
         if not (prefix / "versions" / version).is_dir():
             raise InstallError("install needs --payload or an existing --version under PREFIX/versions")
     if payload and not (prefix / RECEIPT).exists():
-        mine = lambda e: (e.name.startswith(".staging.") or e.name in (TXN, "install-result.json")
+        mine = lambda e: (e.name.startswith(".staging.") or e.name in (TXN, "install-result.json", "install.log")
                           or (e.name in ("versions", "bin") and e.is_dir() and not any(e.iterdir())))
         foreign = [e.name for e in prefix.iterdir() if not mine(e)] if prefix.is_dir() else []
         if foreign:
@@ -1754,7 +1755,7 @@ def cmd_uninstall(a) -> int:
         remove_shortcuts(prefix)
     for name in SHIM_NAMES + LEGACY_SHIM_NAMES:
         _unlink_owned(prefix / "bin" / name)
-    for name in ("current", "current.txt", "install-result.json", TXN):
+    for name in ("current", "current.txt", "install-result.json", "install.log", TXN):
         _unlink_owned(prefix / name)
     running = Path(sys.executable).resolve()  # resolved: a junction/symlinked runtime points into another version's tree
     vroot = prefix / "versions"
@@ -1844,12 +1845,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "PAYLOAD/.keyloom-payload-verified.json. Skips only the incoming-runtime re-hash (same-user attestation)")
     i.add_argument("--runtime-src", help="another Keyloom prefix (owned receipt) whose runtime may be linked; defaults to --adopt-from")
     i.add_argument("--adopt-from", help="pre-rename prefix to take over (startup entry, shortcut, network service, firewall record); it stays as the rollback holder")
-    i.add_argument("--firewall", choices=["ask", "skip"], default="ask", help="Linux UFW rules: ask (default; needs a terminal) or skip")
+    i.add_argument("--firewall", choices=["yes", "skip", "ask"], default="yes", help="firewall rules: yes (default) or skip; ask is accepted and means yes")
     i.add_argument("--model-arg", action="append", default=[], help="extra arg for setup_models.py; use --model-arg=--hf-cache")
     r = sub.add_parser("repair")
     r.add_argument("--payload")
     r.add_argument("--models", action="store_true")
-    r.add_argument("--firewall", choices=["ask", "skip"], default="ask")
+    r.add_argument("--firewall", choices=["yes", "skip", "ask"], default="yes")
     r.add_argument("--model-arg", action="append", default=[])
     c = sub.add_parser("check", help="exit 0 if --version is the active, fully verified build (no changes)")
     c.add_argument("--version", required=True)
