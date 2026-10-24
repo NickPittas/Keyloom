@@ -486,7 +486,7 @@ def make_windows_exe(stage: Path, out: Path, iscc: str | None) -> Path:
                          "Windows wheels and an Inno Setup compile). Nothing was built.")
     exe = find_iscc(iscc)
     iss = render_iss(stage, out)
-    subprocess.run([exe, str(iss)], check=True)
+    subprocess.run([exe, "/Q", str(iss)], check=True)
     built = sorted(out.glob("Keyloom-*-setup.exe"))
     if not built:
         raise SystemExit("ISCC finished but produced no setup exe")
@@ -691,7 +691,7 @@ def make_slim(stage: Path, dest: Path, mapped: set) -> Path:
 
 def make_wrapper(stage: Path, out: Path, cache: Path, smoke: bool) -> Path:
     """<out>/online-boot/keyloom-online/{payload/, wheel-sources.json}; the sources are never inside the payload."""
-    wrap = out / "online-boot" / "keyloom-online"
+    wrap = out / "boot" / "k"  # Keep deep Qt paths within Inno's source-path limit.
     shutil.rmtree(wrap.parent, ignore_errors=True)
     wrap.mkdir(parents=True)
     sources, mapped = wheel_sources(stage, cache)
@@ -737,7 +737,7 @@ def make_online_exe(stage: Path, out: Path, cache: Path, smoke: bool, iscc: str 
         text = text.replace(k, v)
     iss = out / "keyloom-online.iss"
     iss.write_text(text, encoding="utf-8-sig")
-    subprocess.run([exe, str(iss)], check=True)
+    subprocess.run([exe, "/Q", str(iss)], check=True)
     stem = f"Keyloom-online-{m['version_id']}-windows-x86_64"  # no "-setup": make_windows_exe globs Keyloom-*-setup.exe
     built = out / (stem + ".exe")
     if not built.is_file():

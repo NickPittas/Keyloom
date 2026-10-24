@@ -34,7 +34,7 @@ SetupMutex=KeyloomOnlineSetupMutex
 CloseApplications=no
 
 [Files]
-Source: "@WRAP@\*"; DestDir: "{tmp}\keyloom-online"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "@WRAP@\*"; DestDir: "{tmp}\k"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Code]
 var
@@ -78,7 +78,7 @@ begin
     exit;
   end;
   if CurStep <> ssPostInstall then exit;
-  Boot := ExpandConstant('{tmp}\keyloom-online');
+  Boot := ExpandConstant('{tmp}\k');
   Prefix := ExistingPrefix;
   Args := '-I -B "' + Boot + '\payload\app\packaging\online.py" --payload-dir "' + Boot + '\payload" --sources "' +
           Boot + '\wheel-sources.json" --prefix "' + Prefix + '"';
