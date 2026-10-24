@@ -38,7 +38,7 @@ Windows runs `cargo build --release --locked`. The binary must be an ELF (Linux)
 Known limits: the payload identity (`version_id`) is deterministic for the same source, locks and runtime, but installer bytes are not promised identical
 (gzip/Inno timestamps). The build reads the live checkout, so it fingerprints the source before and after and fails if it changed (no isolated copy).
 `version_id` differs between Linux and Windows. Nothing is published, installed or launched, and no models or drivers are bundled.
-The build-time staged self-check (`bundle.BUILD_SELFCHECK_TIMEOUT`, 300 s) is deliberately longer than the installer's `lifecycle.PHASE_TIMEOUT` (10 s), which stays unchanged for installs.
+The build-time staged self-check (`bundle.BUILD_SELFCHECK_TIMEOUT`, 300 s) is a build-only limit; installers have no time budget and use only the 300 s no-progress stall guard (`STALL_SECONDS`).
 
 **Windows workflow (Kamino3 only).** Commit and push on the dev machine, then `git pull` in the single persistent Kamino3 checkout; never ship source by archive,
 snapshot, scp/rsync/SSH pipe or a second checkout, and never copy a runtime, model or artifact over 100 MB. Pinned build dependencies (Python, wheels, FFmpeg,
@@ -119,14 +119,13 @@ after the new manifest and `lifecycle.py` are on disk and before activation, ONE
 as a whole directory (no companion file is opened, hashed or read); exit 1 (fresh install / really different runtime) runs the supervised extraction
 (`installer_payload.py runtime-extract`: verifies each shard's size and sha256 while streaming into a private holder inside the new version folder, accepting only
 the files the metadata assigns to that shard,
-renames it to `runtime` only after everything verified, deadline min(10 s, rest of the 30 s budget) shared by all workers, any worker error or the deadline cancels the rest, process tree killed
+renames it to `runtime` only after everything verified, no time limit (only the 300 s no-progress stall guard), any worker error cancels the rest, process tree killed
 and holder discarded on failure); exit 3 (identical but untrusted) and any other result stop visibly with no fallback; a missing companion stops visibly.
 Installation discovery (online Windows wrapper) is one read-only `installer_payload.py discover` run: HKCU/HKLM keys and the two candidate receipts are probed in parallel,
 then the registry-named folder is checked; precedence /PREFIX > HKCU > HKLM > default is fixed in code. The offline setup's folder choice stays in Inno Pascal because it
 runs before any bundled Python exists.
-A real multi-GB runtime is not expected to extract within 10 s, so a fresh/changed-runtime Windows install is expected to fail that timing gate until the
-user changes the policy. The remaining native Inno copy is the app files and the small bootstrap; it cannot be pre-empted and is only measured afterwards
-against the same 10 s / 30 s limits. The Linux `.run` keeps its runtime in-file (separate gzip segment). Online installers never use this companion.
+A fresh/changed-runtime Windows install takes as long as the extraction takes; it is stopped only if it shows no output for 300 s. The remaining
+native Inno copy is the app files and the small bootstrap and is not timed. The Linux `.run` keeps its runtime in-file (separate gzip segment). Online installers never use this companion.
 Add/Remove Programs
 and the uninstaller come from Inno. Uninstall removes only the individual files Inno copied (no recursive directory entry, so an attached runtime link is never
 traversed) plus, through the lifecycle's safe-unlink logic, the receipt-validated versions carrying our own manifest; the running version is removed by a detached `cmd`. The Start Menu shortcut targets
@@ -174,8 +173,8 @@ registry key (`Inno Setup: App Path`), else `%LOCALAPPDATA%\Programs\Keyloom`. I
 entry, so it never touches the full installer's entry; remove an online-only install with `<prefix>\bin\keyloom-setup.cmd uninstall`.
 
 ## Background autostart contract (written by the app, removed by uninstall)
-The network host is configured during activation using the installed version's full Python runtime with a 90-second
-deadline. Existing identities, service state and explicit removal choices are preserved. Setup failures leave the app
+The network host is configured during activation using the installed version's full Python runtime with the `STALL_SECONDS` (300 s)
+hang guard. Existing identities, service state and explicit removal choices are preserved. Setup failures leave the app
 installed and report that **Clients → Start / Refresh** is needed. This host coordinates discovery and queues; the rendering
 client still needs Keyloom running, visibly or in its existing background mode.
 
@@ -228,5 +227,5 @@ min(that phase's configured budget in `timeouts`, what is left of the finite `de
 the start of `build.log` prints the budgets in force (defaults in `build_release.py` `TIMEOUTS`; `deadline_seconds` default 14400 s). Output is live with a
 one-second heartbeat in the console and `build.log`. The only checks are the staged app self-check, the firewall-helper import gate, `online.py --help`
 and artifact sha256 verification; the build runs no tests and does no test discovery (the source fingerprint prunes test directories before traversing).
-This policy applies to build phases only; installer/local runtime phases keep 10 s per phase and 30 s total (excluding transfers and consent).
+This policy applies to build phases only; installers have no install-time budget, only the 300 s no-progress stall guard (live output and a one-second heartbeat stay).
 Windows `taskkill` cleanup is unproven.

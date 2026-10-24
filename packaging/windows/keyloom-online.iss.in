@@ -49,21 +49,12 @@ begin
   Result := FailCode;  { nonzero => the setup process itself reports failure }
 end;
 
-function GetTickCount: Cardinal; external 'GetTickCount@kernel32.dll stdcall';  { Win32 import; compile UNVERIFIED }
-
-var
-  InstallTick: Cardinal;  { GetTickCount when Inno began unpacking the payload (ssInstall) }
-
-const
-  PhaseSec = 10;
-  TotalSec = 30;  { whole automatic local install; declared user waits and visible downloads are excluded by online.py }
-
 { One supervised Python step in a VISIBLE console: installer_payload.py runs the command as its own process tree, prints a
-  heartbeat every second, kills and reaps the tree at the deadline (exit 124) and exports the private wait file path to it as
+  heartbeat every second, kills and reaps the tree after 300 s without any output (exit 124) and exports the private wait file path to it as
   KEYLOOM_WAIT_FILE (online.py creates it only around real downloads/consent). The path is inside Setup's private tmp folder. }
-function RunPy(Interp, StepName, Cmd: String; Cap: Integer; var Rc: Integer): Boolean;
+function RunPy(Interp, StepName, Cmd: String; var Rc: Integer): Boolean;
 begin
-  Result := Exec(Interp, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" run --label ' + StepName + ' --deadline ' + IntToStr(Cap) +
+  Result := Exec(Interp, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" run --label ' + StepName +
                  ' --wait-file "' + ExpandConstant('{tmp}\waiting-for-user') + '" -- ' + Cmd, '', SW_SHOW, ewWaitUntilTerminated, Rc);
   if not Result then Rc := 2;
 end;
@@ -79,7 +70,7 @@ procedure ExitProcess(uExitCode: Cardinal); external 'ExitProcess@kernel32.dll s
 
 { Same build already installed and verified? Decided in InitializeSetup, BEFORE Inno unpacks the heavy payload: the installed, owned
   lifecycle checks the exact version id built into this setup (fast ordinary check: no runtime rehash, no engine import, no GPU
-  probe), under the supervisor with a visible console and the 10 s phase limit. Candidate folder: /PREFIX, else the full installer's
+  probe), under the supervisor with a visible console. Candidate folder: /PREFIX, else the full installer's
   recorded folder (HKCU before HKLM), else the default; the authoritative parallel `discover` run still happens later. A negative or
   failed probe simply continues to the normal install. Nothing is written. /REPAIR=1 skips it. }
 function InitializeSetup: Boolean;
@@ -105,7 +96,7 @@ begin
   Lc := P + '\versions\' + Trim(String(Raw)) + '\app\packaging\lifecycle.py';
   if (Trim(String(Raw)) = '') or not FileExists(Py) or not FileExists(Lc) then exit;
   ExtractTemporaryFile('installer_payload.py');
-  if Exec(Py, '-I -B "' + ExpandConstant('{tmp}\installer_payload.py') + '" run --label check --deadline ' + IntToStr(PhaseSec) + ' -- "' + Py +
+  if Exec(Py, '-I -B "' + ExpandConstant('{tmp}\installer_payload.py') + '" run --label check -- "' + Py +
           '" -I -B "' + Lc + '" --prefix "' + P + '" check --version {#VID}', '', SW_SHOW, ewWaitUntilTerminated, Rc) and (Rc = 0) then
   begin
     SuppressibleMsgBox('Keyloom {#VID} is already installed and verified. Nothing was changed (settings, models and services are untouched). Use /REPAIR=1 to restore damaged files.', mbInformation, MB_OK, IDOK);
@@ -117,30 +108,17 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   Boot, Prefix, Args, Bpy, DiscFile: String;
   DiscLines: TArrayOfString;
-  Rc, Spent: Integer;
+  Rc: Integer;
 begin
-  if CurStep = ssInstall then
-  begin
-    InstallTick := GetTickCount;
-    exit;  { the install folder is discovered once, read-only, at ssPostInstall (see below) }
-  end;
+  { the install folder is discovered once, read-only, at ssPostInstall (see below) }
   if CurStep <> ssPostInstall then exit;
-  { Inno's unpacking of the bundled payload is native and cannot be pre-empted from here: it is put on the shared clock AFTER
-    the fact. Over the phase limit = visible failure before online.py runs (nothing installed or changed). }
-  Spent := Integer((GetTickCount - InstallTick) div 1000);
-  if Spent > PhaseSec then
-  begin
-    FailCode := 11;
-    SuppressibleMsgBox('Unpacking the installer took ' + IntToStr(Spent) + ' s, over the ' + IntToStr(PhaseSec) + ' s limit for one local phase. Nothing was installed or changed.', mbError, MB_OK, IDOK);
-    exit;
-  end;
   Boot := ExpandConstant('{tmp}\k');
   Bpy := ExpandConstant('{tmp}\kb\python.exe');
   { ONE read-only discovery (HKCU/HKLM keys and both candidate receipts probed in parallel by the bundled helper's bounded pool,
     precedence fixed in code: /PREFIX > HKCU > HKLM > default). No second Python process, no console per probe; nothing is written. }
   DiscFile := ExpandConstant('{tmp}\discovered.txt');
   DeleteFile(DiscFile);
-  if not Exec(Bpy, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" discover --label discover --deadline ' + IntToStr(PhaseSec) +
+  if not Exec(Bpy, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" discover --label discover' +
               ' --prefix-param "' + ExpandConstant('{param:PREFIX|}') + '" --out "' + DiscFile + '"', '', SW_SHOW, ewWaitUntilTerminated, Rc) then
     Rc := 2;
   if (Rc <> 0) or not LoadStringsFromFile(DiscFile, DiscLines) or (GetArrayLength(DiscLines) < 1) then
@@ -164,11 +142,11 @@ begin
   if AdoptDir <> '' then Args := Args + ' --adopt-from "' + AdoptDir + '"';
   { online.py owns the reuse/attach decision and passes --attach-runtime/--runtime-src through the lifecycle itself. Visible,
     supervised console: heartbeat each second plus the client's real download/verify progress. }
-  RunPy(Bpy, 'online', Args, TotalSec - Spent, Rc);
+  RunPy(Bpy, 'online', Args, Rc);
   if Rc = 0 then exit;
   FailCode := Rc;
   if Rc = 124 then
-    SuppressibleMsgBox('Keyloom setup STOPPED: a step exceeded its time limit and was ended. The previous install (if any) is unchanged.', mbError, MB_OK, IDOK)
+    SuppressibleMsgBox('Keyloom setup STOPPED: a step showed no progress for 5 minutes and was ended. The previous install (if any) is unchanged.', mbError, MB_OK, IDOK)
   else if Rc = 4 then
     SuppressibleMsgBox('Keyloom is running. Quit it with File > Quit (a background network service does not need to be stopped) and run setup again. Nothing was changed.', mbError, MB_OK, IDOK)
   else if Rc = 130 then

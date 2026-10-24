@@ -42,10 +42,9 @@ mkdir -p "$PREFIX"
 STAGE=$(mktemp -d "$PREFIX/.staging.XXXXXX")  # same filesystem as PREFIX (not a possibly small tmpfs /tmp); private to this run
 trap '[ -z "${_P:-}" ] || _killtree "$_P"; rm -rf "$STAGE"' EXIT  # a signal also stops the supervised child tree
 trap 'exit 130' INT HUP TERM
-# Local time gates: each local phase <= PHASE_S, all together <= TOTAL_S (shared clock T0). A phase over its limit is stopped
-# (its whole process tree killed and reaped) and the install FAILS; it is never extended or retried. The clock is paused only
-# while online.py/lifecycle declare an explicit wait for the user or a visible download via $KEYLOOM_WAIT_FILE.
-TOTAL_S=30; PHASE_S=10; T0=$(date +%s)
+# No install-time budget: a step is stopped (its whole process tree killed and reaped) and the install FAILS only when it shows no
+# progress for STALL_S seconds. An explicit wait for the user or a visible download, declared via $KEYLOOM_WAIT_FILE, counts as progress.
+STALL_S=300  # a step is stopped only after this long with no output at all: a hung child, never a slow disk or network
 # --- sup begin (pure sh, tested under dash). No job control: there is no controlling terminal to rely on, so the child's
 # process TREE is found through /proc (parent links) and only that tree is stopped, killed and reaped.
 _tree() { # _tree PID: PID and every descendant, space separated
@@ -71,58 +70,57 @@ _killtree() { # freeze the tree first (a stopped process cannot fork), re-scan, 
   _b=$(_tree "$1"); kill -STOP $_b 2>/dev/null
   kill -KILL $_b $_a 2>/dev/null; wait "$1" 2>/dev/null; return 0
 }
-# sup LABEL LIMIT CMD...: heartbeat every second (liveness, plus the size of $PF while it grows); at LIMIT kill the tree. stdin is kept.
+# sup LABEL CMD...: heartbeat every second (liveness, plus the size of $PF while it grows); kill the tree when $PF has not
+# grown for STALL_S seconds. stdin is kept.
 sup() {
-  _L=$1; _D=$2; shift 2
+  _L=$1; shift
   "$@" <&0 & _P=$!
-  _N=0; _T=0
+  _N=0; _T=0; _Z=0; _S=-1
   while _live "$_P"; do
     sleep 0.2; _T=$((_T + 1))
     [ $((_T % 5)) -eq 0 ] || continue
     _N=$((_N + 1))
-    if [ "$_N" -ge "$_D" ]; then
+    _W=$(wc -c < "$PF" 2>/dev/null || echo 0)
+    if [ "$_W" != "$_S" ]; then _S=$_W; _Z=0; else _Z=$((_Z + 1)); fi
+    if [ "$_Z" -ge "$STALL_S" ]; then
       _killtree "$_P"; _P=""
-      echo "FAILED: $_L exceeded its ${_D}s limit; stopped and reaped" >&2; return 124
+      echo "FAILED: $_L made no progress for ${STALL_S}s; stopped and reaped" >&2; return 124
     fi
-    echo "[$_L] supervisor heartbeat: ${_N}s of ${_D}s (liveness only)${PF:+; $(wc -c < "$PF" 2>/dev/null || echo 0) bytes written so far}"
+    echo "[$_L] supervisor heartbeat: ${_N}s (liveness only)${PF:+; $_W bytes written so far}"
   done
   _R=0; wait "$_P" || _R=$?; _P=""; return $_R
 }
 # --- sup end
 echo "Unpacking bootstrap ..."
 PF="$STAGE/boot.tgz"
-sup bootstrap "$PHASE_S" sh -c 'tail -c +"$1" "$2" | head -c "$3" > "$4/boot.tgz" && [ "$(sha256sum < "$4/boot.tgz" | cut -d" " -f1)" = "$5" ] \
+sup bootstrap sh -c 'tail -c +"$1" "$2" | head -c "$3" > "$4/boot.tgz" && [ "$(sha256sum < "$4/boot.tgz" | cut -d" " -f1)" = "$5" ] \
   && tar -xzf "$4/boot.tgz" -C "$4" && rm -f "$4/boot.tgz"' sh "$((STUB_BYTES + BOOT_OFFSET + 1))" "$SELF" "$BOOT_LEN" "$STAGE" "$BOOT_SHA256" \
-  || { echo "ERROR: bootstrap could not be unpacked in time or its checksum differs (download damaged?)" >&2; exit 1; }
+  || { echo "ERROR: bootstrap could not be unpacked or its checksum differs (download damaged?)" >&2; exit 1; }
 PF=""
 PY="$STAGE/boot/python/bin/python3"; IP="$STAGE/boot/installer_payload.py"   # outside keyloom-online/payload: survives every move
-lim() { "$PY" -I -B "$IP" limit --start "$T0" --total "$TOTAL_S" --phase "$1"; }
 # Same build already installed and verified? Decided BEFORE the heavy payload is unpacked: the installed, owned lifecycle checks the
 # exact version id built into this installer (fast ordinary check: version, pointer, manifest identity; no runtime rehash, no engine
 # import, no GPU probe). Supervised like every other automatic step. A negative or failed probe just continues to the normal path.
 if [ -z "$REPAIR" ] && [ -x "$PREFIX/current/runtime/python/bin/python3" ] && [ -f "$PREFIX/current/app/packaging/lifecycle.py" ]; then
-  _CL=$(lim "$PHASE_S") || { echo "FAILED: local ${TOTAL_S}s budget spent before the installed-build check" >&2; exit 124; }
   _CR=0
-  "$PY" -I -B "$IP" run --label check --deadline "$_CL" -- "$PREFIX/current/runtime/python/bin/python3" -I -B \
+  "$PY" -I -B "$IP" run --label check -- "$PREFIX/current/runtime/python/bin/python3" -I -B \
     "$PREFIX/current/app/packaging/lifecycle.py" --prefix "$PREFIX" check --version "@VERSION_ID@" || _CR=$?
   if [ "$_CR" = 0 ]; then
     echo "Nothing to do: Keyloom @VERSION_ID@ is already installed and verified. Use --repair to restore damaged files."; exit 0
   fi
 fi
-_SL=$(lim "$PHASE_S") || { echo "FAILED: local ${TOTAL_S}s budget spent before the payload step" >&2; exit 124; }
 "$PY" -I -B "$IP" extract --run "$SELF" --base "$STUB_BYTES" --label online --offset "$ONLINE_OFFSET" --len "$ONLINE_LEN" \
-  --sha256 "$ONLINE_SHA256" --dest "$STAGE" --deadline "$_SL" --require keyloom-online
+  --sha256 "$ONLINE_SHA256" --dest "$STAGE" --require keyloom-online
 W="$STAGE/keyloom-online"
 set -- --payload-dir "$W/payload" --sources "$W/wheel-sources.json" --prefix "$PREFIX" --firewall "$FIREWALL"
 [ -z "$REPAIR" ] || set -- "$@" --repair
 [ -z "$ADOPT" ] || set -- "$@" --adopt-from "$ADOPT"
 # online.py owns the reuse/attach decision (and passes --attach-runtime/--runtime-src through the lifecycle itself); it is
-# supervised like every other automatic step. Its download phases (visible bytes/speed) and the sudo consent pause the clock
-# only through $KEYLOOM_WAIT_FILE.
+# supervised like every other automatic step. Its download phases (visible bytes/speed) and the sudo consent count as progress
+# through $KEYLOOM_WAIT_FILE.
 KEYLOOM_WAIT_FILE="$STAGE/waiting-for-user"; export KEYLOOM_WAIT_FILE
-_IL=$(lim "$TOTAL_S") || { echo "FAILED: local ${TOTAL_S}s budget spent before the install step" >&2; exit 124; }
 set +e
-"$PY" -I -B "$IP" run --label online --deadline "$_IL" --wait-file "$KEYLOOM_WAIT_FILE" -- "$PY" -I -B "$W/payload/app/packaging/online.py" "$@"
+"$PY" -I -B "$IP" run --label online --wait-file "$KEYLOOM_WAIT_FILE" -- "$PY" -I -B "$W/payload/app/packaging/online.py" "$@"
 RC=$?
 [ "$RC" -ne 4 ] || echo "Keyloom is running: quit it (File > Quit), then run this installer again." >&2
 exit $RC

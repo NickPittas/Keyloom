@@ -444,8 +444,8 @@ def build_stage(out: Path, *, ui_binary=None, build_ui=False, ffmpeg_dir: Path, 
     if smoke:  # real launch validation of the staged tree, from an unrelated CWD
         sys.path.insert(0, str(REPO / "packaging"))
         import lifecycle
-        # Build-only budget: the first import of a fresh staged tree is slow (cold Windows runtime). Installer
-        # phases keep lifecycle.PHASE_TIMEOUT (10 s); this finite value applies to the staged build gate only.
+        # Build-only limit: the first import of a fresh staged tree is slow (cold Windows runtime); installs use the
+        # lifecycle.STALL_SECONDS hang guard instead.
         lifecycle.run_selfcheck(stage, timeout=BUILD_SELFCHECK_TIMEOUT)
     (out / "VERSION_ID").write_text(vid)
     return stage

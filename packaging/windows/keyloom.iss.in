@@ -87,49 +87,29 @@ var
   FailCode: Integer;
 
 procedure ExitProcess(uExitCode: Cardinal); external 'ExitProcess@kernel32.dll stdcall';
-function GetTickCount: Cardinal; external 'GetTickCount@kernel32.dll stdcall';  { same import style as ExitProcess; compile UNVERIFIED }
 
 var
   AdoptDir, SourceDir: String;   { AdoptDir: pre-rename install this one takes over; SourceDir: install whose runtime may be reused }
   RuntimeChecked: Boolean;
-  InstallTick: Cardinal;  { GetTickCount when Inno began copying files (ssInstall) }
-  InstallUsed: Integer;   { UsedSec at that moment: Python steps run inside the copy window and are not counted twice }
-  UsedSec: Integer;   { seconds of AUTOMATIC Python work so far (the supervisor excludes declared user waits); Inno's own file extraction is native wizard progress }
-
-const
-  TotalSec = 30;      { whole automatic local install }
-  PhaseSec = 10;      { any single local phase }
 
 { One supervised Python step: a VISIBLE console runs installer_payload.py, which starts the real command as its own process tree,
-  prints a heartbeat every second, honours the shared budget (phase cap, never more than what is left of TotalSec), kills and reaps
-  the tree on the deadline (exit 124) and never turns a timeout into success. The lifecycle creates the tmp waiting-for-user file only
-  while it waits for the user (firewall consent) or runs a visible model transfer; only then the clock pauses. }
-function RunPyV(Interp, Verb, StepName, Extra: String; Cap: Integer; var Rc: Integer): Boolean;
+  prints a heartbeat every second, kills and reaps the tree after 300 s without any output (exit 124) and never turns a stall
+  into success. There is no install-time budget. The lifecycle creates the tmp waiting-for-user file only while it waits for the
+  user (firewall consent) or runs a visible model transfer; that counts as progress. }
+function RunPyV(Interp, Verb, StepName, Extra: String; var Rc: Integer): Boolean;
 var
-  Lim: Integer;
-  Raw: AnsiString;
-  UsedFile, IP: String;
+  IP: String;
 begin
-  Lim := TotalSec - UsedSec;
-  if Lim > Cap then Lim := Cap;
-  Rc := 124;
-  Result := False;
-  if Lim < 1 then exit;
-  UsedFile := ExpandConstant('{tmp}\used.txt');
-  DeleteFile(UsedFile);
   IP := ExpandConstant('{tmp}\installer_payload.py');  { extracted early for the same-build check; later the bootstrap folder has it }
   if not FileExists(IP) then IP := ExpandConstant('{tmp}\kb\installer_payload.py');
-  Result := Exec(Interp, '-I -B "' + IP + '" ' + Verb + ' --label ' + StepName + ' --deadline ' + IntToStr(Lim) +
-                 ' --used-file "' + UsedFile + '"' + Extra, '', SW_SHOW, ewWaitUntilTerminated, Rc);
-  if LoadStringFromFile(UsedFile, Raw) then UsedSec := UsedSec + StrToIntDef(Trim(String(Raw)), Lim)
-  else UsedSec := UsedSec + Lim;
+  Result := Exec(Interp, '-I -B "' + IP + '" ' + Verb + ' --label ' + StepName + Extra, '', SW_SHOW, ewWaitUntilTerminated, Rc);
   if not Result then Rc := 2;
 end;
 
-{ Any command under the generic supervisor (heartbeat, process-tree kill at the deadline, optional user-wait file). }
-function RunPy(Interp, StepName, Cmd: String; Cap: Integer; var Rc: Integer): Boolean;
+{ Any command under the generic supervisor (heartbeat, process-tree kill on a stall, optional user-wait file). }
+function RunPy(Interp, StepName, Cmd: String; var Rc: Integer): Boolean;
 begin
-  Result := RunPyV(Interp, 'run', StepName, ' --wait-file "' + ExpandConstant('{tmp}\waiting-for-user') + '" -- ' + Cmd, Cap, Rc);
+  Result := RunPyV(Interp, 'run', StepName, ' --wait-file "' + ExpandConstant('{tmp}\waiting-for-user') + '" -- ' + Cmd, Rc);
 end;
 
 { The active version's Python/lifecycle of Dir (read-only use; it is never moved by this setup). }
@@ -203,16 +183,15 @@ var
 begin
   Result := True;
   Dir := DefaultDir('');
-  { Fast ordinary check with the installed Python, supervised (<= PhaseSec) and before any file is written. }
+  { Fast ordinary check with the installed Python, supervised and before any file is written. }
   if DirExists(Dir + '\versions\{#VID}') and (AdoptDir = '') and CurrentPy(Dir, Py, Lc) then
   begin
     ExtractTemporaryFile('installer_payload.py');
-    if RunPy(Py, 'check', '"' + Py + '" -I -B "' + Lc + '" --prefix "' + Dir + '" check --version {#VID}', PhaseSec, Rc) and (Rc = 0) then
+    if RunPy(Py, 'check', '"' + Py + '" -I -B "' + Lc + '" --prefix "' + Dir + '" check --version {#VID}', Rc) and (Rc = 0) then
     begin
       SuppressibleMsgBox('Keyloom {#VID} is already installed and verified. Nothing was changed (settings, models and services are untouched). Use "keyloom-setup repair" to restore damaged files.', mbInformation, MB_OK, IDOK);
       ExitProcess(0);
     end;
-    UsedSec := 0;  { the probe is not part of the install budget }
   end;
 end;
 
@@ -252,12 +231,12 @@ begin
     files, 4 = refused, 2 = invalid. No ordinary `recover` may run between this and `install --version`. }
   Man := ExpandConstant('{tmp}\install-manifest.json');
   Lcp := ExpandConstant('{tmp}\lifecycle.py');
-  RunPy(Py, 'prepare-target', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" prepare-target --manifest "' + Man + '"' + Src, PhaseSec, Rc);
+  RunPy(Py, 'prepare-target', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" prepare-target --manifest "' + Man + '"' + Src, Rc);
   if Rc = 0 then
   begin
     { current vs in-place cannot be read from the output: ask the same lifecycle. current = nothing at all to do; in-place =
       install --version activates the recorded target, no runtime attach. }
-    RunPy(Py, 'check', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" check --version {#VID}', PhaseSec, Rc2);
+    RunPy(Py, 'check', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" check --version {#VID}', Rc2);
     if Rc2 = 0 then
     begin
       SuppressibleMsgBox('Keyloom {#VID} is already installed and verified. Nothing was changed.', mbInformation, MB_OK, IDOK);
@@ -303,33 +282,33 @@ begin
   From := '';
   if CompareText(SourceDir, Dest) <> 0 then From := ' --from "' + SourceDir + '"';
   WizardForm.StatusLabel.Caption := 'Checking the installed runtime (see the console window) ...';
-  RunPy(Bpy, 'runtime-available', Base + 'runtime-available --manifest "' + Man + '"' + From, PhaseSec, Rc);
+  RunPy(Bpy, 'runtime-available', Base + 'runtime-available --manifest "' + Man + '"' + From, Rc);
   if Rc = 0 then
   begin
     { Reusable: attach the installed runtime as ONE whole directory (junction); no per-file hash, copy or link. Failure = failure. }
-    RunPy(Bpy, 'attach-runtime', Base + 'attach-runtime --version {#VID}' + From, PhaseSec, Rc);
+    RunPy(Bpy, 'attach-runtime', Base + 'attach-runtime --version {#VID}' + From, Rc);
     if Rc <> 0 then
       FailSetup(8, 'The installed runtime could not be attached (code ' + IntToStr(Rc) + '). Nothing was extracted. Run "keyloom-setup repair" for the installed version, then run this setup again.');
   end
   else if Rc = 1 then
   begin
     { Fresh install or a really different runtime: extract ONLY the new runtime from the companion files, supervised, visible
-      byte counters every second, deadline min(PhaseSec, what is left of TotalSec). Missing/damaged/modified companion = failure. }
+      byte counters every second. Missing/damaged/modified companion = failure. }
     Meta := ExpandConstant('{src}\@RUNTIME_META@');
     if not FileExists(Meta) then
       FailSetup(12, 'This setup needs its runtime companion files next to it (@RUNTIME_META@ and its numbered parts) because the installed runtime cannot be reused. Download all of them into one folder and run setup again. Nothing was changed.');
     WizardForm.StatusLabel.Caption := 'Extracting the new runtime (see the console window) ...';
     RunPyV(Bpy, 'runtime-extract', 'runtime', ' --meta "' + Meta + '" --meta-sha256 @RUNTIME_META_SHA256@ --runtime-id @RUNTIME_ID@ --dest "' +
-           Dest + '\versions\{#VID}"', PhaseSec, Rc);
+           Dest + '\versions\{#VID}"', Rc);
     if Rc <> 0 then
-      FailSetup(13, 'The runtime could not be extracted from its companion files (code ' + IntToStr(Rc) + (', 124 = time limit; stopped and cleaned up') +
+      FailSetup(13, 'The runtime could not be extracted from its companion files (code ' + IntToStr(Rc) + (', 124 = no progress; stopped and cleaned up') +
                 '). Keyloom was not activated; the previous version (if any) stays active. See the console output.');
     RuntimeExtracted := True;  { every shard was authenticated by the supervised extractor (size + sha256 + owned files) }
   end
   else if Rc = 3 then
     FailSetup(9, 'The installed runtime is identical but is not trusted for a fast update. Run "keyloom-setup repair" (full verification), then run this setup again. The runtime was not extracted again.')
   else if Rc = 124 then
-    FailSetup(10, 'The runtime check exceeded its time limit and was stopped. Nothing was changed.')
+    FailSetup(10, 'The runtime check showed no progress for 5 minutes and was stopped. Nothing was changed.')
   else
     FailSetup(10, 'The runtime check failed (code ' + IntToStr(Rc) + '). Nothing was changed.');
 end;
@@ -356,8 +335,7 @@ begin
   if not FileExists(Py) then Py := OldPy;
   if not FileExists(ExpandConstant('{tmp}\lifecycle.py')) then ExtractTemporaryFile('lifecycle.py');
   Lcp := ExpandConstant('{tmp}\lifecycle.py');
-  UsedSec := 0;  { cleanup is its own bounded phase, even when the install used the whole budget }
-  RunPy(Py, 'recover', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" recover', PhaseSec, Rc);
+  RunPy(Py, 'recover', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" recover', Rc);
   if Rc <> 0 then
     SuppressibleMsgBox('Cleanup of the unfinished install did not complete (code ' + IntToStr(Rc) + '). Run "keyloom-setup recover"; nothing else was changed.', mbError, MB_OK, IDOK);
 end;
@@ -367,13 +345,11 @@ var
   Bpy, Lc, Args, Models, AppDir, OldPy, OldLc: String;
   NonceFile: String;
   NonceRaw: AnsiString;
-  Rc, Rc2, Spent: Integer;
+  Rc, Rc2: Integer;
 begin
   AppDir := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
   if CurStep = ssInstall then
   begin
-    InstallTick := GetTickCount;
-    InstallUsed := UsedSec;
     if IsDriveRoot(ExpandConstant('{app}')) then
     begin
       SuppressibleMsgBox('The install folder cannot be a drive root.', mbError, MB_OK, IDOK);
@@ -384,19 +360,6 @@ begin
       is only extracted once Inno starts copying }
   end;
   if CurStep <> ssPostInstall then exit;
-  { Inno's own copy is now only the app files and the small bootstrap (the runtime is a companion, handled by PrepareRuntime). That
-    native copy still cannot be pre-empted from here, so it is put on the shared clock AFTER the fact: its time counts against the
-    10 s phase and the 30 s total. Over the limit = visible failure BEFORE activation: the lifecycle never runs, the previous
-    version stays active and no receipt, pointer or runtime link is claimed. This is a failed-gate report, not a hard stop. }
-  Spent := Integer((GetTickCount - InstallTick) div 1000) - (UsedSec - InstallUsed);
-  if Spent < 0 then Spent := 0;
-  if Spent > PhaseSec then
-  begin
-    SuppressibleMsgBox('Copying the application files took ' + IntToStr(Spent) + ' s, over the ' + IntToStr(PhaseSec) + ' s limit for one local phase. Keyloom was NOT activated and the previous version (if any) stays active. Run "keyloom-setup repair" or uninstall the incomplete copy before retrying.', mbError, MB_OK, IDOK);
-    FailCode := 11;
-    Abort;
-  end;
-  UsedSec := UsedSec + Spent;
   { In-place target: no files were placed and the existing runtime stays exactly as it is, so there is no runtime decision at all. }
   if not InPlace then
     PrepareRuntime;  { the single availability decision: attach whole directory / supervised companion extraction / stop visibly }
@@ -416,15 +379,15 @@ begin
   begin
     NonceFile := ExpandConstant('{tmp}\nonce.txt');
     DeleteFile(NonceFile);
-    RunPyV(Bpy, 'attest', 'attest', ' --lifecycle "' + Lc + '" --dest "' + AppDir + '\versions\{#VID}" --producer segments --out "' + NonceFile + '"', PhaseSec, Rc2);
+    RunPyV(Bpy, 'attest', 'attest', ' --lifecycle "' + Lc + '" --dest "' + AppDir + '\versions\{#VID}" --producer segments --out "' + NonceFile + '"', Rc2);
     if (Rc2 = 0) and LoadStringFromFile(NonceFile, NonceRaw) and (Trim(String(NonceRaw)) <> '') then
       Args := Args + ' --payload-attested ' + Trim(String(NonceRaw));
   end;
-  { Visible, supervised console: second-by-second heartbeat, shared 30 s automatic budget, tree killed on the deadline.
+  { Visible, supervised console: second-by-second heartbeat, tree killed after 300 s without output.
     Model downloads and the firewall consent are declared by the lifecycle through the wait file and shown there. }
   WizardForm.StatusLabel.Caption := 'Validating and activating Keyloom (see the console window) ...';
   RecoverPending := True;  { until install reports success; install itself restores on failure, recover settles what a crash left }
-  RunPy(Bpy, 'install', Args, TotalSec, Rc);
+  RunPy(Bpy, 'install', Args, Rc);
   if (Rc = 0) or (Rc = 3) then RecoverPending := False;
   if Rc = 3 then
     SuppressibleMsgBox('Keyloom is installed but model setup is INCOMPLETE. Run "keyloom-setup models" (or repair) to finish; affected workflows stay unavailable until then.', mbInformation, MB_OK, IDOK)
@@ -435,7 +398,7 @@ begin
       setup shim (if any) finishes that cleanup now. }
     { the failed transaction is settled by DeinitializeSetup (core `recover`, bounded, from the stable bootstrap) }
     if Rc = 124 then
-      SuppressibleMsgBox('Installation STOPPED: a step exceeded its time limit and was ended. The previous version (if any) stays active; nothing was reported as installed.', mbError, MB_OK, IDOK)
+      SuppressibleMsgBox('Installation STOPPED: a step showed no progress for 5 minutes and was ended. The previous version (if any) stays active; nothing was reported as installed.', mbError, MB_OK, IDOK)
     else
       SuppressibleMsgBox('Installation FAILED (code ' + IntToStr(Rc) + '): launch validation did not pass. The previous version (if any) stays active. See the console output.', mbError, MB_OK, IDOK);
   end;

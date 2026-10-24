@@ -62,11 +62,8 @@ MAX_JSON = 256 << 20
 MAX_FILES = 500_000
 RETRIES = 5
 READ_TIMEOUT = 20  # connect and every socket read; a silent server fails after this, never hangs
-FAST_DEADLINE = 30  # whole lifecycle handoff when no runtime bytes move (attach path)
-PHASE_LIMIT = 10 # one local helper (settings rename ...)
 WORKERS = 8  # default size of the ONE bounded worker pool shared by every parallel stage (probes, copies, wheels)
 MAX_WORKERS = 16  # hard cap
-TERM_GRACE = 3 # the lifecycle child is terminated this long BEFORE the absolute boundary so its rollback fits inside it
 MARGIN = 512 << 20
 CACHE = ".staging.dl"  # a ".staging.*" name: lifecycle accepts it as ours in a not-yet-installed prefix
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -76,22 +73,13 @@ NET_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionError, http.client.
 
 
 class Budget:
-    """ONE counted local-install clock for every path (fresh, changed runtime, update): FAST_DEADLINE seconds in total and
-    PHASE_LIMIT per automatic local phase. Only an actual network transfer (pause()) and explicit human consent inside the
-    lifecycle child (KEYLOOM_WAIT_FILE, see run_lifecycle) stop it; hashing, copying, extraction, selfchecks do not.
-    Expiry raises Fail (the staging area is removed, nothing is activated); it is never extended or turned into a fallback."""
+    """Tracks which workers are in a network transfer (net) or doing local work (local) and owns KEYLOOM_WAIT_FILE accordingly.
+    There is no time budget: the supervising installer stops a step only after it shows no progress (see installer_payload)."""
 
     def __init__(self):
-        self.t0 = time.monotonic()
-        self.paused, self.name, self.base = 0.0, "start", 0.0
-        # Thread safe. The clock stands still only while at least one worker is in a network transfer (net) AND none is doing
-        # local work (local); that same moment owns KEYLOOM_WAIT_FILE. Overlapping hash/copy/extract keeps it running.
+        # Thread safe. The wait file exists only while at least one worker is in a network transfer (net) AND none is doing
+        # local work (local). Overlapping hash/copy/extract keeps it away.
         self.lock, self.net_n, self.loc_n, self.pstart, self.wait_cm = threading.RLock(), 0, 0, None, None
-
-    def counted(self) -> float:
-        with self.lock:
-            now = time.monotonic()
-            return now - self.t0 - self.paused - (now - self.pstart if self.pstart is not None else 0.0)
 
     @property
     def network_only(self) -> bool:
@@ -105,7 +93,6 @@ class Budget:
             cm.__enter__()
             self.wait_cm = cm
         elif not want and self.pstart is not None:
-            self.paused += now - self.pstart
             self.pstart = None
             cm, self.wait_cm = self.wait_cm, None
             if cm is not None:
@@ -129,19 +116,9 @@ class Budget:
     def local(self):
         return self._count("loc_n")
 
-    def begin(self, name: str):
-        self.name, self.base = name, self.counted()
-
-    def check(self, phase_limited: bool = True):
+    def check(self):
         if POOL.stop.is_set():
-            raise Fail("cancelled: another parallel task failed or the local budget expired")
-        c = self.counted()
-        if c > FAST_DEADLINE:
-            raise Fail(f"the local install exceeded {FAST_DEADLINE}s of counted time in phase '{self.name}' "
-                       "(network transfer and your consent are not counted); nothing was activated, run again")
-        if phase_limited and c - self.base > PHASE_LIMIT:
-            raise Fail(f"local phase '{self.name}' exceeded {PHASE_LIMIT}s (network transfer and your consent are not counted); "
-                       "nothing was activated, run again")
+            raise Fail("cancelled: another parallel task failed")
 
 BUDGET = Budget()
 
@@ -162,13 +139,17 @@ class Pool:
             self.bytes += n
 
     def _report(self, end: threading.Event, cache: Path | None):
-        t0, last = time.monotonic(), 0
+        t0, last, seen = time.monotonic(), 0, None
         while not end.wait(1.0):
             with self.lock:
                 b, a, c, t, tot, ph = self.bytes, self.active, self.completed, self.tasks, self.total, self.phase
-            state = "NETWORK transfer only (clock paused)" if BUDGET.network_only else "local work"
+            if (b, c) == seen:  # nothing moved: stay silent so the supervisor's stall guard can see it
+                last = b
+                continue
+            seen = (b, c)
+            state = "NETWORK transfer only" if BUDGET.network_only else "local work"
             say(f"  {ph}: {b / 1048576:.1f}/{tot / 1048576:.1f} MiB, {(b - last) / 1048576:.1f} MiB/s, workers {a}/{self.n} active, "
-                f"{c}/{t} done, elapsed {time.monotonic() - t0:.0f}s, {state}; counted {BUDGET.counted():.0f}/{FAST_DEADLINE}s")
+                f"{c}/{t} done, elapsed {time.monotonic() - t0:.0f}s, {state}")
             last = b
             if cache is not None:
                 try:
@@ -216,8 +197,7 @@ class Pool:
             self.stop.set()
             for f in pending:
                 f.cancel()
-            left = min(PHASE_LIMIT, max(0.0, FAST_DEADLINE - BUDGET.counted()))  # cleanup stays inside the counted budget
-            _, still = concurrent.futures.wait(pending, timeout=left)
+            _, still = concurrent.futures.wait(pending, timeout=10)  # workers see the stop flag every chunk
             if still:
                 say(f"  {len(still)} local worker(s) still stopping (they check the stop flag every chunk); "
                     "the partial downloads are kept for resume")
@@ -500,7 +480,7 @@ _PHASE = ["local"]  # CHILD side only: "net" while connecting/transferring, "loc
 
 def hash_file(path: Path, label: str) -> str:
     h = hashlib.sha256()
-    with BUDGET.local(), open(path, "rb") as f:  # local work: keeps the counted clock running beside other workers' transfers
+    with BUDGET.local(), open(path, "rb") as f:  # local work
         for b in iter(lambda: f.read(1 << 20), b""):
             h.update(b)
             POOL.add(len(b))
@@ -564,7 +544,7 @@ def fetch_once(fx: Fetcher, w: dict, cache: Path) -> Path:
         if have != size:
             raise Transient("connection closed early")
 
-    _PHASE[0] = "net"  # the parent reads this phase and pauses the counted clock only for genuine transfer
+    _PHASE[0] = "net"  # the parent reads this phase to tell a genuine transfer from local work
     attempt()
     _PHASE[0] = "local"
     if part.stat().st_size != size or hash_file(part, wheel_name(w)) != sha:
@@ -583,12 +563,12 @@ _FETCH_CODE = ("import sys,importlib.util as u;s=u.spec_from_file_location('ck_o
 def fetch_child() -> int:
     """CHILD entry (own process, bootstrap interpreter): ONE attempt of fetch_once for the wheel on stdin. Only this process
     opens the connection and writes that wheel's .part/.whl. It publishes {b: bytes, p: phase} (and err/code at the end) to
-    <cache>/<sha>.status twice a second. It has no wait file, no budget and no URL output. Exit 0 ok, 20 transient network
+    <cache>/<sha>.status twice a second. It has no wait file and no URL output. Exit 0 ok, 20 transient network
     error (the parent retries/resumes), 10 anything else."""
     job = json.loads(sys.stdin.readline())
     w, cache = job["w"], Path(job["cache"])
     status, end = cache / f"{w['sha256']}.status", threading.Event()
-    BUDGET.check = lambda *a, **k: None  # the parent owns the budget and kills this process on expiry
+    BUDGET.check = lambda *a, **k: None  # the parent cancels this process by killing it
 
     def publish(extra=None):
         tmp = status.with_name(status.name + ".tmp")
@@ -630,7 +610,7 @@ def _read_status(path: Path) -> dict:
 def run_fetch_child(tls_base: Path, w: dict, cache: Path) -> tuple[int, str]:
     """PARENT supervision of one killable transfer process. Reacts to the shared stop flag within ~0.2 s (even during DNS/connect),
     enforces the no-progress deadline itself, feeds the aggregate byte counter, and tells the Budget what is genuinely happening:
-    child phase "net" counts as network, anything else as local work. Returns (code, message); cancellation/budget expiry raise."""
+    child phase "net" counts as network, anything else as local work. Returns (code, message); cancellation raises."""
     status = cache / f"{w['sha256']}.status"
     status.unlink(missing_ok=True)
     env = {k: v for k, v in L.clean_env().items() if k != "KEYLOOM_WAIT_FILE"}  # only the parent owns the wait file
@@ -660,7 +640,7 @@ def run_fetch_child(tls_base: Path, w: dict, cache: Path) -> tuple[int, str]:
             if rc is not None:
                 break
             if POOL.stop.is_set():
-                raise Fail("cancelled: another parallel task failed or the local budget expired")
+                raise Fail("cancelled: another parallel task failed")
             BUDGET.check()
             if ph == "net" and now - quiet > READ_TIMEOUT + 5:  # covers DNS/connect/read: nothing can evade this
                 early = (20, f"stalled: no data for {READ_TIMEOUT + 5}s")
@@ -698,10 +678,10 @@ def download(tls_base: Path, w: dict, cache: Path) -> Path:
             raise Fail(msg)
         if attempt == RETRIES - 1:
             raise Fail(f"network error ({msg}); run again to resume")
-        with BUDGET.net():  # a retry wait is a network wait: it does not consume the local budget (others' local work still counts)
+        with BUDGET.net():  # a retry wait is a network wait
             stopped = POOL.stop.wait(min(2 ** attempt, 20))  # interruptible backoff
         if stopped:
-            raise Fail("cancelled: another parallel task failed or the local budget expired")
+            raise Fail("cancelled: another parallel task failed")
     raise Fail("download failed")
 
 
@@ -878,7 +858,6 @@ def build_tree(tls_base: Path | None, prefix: Path, rec: dict | None, stage: Pat
     # stage + downloads at the peak; lifecycle then wants 2x the bundle free (its own preflight), the cache not counted
     free_check(prefix, total + max(dl, 2 * int(mani.get("total_bytes") or 0)), "the new version and its downloads")
 
-    BUDGET.begin("reuse installed files")
     staged, reused, memo = set(), 0, {}
     def reuse_one(r):  # one worker per destination path: no two workers write the same file; sources are only read
         hit = plan[r]
@@ -894,7 +873,6 @@ def build_tree(tls_base: Path | None, prefix: Path, rec: dict | None, stage: Pat
             reused += regular[r]["size"]
     if staged:
         say(f"Reusing {len(staged)} unchanged files ({reused >> 20} MiB) from the installed version.")
-    BUDGET.begin("copy installer files")
     proot, memo, own = pdir.resolve(), {}, 0
     def copy_one(r):
         return copy_verified(pdir / r, tree / r, regular[r]) if parent_inside(proot, pdir / r, memo) else False
@@ -919,7 +897,6 @@ def build_tree(tls_base: Path | None, prefix: Path, rec: dict | None, stage: Pat
         with BUDGET.local():
             return extract_wheel(arc, w, regular, tree, snap, Sub())
     if todo:
-        BUDGET.begin("wheels: download, verify, extract")
         # simultaneous cache + extracted bytes must fit the free space: fewer wheels in flight rather than a full disk
         worst = max(w["size"] + need_of(w) for w in todo)
         k = max(1, min(POOL.n, (shutil.disk_usage(prefix).free - MARGIN) // max(worst, 1)))
@@ -1056,7 +1033,7 @@ def migrate_settings_folder(pdir: Path, prefix: Path, adopt: Path | None) -> Non
         with InstanceLock():
             pass  # refuse early (clear message) when the app is running; released before the child takes the app lock itself
         r = subprocess.run([str(py), "-I", "-B", "-c", code, str(pdir / "app"), str(prefix), str(adopt or "")], env=L.clean_env(),
-                           capture_output=True, text=True, timeout=PHASE_LIMIT)
+                           capture_output=True, text=True, timeout=L.INNER_TIMEOUT)
         if r.returncode != 0 or not r.stdout.strip():
             raise ValueError(f"the migration check exited with code {r.returncode} or gave no result")
         out = json.loads(r.stdout.strip().splitlines()[-1])
@@ -1086,43 +1063,22 @@ def run_lifecycle(prefix: Path, tree: Path, verb: str, firewall: str = "ask", ad
     """The staged lifecycle.py runs under the separate bootstrap, outside the version being activated.
     attach=True passes `install --attach-runtime` (payload has no runtime/). nonce passes `install --payload-attested NONCE`
     (core consumes the marker written by L.write_attestation). script, for an in-place activation, is the already-running
-    bootstrap lifecycle.py, so no staged file is needed. The handoff is bounded by the shared counted budget: SIGTERM
-    at FAST_DEADLINE - TERM_GRACE (it rolls itself back), a kill at FAST_DEADLINE, and 124 is returned."""
+    bootstrap lifecycle.py, so no staged file is needed. The handoff waits for the lifecycle to finish; the supervising
+    installer stops it if it shows no output for too long, and the lifecycle rolls itself back."""
     global CHILD
-    if BUDGET.counted() > FAST_DEADLINE - TERM_GRACE:  # no room left for even a rolled-back attempt: do not start
-        raise Fail(f"the {FAST_DEADLINE}s counted local-install budget is used up before activation; nothing was activated, run again")
     cmd = [sys.executable, "-I", "-B", str(script or tree / "app/packaging/lifecycle.py"), "--prefix", str(prefix), verb,
            "--payload", str(tree), "--firewall", firewall] + (["--models", "skip"] if verb == "install" else []) \
         + (["--adopt-from", str(adopt)] if adopt and verb == "install" else []) \
         + (["--attach-runtime"] if attach and verb == "install" else []) \
         + (["--payload-attested", nonce] if nonce and verb == "install" else [])
     CHILD =subprocess.Popen(cmd, env=L.clean_env())
-    interrupted, el, last, timed_out = False, 0.0, time.monotonic(), False
-    wait_file = os.environ.get("KEYLOOM_WAIT_FILE")  # lifecycle creates it only around consent / explicit transfers
+    interrupted = False
     while True:
         try:
-            try:
-                rc = CHILD.wait(timeout=1.0)
-                break
-            except subprocess.TimeoutExpired:
-                now = time.monotonic()
-                paused = bool(wait_file) and os.path.exists(wait_file)
-                if paused:
-                    BUDGET.paused += now - last  # consent / explicit transfer: the shared counted clock stands still
-                last = now
-                el = BUDGET.counted()  # whole-run counted time (staging + this handoff), not just the handoff
-                say(f"  installing (lifecycle {verb}): {'WAITING for you / an explicit transfer' if paused else 'working'}, "
-                    f"elapsed {el:.0f}s (not byte progress)")
-                if el > FAST_DEADLINE - TERM_GRACE and not paused and not timed_out:
-                    timed_out = True  # terminate early enough that its rollback fits inside the absolute budget
-                    say(f"ERROR: the local install is out of its {FAST_DEADLINE}s counted budget; stopping it (it rolls back)")
-                    CHILD.terminate()
-                if timed_out and el >= FAST_DEADLINE:
-                    CHILD.kill()  # never beyond the absolute boundary
+            rc = CHILD.wait()
+            break
         except KeyboardInterrupt:
             interrupted = True  # the terminal sent the child the same SIGINT; wait for its rollback
-    if timed_out:
-        return 124
     return 130 if (interrupted or STOPPED) and rc else rc
 
 
@@ -1158,8 +1114,6 @@ def _install(a) -> int:
     if not a.repair and not up_to_date(prefix, peek_receipt(prefix), mani, deep=False):
         migrate_settings_folder(pdir, prefix, adopt)
     with InstanceLock():
-        BUDGET.__init__()  # one counted local clock for this run, started once the instance lock is held
-        BUDGET.begin("pre-check")
         rec = inspect_prefix(prefix)
         if not a.repair and up_to_date(prefix, rec, mani):
             say(f"Keyloom {vid} is already installed and verified; nothing to do.")

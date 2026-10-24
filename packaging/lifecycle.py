@@ -42,7 +42,8 @@ LEGACY_APP_ID = "CorridorKey"  # receipts written before the rename keep this va
 DESCRIPTOR = "keyloom-install.json"
 LEGACY_DESCRIPTOR = "corridorkey-install.json"
 KEEP_VERSIONS = 2  # active + previous (rollback target)
-SERVICE_TIMEOUT = 10  # seconds for the network-service refresh phase (== PHASE_TIMEOUT)
+STALL_SECONDS = 300  # a local step is stopped only after this long with no output at all: a hung child, never a slow disk or network
+INNER_TIMEOUT = STALL_SECONDS - 60  # inner hang guards must fire (and report) before the supervisor's outer no-output stall guard
 
 
 VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,79}$")
@@ -158,7 +159,7 @@ def mutation_lock(prefix: Path, wait: float = 10):
 
 @contextlib.contextmanager
 def user_wait(reason: str):
-    """Pause the supervisor's automatic clock ONLY while the user must act (consent/UAC/sudo) or an explicit model/network
+    """Declare a wait (counts as progress for the supervisor's stall guard) ONLY while the user must act (consent/UAC/sudo) or an explicit model/network
     transfer runs: KEYLOOM_WAIT_FILE exists exactly as long as the block does, and is removed on success, failure and Ctrl-C.
     Never wrap service setup, selfchecks, hashing or extraction. No password is read or stored here."""
     f = os.environ.get("KEYLOOM_WAIT_FILE")
@@ -492,10 +493,7 @@ def check_system_libs() -> None:
             "current NVIDIA driver (Linux Mint: Driver Manager) before use.")
 
 
-PHASE_TIMEOUT = 10  # seconds: every automatic local subprocess phase (self-check, UI check, GPU probe, service refresh)
-
-
-def run_selfcheck(version_dir: Path, timeout: int = PHASE_TIMEOUT, shared: Path | None = None) -> dict:
+def run_selfcheck(version_dir: Path, timeout: int = INNER_TIMEOUT, shared: Path | None = None) -> dict:
     """Launch validation from an unrelated CWD with a polluted-env-free child:
     the bundled interpreter imports every engine, and the real UI binary resolves the descriptor."""
     py, app = descriptor_python(version_dir), version_dir / "app"
@@ -537,9 +535,9 @@ def _ui_check(version_dir: Path, env: dict, cwd: str, shared: Path | None, timeo
     return {k: ui.get(k) for k in ("version", "installed")}
 
 
-def run_light_check(version_dir: Path, shared: Path | None = None, timeout: int = 10) -> dict:
+def run_light_check(version_dir: Path, shared: Path | None = None, timeout: int = INNER_TIMEOUT) -> dict:
     """Ordinary app update on a validated shared runtime: the descriptor resolves to an existing interpreter and the UI binary
-    self-checks, each bounded (default 10 s). No engine import, no GPU probe, no torch."""
+    self-checks, each with a hang guard (default INNER_TIMEOUT). No engine import, no GPU probe, no torch."""
     py = descriptor_python(version_dir)
     if not py.exists():
         raise InstallError(f"launch validation: interpreter {py} is missing")
@@ -772,7 +770,7 @@ def refresh_network_service(version_dir: Path, prefix: Path, receipt: dict | Non
         )
         result = subprocess.run(
             [str(descriptor_python(version_dir)), "-I", "-B", "-c", bootstrap, str(version_dir / "app"), str(prefix)] + ([str(ADOPT)] if ADOPT else []),
-            env=clean_env(), capture_output=True, text=True, timeout=SERVICE_TIMEOUT,  # bounded phase; a timeout is reported below, never success
+            env=clean_env(), capture_output=True, text=True, timeout=INNER_TIMEOUT,  # hang guard; a timeout is reported below, never success
         )
         if result.returncode:
             raise InstallError(f"network setup exited with code {result.returncode}; open Clients for details")
@@ -820,8 +818,8 @@ def _firewall_run(version_dir: Path, mode: str, prior: dict | None) -> dict | No
     try:
         cmd = [str(descriptor_python(version_dir)), "-I", "-B", str(version_dir / "app/packaging/firewall.py"),
                mode, json.dumps(prior or {}), str(out)]
-        # The helper itself pauses the clock (user_wait in firewall.py) around the consent question and sudo/UAC only; its
-        # automatic probes stay counted. Its own consent deadlines (120 s answer, 180 s sudo) bound the human wait.
+        # The helper itself declares the wait (user_wait in firewall.py) around the consent question and sudo/UAC. Its own
+        # consent deadlines (120 s answer, 180 s sudo) bound the human wait.
         rc = subprocess.run(cmd, env=clean_env(), timeout=1200).returncode
         if rc:
             raise InstallError(f"firewall helper exited with code {rc}")
@@ -952,7 +950,7 @@ def pointer_ok(prefix: Path, version: str) -> bool:
 def gpu_info() -> dict:
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
-                            "--format=csv,noheader"], capture_output=True, text=True, timeout=PHASE_TIMEOUT)
+                            "--format=csv,noheader"], capture_output=True, text=True, timeout=INNER_TIMEOUT)
         if r.returncode == 0 and r.stdout.strip():
             return {"nvidia": r.stdout.strip().splitlines()}
         return {"nvidia": None, "note": "nvidia-smi failed; CorridorKey 2.0 needs an NVIDIA GPU + driver"}
@@ -1050,6 +1048,7 @@ def activate(prefix: Path, version: str, *, shortcuts: bool = True, selfcheck: b
         # descriptor interpreter and the real UI binary are checked (bounded). The full engine self-check stays a build-time
         # gate (run_selfcheck, called by bundle.py), not an install step.
         prior = receipt.get("runtime") or (read_receipt(runtime_src).get("runtime") if runtime_src else None) or {}
+        say("Checking the runtime (first start can take a few minutes) ...")  # the one step that may stay silent
         info = dict(prior, **run_light_check(vdir, shared))
     previous_receipt = copy.deepcopy(receipt)
     old = receipt.get("current")
@@ -1100,7 +1099,7 @@ def run_models(prefix: Path, version: str, extra: list[str], timeout: int | None
     """Full model setup through the shared manager only (no other downloader).
 
     Installed models are trusted: nothing already ready is re-hashed or re-downloaded. An offline per-artifact check (stat/cache
-    based, bounded to one automatic phase) selects only the missing/new artifacts, and only those are downloaded; the manager
+    based, with a hang guard) selects only the missing/new artifacts, and only those are downloaded; the manager
     authenticates exactly those incoming files once. Ready = every artifact ready or its download reported ok.
     """
     vdir = vpath(prefix, version)
@@ -1110,7 +1109,7 @@ def run_models(prefix: Path, version: str, extra: list[str], timeout: int | None
 
     def stage(op_args: list[str], op: str, limit: float | None = None, statuses: list | None = None) -> bool:
         """Run one manager op, forwarding its events; every quiet second prints elapsed/stall, every progress second bytes+speed.
-        `limit` (seconds) is a hard deadline (killed, reported as failure, never success)."""
+        `limit` (seconds) is a stall guard: no data for that long kills it (reported as failure, never success)."""
         import queue
         import threading
         op_id = f"install-{uuid.uuid4().hex[:12]}"
@@ -1130,10 +1129,10 @@ def run_models(prefix: Path, version: str, extra: list[str], timeout: int | None
                 now = time.monotonic()
                 if line is None:
                     break
-                if limit is not None and now - t0 > limit:
+                if limit is not None and now - last_data > limit:
                     p.kill()
                     p.wait()
-                    say(f"  [{op}] FAILED: exceeded its {limit:.0f} s phase limit")
+                    say(f"  [{op}] FAILED: no data for {limit:.0f} s")
                     return False
                 try:
                     ev = json.loads(line) if line else None
@@ -1168,7 +1167,7 @@ def run_models(prefix: Path, version: str, extra: list[str], timeout: int | None
         return bool(done and p.returncode == 0 and (done.get("ok") or op == "check"))
 
     statuses: list = []
-    checked = stage(["--check", "--json"], "check", PHASE_TIMEOUT, statuses)  # offline, automatic, bounded
+    checked = stage(["--check", "--json"], "check", INNER_TIMEOUT, statuses)  # offline, automatic, hang guard
     # Protocol (backend/model_provision.op_check): one {"event":"status","artifact":ID,"kind":K,"present":bool,"ready":bool,...} per
     # artifact. `present` = every required file exists at its catalog size (stat only); that is what an installed model is
     # trusted for here. Python-package/vendored-code artifacts are not downloadable and are not selected.
@@ -1188,7 +1187,7 @@ def run_models(prefix: Path, version: str, extra: list[str], timeout: int | None
 
 
 def _download_models(stage, args: list[str]) -> bool:
-    """The explicit model transfer: only this pauses the supervisor's automatic clock (visible per-second events come from `stage`)."""
+    """The explicit model transfer: only this declares a wait to the supervisor (visible per-second events come from `stage`)."""
     with user_wait("explicit model download transfer"):
         return stage(args, "download")
 

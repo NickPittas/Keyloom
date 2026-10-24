@@ -225,7 +225,7 @@ def sudo_ufw(ufw: str, args: list[str], capture: bool = False):
 
 
 def interactive() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()
+    return sys.stdin.isatty()  # stdout is the installer supervisor's pipe
 
 
 def ask(question: str) -> bool:
