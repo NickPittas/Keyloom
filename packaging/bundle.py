@@ -735,13 +735,13 @@ def lock_pins() -> dict:
 
 
 def _get(url: str, tries: int = 3) -> bytes | None:
-    """Page bytes, None for 404 (project not on this index)."""
+    """Page bytes, None for 404/403 (project not on this index; download.pytorch.org answers 403 for projects it does not host)."""
     for i in range(tries):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "keyloom-build"}), timeout=60) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
-            if e.code == 404:
+            if e.code in (404, 403):
                 return None
             err = e
         except OSError as e:
