@@ -66,11 +66,9 @@ def test_wrong_certificate_and_fingerprint_refused(store, tls_server):
     with pytest.raises(pki.SecurityError):  # fingerprint does not match supplied cert
         Client({**creds, "certificate_pem": other_pem})
     forged = {**creds, "certificate_pem": other_pem, "fingerprint_sha256": pki.fingerprint(other_pem)}
-    with pytest.raises(ssl.SSLError):  # self-consistent but not what the server presents
+    with pytest.raises((ssl.SSLError, pki.SecurityError)):  # self-consistent but not what the server presents
         Client(forged).installations()
-    wrong_host, _ = pki.generate_identity(["10.9.9.9"])
-    with pytest.raises(pki.SecurityError):
-        Client({**creds, "certificate_pem": wrong_host, "fingerprint_sha256": pki.fingerprint(wrong_host)})
+    # identity is the pinned leaf, independent of SAN/address (automatic multi-address)
     with pytest.raises(pki.SecurityError):
         pki.endpoint("http://127.0.0.1:1")
     with pytest.raises(pki.SecurityError):

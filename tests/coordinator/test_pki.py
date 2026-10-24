@@ -56,12 +56,15 @@ def test_windows_acl_verification(monkeypatch):
         pki.protect_private("f")
 
 
-def test_cert_san_and_hostname(tmp_path):
+def test_cert_identity_survives_address_change(tmp_path):
     pem, _ = pki.generate_identity(["127.0.0.1", "nas.lan"])
     assert pki.cert_covers_host(pem, "127.0.0.1") and pki.cert_covers_host(pem, "NAS.lan")
     assert not pki.cert_covers_host(pem, "evil.lan")
+    pki.write_invitation(str(tmp_path / "i"), "https://192.168.100.5:8443", pem, "C", 1)
+    _, _, ctx = pki.verified_trust("https://100.126.185.76:8443", pem, pki.fingerprint(pem))
+    assert not ctx.check_hostname
     with pytest.raises(pki.SecurityError):
-        pki.write_invitation(str(tmp_path / "i"), "https://evil.lan:1", pem, "C", 1)
+        pki.verified_trust("https://100.126.185.76:8443", pem, "0" * 64)
 
 
 def test_cli_pair_flow_and_safe_failures(tmp_path, store, tls_server, capsys):

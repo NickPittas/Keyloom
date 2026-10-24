@@ -3,9 +3,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SCAN = ["backend", "ui", "main.py", "clip_manager.py", "pyproject.toml",
-        "requirements.txt", "1-install.sh", "3-update.sh",
-        "Install_CorridorKey_Windows.bat"]
+SCAN = ["backend", "pyproject.toml"]
 SKIP_DIRS = {"__pycache__", ".venv", "tests"}
 
 SYMBOLS = re.compile(

@@ -179,7 +179,7 @@ fn relative_project_path_yields_absolute_clip_paths_for_every_task_job() {
     .unwrap();
     std::fs::write(clip.join("clip.json"), "{}").unwrap();
     std::fs::write(proj.join("project.json"), r#"{"version":2}"#).unwrap();
-    // Load through a path relative to the process cwd, as `corridorkey-ui target/.../project` does.
+    // Load through a path relative to the process cwd, as `keyloom-ui target/.../project` does.
     let cwd = std::env::current_dir().unwrap();
     let rel = pathdiff(&proj, &cwd);
     let p = load_project(&rel, &LoadOptions::default()).unwrap();

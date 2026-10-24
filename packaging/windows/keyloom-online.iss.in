@@ -60,7 +60,7 @@ const
 
 { One supervised Python step in a VISIBLE console: installer_payload.py runs the command as its own process tree, prints a
   heartbeat every second, kills and reaps the tree at the deadline (exit 124) and exports the private wait file path to it as
-  KEYLOOM_WAIT_FILE (online.py creates it only around real downloads/consent). The path is inside Setup's private {tmp}. }
+  KEYLOOM_WAIT_FILE (online.py creates it only around real downloads/consent). The path is inside Setup's private tmp folder. }
 function RunPy(Interp, StepName, Cmd: String; Cap: Integer; var Rc: Integer): Boolean;
 begin
   Result := Exec(Interp, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" run --label ' + StepName + ' --deadline ' + IntToStr(Cap) +

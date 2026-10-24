@@ -108,10 +108,10 @@ def test_runtime_uses_descriptor_user_data_and_checks_dependency_closure(monkeyp
     app = tmp_path / "app"
     app.mkdir()
     data = tmp_path / "chosen-user-data"
-    descriptor = app / "corridorkey-install.json"
+    descriptor = app / "keyloom-install.json"
     descriptor.write_text(json.dumps({
         "schema": 1,
-        "app_name": "CorridorKey",
+        "app_name": "Keyloom",
         "app_version": "test",
         "roots": {
             "python": "runtime/python",

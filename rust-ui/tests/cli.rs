@@ -3,14 +3,14 @@ use std::process::Command;
 
 #[test]
 fn version_and_self_check_never_open_a_window() {
-    let exe = env!("CARGO_BIN_EXE_corridorkey-ui");
+    let exe = env!("CARGO_BIN_EXE_keyloom-ui");
     let v = Command::new(exe).arg("--version").output().unwrap();
     assert!(v.status.success());
-    assert!(String::from_utf8_lossy(&v.stdout).starts_with("corridorkey-ui "));
+    assert!(String::from_utf8_lossy(&v.stdout).starts_with("keyloom-ui "));
     // Bogus descriptor: the self-check must fail loudly (exit 1 + JSON problem), not fall back to a GUI.
     let bad = Command::new(exe)
         .arg("--self-check")
-        .env("CK_INSTALL", "/nonexistent/corridorkey-install.json")
+        .env("CK_INSTALL", "/nonexistent/keyloom-install.json")
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .output()

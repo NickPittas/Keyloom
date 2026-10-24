@@ -37,12 +37,14 @@ def make_payload(root: Path, name="payload", tag="a") -> Path:
     (p / "app/packaging/selfcheck.py").write_text(SELFCHECK)
     (p / "app/packaging/lifecycle.py").write_text((REPO / "packaging/lifecycle.py").read_text())
     (p / "app/scripts/setup_models.py").write_text(FAKE_SETUP)
-    ui = p / "bin/corridorkey-ui"  # stand-in UI: reports paths inside its own version dir, like --self-check
+    # stand-in firewall helper: the real one is covered by test_installer_firewall.py and must not run sudo/ufw here
+    (p / "app/packaging/firewall.py").write_text("import sys, pathlib\npathlib.Path(sys.argv[3]).write_text('{}')\n")
+    ui = p / "bin/keyloom-ui"  # stand-in UI: reports paths inside its own version dir, like --self-check
     ui.write_text('#!/bin/sh\nD=$(cd "$(dirname "$0")/.." && pwd -P)\n'
                   'printf \'{"ok":true,"installed":true,"python":"%s","repo":"%s"}\\n\' "$D/runtime/python/bin/python3" "$D/app"\n'
                   f"# {tag}\n")
     ui.chmod(0o755)
-    (p / "share/corridorkey.png").write_bytes(b"png")
+    (p / "share/keyloom.png").write_bytes(b"png")
     bundle.descriptor(p, "9.9")
     bundle.write_manifest(p, "9.9", "lock", "cat")
     return p
@@ -70,13 +72,13 @@ def test_install_update_rollback_unicode_spaces(env):
     v1 = json.loads((p1 / "install-manifest.json").read_text())["version_id"]
     assert install(env, p1, prefix) == 3  # models skipped => explicitly incomplete
     r = lifecycle.read_receipt(prefix)
-    assert r["current"] == v1 and r["network"] == {"listeners": False, "services": False, "firewall_rules": False}
+    assert r["current"] == v1  # fake payload has no network service module: nothing configured
     assert r["models"]["ready"] is False
     assert os.readlink(prefix / "current") == f"versions/{v1}"
-    desk = Path(os.environ["XDG_DATA_HOME"]) / "applications/corridorkey.desktop"
-    assert str(prefix / f"versions/{v1}/bin/corridorkey-ui") in desk.read_text()
+    desk = Path(os.environ["XDG_DATA_HOME"]) / "applications/keyloom.desktop"
+    assert str(prefix / f"versions/{v1}/bin/keyloom-ui") in desk.read_text()
     assert "env -u PYTHONPATH -u PYTHONHOME" in desk.read_text()
-    assert (prefix / "bin/corridorkey-setup").stat().st_mode & 0o100
+    assert (prefix / "bin/keyloom-setup").stat().st_mode & 0o100
 
     p2 = make_payload(env, "p2", "b")
     v2 = json.loads((p2 / "install-manifest.json").read_text())["version_id"]
@@ -107,7 +109,7 @@ def test_failed_activation_keeps_previous_and_discards_new(env):
 def test_corrupt_payload_rejected_before_switch(env):
     prefix = env / "p"
     p = make_payload(env)
-    (p / "share/corridorkey.png").write_text("tampered")
+    (p / "share/keyloom.png").write_text("tampered")
     assert install(env, p, prefix) == 2
     assert not (prefix / "current").exists()
 
@@ -116,9 +118,9 @@ def test_repair_restores_damaged_file_from_payload(env):
     prefix = env / "p"
     install(env, make_payload(env, "p1"), prefix)
     cur = lifecycle.read_receipt(prefix)["current"]
-    ui = prefix / "versions" / cur / "share/corridorkey.png"
+    ui = prefix / "versions" / cur / "share/keyloom.png"
     ui.write_text("damaged")
-    assert lifecycle.verify_bundle(prefix / "versions" / cur) == [("changed", "share/corridorkey.png")]
+    assert lifecycle.verify_bundle(prefix / "versions" / cur) == [("changed", "share/keyloom.png")]
     assert run("--prefix", str(prefix), "repair") == 2  # no payload: reports, does not guess
     assert run("--prefix", str(prefix), "repair", "--payload", str(make_payload(env, "p2"))) == 0
     assert lifecycle.verify_bundle(prefix / "versions" / cur) == []
@@ -145,7 +147,7 @@ def test_uninstall_removes_only_owned_and_keeps_user_data(env):
     assert run("--prefix", str(prefix), "uninstall") == 0
     assert (models / "w.safetensors").exists() and (prefix / "user-note.txt").exists()
     assert not (prefix / "versions").exists() and not (prefix / "receipt.json").exists()
-    assert not (Path(os.environ["XDG_DATA_HOME"]) / "applications/corridorkey.desktop").exists()
+    assert not (Path(os.environ["XDG_DATA_HOME"]) / "applications/keyloom.desktop").exists()
 
 
 def test_uninstall_refuses_without_receipt(env):
@@ -157,8 +159,8 @@ def test_uninstall_refuses_without_receipt(env):
 
 
 def test_shortcut_text_quoting():
-    e = lifecycle.desktop_entry(Path('/a b/"x"$y/corridorkey-ui'), None)
-    assert '"/a b/\\\\"x\\\\"\\\\$y/corridorkey-ui" %F' in e
+    e = lifecycle.desktop_entry(Path('/a b/"x"$y/keyloom-ui'), None)
+    assert '"/a b/\\\\"x\\\\"\\\\$y/keyloom-ui" %F' in e
     s = lifecycle.windows_shortcut_script(Path("C:/Start/it's.lnk"), Path("C:/Ünï/ui.exe"), Path("C:/"), None)
     assert "it''s.lnk" in s and "Ünï" in s
 
@@ -192,7 +194,9 @@ def test_iss_rendering(env):
     iss = bundle.render_iss(stage, env).read_text(encoding="utf-8-sig")
     assert "@" not in re.sub(r"\{.*?\}|[\w.]+@[\w.]+", "", iss.replace("@VERSION_ID@", ""))
     assert "PrivilegesRequired=lowest" in iss and "--models" in iss
-    assert "firewall" not in iss.lower().replace("no firewall rule", "")
+    low = iss.lower().replace("no admin or automatic firewall rule", "").replace("(no admin or automatic firewall rule)", "")
+    assert low.count("firewall") == 1 and "--firewall skip" in low  # only the silent-install switch: rules are the lifecycle's (UAC) step
+    assert "exitprocess(0)" in low and "check: needruntime" in low and "runtimechecked" in low  # Check runs per file: the answer must be cached and "excludes: \"runtime" in low  # exit-0 no-op; runtime reuse
 
 
 @pytest.mark.parametrize("name", ["linux-x86_64", "windows-x86_64"])
@@ -206,7 +210,7 @@ def test_locks_are_hashed_and_pinned(name):
 def test_descriptor_is_accepted_by_runtime_contract(env, monkeypatch):
     from backend import install_paths
     stage = make_payload(env, "stage")
-    monkeypatch.setenv("CK_INSTALL", str(stage / "corridorkey-install.json"))
+    monkeypatch.setenv("CK_INSTALL", str(stage / "keyloom-install.json"))
     d = install_paths.discover()
     assert d.python == stage / "runtime/python/bin/python3" and d.helper == stage / "app"
 
@@ -239,11 +243,13 @@ def test_interrupt_leaves_no_orphans_and_keeps_old(env, monkeypatch, same_versio
     install(env, p1, prefix)
     v1 = lifecycle.read_receipt(prefix)["current"]
     p2 = make_payload(env, "b2", "a" if same_version else "b")
+    if same_version:  # an intact identical build is a no-op now; a damaged one takes the replace-with-backup path
+        (prefix / "versions" / v1 / "share/keyloom.png").write_text("damaged")
     monkeypatch.setattr(lifecycle, "run_selfcheck", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
     assert install(env, p2, prefix) == 130
     assert lifecycle.read_receipt(prefix)["current"] == v1
     assert sorted(d.name for d in (prefix / "versions").iterdir()) == [v1]
-    assert lifecycle.verify_bundle(prefix / "versions" / v1) == []
+    assert lifecycle.verify_bundle(prefix / "versions" / v1) == ([("changed", "share/keyloom.png")] if same_version else [])
     assert not (prefix / ".txn.json").exists()
     assert run("--prefix", str(prefix), "uninstall") == 0
     assert not prefix.exists()
@@ -345,7 +351,7 @@ def test_repair_default_skips_models_and_handles_names_and_links(env):
     prefix = env / "r"
     p = make_payload(env, "p1")
     (p / "weird name (1).txt").write_text("w")
-    os.symlink("share/corridorkey.png", p / "lnk")
+    os.symlink("share/keyloom.png", p / "lnk")
     bundle.write_manifest(p, "9.9", "lock", "cat")
     install(env, p, prefix)
     cur = lifecycle.read_receipt(prefix)["current"]
@@ -355,7 +361,7 @@ def test_repair_default_skips_models_and_handles_names_and_links(env):
     (v / "lnk").write_text("regular file now")
     pay = make_payload(env, "p2")
     (pay / "weird name (1).txt").write_text("w")
-    os.symlink("share/corridorkey.png", pay / "lnk")
+    os.symlink("share/keyloom.png", pay / "lnk")
     bundle.write_manifest(pay, "9.9", "lock", "cat")
     assert run("--prefix", str(prefix), "repair", "--payload", str(pay)) == 0  # no --models: nothing downloaded
     assert lifecycle.verify_bundle(v) == []
@@ -366,7 +372,7 @@ def test_env_is_scrubbed_for_children_and_shims(env, monkeypatch):
     assert "PYTHONPATH" not in lifecycle.clean_env() and lifecycle.clean_env()["PYTHONNOUSERSITE"] == "1"
     prefix = env / "s"
     install(env, make_payload(env), prefix)
-    shim = (prefix / "bin/corridorkey").read_text()
+    shim = (prefix / "bin/keyloom").read_text()
     assert "unset PYTHONPATH PYTHONHOME" in shim and "PYTHONNOUSERSITE=1" in shim
 
 
@@ -386,7 +392,7 @@ def test_min_glibc_scans_elf_symbol_versions(env):
 
 
 def test_iss_has_no_wholesale_deletes_and_checks_exit_and_root(env):
-    iss = (REPO / "packaging/windows/corridorkey.iss.in").read_text()
+    iss = (REPO / "packaging/windows/keyloom.iss.in").read_text()
     assert 'Name: "{app}\\versions"' in iss and "filesandordirs; Name: \"{app}\\versions\"" not in iss
     assert "filesandordirs; Name: \"{app}\\bin\"" not in iss
     assert "Rc <> 0" in iss and "IsDriveRoot" in iss and "RemoveBackslashUnlessRoot" in iss
@@ -396,7 +402,7 @@ def test_desktop_exec_escapes_percent_and_backslash_two_layers():
     e = lifecycle.desktop_entry(Path("/a%b/c\\d/ui"), None, Path("/p"))
     exec_line = [l for l in e.splitlines() if l.startswith("Exec=")][0]
     assert '"/a%%b/c\\\\\\\\d/ui"' in exec_line  # % doubled; one literal backslash = 4 in the file
-    assert f"X-CorridorKey-Owner={lifecycle.owner_id(Path('/p'))}" in e
+    assert f"X-Keyloom-Owner={lifecycle.owner_id(Path('/p'))}" in e
 
 
 def test_uninstall_leaves_foreign_versions_dirs_and_foreign_desktop_file(env):
@@ -405,7 +411,7 @@ def test_uninstall_leaves_foreign_versions_dirs_and_foreign_desktop_file(env):
     foreign = prefix / "versions/draft-2024"
     foreign.mkdir()
     (foreign / "essay.txt").write_text("precious")
-    desk = Path(os.environ["XDG_DATA_HOME"]) / "applications/corridorkey.desktop"
+    desk = Path(os.environ["XDG_DATA_HOME"]) / "applications/keyloom.desktop"
     desk.write_text("[Desktop Entry]\nName=someone else's\n")  # not written by this prefix
     assert run("--prefix", str(prefix), "uninstall") == 0
     assert (foreign / "essay.txt").exists() and desk.exists()
@@ -427,7 +433,7 @@ def test_first_install_failure_removes_shortcuts_shims_and_retry_works(env, monk
     prefix = env / "g"
     monkeypatch.setattr(lifecycle, "prune_versions", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
     assert install(env, make_payload(env), prefix) == 2  # unexpected errors exit 2, not a traceback
-    assert not (Path(os.environ["XDG_DATA_HOME"]) / "applications/corridorkey.desktop").exists()
+    assert not (Path(os.environ["XDG_DATA_HOME"]) / "applications/keyloom.desktop").exists()
     assert not (prefix / "bin").exists() and not (prefix / "receipt.json").exists()
     assert not (prefix / "current").exists() and not list((prefix / "versions").iterdir())
     monkeypatch.undo()
@@ -484,7 +490,7 @@ def test_reuse_runtime_requires_provenance_marker(env):
 
 
 def test_iss_sets_failing_exit_code_and_suppressible_boxes():
-    iss = (REPO / "packaging/windows/corridorkey.iss.in").read_text()
+    iss = (REPO / "packaging/windows/keyloom.iss.in").read_text()
     assert "GetCustomSetupExitCode" in iss and "FailCode := Rc" in iss and "SuppressibleMsgBox" in iss
     assert "recover" in iss and "already installed" in iss
 
@@ -577,7 +583,7 @@ def test_uninstall_refuses_before_deleting_when_a_receipt_version_is_foreign(env
     r["versions"].append("mine-not")
     lifecycle.atomic_write_json(prefix / "receipt.json", r)
     assert run("--prefix", str(prefix), "uninstall") == 2
-    assert (prefix / "versions" / r["current"]).is_dir() and (prefix / "bin/corridorkey").exists()
+    assert (prefix / "versions" / r["current"]).is_dir() and (prefix / "bin/keyloom").exists()
 
 
 def _run_selfcheck_with_fake_sam2(tmp, platform, with_c):

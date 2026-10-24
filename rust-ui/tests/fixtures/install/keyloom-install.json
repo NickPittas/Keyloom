@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "app_name": "CorridorKey",
+  "app_name": "Keyloom",
   "app_version": "0.0-descriptor-fixture",
   "roots": {
     "python": "runtime/python/bin/python3",

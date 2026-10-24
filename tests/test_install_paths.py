@@ -1,6 +1,6 @@
 """Shared install-descriptor contract tests — the mirror of rust-ui/src/runtime.rs's tests.
 
-Both languages parse the SAME fixture (rust-ui/tests/fixtures/install/corridorkey-install.json)
+Both languages parse the SAME fixture (rust-ui/tests/fixtures/install/keyloom-install.json)
 and assert the same resolution and error wording: a mismatch here is a contract break, not a
 test nit. Broken descriptors raise instead of falling back anywhere.
 """
@@ -90,7 +90,7 @@ def test_ck_install_env_accepts_file_or_folder(tmp_path, monkeypatch, no_install
 
 def test_ck_install_env_pointing_nowhere_raises(tmp_path, monkeypatch, no_install_env):
     monkeypatch.setenv(ip.CK_INSTALL_ENV, str(tmp_path / "nowhere"))
-    with pytest.raises(ip.InstallDescriptorError, match="corridorkey-install.json"):
+    with pytest.raises(ip.InstallDescriptorError, match="keyloom-install.json"):
         ip.discover()
 
 
@@ -152,15 +152,15 @@ def test_platform_user_data_windows_needs_no_home():
     # Pure helpers mirror rust-ui settings/runtime split: no HOME involved on Windows.
     assert ip.windows_user_data(None, None) is None
     assert ip.windows_user_data("", "") is None
-    assert ip.windows_user_data(roaming, local) == Path(roaming) / "CorridorKey"
-    assert ip.windows_user_data(None, local) == Path(local) / "CorridorKey"
+    assert ip.windows_user_data(roaming, local) == Path(roaming) / "Keyloom"
+    assert ip.windows_user_data(None, local) == Path(local) / "Keyloom"
 
 
 def test_platform_cache_prefers_local_appdata():
     roaming = r"C:\Users\u\AppData\Roaming"
     local = r"C:\Users\u\AppData\Local"
-    assert ip.windows_cache(local, roaming) == Path(local) / "CorridorKey/cache"
-    assert ip.windows_cache(None, roaming) == Path(roaming) / "CorridorKey/cache"
+    assert ip.windows_cache(local, roaming) == Path(local) / "Keyloom/cache"
+    assert ip.windows_cache(None, roaming) == Path(roaming) / "Keyloom/cache"
     assert ip.windows_cache(None, None) is None
 
 
@@ -168,9 +168,9 @@ def test_platform_cache_and_scratch(monkeypatch, tmp_path):
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
-    assert ip.platform_user_data() == tmp_path / ".local/share/CorridorKey"
-    assert ip.platform_cache() == tmp_path / ".cache/CorridorKey"
-    assert ip.platform_scratch() == tmp_path / ".local/share/CorridorKey/scratch"
+    assert ip.platform_user_data() == tmp_path / ".local/share/Keyloom"
+    assert ip.platform_cache() == tmp_path / ".cache/Keyloom"
+    assert ip.platform_scratch() == tmp_path / ".local/share/Keyloom/scratch"
 
 
 def test_read_only_app_root_resolves(tmp_path, no_install_env):

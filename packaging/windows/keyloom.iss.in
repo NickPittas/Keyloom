@@ -102,7 +102,7 @@ const
 
 { One supervised Python step: a VISIBLE console runs installer_payload.py, which starts the real command as its own process tree,
   prints a heartbeat every second, honours the shared budget (phase cap, never more than what is left of TotalSec), kills and reaps
-  the tree on the deadline (exit 124) and never turns a timeout into success. The lifecycle creates {tmp}\waiting-for-user only
+  the tree on the deadline (exit 124) and never turns a timeout into success. The lifecycle creates the tmp waiting-for-user file only
   while it waits for the user (firewall consent) or runs a visible model transfer; only then the clock pauses. }
 function RunPyV(Interp, Verb, StepName, Extra: String; Cap: Integer; var Rc: Integer): Boolean;
 var
@@ -182,7 +182,7 @@ begin
   if (Prev <> '') and (CompareText(Prev, Old) <> 0) then Result := Prev
   else if (CompareText(Prev, Old) = 0) or ((Prev = '') and FileExists(Old + '\receipt.json')) then
     if not FileExists(Result + '\receipt.json') then AdoptDir := Old;
-  { The runtime source is ONLY the pre-rename install being adopted (explicitly detected above) or, when empty, the chosen {app} itself
+  { The runtime source is ONLY the pre-rename install being adopted (explicitly detected above) or, when empty, the chosen app folder itself
     (PrepareRuntime). The default folder is never assumed to be the source: a user who picks a custom folder must not get a runtime
     junction into some other install. }
   SourceDir := AdoptDir;
@@ -224,9 +224,9 @@ var
   RuntimeExtracted: Boolean;   { the runtime was extracted from fully authenticated shards in this run }
   InPlace: Boolean;   { core target-state exit 0: recorded, inactive, identical, trusted: activate where it stands }
 
-{ Called from PlaceFiles (first Check of the version-folder entry), BEFORE Inno writes anything into versions\{#VID}. Pascal never deletes or moves a folder: core's
+{ Called from PlaceFiles (first Check of the version-folder entry), BEFORE Inno writes anything into versions\<id>. Pascal never deletes or moves a folder: core's
   `prepare-target` does it under its lock, run with the installed (trusted, never moved) Python and the new lifecycle.py/manifest
-  that were extracted to {tmp} (the pinned incoming manifest). A folder that does not exist needs no preparation (fresh install: no
+  that were extracted to the tmp folder (the pinned incoming manifest). A folder that does not exist needs no preparation (fresh install: no
   installed Python may exist yet either). }
 procedure ClassifyTarget(AppDir: String);
 var
@@ -341,7 +341,7 @@ end;
 
 { Runs on EVERY exit path (success, FailSetup/Abort, native copy failure, shard failure, cancel). When a prepared or begun transaction
   was not completed, core's ordinary `recover` undoes it (restores a journaled backup, removes the unrecorded new copy, never
-  deletes a referenced runtime) - bounded, supervised, from the bundled bootstrap with the lifecycle copy in {tmp}, both of which
+  deletes a referenced runtime) - bounded, supervised, from the bundled bootstrap with the lifecycle copy in the tmp folder, both of which
   live outside every tree that can move. It is never called between prepare-target and install --version. }
 procedure DeinitializeSetup;
 var
@@ -400,7 +400,7 @@ begin
   { In-place target: no files were placed and the existing runtime stays exactly as it is, so there is no runtime decision at all. }
   if not InPlace then
     PrepareRuntime;  { the single availability decision: attach whole directory / supervised companion extraction / stop visibly }
-  { Runs from the bundled bootstrap in {tmp}\kb, never from the version's (possibly attached) runtime. The runtime was either
+  { Runs from the bundled bootstrap in the tmp kb folder, never from the version's (possibly attached) runtime. The runtime was either
     extracted by Inno or attached by NeedRuntime BEFORE this point; install --version never attaches by itself. }
   Bpy := ExpandConstant('{tmp}\kb\python.exe');
   Lc := AppDir + '\versions\{#VID}\app\packaging\lifecycle.py';
@@ -409,7 +409,7 @@ begin
   if (AdoptDir <> '') and (CompareText(AdoptDir, AppDir) <> 0) then Args := Args + ' --adopt-from "' + AdoptDir + '"';
   if WizardSilent then Args := Args + ' --firewall skip';
   { Attestation only after the runtime shards were authenticated and extracted here. The lifecycle's one writer binds manifest sha,
-    runtime id, resolved versions\{#VID} root and a fresh nonce; app files are still hashed by the lifecycle. An attached runtime
+    runtime id, resolved versions\<id> root and a fresh nonce; app files are still hashed by the lifecycle. An attached runtime
     (core trusts it through runtime_trusted and skips the hash) and an in-place target need no attestation. Without one after an
     extraction here, the lifecycle hashes the freshly extracted runtime itself, once. }
   if RuntimeExtracted then
