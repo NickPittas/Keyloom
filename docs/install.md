@@ -21,18 +21,18 @@ The installers are for private use. The licence is non-commercial (CC-BY-NC-SA-4
 
 GitHub limits file size, so the installer comes in slices: one `.exe` plus several `.bin` files (each up to 1900 MiB), and a `.sha256` file.
 
-`<id>` below stands for the build identifier in the file names of the release you download (the same in every file of one release). Final installer IDs are not published yet.
+The Windows payload is `2.2.0-8f144ac0b0`; the Linux payload is `2.2.0-56885597c1`. These suffixes identify the bundled contents.
 
 Download the [Windows release](https://github.com/NickPittas/Keyloom/releases/tag/v2.2.0-windows).
 
 1. Download **all** of these into the **same folder**:
-   - `Keyloom-2.2.0-<id>-windows-x86_64-setup.exe`
-   - every `Keyloom-2.2.0-<id>-windows-x86_64-setup-1.bin`, `-2.bin`, … (all of them)
-   - `Keyloom-2.2.0-<id>-windows-x86_64-setup.exe.sha256`
+   - `Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup.exe`
+   - every `Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup-1.bin`, `-2.bin`, … (all of them)
+   - `Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup.exe.sha256`
 2. Check the files. In PowerShell, inside that folder:
 
    ```powershell
-   Get-Content .\Keyloom-2.2.0-<id>-windows-x86_64-setup.exe.sha256 | ForEach-Object {
+   Get-Content .\Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup.exe.sha256 | ForEach-Object {
      $hash, $name = $_ -split '\s+', 2
      $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $name).Hash
      if ($got -ine $hash) { throw "SHA256 mismatch: $name" }
@@ -63,16 +63,16 @@ The release is a single self-extracting `.run` file. If it is hosted on GitHub i
 
 Put these files in one folder:
 
-- `Keyloom-2.2.0-<id>-linux-x86_64.run.part001`, `.part002`, `.part003` (every part)
-- `Keyloom-2.2.0-<id>-linux-x86_64.run.parts.sha256` (checksums of the parts)
-- `Keyloom-2.2.0-<id>-linux-x86_64.run.sha256` (checksum of the whole file)
+- `Keyloom-2.2.0-56885597c1-linux-x86_64.run.part001`, `.part002`, `.part003` (every part)
+- `Keyloom-2.2.0-56885597c1-linux-x86_64.run.parts.sha256` (checksums of the parts)
+- `Keyloom-2.2.0-56885597c1-linux-x86_64.run.sha256` (checksum of the whole file)
 
 ```sh
-cd ~/Downloads/corridorkey
-sha256sum -c Keyloom-2.2.0-<id>-linux-x86_64.run.parts.sha256
-cat Keyloom-2.2.0-<id>-linux-x86_64.run.part[0-9][0-9][0-9] > Keyloom-2.2.0-<id>-linux-x86_64.run
-sha256sum -c Keyloom-2.2.0-<id>-linux-x86_64.run.sha256
-chmod +x Keyloom-2.2.0-<id>-linux-x86_64.run
+cd ~/Downloads/keyloom
+sha256sum -c Keyloom-2.2.0-56885597c1-linux-x86_64.run.parts.sha256
+cat Keyloom-2.2.0-56885597c1-linux-x86_64.run.part[0-9][0-9][0-9] > Keyloom-2.2.0-56885597c1-linux-x86_64.run
+sha256sum -c Keyloom-2.2.0-56885597c1-linux-x86_64.run.sha256
+chmod +x Keyloom-2.2.0-56885597c1-linux-x86_64.run
 ```
 
 Use the numeric pattern `part[0-9][0-9][0-9]`. A plain `part*` would also match the `.parts.sha256` file and corrupt the result. Each check must print `OK`.
@@ -80,7 +80,7 @@ Use the numeric pattern `part[0-9][0-9][0-9]`. A plain `part*` would also match 
 ### Run the installer
 
 ```sh
-./Keyloom-2.2.0-<id>-linux-x86_64.run
+./Keyloom-2.2.0-56885597c1-linux-x86_64.run
 ```
 
 It installs to `~/.local/opt/CorridorKey` by default, adds a desktop entry, installs the `corridorkey`, `corridorkey-setup` and `corridorkey-coordinator` commands under `~/.local/opt/CorridorKey/bin`, then downloads and verifies the full model set.

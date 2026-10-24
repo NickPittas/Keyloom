@@ -1,6 +1,11 @@
 # Keyloom 2.2.0 release record
 
-Keyloom — powered by CorridorKey. Separate Linux and Windows installers are being prepared for the private repository; final asset identities are listed in the release asset manifest.
+Keyloom — powered by CorridorKey. Separate Linux and Windows installers are distributed in the private repository. The source payload was built from commit `db179cc` (later documentation commits do not alter the payload). Full downloadable asset sizes and SHA256 hashes are in [the asset manifest](release-2.2.0-assets.json).
+
+| Platform | Payload identity | Downloads |
+|---|---|---|
+| Linux x86-64 | `2.2.0-56885597c1` | Three numeric installer parts and two checksum files |
+| Windows x86-64 | `2.2.0-8f144ac0b0` | Setup exe, two bin slices and the checksum file |
 
 ## Changed setup verified on the existing PCs
 
@@ -9,7 +14,8 @@ Keyloom — powered by CorridorKey. Separate Linux and Windows installers are be
 - Windows: installed the per-user logon service from Clients, allowed the OS firewall prompt, joined the host locally, created an invitation, stopped and removed the service. Recreated the temporary network using its reachable Tailscale address.
 - Two separate Linux PCs joined that Windows network using the **same invitation file**. The member lists showed all three PCs connected. No render was submitted during this setup check.
 - The setup check exposed a Linux unit WorkingDirectory quoting error and a disconnected-client request backlog on Windows. Both are fixed. The backlog fix limits outstanding status requests and enters reconnect backoff when membership refresh fails.
-- Code review confirmed that older network certificates keep their identity when moving to the UI-managed service. Local joining uses loopback transport while retaining the advertised hostname and pinned certificate for TLS verification.
+- The original network was moved to the UI-managed service without changing its certificate or client IDs. All three PCs reconnected using their existing credentials and retained their shot assignments. Local joining supports older certificates using loopback transport while retaining the advertised hostname and pinned certificate for TLS verification.
+- Final Linux and Windows payload activation and installed runtime self-checks passed. Models were deliberately skipped because the existing model stores were reused. A brief host stop made the final Windows client show Not connected; the host was restarted to verify automatic recovery without restarting the client.
 
 ## Earlier accepted behavior
 

@@ -1,44 +1,62 @@
 [
   {
-    "name": "CorridorKey-2.2.0-a263fbf35a-linux-x86_64.run",
-    "size": 4816995552,
-    "sha256": "2340b8606a96577b89461ba16c544a7d0e682bc4d5f6fe78ea90fcffcd5aab24",
+    "name": "Keyloom-2.2.0-56885597c1-linux-x86_64.run",
+    "size": 4817031543,
+    "sha256": "17848da4e75b6cef21ffd9cb832735d484276beadb47e7922a31b1be21629a64",
     "github_asset": false
   },
   {
-    "name": "CorridorKey-2.2.0-a263fbf35a-linux-x86_64.run.part001",
+    "name": "Keyloom-2.2.0-56885597c1-linux-x86_64.run.part001",
     "size": 1992294400,
-    "sha256": "3954b2bac6f7e0ed1ca9a15fbbf9f813147a1352e507cf2309a82a25da29aee4",
+    "sha256": "47d7142ce6f6651b7be65b03d0a41733c20984973b5ef19b6925c282e7472b8b",
     "github_asset": true
   },
   {
-    "name": "CorridorKey-2.2.0-a263fbf35a-linux-x86_64.run.part002",
+    "name": "Keyloom-2.2.0-56885597c1-linux-x86_64.run.part002",
     "size": 1992294400,
-    "sha256": "99f252c149ef86c6b0ebde816822098ee8580b2372bdb8491639485dc46c74f4",
+    "sha256": "cd5835697a7de34048903f06b66897ff9f578a3ae01c333fd81e8eb951e6779d",
     "github_asset": true
   },
   {
-    "name": "CorridorKey-2.2.0-a263fbf35a-linux-x86_64.run.part003",
-    "size": 832406752,
-    "sha256": "ec067b6580322bcd03012bca9eea7f350411585352bc036f7b3d24eba47dd35c",
+    "name": "Keyloom-2.2.0-56885597c1-linux-x86_64.run.part003",
+    "size": 832442743,
+    "sha256": "c21f2ae660c8dc34ef5b00d4871093f194ba22284ebcf8718dddd897469ca959",
     "github_asset": true
   },
   {
-    "name": "CorridorKey-2.2.0-bcc0720114-windows-x86_64-setup.exe",
-    "size": 5444035,
-    "sha256": "6698885b3f6334709aecb3e4cfaea8617e71e52479a540d09aae2b793a6293e4",
+    "name": "Keyloom-2.2.0-56885597c1-linux-x86_64.run.parts.sha256",
+    "size": 348,
+    "sha256": "be3598194e883085de6828abe971d01654dd0b46f2f96892bce6a999d7bbae86",
     "github_asset": true
   },
   {
-    "name": "CorridorKey-2.2.0-bcc0720114-windows-x86_64-setup-1.bin",
-    "size": 1986850304,
-    "sha256": "ff11c5ff343c02f16a78df95ce569a2b15c593f843cadf7a822025da17d726ee",
+    "name": "Keyloom-2.2.0-56885597c1-linux-x86_64.run.sha256",
+    "size": 108,
+    "sha256": "3ccb0a389325ee9864c6ce512dea99eab8211f2da8e61a68aa47827e9b6cfa45",
     "github_asset": true
   },
   {
-    "name": "CorridorKey-2.2.0-bcc0720114-windows-x86_64-setup-2.bin",
-    "size": 1346107422,
-    "sha256": "467bcbdcc79de43555fabafea2a0d862fa5b13f19af003655865eb2a5d033191",
+    "name": "Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup-1.bin",
+    "size": 1986849792,
+    "sha256": "eed326703e4fb43c0f6f9408686be99d8af2fc3561fa90a0745bcb635d133f8c",
+    "github_asset": true
+  },
+  {
+    "name": "Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup-2.bin",
+    "size": 1346130913,
+    "sha256": "9ffb26e04c808aa4614cc98da7d25fcdb863df53165077fe712fa5fa515ca557",
+    "github_asset": true
+  },
+  {
+    "name": "Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup.exe",
+    "size": 5444214,
+    "sha256": "e7fbd90d16f0627874486a69d19677856fd791e198d3ba704d5544e063bb05df",
+    "github_asset": true
+  },
+  {
+    "name": "Keyloom-2.2.0-8f144ac0b0-windows-x86_64-setup.exe.sha256",
+    "size": 355,
+    "sha256": "87d4967f744521356593ae319452ee3d2831ad693b03226bb86cc1e9f4a3c3bc",
     "github_asset": true
   }
 ]
