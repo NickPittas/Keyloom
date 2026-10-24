@@ -53,6 +53,8 @@ Opening a project shows the batch board; import may open the new clip directly. 
 
 ![Batch board](screenshots/native/04-batch.png)
 
+The captured queue shows results from earlier work; no render was submitted for this screenshot.
+
 - One card per clip, with thumbnail, name, range and a summary of what exists (frames, hint, results).
 - **All** and the per-clip checkboxes select clips; **N selected** shows the count.
 - **Open clip** opens the one selected clip (it needs frames).
