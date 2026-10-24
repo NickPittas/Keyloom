@@ -11,10 +11,16 @@ Protocol v1 — one JSON object per line on stdin (UTF-8, <= 1 MiB incl. newline
   startup : {"event": "ready", "protocol": 1}      EOF on stdin or op "close" ends the process (exit 0).
 stdout carries nothing else; stderr gets at most a few bounded diagnostics. Requests are served in order.
 Ops (args are exact; unknown keys are refused; bodies are validated by the coordinator):
-  pair          invitation_path, credentials_path, name, [existing_credentials_path, existing_credentials_paths[]]   -> installation_id   (credentials written 0600, never echoed;
-                the destination is reserved before the one-use code is redeemed)
-  connect       credentials_path                           -> installation_id   (session id kept beside it, 0600; takes an exclusive
+  pair          invitation_path, credentials_path, name, [existing_credentials_path, existing_credentials_paths[], endpoints[]]   -> installation_id   (credentials written 0600, never echoed;
+                the destination is reserved before the one-use code is redeemed; `endpoints` are extra routes to the SAME pinned certificate)
+  connect       credentials_path, [endpoints[]]            -> installation_id   (session id kept beside it, 0600; takes an exclusive
                 lock on <credentials>.lock until close/EOF/exit, so a second bridge on the same credentials gets `busy`)
+  endpoints     urls[<=16 https]   replaces the connected client's extra addresses atomically (token, ids and the connection are untouched)
+  discover      [timeout_s (3-20, default 20)], [known[<=64 https URLs]]   -> {elapsed_ms, sources{broadcast_ifaces, tailscale, neighbors},
+                partial, pcs[{network_id, fingerprint_sha256, name, host_installation_id, join, receiver_online, self,
+                endpoints[{url, kind, reachable, rtt_ms, error}]}]}   (synchronous, returns by its deadline; run it on its own bridge process)
+  Addressing: the pinned certificate is the identity; addresses are routes. Calls try the last working address first and fail over only
+  on connect/TLS/pin failure BEFORE any request byte; a sent request is never retried.
   register      build, gpu{uuid,name,vram_total_mb,ram_total_mb}, [name]   (name = this PC's display name; updates the same installation)
   submit        submission_id, spec, target
   claim         claim_id, capabilities, resources
@@ -23,14 +29,23 @@ Ops (args are exact; unknown keys are refused; bodies are validated by the coord
   events        attempt_id, events[]
   stats         seq, measured_age_ms, [cpu_percent, ram_used_bytes, ram_total_bytes, gpus]   (README stats schema)
   cancel | job  job_id          job_events  job_id, [after, limit]          installations      close
-  service_status|service_start|service_stop|service_remove  state_dir        service_install  state_dir, address, port, allow_address_join
-  join_address  url, name, credentials_path, [existing_credentials_path, existing_credentials_paths[]]
+  service_status|service_start|service_stop|service_remove  state_dir   (start installs first when nothing is installed; stop never removes)
+  service_install  state_dir, [allow_address_join, name]   (+ optional legacy address, port: not needed)
+  service_configure  state_dir, allow_address_join, [name]   (live: the running service applies it within ~1 s, nothing restarts)
+  status adds endpoints[{url,kind}], discovery, host_installation_id, receiver_online, name, allow_address_join, removed, diagnostic.
+  join_address  url, name, credentials_path, [existing_credentials_path, existing_credentials_paths[], fingerprint_sha256, endpoints[]]
+                (a discovery-selected `fingerprint_sha256` is checked again at connection, before auth or reuse; a changed certificate
+                is never trusted)
   service_local_join  state_dir, credentials_path, name, [existing_credentials_path, existing_credentials_paths[]]
   network_invite  path (needs a connected link; writes a reusable 7-day non-admin invitation file, reply never carries the code)
-  pair/join_address/service_local_join reply {installation_id, credentials_path, reused[, url, fingerprint_sha256, network_id]}: with
+  pair/join_address/service_local_join reply {installation_id, credentials_path, reused, endpoints[], host_installation_id[, url, fingerprint_sha256, network_id]}
+  (endpoints/host_installation_id come from a verified hello; null/[] if it could not be obtained): with
   an existing candidate pinning the SAME certificate nothing is redeemed and that identity is reused (credentials_path = the saved one);
   unreadable unrelated candidates are skipped. Status adds certificate_addresses[].
-  Extra error codes: service_unavailable, permission, port_in_use, service_conflict, not_installed, not_configured, cert_mismatch,
+  pair also takes optional discovery_endpoints[<=64 {fingerprint_sha256, endpoints[<=16 https]}] (from the current scan): only entries whose
+  fingerprint equals the invitation's are used, as extra routes after `endpoints`; the invitation URL is still tried with them.
+  service_local_join with reused credentials the host no longer knows (revoked) -> error identity_revoked; nothing is deleted or re-minted.
+  Extra error codes: identity_revoked, service_unavailable, permission, port_in_use, service_conflict, not_installed, not_configured, cert_mismatch,
   start_failed, start_timeout. Service ops use no coordinator connection and work with nothing paired.
 Errors: codes from the coordinator are passed through; bridge codes are bad_request, too_large, unknown_op,
 not_connected, busy (a running link already holds these credentials), security (incl. rejected server certificate), io (local file), transport (network/DNS/timeout; nothing is
@@ -52,7 +67,8 @@ import time
 from . import coordinator as _c
 from . import network_service as _svc
 from .coordinator import pki
-from .coordinator.client import BadReply, Client, CoordinatorError, join_to_file, redeem_to_file
+from . import discovery as _disc
+from .coordinator.client import BadReply, Client, CoordinatorError, fetch_pinned_cert, join_to_file, redeem_to_file
 from .coordinator.schema import MAX_BODY, ApiError, parse_json
 
 _ID = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
@@ -103,6 +119,33 @@ def _same_network(a, fingerprint):
         if hmac.compare_digest(have["fingerprint_sha256"].lower(), fingerprint.lower()):
             return p, have
     return None
+
+
+def _routes(v, fingerprint):
+    """`discovery_endpoints` [{fingerprint_sha256, endpoints[<=16]}] (<=64 PCs, from the app's current scan) -> the URLs of the
+    entries pinning EXACTLY `fingerprint`; others are validated and ignored. Routes only: the pin still decides trust."""
+    if not isinstance(v, list) or len(v) > 64:
+        raise BridgeError("bad_request", "discovery_endpoints must be a list of at most 64 objects")
+    out = []
+    for e in v:
+        if not isinstance(e, dict) or set(e) != {"fingerprint_sha256", "endpoints"} or not isinstance(e["fingerprint_sha256"], str) \
+                or not re.fullmatch(r"[0-9a-fA-F]{64}", e["fingerprint_sha256"]):
+            raise BridgeError("bad_request", "discovery_endpoints entries need exactly fingerprint_sha256 (64 hex) and endpoints")
+        urls = _urls(e["endpoints"], "discovery_endpoints endpoints")
+        if hmac.compare_digest(e["fingerprint_sha256"].lower(), fingerprint.lower()):
+            out += urls
+    return out
+
+
+def _urls(v, what, limit=16):
+    if not isinstance(v, list) or len(v) > limit or any(not isinstance(u, str) or len(u) > 300 for u in v):
+        raise BridgeError("bad_request", f"{what} must be a list of at most {limit} https URLs")
+    for u in v:
+        try:
+            pki.endpoint(u)
+        except pki.SecurityError:
+            raise BridgeError("bad_request", f"{what}: {u[:80]!r} is not an https://host[:port] URL") from None
+    return v
 
 
 class _Net:
@@ -170,15 +213,20 @@ class Bridge:
     # ---- operations -------------------------------------------------------------------------------
 
     def op_pair(self, a):
-        _need(a, ("invitation_path", "credentials_path", "name"), _EXISTING)
+        _need(a, ("invitation_path", "credentials_path", "name"), _EXISTING + ("endpoints", "discovery_endpoints"))
+        eps = _urls(a.get("endpoints", []), "endpoints")
         inv = pki.read_invitation(_path(a["invitation_path"], "invitation_path"))
         self._secret(inv["code"])
+        # the invitation's own URL is often unreachable from here: also try this scan's routes to the SAME pinned certificate
+        eps = list(dict.fromkeys([*eps, *_routes(a.get("discovery_endpoints", []), inv["fingerprint_sha256"])]))[:16]
         dest = _path(a["credentials_path"], "credentials_path")
         have = _same_network(a, inv["fingerprint_sha256"])  # same network (pinned certificate) as a saved identity: reuse it, redeem nothing
         if have:
-            return {"installation_id": have[1]["installation_id"], "credentials_path": have[0], "reused": True}
+            return {"installation_id": have[1]["installation_id"], "credentials_path": have[0], "reused": True,
+                    **self._hello_info(have[0], eps)}
         # Same routine as the CLI: reserves the private destination BEFORE the one-use code is redeemed.
-        return {"installation_id": redeem_to_file(inv, dest, a["name"]), "credentials_path": dest, "reused": False}
+        iid = redeem_to_file(inv, dest, a["name"], eps)
+        return {"installation_id": iid, "credentials_path": dest, "reused": False, **self._hello_info(dest, eps)}
 
     # ---- network service / address join / invitations (no coordinator connection needed except network_invite) ----
 
@@ -190,8 +238,12 @@ class Bridge:
         return _svc.status(self._state_dir(a))
 
     def op_service_install(self, a):
-        sd = self._state_dir(a, ("state_dir", "address", "port", "allow_address_join"))
-        return _svc.install(sd, a["address"], a["port"], a["allow_address_join"])
+        sd = self._state_dir(a, ("state_dir",), ("address", "port", "allow_address_join", "name"))
+        return _svc.install(sd, a.get("address"), a.get("port"), a.get("allow_address_join"), a.get("name"))
+
+    def op_service_configure(self, a):
+        sd = self._state_dir(a, ("state_dir", "allow_address_join"), ("name",))
+        return _svc.configure(sd, a["allow_address_join"], a.get("name"))
 
     def op_service_start(self, a):
         return _svc.start(self._state_dir(a))
@@ -202,27 +254,54 @@ class Bridge:
     def op_service_remove(self, a):
         return _svc.remove(self._state_dir(a))
 
-    def _joined(self, a, url, **kw):
+    def _hello_info(self, creds_path, known=(), loopback=False, url=None):
+        """{endpoints, host_installation_id} from a hello over a connection pinned to these credentials' certificate. Best effort:
+        never fails the join/pair that already succeeded (then endpoints = what the caller already knew, id = null)."""
+        known = list(known)
+        try:
+            creds = pki.read_credentials(creds_path)
+        except (OSError, ValueError, pki.SecurityError):
+            return {"endpoints": [], "host_installation_id": None}
+        if url:  # the saved credentials may name an old port; the file is not changed
+            creds = {**creds, "url": url}
+        explicit = [creds["url"], *known]
+        try:
+            c = Client(creds, min(self.timeout, 8), loopback=loopback, endpoints=known)
+            h = c.hello()
+            adv = [e["url"] for e in h.get("endpoints", []) if isinstance(e, dict) and isinstance(e.get("url"), str)] \
+                if isinstance(h.get("endpoints"), list) else []
+            iid = h.get("host_installation_id")
+            return {"endpoints": pki.clean_endpoints([creds["url"], *([c.last] if c.last else []), *adv, *known], explicit=explicit),
+                    "host_installation_id": iid if isinstance(iid, str) and pki.valid_installation_id(iid) else None}
+        except Exception:  # noqa: BLE001
+            return {"endpoints": pki.clean_endpoints([creds["url"], *known], explicit=explicit), "host_installation_id": None}
+
+    def _joined(self, a, url, hello=True, **kw):
         dest = _path(a["credentials_path"], "credentials_path")
         pem = kw.pop("pem", None)
-        if pem is None:  # fetch ONCE (trust on first use, as join_to_file does) so the matching saved identity can be chosen first
-            host, port = pki.endpoint(url)
+        pin = a.get("fingerprint_sha256")
+        if pin is not None and (not isinstance(pin, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", pin)):
+            raise BridgeError("bad_request", "fingerprint_sha256 must be 64 hex characters")
+        eps = _urls(a.get("endpoints", []), "endpoints")
+        host, port = pki.endpoint(url)
+        if pem is None:  # fetch ONCE (the selected certificate, or trust on first use of a typed address) so the matching saved identity can be chosen first
+            urls = [pki.url_for(host, port), *[u for u in pki.clean_endpoints(eps, explicit=[url]) if u != pki.url_for(host, port)]]
             try:
-                pem = ssl.get_server_certificate((host, port), timeout=self.timeout)  # handshake only: nothing is sent
+                pem, _ = fetch_pinned_cert(urls, pin, self.timeout)  # handshake only: nothing is sent; a different certificate is never trusted
             except (OSError, ValueError) as e:
                 raise CoordinatorError(0, "transport", f"could not reach {host}:{port} ({type(e).__name__})") from None
-            if not pki.cert_covers_host(pem, host):
-                raise pki.SecurityError(f"the certificate presented by {host} does not cover that address; not trusting it")
         have = _same_network(a, pki.fingerprint(pem))
-        iid, fp, reused = join_to_file(url, dest, a["name"], existing=have and have[0], timeout=self.timeout, pem=pem, **kw)
-        return {"installation_id": iid, "credentials_path": have[0] if reused else dest, "reused": reused,
-                "fingerprint_sha256": fp, "network_id": pki.network_id(fp)}
+        iid, fp, reused = join_to_file(url, dest, a["name"], existing=have and have[0], timeout=self.timeout, pem=pem,
+                                       fingerprint_sha256=pin, endpoints=eps, **kw)
+        path = have[0] if reused else dest
+        out = {"installation_id": iid, "credentials_path": path, "reused": reused, "fingerprint_sha256": fp, "network_id": pki.network_id(fp)}
+        return {**out, **self._hello_info(path, eps, kw.get("loopback", False))} if hello else out
 
     def op_join_address(self, a):
-        _need(a, ("url", "name", "credentials_path"), _EXISTING)
+        _need(a, ("url", "name", "credentials_path"), _EXISTING + ("fingerprint_sha256", "endpoints"))
         url = _path(a["url"], "url")
         host, port = pki.endpoint(url)
-        return {**self._joined(a, url), "url": f"https://{host if ':' not in host else '[' + host + ']'}:{port}"}
+        return {**self._joined(a, url), "url": pki.url_for(host, port)}
 
     def op_service_local_join(self, a):
         sd = _svc.state_path(self._state_dir(a, ("state_dir", "credentials_path", "name"), _EXISTING))
@@ -232,9 +311,23 @@ class Bridge:
         token = pki.read_private(str(sd / "local-join.token")).strip()
         self._secret(token)
         pem = (sd / "server-cert.pem").read_text(encoding="utf-8")
-        host = "127.0.0.1" if pki.cert_covers_host(pem, "127.0.0.1") else cfg["address"]
-        url = f"https://{host}:{cfg['port']}"
-        return {**self._joined(a, url, path="/v1/local-join", extra={"token": token}, pem=pem, loopback=True), "url": url}
+        url = f"https://127.0.0.1:{cfg['port']}"  # the certificate pin, not its names, is the identity
+        out = self._joined(a, url, hello=False, path="/v1/local-join", extra={"token": token}, pem=pem, loopback=True)
+        if out["reused"]:
+            # Earlier credentials were reused, so the server saw no join: tell it (loopback + private token) which installation is this PC.
+            base = {"url": url, "certificate_pem": pem, "fingerprint_sha256": out["fingerprint_sha256"], "installation_id": "-", "token": "-"}
+            try:
+                Client(base, self.timeout, loopback=True)._call("POST", "/v1/local-identity", {
+                    "protocol": _c.PROTOCOL, "token": token, "installation_id": out["installation_id"]}, auth=False)
+            except CoordinatorError as e:
+                if e.code == "unknown_installation":  # revoked (or never known) on this host; nothing is deleted or re-minted
+                    raise BridgeError("identity_revoked", "the saved identity for this PC was revoked on the host. Its jobs and credentials were "
+                                      "left untouched. Restore the host database or recover this saved identity before reconnecting; "
+                                      "a new invitation alone cannot restore a revoked identity") from None
+                raise
+            except (OSError, http.client.HTTPException, BadReply) as e:
+                raise BridgeError("transport", type(e).__name__) from None
+        return {**out, **self._hello_info(out["credentials_path"], (), True, url), "url": url}
 
     def op_network_invite(self, a):
         """Reusable 7-day NON-ADMIN invitation for the network this bridge is connected to. The code goes only into the new
@@ -259,8 +352,9 @@ class Bridge:
             self.lock = None
 
     def op_connect(self, a):
-        _need(a, ("credentials_path",))
+        _need(a, ("credentials_path",), ("endpoints",))
         path = _path(a["credentials_path"], "credentials_path")
+        eps = _urls(a.get("endpoints", []), "endpoints")
         creds = pki.read_credentials(path)
         self._secret(creds["token"])
         # One bridge per credentials: the persisted session id would otherwise let two processes act as one installation.
@@ -272,7 +366,7 @@ class Bridge:
         except pki.OwnerBusy:
             raise pki.OwnerBusy("these credentials are already in use by a running link") from None
         try:
-            client = self.client_cls(creds, self.timeout)
+            client = self.client_cls(creds, self.timeout, endpoints=eps) if eps else self.client_cls(creds, self.timeout)
             session_id = self._session(path)
         except BaseException:
             if not keep:
@@ -282,7 +376,26 @@ class Bridge:
             self.release()
         self.lock, self.client, self.session_id, self.creds = new, client, session_id, creds
         return {"installation_id": creds["installation_id"], "session_id": session_id,
-                "url": creds["url"], "network_id": pki.network_id(creds["fingerprint_sha256"])}
+                "url": creds["url"], "network_id": pki.network_id(creds["fingerprint_sha256"]),
+                "endpoints": list(getattr(client, "endpoints", [creds["url"]]))}
+
+    def op_endpoints(self, a):
+        """Replace the connected client's extra addresses (same pinned certificate) without reconnecting or touching any id/token."""
+        _need(a, ("urls",))
+        urls = _urls(a["urls"], "urls")
+        c = self._live()  # not_connected if there is no link
+        kept = pki.clean_endpoints(urls, explicit=[self.creds["url"]])
+        if urls and not kept:
+            raise BridgeError("bad_request", "none of those addresses is a LAN, Tailscale or ZeroTier address")
+        self.client.set_endpoints(kept)
+        return {"endpoints": list(self.client.endpoints)}
+
+    def op_discover(self, a):
+        _need(a, (), ("timeout_s", "known"))
+        t = a.get("timeout_s", 20)
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not 3 <= t <= 20:
+            raise BridgeError("bad_request", "timeout_s must be a number from 3 to 20")
+        return _disc.scan(t, _urls(a.get("known", []), "known", 64))
 
     def op_register(self, a):
         _need(a, ("build", "gpu"), ("name",))

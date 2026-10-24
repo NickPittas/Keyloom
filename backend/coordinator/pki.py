@@ -1,7 +1,9 @@
 """TLS identity, invitations and private credential files.
 Trust model: the invitation (delivered through a channel the user verifies) carries the server certificate
 PEM *and* its SHA-256 fingerprint. The client checks the fingerprint offline, then uses that certificate as
-the only trust anchor with hostname checking. No CERT_NONE, no trust-on-first-use."""
+the only trust anchor (CERT_REQUIRED). The identity is the pinned certificate, NOT an address: host-name checking is off and
+the leaf's SHA-256 is compared right after every handshake, before any request byte, so the same identity works over every
+address of the PC (LAN, Tailscale, ZeroTier, loopback) and across address changes. Certificate SANs are cosmetic."""
 import datetime
 import functools
 import hashlib
@@ -172,7 +174,7 @@ def generate_identity(hosts, days=365):
     if not hosts or any(h in ("0.0.0.0", "::", "") for h in hosts):
         raise SecurityError("certificate needs explicit endpoint host names/addresses, not a wildcard bind address")
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "CorridorKey coordinator")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Keyloom coordinator")])
     now = datetime.datetime.now(datetime.timezone.utc)
     pub = key.public_key()
     cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(pub)
@@ -214,11 +216,12 @@ def server_context(cert_path, key_path):
 
 
 def client_context(cert_pem, expected_fingerprint):
-    """The supplied certificate is the sole trust anchor, after its fingerprint matched the invitation."""
+    """The supplied certificate is the sole trust anchor, after its fingerprint matched the invitation.
+    No host-name check: callers MUST run `check_pin` on the handshaken socket before sending anything."""
     if not hmac.compare_digest(fingerprint(cert_pem), expected_fingerprint.lower()):
         raise SecurityError("certificate does not match the invitation fingerprint")
     ctx = ssl.create_default_context(cadata=cert_pem)  # explicit cadata: system roots are not loaded
-    ctx.check_hostname, ctx.verify_mode = True, ssl.CERT_REQUIRED
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_REQUIRED
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     return ctx
 
@@ -231,20 +234,81 @@ def endpoint(url):
 
 
 def verified_trust(url, cert_pem, expected_fingerprint):
-    """Offline checks shared by pairing and every later connection."""
+    """Offline checks shared by pairing and every later connection (the address is not part of the identity)."""
     host, port = endpoint(url)
-    ctx = client_context(cert_pem, expected_fingerprint)
-    if not cert_covers_host(cert_pem, host):
-        raise SecurityError(f"certificate does not cover {host}; ask the server owner for an invitation naming that address")
-    return host, port, ctx
+    return host, port, client_context(cert_pem, expected_fingerprint)
+
+
+def check_pin(sock, expected_fingerprint):
+    """Right after a TLS handshake: the peer's leaf certificate must be exactly the pinned one."""
+    der = sock.getpeercert(binary_form=True)
+    if not der or not hmac.compare_digest(hashlib.sha256(der).hexdigest(), expected_fingerprint.lower()):
+        raise SecurityError("the server at this address presents a different certificate than the pinned one")
+
+
+def url_for(host, port):
+    return f"https://{'[' + host + ']' if ':' in host else host}:{port}"
+
+
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+_TS6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def trusted_address(host, allow_loopback=False):
+    """LAN / link-local-free private / Tailscale / ZeroTier-private literals only; public and (by default) loopback are not."""
+    try:
+        a = ipaddress.ip_address(str(host).split("%")[0])
+    except ValueError:
+        return False
+    a = getattr(a, "ipv4_mapped", None) or a
+    if a.is_loopback:
+        return allow_loopback
+    return not a.is_unspecified and not a.is_multicast and (a.is_private or a.is_link_local or a in _CGNAT)
+
+
+def address_kind(host, iface=""):
+    try:
+        a = ipaddress.ip_address(str(host).split("%")[0])
+    except ValueError:
+        return "name"
+    n = iface.lower()
+    if a.is_loopback:
+        return "loopback"
+    if a in _CGNAT or a in _TS6 or n.startswith("tailscale"):
+        return "tailscale"
+    if n.startswith("zt") or "zerotier" in n:
+        return "zerotier"
+    return "lan"
+
+
+def clean_endpoints(urls, explicit=(), limit=16):
+    """Distinct canonical https URLs. Untrusted advertisements keep only trusted literals; hosts of `explicit` URLs
+    (a deliberate invitation / address the user typed) are kept whatever they are."""
+    allow = set()
+    for u in explicit:
+        try:
+            allow.add(endpoint(u)[0].lower())
+        except (SecurityError, ValueError, TypeError):
+            pass
+    out = []
+    for u in urls if isinstance(urls, (list, tuple)) else ():
+        try:
+            h, p = endpoint(u)
+        except (SecurityError, ValueError, TypeError, AttributeError):
+            continue
+        if not 1 <= p <= 65535 or len(str(u)) > 300:
+            continue
+        if h.lower() in allow or trusted_address(h):
+            c = url_for(h, p)
+            if c not in out:
+                out.append(c)
+    return out[:limit]
 
 
 # ---- invitation / credentials --------------------------------------------------------------------
 
 def write_invitation(path, url, cert_pem, code, expires_at):
-    host, _ = endpoint(url)
-    if not cert_covers_host(cert_pem, host):
-        raise SecurityError(f"server certificate does not cover {host}")
+    endpoint(url)
     write_private_new(path, json.dumps({"version": 1, "url": url, "certificate_pem": cert_pem,
                                         "fingerprint_sha256": fingerprint(cert_pem), "code": code, "expires_at": expires_at}))
 

@@ -59,6 +59,8 @@ enum Pend {
     Estimate(String),
     /// Writes a reusable invitation file (the bridge never returns its secret).
     Invite,
+    /// Replaces the connected client's endpoint list (token and session are kept).
+    Endpoints(Vec<String>),
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +199,12 @@ pub struct Conn {
     pub name: String,
     /// The set's round robin allows this connection to claim now (offers are serialized across networks).
     pub may_claim: bool,
+    /// Known https addresses of the host, sent on connect and refreshed while online.
+    pub endpoints: Vec<String>,
+    /// Exact host installation this connection targets (empty = every member, as before).
+    pub target_host: String,
+    /// This PC's queue receives work; other PCs are selected through their own host connection.
+    pub local_host: bool,
 }
 
 pub struct Env<'a> {
@@ -257,10 +265,17 @@ pub struct Remote {
     /// Shutdown began: nothing new is claimed.
     closing: bool,
     wake_hint: Option<Arc<dyn Fn() + Send + Sync>>,
+    sent_endpoints: Vec<String>,
+    endpoints_inflight: bool,
+    target_host: String,
+    local_host: bool,
 }
 
 pub(crate) fn default_name() -> String {
-    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "Keyloom PC".into())
+    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).ok().filter(|s| !s.is_empty())
+        // HOSTNAME is a shell variable, not exported to GUI launches; the kernel value matches the service's own name
+        .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "Keyloom PC".into())
 }
 
 pub fn credentials_path(s: &Settings, settings_path: Option<&Path>) -> Option<PathBuf> {
@@ -460,6 +475,10 @@ impl Remote {
             invite_note: None,
             closing: false,
             wake_hint: None,
+            sent_endpoints: vec![],
+            endpoints_inflight: false,
+            target_host: String::new(),
+            local_host: false,
         }
     }
 
@@ -554,6 +573,15 @@ impl Remote {
     fn slot(&self, attempt: &str) -> String {
         format!("{}/{attempt}", self.key)
     }
+    /// A connection that names its host targets only that exact installation (and never this PC itself);
+    /// Older peer connections without metadata keep every member; our own queue supplies no remote targets.
+    fn host_only(&self, id: &str) -> bool {
+        !self.local_host && (self.target_host.is_empty() || (id == self.target_host && Some(id) != self.me.as_deref()))
+    }
+    /// The coordinator address from the credentials file (labels and discovery's known addresses).
+    pub fn url(&self) -> Option<String> {
+        self.network_url.clone()
+    }
     pub fn has_install(&self, id: &str) -> bool {
         self.installs.iter().any(|i| i.id == id)
     }
@@ -612,6 +640,7 @@ impl Remote {
         self.me = None;
         self.last_stats = None;
         self.last_installs = None;
+        self.endpoints_inflight = false;
     }
 
     fn req(&mut self, op: Op, args: Value, p: Pend) -> bool {
@@ -629,6 +658,8 @@ impl Remote {
 
     pub fn tick(&mut self, now: Instant, env: &mut Env) {
         self.wake_hint = Some(env.wake.clone());
+        self.target_host.clone_from(&env.cfg.target_host);
+        self.local_host = env.cfg.local_host;
         if !self.held.is_empty() && matches!(self.rx, Rx::Idle) {
             env.ai.release_network_slot(&self.held);
             self.held.clear();
@@ -707,12 +738,24 @@ impl Remote {
                         }
                     }
                 } else if let Some(c) = &creds {
-                    if self.req(Op::Connect, json!({"credentials_path": c.display().to_string()}), Pend::Connect) {
+                    let mut args = json!({"credentials_path": c.display().to_string()});
+                    let eps: Vec<String> = env.cfg.endpoints.iter().take(16).cloned().collect();
+                    if !eps.is_empty() {
+                        args["endpoints"] = json!(eps);
+                    }
+                    if self.req(Op::Connect, args, Pend::Connect) {
+                        self.sent_endpoints = eps;
                         self.phase = Phase::Connecting;
                     }
                 }
             }
-            Phase::Online => self.drive(now, env, creds.as_deref()),
+            Phase::Online => {
+                let want: Vec<String> = env.cfg.endpoints.iter().take(16).cloned().collect();
+                if !self.endpoints_inflight && want != self.sent_endpoints {
+                    self.endpoints_inflight = self.req(Op::Endpoints, json!({"urls": want}), Pend::Endpoints(want));
+                }
+                self.drive(now, env, creds.as_deref())
+            }
             _ => {}
         }
     }
@@ -737,6 +780,13 @@ impl Remote {
                     Ok(_) => "Invitation saved. It can be reused for 7 days by any PC; keep the file private.".into(),
                     Err(e) => format!("Invitation not created ({})", err_text(&e)),
                 });
+            }
+            (Pend::Endpoints(sent), r) => {
+                self.endpoints_inflight = false;
+                self.sent_endpoints = sent; // retry only when addresses change or the link reconnects
+                if let Err(e) = r {
+                    self.status = Some(format!("Could not update host addresses: {}", err_text(&e)));
+                }
             }
             (Pend::Pair, Ok(v)) => {
                 let c = env.cfg.creds.clone().map(|c| c.display().to_string());
@@ -910,6 +960,7 @@ impl Remote {
         match p {
             Pend::Pair => "pair",
             Pend::Invite => "invite",
+            Pend::Endpoints(_) => "endpoints",
             Pend::Connect => "connect",
             Pend::Register => "register",
             Pend::Stats => "stats",
@@ -949,7 +1000,7 @@ impl Remote {
     /// This network's PCs with a GPU, as picker entries `network id/PC id` (stable across hosts and restarts).
     pub fn targets(&self, label: Option<&str>) -> Vec<(String, String)> {
         let Some(ns) = self.ns() else { return vec![] };
-        self.installs.iter().filter(|i| i.gpu.is_some()).map(|i| (format!("{ns}/{}", i.id), format!("{}{}{}", i.name, if i.connected && self.online() { "" } else { " (offline)" }, label.map_or(String::new(), |l| format!(" · {l}"))))).collect()
+        self.installs.iter().filter(|i| i.gpu.is_some() && self.host_only(&i.id)).map(|i| (format!("{ns}/{}", i.id), format!("{}{}{}", i.name, if i.connected && self.online() { "" } else { " (offline)" }, label.map_or(String::new(), |l| format!(" · {l}"))))).collect()
     }
 
     // ---- driving ---------------------------------------------------------------------------------------------------
@@ -974,7 +1025,7 @@ impl Remote {
                     Ok(u) => {
                         let ram_mb = s.ram_total.map(|b| b / (1 << 20));
                         if let Some(ram) = ram_mb.filter(|r| *r > 0) {
-                            let mut args = json!({"build": format!("corridorkey-ui {}", env!("CARGO_PKG_VERSION")), "gpu": {"uuid": u, "name": truncate(&g.name, 120), "vram_total_mb": ((g.vram_gb * 1024.0) as u64).max(1), "ram_total_mb": ram}});
+                            let mut args = json!({"build": format!("keyloom-ui {}", env!("CARGO_PKG_VERSION")), "gpu": {"uuid": u, "name": truncate(&g.name, 120), "vram_total_mb": ((g.vram_gb * 1024.0) as u64).max(1), "ram_total_mb": ram}});
                             let name = truncate(env.cfg.name.trim(), 64); // the host accepts 1-64 characters
                             self.reg_sent_name = !name.is_empty() && !self.name_unsupported;
                             if self.reg_sent_name {
@@ -1568,7 +1619,7 @@ impl Remote {
     }
 
     pub fn other_installations(&self, label: Option<&str>) -> Vec<Install> {
-        self.installs.iter().filter(|i| Some(&i.id) != self.me.as_ref()).cloned().map(|mut i| {
+        self.installs.iter().filter(|i| Some(&i.id) != self.me.as_ref() && self.host_only(&i.id)).cloned().map(|mut i| {
             i.connected &= self.online();
             if let Some(l) = label { i.name = format!("{} · {l}", i.name); }
             i
@@ -1703,5 +1754,24 @@ impl Remote {
         });
         ui.add_space(6.0);
         acts
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn own_queue_does_not_offer_submitters_as_render_targets() {
+        let mut r = Remote::blank(Source::Off, String::new());
+        r.me = Some("this-pc".into());
+        r.local_host = true;
+        assert!(!r.host_only("submitter"));
+        assert!(!r.host_only("this-pc"));
+        r.local_host = false;
+        r.target_host = "selected-host".into();
+        assert!(r.host_only("selected-host"));
+        assert!(!r.host_only("submitter"));
+        assert!(!r.host_only("this-pc"));
     }
 }

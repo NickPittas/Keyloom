@@ -735,16 +735,13 @@ class ProvisionManager:
 
         before = self.checker.check_artifact(art)
         if before["present"] and not repair:
-            self.checker.verify_artifact(art)
-            if not self.checker.hash_cache.save():
-                self.checker.hash_cache.reload()
-                raise ArtifactError("verification-cache", "could not persist verification cache")
-            before = self.checker.check_artifact(art)
-            if before["ready"]:
-                self.emit({"event": "artifact-done", "artifact": art.id,
-                           "verified": True, "ready": True, "path": before["path"],
-                           "note": "already installed and verified"})
-                return True
+            # Installed artifacts are trusted: a download request never re-hashes what is already complete on disk (stat closure
+            # = every required file present at its catalog size). Rehashing is explicit: `--verify` / `--repair`. Only bytes
+            # downloaded below are authenticated against the pinned digests, once, before promotion.
+            self.emit({"event": "artifact-done", "artifact": art.id,
+                       "verified": before["verified"], "ready": before["ready"], "path": before["path"],
+                       "note": "already installed; not re-hashed (use verify or repair to re-check)"})
+            return True
         needed_bytes = self._missing_bytes(art)
         self.emit({"event": "artifact-start", "artifact": art.id,
                    "bytes_total": needed_bytes,

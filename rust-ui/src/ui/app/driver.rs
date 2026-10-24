@@ -31,6 +31,9 @@ impl<T> Held<T> {
     pub fn hold(&self) {
         let _ = self.guard.get_or_init(|| self.arc.lock_arc());
     }
+    pub fn is_held(&self) -> bool {
+        self.guard.get().is_some()
+    }
     /// Hand the lock to the driver (fairly: a waiting driver gets it before the next frame can re-take it).
     pub fn release(&mut self) {
         if let Some(g) = self.guard.take() {

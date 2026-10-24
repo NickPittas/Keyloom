@@ -43,7 +43,7 @@ Repository reconnaissance for proposing 5–10 muted, Nuke-like UI directions fo
 
 - `docs/screenshots/EZ-CorridorKey_Inference_Done.jpg` is the only full application screenshot found, but it is referenced inside the **historical upstream README** and should be treated as legacy visual reference, not guaranteed current fork appearance.
 - `docs/screenshots/quality_comparison_v1.5.0.png` is a historical quality comparison, not a current app screen.
-- `ui/theme/corridorkey.png` and `ui/theme/icons/eyedropper.png` are brand/UI assets. Repository scan found no sample video, EXR frames, or current workspace screenshots. For mockups, use the legacy app screenshot only as structural reference and use a clearly labeled synthetic checkerboard subject/media frame, or capture current runtime UI separately.
+- `ui/theme/keyloom.png` and `ui/theme/icons/eyedropper.png` are brand/UI assets. Repository scan found no sample video, EXR frames, or current workspace screenshots. For mockups, use the legacy app screenshot only as structural reference and use a clearly labeled synthetic checkerboard subject/media frame, or capture current runtime UI separately.
 
 ## Key code map
 

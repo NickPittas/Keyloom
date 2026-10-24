@@ -1,11 +1,11 @@
 ; Keyloom (powered by CorridorKey) Windows ONLINE installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
-; Per-user, no admin, no service, no firewall rule, no listener, no account or sign-in. This exe carries Keyloom itself
+; Per-user, no admin or automatic firewall rule, no account or sign-in. Activation configures the network host. This exe carries Keyloom itself
 ; (app, UI, FFmpeg, bundled Python and every small dependency) unpacked into {tmp} (deleted when Setup exits); online.py
 ; then downloads only the large public wheels (torch, triton, NVIDIA CUDA libraries) from PyPI / download.pytorch.org,
 ; reusing files of the installed versions, and hands the assembled payload to lifecycle.py (same transactional install as
 ; the full installer). No models here: download them from the app. Projects, settings, network identities and models are
 ; never touched. It is NOT uninstallable and registers no Add/Remove Programs entry (Uninstallable=no) with its own AppId,
-; so it never replaces or breaks the full installer's entry; uninstall with "<prefix>\bin\corridorkey-setup.cmd uninstall".
+; so it never replaces or breaks the full installer's entry; uninstall with "<prefix>\bin\keyloom-setup.cmd uninstall".
 #define VID "@VERSION_ID@"
 
 [Setup]
@@ -34,6 +34,10 @@ SetupMutex=KeyloomOnlineSetupMutex
 CloseApplications=no
 
 [Files]
+; The minimal bundled Python (and the supervisor script) live in {tmp}\kb, OUTSIDE the payload that online.py assembles and
+; moves; every Python step below runs from there. {tmp} is private to this Setup run and deleted when it exits.
+Source: "@BOOT@\installer_payload.py"; DestDir: "{tmp}"; Flags: dontcopy
+Source: "@BOOT@\*"; DestDir: "{tmp}\kb"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "@WRAP@\*"; DestDir: "{tmp}\k"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Code]
@@ -45,50 +49,127 @@ begin
   Result := FailCode;  { nonzero => the setup process itself reports failure }
 end;
 
-{ Where the install lives: /PREFIX=DIR wins, else the folder the full Inno installer recorded (a custom location chosen
-  there), else the default %LOCALAPPDATA%\Programs\CorridorKey. Never ends in a backslash (it goes into a quoted command line). }
-function ExistingPrefix: String;
+function GetTickCount: Cardinal; external 'GetTickCount@kernel32.dll stdcall';  { Win32 import; compile UNVERIFIED }
+
 var
-  Key, S: String;
+  InstallTick: Cardinal;  { GetTickCount when Inno began unpacking the payload (ssInstall) }
+
+const
+  PhaseSec = 10;
+  TotalSec = 30;  { whole automatic local install; declared user waits and visible downloads are excluded by online.py }
+
+{ One supervised Python step in a VISIBLE console: installer_payload.py runs the command as its own process tree, prints a
+  heartbeat every second, kills and reaps the tree at the deadline (exit 124) and exports the private wait file path to it as
+  KEYLOOM_WAIT_FILE (online.py creates it only around real downloads/consent). The path is inside Setup's private {tmp}. }
+function RunPy(Interp, StepName, Cmd: String; Cap: Integer; var Rc: Integer): Boolean;
 begin
-  Result := ExpandConstant('{param:PREFIX|}');
-  if Result = '' then
+  Result := Exec(Interp, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" run --label ' + StepName + ' --deadline ' + IntToStr(Cap) +
+                 ' --wait-file "' + ExpandConstant('{tmp}\waiting-for-user') + '" -- ' + Cmd, '', SW_SHOW, ewWaitUntilTerminated, Rc);
+  if not Result then Rc := 2;
+end;
+
+{ Where the install lives is decided by the bundled helper's one parallel read-only `discover` run at ssPostInstall: /PREFIX=DIR
+  wins, else the folder the full Inno installer recorded (HKCU before HKLM), else an existing pre-rename %LOCALAPPDATA%\Programs\CorridorKey
+  (adopted), else %LOCALAPPDATA%\Programs\Keyloom. It never ends in a backslash (it goes into a quoted command line). }
+var
+  AdoptDir: String;  { pre-rename install this one takes over (its settings, models, shortcut, startup entry and service move across) }
+
+
+procedure ExitProcess(uExitCode: Cardinal); external 'ExitProcess@kernel32.dll stdcall';
+
+{ Same build already installed and verified? Decided in InitializeSetup, BEFORE Inno unpacks the heavy payload: the installed, owned
+  lifecycle checks the exact version id built into this setup (fast ordinary check: no runtime rehash, no engine import, no GPU
+  probe), under the supervisor with a visible console and the 10 s phase limit. Candidate folder: /PREFIX, else the full installer's
+  recorded folder (HKCU before HKLM), else the default; the authoritative parallel `discover` run still happens later. A negative or
+  failed probe simply continues to the normal install. Nothing is written. /REPAIR=1 skips it. }
+function InitializeSetup: Boolean;
+var
+  P, S, Raw2, Py, Lc: String;
+  Raw: AnsiString;
+  Rc: Integer;
+begin
+  Result := True;
+  if ExpandConstant('{param:REPAIR|0}') = '1' then exit;
+  P := ExpandConstant('{param:PREFIX|}');
+  if P = '' then
   begin
-    Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{7C1E6C52-3B0F-4D5A-9E57-2D6C7A0B7E21}_is1';
-    if RegQueryStringValue(HKCU, Key, 'Inno Setup: App Path', S) or RegQueryStringValue(HKLM, Key, 'Inno Setup: App Path', S) then
-      if DirExists(S) then Result := S;
+    Raw2 := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{7C1E6C52-3B0F-4D5A-9E57-2D6C7A0B7E21}_is1';
+    if RegQueryStringValue(HKCU, Raw2, 'Inno Setup: App Path', S) or RegQueryStringValue(HKLM, Raw2, 'Inno Setup: App Path', S) then
+      if DirExists(S) then P := S;
   end;
-  if Result = '' then Result := ExpandConstant('{localappdata}\Programs\CorridorKey');
-  Result := RemoveBackslashUnlessRoot(Result);
+  if P = '' then P := ExpandConstant('{localappdata}\Programs\Keyloom');
+  P := RemoveBackslashUnlessRoot(P);
+  if not DirExists(P + '\versions\{#VID}') then exit;
+  if not LoadStringFromFile(P + '\current.txt', Raw) then exit;
+  Py := P + '\versions\' + Trim(String(Raw)) + '\runtime\python\python.exe';
+  Lc := P + '\versions\' + Trim(String(Raw)) + '\app\packaging\lifecycle.py';
+  if (Trim(String(Raw)) = '') or not FileExists(Py) or not FileExists(Lc) then exit;
+  ExtractTemporaryFile('installer_payload.py');
+  if Exec(Py, '-I -B "' + ExpandConstant('{tmp}\installer_payload.py') + '" run --label check --deadline ' + IntToStr(PhaseSec) + ' -- "' + Py +
+          '" -I -B "' + Lc + '" --prefix "' + P + '" check --version {#VID}', '', SW_SHOW, ewWaitUntilTerminated, Rc) and (Rc = 0) then
+  begin
+    SuppressibleMsgBox('Keyloom {#VID} is already installed and verified. Nothing was changed (settings, models and services are untouched). Use /REPAIR=1 to restore damaged files.', mbInformation, MB_OK, IDOK);
+    ExitProcess(0);
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  Boot, Prefix, Args: String;
-  Rc: Integer;
+  Boot, Prefix, Args, Bpy, DiscFile: String;
+  DiscLines: TArrayOfString;
+  Rc, Spent: Integer;
 begin
   if CurStep = ssInstall then
   begin
-    if Length(ExistingPrefix) <= 3 then
-    begin
-      SuppressibleMsgBox('The install folder cannot be a drive root (for example use D:\Apps\CorridorKey).', mbError, MB_OK, IDOK);
-      FailCode := 5;
-      Abort;
-    end;
-    exit;
+    InstallTick := GetTickCount;
+    exit;  { the install folder is discovered once, read-only, at ssPostInstall (see below) }
   end;
   if CurStep <> ssPostInstall then exit;
+  { Inno's unpacking of the bundled payload is native and cannot be pre-empted from here: it is put on the shared clock AFTER
+    the fact. Over the phase limit = visible failure before online.py runs (nothing installed or changed). }
+  Spent := Integer((GetTickCount - InstallTick) div 1000);
+  if Spent > PhaseSec then
+  begin
+    FailCode := 11;
+    SuppressibleMsgBox('Unpacking the installer took ' + IntToStr(Spent) + ' s, over the ' + IntToStr(PhaseSec) + ' s limit for one local phase. Nothing was installed or changed.', mbError, MB_OK, IDOK);
+    exit;
+  end;
   Boot := ExpandConstant('{tmp}\k');
-  Prefix := ExistingPrefix;
-  Args := '-I -B "' + Boot + '\payload\app\packaging\online.py" --payload-dir "' + Boot + '\payload" --sources "' +
+  Bpy := ExpandConstant('{tmp}\kb\python.exe');
+  { ONE read-only discovery (HKCU/HKLM keys and both candidate receipts probed in parallel by the bundled helper's bounded pool,
+    precedence fixed in code: /PREFIX > HKCU > HKLM > default). No second Python process, no console per probe; nothing is written. }
+  DiscFile := ExpandConstant('{tmp}\discovered.txt');
+  DeleteFile(DiscFile);
+  if not Exec(Bpy, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" discover --label discover --deadline ' + IntToStr(PhaseSec) +
+              ' --prefix-param "' + ExpandConstant('{param:PREFIX|}') + '" --out "' + DiscFile + '"', '', SW_SHOW, ewWaitUntilTerminated, Rc) then
+    Rc := 2;
+  if (Rc <> 0) or not LoadStringsFromFile(DiscFile, DiscLines) or (GetArrayLength(DiscLines) < 1) then
+  begin
+    FailCode := 14;
+    SuppressibleMsgBox('Setup could not determine the install folder (code ' + IntToStr(Rc) + '). Nothing was installed or changed.', mbError, MB_OK, IDOK);
+    exit;
+  end;
+  Prefix := Trim(DiscLines[0]);
+  AdoptDir := '';
+  if GetArrayLength(DiscLines) > 1 then AdoptDir := Trim(DiscLines[1]);
+  if Length(Prefix) <= 3 then
+  begin
+    FailCode := 5;
+    SuppressibleMsgBox('The install folder cannot be a drive root (for example use D:\Apps\Keyloom).', mbError, MB_OK, IDOK);
+    exit;
+  end;
+  Args := '"' + Bpy + '" -I -B "' + Boot + '\payload\app\packaging\online.py" --payload-dir "' + Boot + '\payload" --sources "' +
           Boot + '\wheel-sources.json" --prefix "' + Prefix + '"';
   if ExpandConstant('{param:REPAIR|0}') = '1' then Args := Args + ' --repair';
-  { Visible console: the client prints its real download/verify progress. }
-  if not Exec(Boot + '\payload\runtime\python\python.exe', Args, '', SW_SHOW, ewWaitUntilTerminated, Rc) then
-    Rc := 2;
+  if AdoptDir <> '' then Args := Args + ' --adopt-from "' + AdoptDir + '"';
+  { online.py owns the reuse/attach decision and passes --attach-runtime/--runtime-src through the lifecycle itself. Visible,
+    supervised console: heartbeat each second plus the client's real download/verify progress. }
+  RunPy(Bpy, 'online', Args, TotalSec - Spent, Rc);
   if Rc = 0 then exit;
   FailCode := Rc;
-  if Rc = 4 then
+  if Rc = 124 then
+    SuppressibleMsgBox('Keyloom setup STOPPED: a step exceeded its time limit and was ended. The previous install (if any) is unchanged.', mbError, MB_OK, IDOK)
+  else if Rc = 4 then
     SuppressibleMsgBox('Keyloom is running. Quit it with File > Quit (a background network service does not need to be stopped) and run setup again. Nothing was changed.', mbError, MB_OK, IDOK)
   else if Rc = 130 then
     SuppressibleMsgBox('Setup was cancelled. The previous Keyloom install (if any) is unchanged.', mbInformation, MB_OK, IDOK)

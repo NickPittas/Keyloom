@@ -2210,6 +2210,7 @@ fn board_status(c: &Clip) -> String {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.net_logic(ctx);
         // eframe skips ui() for hidden/occluded Windows windows, but keeps calling logic().
         if let Some(dir) = &self.opts.instance_dir {
             if std::fs::remove_file(dir.join("instance.show")).is_ok() {
@@ -2572,10 +2573,15 @@ impl App {
 
     /// Per frame: drive the network client (connect, stats, Batch submissions, receiving) without blocking.
     fn net_tick(&mut self, now: std::time::Instant, wake: &std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.setup.ensure(self.settings.saved(), self.settings.store_path());
         self.setup.tick(self.net_repo.as_deref(), self.net_python.as_deref(), wake);
         if !self.settings_open {
             if let Some(j) = self.setup.take_joined() {
                 self.net_joined(j);
+            }
+            let ups = self.setup.take_updates();
+            if !ups.is_empty() {
+                self.net_scan_updates(ups);
             }
         }
         if !self.remote.available() {
@@ -2626,15 +2632,93 @@ impl App {
     }
 
     /// A join finished: keep every existing connection and session; only an explicit Save changes the global name.
+    /// This PC's own service is received on by default; a chosen peer is only a render target (receive off).
     fn net_joined(&mut self, j: crate::network_setup::Joined) {
-        let known = self.remote.infos().into_iter().any(|c| c.credentials == j.creds || (j.network_id.is_some() && c.network_id == j.network_id));
+        let infos = self.remote.infos();
+        let known = infos.iter().any(|c| c.credentials == j.creds || (j.network_id.is_some() && c.network_id == j.network_id));
         let n = self.net_draft();
-        match n.connections.iter_mut().find(|c| c.credentials == j.creds) {
-            Some(c) => c.enabled = true, // rejoining a saved (possibly unticked) connection connects it
-            None if !known => n.connections.push(crate::settings::Connection { credentials: j.creds, enabled: true, ..Default::default() }),
-            None => {}
+        let found = n.connections.iter().position(|c| c.credentials == j.creds || (!c.network_id.is_empty() && Some(&c.network_id) == j.network_id.as_ref() && (j.host_installation_id.is_none() || c.host_installation_id.is_empty() || Some(&c.host_installation_id) == j.host_installation_id.as_ref())))
+            .or_else(|| infos.iter().find(|i| i.network_id.is_some() && i.network_id == j.network_id).and_then(|i| n.connections.iter().position(|c| c.credentials == i.credentials)));
+        let idx = match found {
+            Some(i) => i,
+            None if !known => {
+                n.connections.push(crate::settings::Connection { credentials: j.creds.clone(), receive: j.local_host, ..Default::default() });
+                n.connections.len() - 1
+            }
+            None => return,
+        };
+        let c = &mut n.connections[idx];
+        c.enabled = true; // rejoining a saved (possibly unticked) connection connects it
+        if let Some(id) = &j.network_id {
+            if c.network_id.is_empty() {
+                c.network_id.clone_from(id);
+            }
+        }
+        if !j.endpoints.is_empty() {
+            c.endpoints = j.endpoints.clone();
+        }
+        if j.local_host {
+            c.local_host = true;
+        } else if c.host_installation_id.is_empty() {
+            if let Some(h) = &j.host_installation_id {
+                c.host_installation_id.clone_from(h); // a new peer connection targets exactly this host
+            }
+        }
+        if c.host_name.is_empty() {
+            c.host_name = j.host_name;
         }
         self.net_save("Joined");
+    }
+
+    /// Fresh scan addresses for saved connections (matched by full fingerprint, never by name). A legacy connection
+    /// keeps targeting every member; one that already names a host is corrected to the host the scan shows.
+    fn net_scan_updates(&mut self, ups: Vec<crate::network_setup::ScanUpdate>) {
+        let infos = self.remote.infos();
+        let conns = self.settings.saved().network.effective_connections(self.settings.store_path());
+        let nid = |c: &crate::settings::Connection| if c.network_id.is_empty() { infos.iter().find(|i| i.credentials == c.credentials).and_then(|i| i.network_id.clone()).unwrap_or_default() } else { c.network_id.clone() };
+        let edits: Vec<_> = conns.iter().filter(|c| !c.local_host).filter_map(|c| {
+            let id = nid(c);
+            let u = ups.iter().find(|u| u.network_id.eq_ignore_ascii_case(&id) && (c.host_installation_id.is_empty() || u.host_iid.as_deref().is_none_or(|h| h.is_empty() || h == c.host_installation_id)))?;
+            let mut n = c.clone();
+            n.network_id = id;
+            if !u.endpoints.is_empty() {
+                n.endpoints = u.endpoints.clone();
+            }
+            if n.host_name.is_empty() {
+                n.host_name.clone_from(&u.name);
+            }
+            (n != *c).then_some(n)
+        }).collect();
+        if edits.is_empty() {
+            return;
+        }
+        let list = &mut self.net_draft().connections;
+        for e in edits {
+            if let Some(c) = list.iter_mut().find(|c| c.credentials == e.credentials) {
+                *c = e;
+            }
+        }
+        self.net_save("Addresses refreshed");
+    }
+
+    /// A Clients row checkbox: switches a saved connection on or off (files, attempts and jobs are never touched).
+    fn net_use_pc(&mut self, credentials: &str, network_id: &str, host_iid: Option<String>, name: &str, endpoints: Vec<String>, on: bool) {
+        if let Some(c) = self.net_draft().connections.iter_mut().find(|c| c.credentials == credentials) {
+            c.enabled = on;
+            if c.network_id.is_empty() {
+                c.network_id = network_id.to_owned();
+            }
+            if !endpoints.is_empty() {
+                c.endpoints = endpoints;
+            }
+            if c.host_name.is_empty() {
+                c.host_name = name.to_owned();
+            }
+            if let (false, Some(h)) = (c.host_installation_id.is_empty(), host_iid) {
+                c.host_installation_id = h; // metadata exists: point it at the exact host the scan shows
+            }
+        }
+        self.net_save("Updated");
     }
 
     fn net_action(&mut self, a: crate::remote::Action) {
@@ -2817,6 +2901,27 @@ impl App {
     pub fn back_rect(&self) -> Option<egui::Rect> {
         self.back_rect
     }
+    /// Between frames (`logic`) the network client still ticks. It must take the shared objects in the driver's
+    /// order (ai, remote, metrics) and hand them all back: a lone lazy `remote` lock kept until the next frame's
+    /// `ai.hold()` deadlocks against the driver, which holds ai and waits for remote.
+    fn net_logic(&mut self, ctx: &egui::Context) {
+        if self.driver.is_none() {
+            return;
+        }
+        self.ai.hold();
+        self.remote.hold();
+        self.metrics.hold();
+        if self.remote.available() {
+            let wake = self.metrics_wake.get_or_insert_with(|| {
+                let c = ctx.clone();
+                std::sync::Arc::new(move || c.request_repaint())
+            }).clone();
+            self.net_tick(std::time::Instant::now(), &wake);
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        self.release_shared();
+    }
+
     /// Hand the shared runtime objects back to the driver.
     fn release_shared(&mut self) {
         self.ai.release();
@@ -2884,7 +2989,9 @@ impl App {
             self.metrics.tick(now, &wake);
         }
         ctx.request_repaint_after(std::time::Duration::from_secs(1)); // ages (stale) advance without any new sample
-        self.net_tick(now, &wake);
+        if self.driver.is_none() {
+            self.net_tick(now, &wake);
+        }
         let active = self.active_gpus();
         let cells = crate::metrics::view_cells(&self.metrics.view(now), &active);
         // Outermost bottom panel: on every page (Board, clip, Settings, Clients, Models), fixed height.
@@ -2969,10 +3076,6 @@ impl App {
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
                             let paired = self.remote.other_installations();
-                            if let Some(p) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.client_telemetry, &paired) {
-                                self.ai.placement = p;
-                            }
-                            net_actions = self.remote.ui(ui, self.settings.saved(), self.settings.store_path());
                             if self.remote.available() {
                                 let infos = self.remote.infos();
                                 let cx = crate::network_setup::Ctx {
@@ -2983,7 +3086,14 @@ impl App {
                                     invite_note: self.remote.invite_note(),
                                 };
                                 setup_cmds = self.setup.ui(ui, &cx);
+                                ui.add_space(14.0);
                             }
+                            if let Some(p) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.client_telemetry, &paired) {
+                                self.ai.placement = p;
+                            }
+                            egui::CollapsingHeader::new("Connection details (advanced)").default_open(false).show(ui, |ui| {
+                                net_actions = self.remote.ui(ui, self.settings.saved(), self.settings.store_path());
+                            });
                         });
                 });
                 for a in net_actions {
@@ -2999,6 +3109,23 @@ impl App {
                         crate::network_setup::Cmd::SaveName(n) => {
                             self.net_draft().name = n;
                             self.net_save("Name changed");
+                        }
+                        crate::network_setup::Cmd::UsePc { credentials, network_id, host_iid, name, endpoints, on } => {
+                            self.net_use_pc(&credentials, &network_id, host_iid, &name, endpoints, on);
+                        }
+                        crate::network_setup::Cmd::HostRemoved(gone) => {
+                            let n = self.net_draft();
+                            n.host_removed = gone;
+                            if gone {
+                                n.connections.iter_mut().filter(|c| c.local_host).for_each(|c| c.enabled = false);
+                            } else {
+                                n.connections.iter_mut().filter(|c| c.local_host).for_each(|c| c.enabled = true);
+                            }
+                            self.net_save("Updated");
+                        }
+                        crate::network_setup::Cmd::UseInvitation(on) => {
+                            self.net_draft().use_invitation = on;
+                            self.net_save("Updated");
                         }
                         crate::network_setup::Cmd::Browse(k) => {
                             let w = ctx.clone();
@@ -3936,5 +4063,37 @@ mod settings_handoff_tests {
             "My_shot_1_A"
         );
         assert_eq!(super::super::import::folder_stem("__"), "");
+    }
+}
+
+#[cfg(test)]
+mod lock_order_tests {
+    use super::*;
+
+    /// `logic` runs between frames while the driver ticks. It used to leave `remote` locked until the next frame's
+    /// `ai.hold()`, the reverse of the driver's order: the UI and the driver then waited on each other forever.
+    #[test]
+    fn logic_never_keeps_a_shared_lock_between_frames() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { net: crate::netlink::Source::Command(vec!["/bin/false".into()]), ..Default::default() });
+        app.release_shared();
+        let parts = driver::Parts {
+            ai: app.ai.shared(),
+            remote: app.remote.shared(),
+            metrics: app.metrics.shared(),
+            repo: None,
+            python: None,
+            ctx: ctx.clone(),
+        };
+        app.driver = Some(driver::Driver::start(parts, driver::Snapshot::default()).unwrap());
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(2) {
+            app.net_logic(&ctx);
+            assert!(!app.ai.is_held() && !app.remote.is_held() && !app.metrics.is_held());
+            app.ai.hold(); // what `frame` does next: must not wait on a driver that waits on us
+            app.remote.hold();
+            app.metrics.hold();
+            app.release_shared();
+        }
     }
 }

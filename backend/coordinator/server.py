@@ -5,12 +5,13 @@ import ipaddress
 import json
 import re
 import socket
+import socketserver
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from . import PROTOCOL
+from . import PROTOCOL, pki
 from .schema import ApiError, MAX_BODY, bad, obj, parse_json
 from .store import Store
 
@@ -41,33 +42,33 @@ class Limiter:
                 self.hits = {k: v for k, v in self.hits.items() if self._recent(k)}
 
 
-_TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
-
-
 def trusted_peer(ip, loopback_only=False):
     """Unauthenticated joins are limited to this machine, private/link-local LAN ranges and Tailscale (100.64/10, fd7a::/48 is ULA)."""
+    if pki.trusted_address(ip, allow_loopback=True) and not loopback_only:
+        return True
     try:
         a = ipaddress.ip_address(str(ip).split("%")[0])
     except ValueError:
         return False
-    a = getattr(a, "ipv4_mapped", None) or a
-    if a.is_loopback:
-        return True
-    return not loopback_only and (a.is_private or a.is_link_local or a in _TAILSCALE_V4)
+    return (getattr(a, "ipv4_mapped", None) or a).is_loopback
 
 
 _POST = {
-    r"/v1/pair": "pair", r"/v1/join": "join", r"/v1/local-join": "local_join", r"/v1/invitations": "invite", r"/v1/session": "session", r"/v1/stats": "stats", r"/v1/claim": "claim", r"/v1/jobs": "submit",
+    r"/v1/pair": "pair", r"/v1/join": "join", r"/v1/local-join": "local_join", r"/v1/local-identity": "local_identity", r"/v1/invitations": "invite", r"/v1/session": "session", r"/v1/stats": "stats", r"/v1/claim": "claim", r"/v1/jobs": "submit",
     r"/v1/attempts/([\w-]{1,80})/(reject|start|events)": "attempt", r"/v1/jobs/([\w-]{1,80})/cancel": "cancel",
 }
-_GET = {r"/v1/installations": "installations", r"/v1/jobs/([\w-]{1,80})": "job", r"/v1/jobs/([\w-]{1,80})/events": "job_events"}
+_GET = {r"/v1/hello": "hello", r"/v1/installations": "installations", r"/v1/jobs/([\w-]{1,80})": "job", r"/v1/jobs/([\w-]{1,80})/events": "job_events"}
 
 
 class Api:
     """Transport-independent routing so the HTTP layer stays dumb."""
 
-    def __init__(self, store, throttle=None, join_enabled=False, local_token=None, advertise_url=None):
+    def __init__(self, store, throttle=None, join_enabled=False, local_token=None, advertise_url=None, info=None, local_identity=None):
         self.store = store
+        self.info = info  # () -> {fingerprint_sha256, network_id, name, host_installation_id, receiver_online, endpoints[{url,kind}]}
+        self.local_identity = local_identity  # (installation_id) -> None: records which installation is THIS PC (private file)
+        self.hello_try = Limiter(60, 60)
+        self.hello_global = Limiter(600, 60)
         self.auth_fail = throttle or Limiter(10, 60)
         self.pair_fail = Limiter(10, 60)
         self.pair_global = Limiter(30, 300)
@@ -85,6 +86,10 @@ class Api:
                 break
         else:
             raise ApiError(404, "not_found", "no such endpoint")
+        if name == "hello":
+            return self._hello(peer)
+        if name == "local_identity":
+            return self._local_identity(parse_json(body), peer)
         if name == "pair":
             return self._pair(parse_json(body), peer)
         if name in ("join", "local_join"):
@@ -133,6 +138,40 @@ class Api:
             return s.cancel(inst, m[1])
         return {"reject": s.reject, "start": s.start, "events": s.report}[m[2]](inst, m[1], b)
 
+    def _hello(self, peer):
+        """Unauthenticated, read-only, secret-free identity of this host (peer certificate fingerprint, PC name, whether the
+        PC's own app session is online, whether address join is on, its addresses). Rate-capped per peer and globally."""
+        if self.hello_try.blocked(peer) or self.hello_global.blocked("*"):
+            raise ApiError(429, "throttled", "too many hello requests")
+        self.hello_try.fail(peer)
+        self.hello_global.fail("*")
+        i = (self.info() if self.info else None) or {}
+        iid = i.get("host_installation_id")
+        return {"protocol": PROTOCOL, "fingerprint_sha256": i.get("fingerprint_sha256"), "network_id": i.get("network_id"),
+                "name": i.get("name"), "host_installation_id": iid, "receiver_online": bool(i.get("receiver_online")),
+                "join": bool(self.join_enabled), "endpoints": list(i.get("endpoints") or [])[:16]}
+
+    def _local_identity(self, b, peer):
+        """Loopback + the service's private token: tell the host which EXISTING installation is this PC (legacy credentials
+        reused instead of joining again). Mints nothing and returns no secret."""
+        if not self.local_token or not self.local_identity:
+            raise ApiError(404, "not_found", "no such endpoint")
+        if not trusted_peer(peer, loopback_only=True):
+            raise ApiError(403, "join_refused", "this is limited to this PC")
+        if self.join_try.blocked(peer):
+            raise ApiError(429, "throttled", "too many attempts")
+        self.join_try.fail(peer)
+        obj(b, "local identity", ("protocol", "token", "installation_id"))
+        if b["protocol"] != PROTOCOL or isinstance(b["protocol"], bool):
+            bad("unsupported protocol", "unsupported_protocol")
+        if not (isinstance(b["token"], str) and hmac.compare_digest(b["token"].encode(), self.local_token.encode())):
+            raise ApiError(403, "join_refused", "local join token rejected")
+        iid = b["installation_id"]
+        if not pki.valid_installation_id(iid) or not self.store.installation_active(iid):
+            raise ApiError(404, "unknown_installation", "no such installation")
+        self.local_identity(iid)
+        return {"host_installation_id": iid}
+
     def _join(self, name, b, peer):
         """/v1/join (explicitly enabled) or /v1/local-join (loopback + the service's private token). Both mint a unique
         non-admin installation; neither gives access to jobs without the token they return."""
@@ -152,6 +191,11 @@ class Api:
         if local and not (isinstance(b["token"], str) and hmac.compare_digest(b["token"].encode(), self.local_token.encode())):
             raise ApiError(403, "join_refused", "local join token rejected")
         iid, token = self.store.join(b["name"])
+        if local and self.local_identity:
+            try:
+                self.local_identity(iid)
+            except OSError:
+                pass  # the join stands; status will simply not know this PC's installation yet
         return {"installation_id": iid, "token": token}
 
     def _pair(self, b, peer):
@@ -172,7 +216,7 @@ class Api:
 
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "CorridorKeyCoordinator"
+    server_version = "KeyloomCoordinator"
     sys_version = ""
 
     def setup(self):
@@ -273,8 +317,19 @@ class CoordinatorServer(ThreadingHTTPServer):
         self.conn_deadline = conn_deadline
         self.slots = threading.BoundedSemaphore(max_connections)
         self._guards = {}
+        if addr[0] == "::":  # dual-stack wildcard: IPv4 and IPv6 on one socket; the caller falls back to IPv4 on OSError
+            self.address_family = socket.AF_INET6
         super().__init__(addr, _Handler)
         self.socket = ssl_context.wrap_socket(self.socket, server_side=True, do_handshake_on_connect=False)
+
+    def server_bind(self):
+        if self.address_family == socket.AF_INET6:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (OSError, AttributeError):
+                raise OSError("dual-stack sockets are not available") from None
+        socketserver.TCPServer.server_bind(self)  # not HTTPServer's: its getfqdn() can block on DNS
+        self.server_name, self.server_port = "keyloom", self.server_address[1]
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):

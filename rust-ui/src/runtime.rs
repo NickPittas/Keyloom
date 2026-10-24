@@ -10,7 +10,18 @@ use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
 /// Descriptor file name, identical in both languages.
-pub const DESCRIPTOR_NAME: &str = "corridorkey-install.json";
+pub const DESCRIPTOR_NAME: &str = "keyloom-install.json";
+/// Name written by installs made before the Keyloom rename; still read so those installs keep working.
+pub const LEGACY_DESCRIPTOR_NAME: &str = "corridorkey-install.json";
+
+/// The descriptor in `dir`: the Keyloom name, else a pre-rename one, else the Keyloom path (for messages).
+pub fn descriptor_in(dir: &Path) -> PathBuf {
+    let legacy = dir.join(LEGACY_DESCRIPTOR_NAME);
+    if !dir.join(DESCRIPTOR_NAME).is_file() && legacy.is_file() {
+        return legacy;
+    }
+    dir.join(DESCRIPTOR_NAME)
+}
 /// Explicit pointer at a descriptor file or its folder; also exported to child processes.
 pub const ENV_INSTALL: &str = "CK_INSTALL";
 /// Explicit developer checkout (validated: must contain `backend/worker`).
@@ -118,7 +129,7 @@ pub fn load(path: &Path) -> Result<Install, String> {
             .collect();
         if !unknown.is_empty() {
             return Err(format!(
-                "unknown field {:?} in {w}: this CorridorKey is older than the install; update the app (or point {ENV_INSTALL} at a matching install).",
+                "unknown field {:?} in {w}: this Keyloom is older than the install; update the app (or point {ENV_INSTALL} at a matching install).",
                 unknown.join(", "),
                 w = where_()
             ));
@@ -128,7 +139,7 @@ pub fn load(path: &Path) -> Result<Install, String> {
         Some(SCHEMA) => {}
         Some(v) => {
             return Err(format!(
-                "schema version {v} in {w}, this build reads {SCHEMA}: the install was made by a newer CorridorKey; update the app (or point {ENV_INSTALL} at a matching install).",
+                "schema version {v} in {w}, this build reads {SCHEMA}: the install was made by a newer Keyloom; update the app (or point {ENV_INSTALL} at a matching install).",
                 w = where_()
             ))
         }
@@ -157,7 +168,7 @@ pub fn load(path: &Path) -> Result<Install, String> {
         .collect();
     if !unknown_roots.is_empty() {
         return Err(format!(
-            "unknown roots field {:?} in {w}: this CorridorKey is older than the install; update the app.",
+            "unknown roots field {:?} in {w}: this Keyloom is older than the install; update the app.",
             unknown_roots.join(", "),
             w = where_()
         ));
@@ -203,7 +214,7 @@ fn first_descriptor(starts: &[PathBuf]) -> Option<PathBuf> {
     starts.iter().find_map(|s| {
         s.ancestors()
             .take(4)
-            .map(|d| d.join(DESCRIPTOR_NAME))
+            .map(descriptor_in)
             .find(|p| p.is_file())
     })
 }
@@ -216,7 +227,7 @@ pub fn discover_with(env: Option<PathBuf>, starts: &[PathBuf]) -> Found {
         let cand = if p.is_file() {
             p.clone()
         } else {
-            p.join(DESCRIPTOR_NAME)
+            descriptor_in(&p)
         };
         if !cand.is_file() {
             return Found::Broken {
@@ -404,24 +415,34 @@ fn nonempty(v: Option<std::ffi::OsString>) -> Option<PathBuf> {
     v.filter(|s| !s.is_empty()).map(PathBuf::from)
 }
 
-/// Unix user area for app data (not settings): `$XDG_DATA_HOME` or `~/.local/share`, then `CorridorKey`.
+/// `base/Keyloom`, unless only the pre-rename `base/CorridorKey` exists: existing models and data stay where they are.
+fn user_area(base: PathBuf) -> PathBuf {
+    let old = base.join("CorridorKey");
+    if old.is_dir() && !base.join("Keyloom").exists() {
+        old
+    } else {
+        base.join("Keyloom")
+    }
+}
+
+/// Unix user area for app data (not settings): `$XDG_DATA_HOME` or `~/.local/share`, then `Keyloom`.
 pub fn unix_user_data(
     xdg: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
     nonempty(xdg)
-        .map(|p| p.join("CorridorKey"))
-        .or_else(|| nonempty(home).map(|h| h.join(".local/share/CorridorKey")))
+        .map(user_area)
+        .or_else(|| nonempty(home).map(|h| user_area(h.join(".local/share"))))
 }
 
-/// Windows user area, no `HOME` involved: `%APPDATA%` (roaming), else `%LOCALAPPDATA%`, then `CorridorKey`.
+/// Windows user area, no `HOME` involved: `%APPDATA%` (roaming), else `%LOCALAPPDATA%`, then `Keyloom`.
 pub fn windows_user_data(
     appdata: Option<std::ffi::OsString>,
     local: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
     nonempty(appdata)
         .or_else(|| nonempty(local))
-        .map(|p| p.join("CorridorKey"))
+        .map(user_area)
 }
 
 pub fn platform_user_data() -> Option<PathBuf> {
@@ -443,7 +464,7 @@ mod tests {
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/install/",
-        "corridorkey-install.json"
+        "keyloom-install.json"
     );
 
     fn tmp(name: &str) -> PathBuf {
@@ -451,6 +472,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn pre_rename_descriptor_and_user_area_are_still_found() {
+        let d = tmp("legacy-names");
+        std::fs::write(d.join(LEGACY_DESCRIPTOR_NAME), "{}").unwrap();
+        assert_eq!(descriptor_in(&d), d.join(LEGACY_DESCRIPTOR_NAME));
+        std::fs::write(d.join(DESCRIPTOR_NAME), "{}").unwrap();
+        assert_eq!(descriptor_in(&d), d.join(DESCRIPTOR_NAME));
+        let base = tmp("legacy-area");
+        std::fs::create_dir_all(base.join("CorridorKey")).unwrap();
+        assert_eq!(user_area(base.clone()), base.join("CorridorKey"));
+        std::fs::create_dir_all(base.join("Keyloom")).unwrap();
+        assert_eq!(user_area(base.clone()), base.join("Keyloom"));
     }
 
     /// An install layout built from the shared fixture; `(root, install_dir)` where `install_dir` is
@@ -540,7 +575,7 @@ mod tests {
         ] {
             let err = load(&w(body)).unwrap_err();
             assert!(err.contains(want), "{body} -> {err}");
-            assert!(err.contains("corridorkey-install.json"), "{body} -> {err}");
+            assert!(err.contains("keyloom-install.json"), "{body} -> {err}");
         }
     }
 
@@ -700,23 +735,23 @@ mod tests {
         let h = std::ffi::OsString::from("/home/u");
         assert_eq!(
             unix_user_data(Some(a.clone()), Some(h.clone())),
-            Some(PathBuf::from("/xdg/CorridorKey"))
+            Some(PathBuf::from("/xdg/Keyloom"))
         );
         assert_eq!(
             unix_user_data(None, Some(h.clone())),
-            Some(PathBuf::from("/home/u/.local/share/CorridorKey"))
+            Some(PathBuf::from("/home/u/.local/share/Keyloom"))
         );
         assert_eq!(unix_user_data(None, None), None);
         let ad = std::ffi::OsString::from(r"C:\Users\u\AppData\Roaming");
         let la = std::ffi::OsString::from(r"C:\Users\u\AppData\Local");
         assert_eq!(
             windows_user_data(Some(ad.clone()), Some(la.clone())),
-            Some(PathBuf::from(r"C:\Users\u\AppData\Roaming").join("CorridorKey"))
+            Some(PathBuf::from(r"C:\Users\u\AppData\Roaming").join("Keyloom"))
         );
         // Windows without APPDATA and without HOME still resolves via LOCALAPPDATA.
         assert_eq!(
             windows_user_data(None, Some(la.clone())),
-            Some(PathBuf::from(r"C:\Users\u\AppData\Local").join("CorridorKey"))
+            Some(PathBuf::from(r"C:\Users\u\AppData\Local").join("Keyloom"))
         );
         assert_eq!(windows_user_data(None, None), None);
     }

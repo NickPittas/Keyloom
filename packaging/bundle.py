@@ -27,19 +27,22 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 IS_WIN = os.name == "nt"
+BUILD_SELFCHECK_TIMEOUT = 300  # seconds, finite; staged-tree self-check + UI check at build time only
 PLATFORM = "windows-x86_64" if IS_WIN else "linux-x86_64"
 APP_DIRS = ["backend", "CorridorKeyModule", "CorridorKeyV2", "gvm_core", "sam2_tracker",
-            "VideoMaMaInferenceModule", "modules", "ui", "scripts", "packaging"]
+            "VideoMaMaInferenceModule", "modules", "scripts", "packaging"]
 APP_FILES = ["pyproject.toml", "README.md"]
 WEIGHT_EXT = {".pt", ".pth", ".ckpt", ".safetensors", ".onnx", ".npz", ".bin", ".gguf"}
 SKIP_DIRS = {"__pycache__", ".git", "tests", "checkpoints", "weights", "locks", "dist"}
@@ -79,15 +82,15 @@ def stage_app(stage: Path) -> None:
     helper.mkdir(parents=True)
     shutil.copy2(REPO / "rust-ui/tools/ck_import.py", helper / "ck_import.py")
     (stage / "share").mkdir(exist_ok=True)
-    shutil.copy2(REPO / "ui/theme/corridorkey.png", stage / "share/corridorkey.png")
-    shutil.copy2(REPO / "ui/theme/corridorkey.ico", stage / "share/corridorkey.ico")
+    shutil.copy2(REPO / "ui/theme/keyloom.png", stage / "share/keyloom.png")
+    shutil.copy2(REPO / "ui/theme/keyloom.ico", stage / "share/keyloom.ico")
 
 
 def stage_ui(stage: Path, binary: Path | None, build: bool) -> None:
-    exe = "corridorkey-ui.exe" if IS_WIN else "corridorkey-ui"
+    exe = "keyloom-ui.exe" if IS_WIN else "keyloom-ui"
     binary = binary or REPO / "rust-ui/target/release" / exe
     if build:
-        subprocess.run(["cargo", "build", "--release", "--locked", "--bin", "corridorkey-ui"],
+        subprocess.run(["cargo", "build", "--release", "--locked", "--bin", "keyloom-ui"],
                        cwd=REPO / "rust-ui", check=True)
     if not binary.is_file():
         raise SystemExit(f"UI binary not found: {binary} (pass --ui-binary or --build-ui)")
@@ -325,12 +328,19 @@ def min_glibc(stage: Path) -> str | None:
 
 def descriptor(stage: Path, version: str) -> None:
     py = "runtime/python/python.exe" if IS_WIN else "runtime/python/bin/python3"
-    (stage / "corridorkey-install.json").write_text(json.dumps({
+    (stage / "keyloom-install.json").write_text(json.dumps({
         "schema": 1, "app_name": "Keyloom", "app_version": version,
         # models/cache/scratch/user_data null => platform defaults, shared across versions and
         # untouched by uninstall; the app root itself may be read-only.
         "roots": {"python": py, "helper": "app", "models": None, "cache": None,
                   "scratch": None, "user_data": None}}, indent=2) + "\n")
+
+
+def runtime_id(files: dict) -> str:
+    """Full 64-hex identity of the runtime: sha256 of the canonical JSON of the manifest `files` entries whose key starts
+    with "runtime/" (keys kept verbatim, not stripped). Producer and every consumer must use exactly this function."""
+    sub = {k: v for k, v in files.items() if k.startswith("runtime/")}
+    return hashlib.sha256(json.dumps(sub, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def write_manifest(stage: Path, version: str, lock_sha: str, catalog_sha: str, glibc: str | None = None) -> str:
@@ -353,7 +363,7 @@ def write_manifest(stage: Path, version: str, lock_sha: str, catalog_sha: str, g
     (stage / "install-manifest.json").write_text(json.dumps({
         "schema": 1, "app_version": version, "version_id": vid, "platform": PLATFORM,
         "lock_sha256": lock_sha, "catalog_sha256": catalog_sha, "min_glibc": glibc, "total_bytes": total,
-        "files": files}, indent=1, sort_keys=True))
+        "runtime_id": runtime_id(files), "files": files}, indent=1, sort_keys=True))
     return vid
 
 
@@ -409,27 +419,107 @@ def build_stage(out: Path, *, ui_binary=None, build_ui=False, ffmpeg_dir: Path, 
     if smoke:  # real launch validation of the staged tree, from an unrelated CWD
         sys.path.insert(0, str(REPO / "packaging"))
         import lifecycle
-        lifecycle.run_selfcheck(stage)
+        # Build-only budget: the first import of a fresh staged tree is slow (cold Windows runtime). Installer
+        # phases keep lifecycle.PHASE_TIMEOUT (10 s); this finite value applies to the staged build gate only.
+        lifecycle.run_selfcheck(stage, timeout=BUILD_SELFCHECK_TIMEOUT)
     (out / "VERSION_ID").write_text(vid)
     return stage
 
 
+BOOT_DROP_DIRS = {"site-packages", "test", "tests", "tkinter", "idlelib", "turtledemo", "ensurepip", "__pycache__", "include",
+                  "share", "pkgconfig", "Scripts", "Tools", "libs", "tcl", "Doc"}  # the last five: Windows layout
+
+
+def _boot_keep(rel: str) -> bool:
+    """Stdlib + interpreter closure of the staged python: no site-packages (torch/CUDA/modules), tests, Tk, headers or pip."""
+    parts = rel.split("/")
+    if set(parts) & BOOT_DROP_DIRS or (parts[0] == "bin" and len(parts) > 1 and not parts[1].startswith("python")):
+        return False
+    if re.match(r"(_tkinter|tcl\d|tk\d)", parts[-1], re.I):
+        return False
+    return not (parts[0] == "lib" and len(parts) > 1 and re.match(r"(tcl|tk|itcl|Tix)", parts[1])) \
+        and not rel.startswith(PROVENANCE)
+
+
+def add_bootstrap(t: tarfile.TarFile, stage: Path) -> None:
+    py = stage / "runtime/python"
+
+    def flt(info):
+        rel = info.name[len("boot/python"):].lstrip("/")
+        return info if not rel or _boot_keep(rel) else None
+    t.add(py, arcname="boot/python", filter=flt)
+    t.add(REPO / "packaging/installer_payload.py", arcname="boot/installer_payload.py")
+
+
+def make_boot_dir(stage: Path, dest: Path) -> Path:
+    """Windows: the same minimal Python closure as the Linux boot segment, as a plain folder the Inno scripts extract to
+    {tmp}\\kb (outside any runtime that will move): python/ is NOT nested, python.exe sits in the folder root."""
+    shutil.rmtree(dest, ignore_errors=True)
+    src = stage / "runtime/python"
+
+    def ignore(d, names):
+        rel = Path(d).relative_to(src).as_posix()
+        return {n for n in names if not _boot_keep(n if rel == "." else f"{rel}/{n}")}
+    shutil.copytree(src, dest, symlinks=True, ignore=ignore)
+    shutil.copy2(REPO / "packaging/installer_payload.py", dest / "installer_payload.py")
+    return dest
+
+
+def _assemble_run(stub: str, segs: list, run: Path) -> None:
+    """<stub><seg...>: fills the 12-wide @STUB_BYTES@ token (it cannot change the length it records), appends the segment files."""
+    stub = stub.replace("@STUB_BYTES@", str(len(stub.encode())).ljust(12))
+    with open(run, "wb") as f:
+        f.write(stub.encode())
+        for tgz, _, _ in segs:
+            with open(tgz, "rb") as p:
+                shutil.copyfileobj(p, f, 1 << 20)
+            tgz.unlink()
+    run.chmod(0o755)
+    (run.parent / (run.name + ".sha256")).write_text(f"{sha256_file(run)}  {run.name}\n")
+
+
+def compress_segments(out: Path, jobs) -> dict:
+    """Independent segments are compressed concurrently by one bounded pool (one task per segment, never nested). The result is
+    keyed by name, so the archive order is the caller's, never completion order."""
+    def one(job):
+        name, add = job
+        tgz = out / f"{name}.tar.gz"
+        with tarfile.open(tgz, "w:gz", compresslevel=3) as t:
+            add(t)
+        return name, (tgz, tgz.stat().st_size, sha256_file(tgz))
+    with ThreadPoolExecutor(max_workers=min(SHARD_WORKERS, len(jobs))) as pool:
+        return dict(pool.map(one, jobs))
+
+
 def make_linux_run(stage: Path, out: Path) -> Path:
-    print("compressing payload (single-threaded gzip; several minutes for ~8 GB)", flush=True)
-    vid = json.loads((stage / "install-manifest.json").read_text())["version_id"]
-    tgz = out / "payload.tar.gz"
-    with tarfile.open(tgz, "w:gz", compresslevel=3) as t:
-        t.add(stage, arcname="payload")
-    sha = sha256_file(tgz)
-    stub = (REPO / "packaging/linux/installer-stub.sh").read_text().replace("@PAYLOAD_SHA256@", sha) \
-        .replace("@VERSION_ID@", vid)
+    """Layout: <stub><boot.tgz><app.tgz><runtime.tgz>, independent gzip streams. boot = a minimal launchable Python (boot/python,
+    boot/installer_payload.py) that runs the install from OUTSIDE the payload the lifecycle later renames; app = payload/ without
+    runtime/; runtime = payload/runtime/. An update that keeps the runtime reads only boot+app. The stub embeds each segment's
+    byte offset (relative to the first byte after the stub), length, sha256, the runtime_id and its own length."""
+    print("compressing payload (bootstrap, app, runtime segments; single-threaded gzip)", flush=True)
+    m = json.loads((stage / "install-manifest.json").read_text())
+    vid = m["version_id"]
+    segs = {}
+    segs = compress_segments(out, (("boot", lambda t: add_bootstrap(t, stage)),
+                                   ("app", lambda t: t.add(stage, arcname="payload", filter=lambda i: None if i.name.startswith("payload/runtime") else i)),
+                                   ("runtime", lambda t: t.add(stage / "runtime", arcname="payload/runtime"))))
+    boot, app, rt = segs["boot"], segs["app"], segs["runtime"]
+    stub = (REPO / "packaging/linux/installer-stub.sh").read_text()
+    for k, v in {"@VERSION_ID@": vid, "@BOOT_OFFSET@": 0, "@BOOT_LEN@": boot[1], "@BOOT_SHA256@": boot[2],
+                 "@APP_OFFSET@": boot[1], "@APP_LEN@": app[1], "@APP_SHA256@": app[2],
+                 "@RUNTIME_OFFSET@": boot[1] + app[1], "@RUNTIME_LEN@": rt[1], "@RUNTIME_SHA256@": rt[2],
+                 "@RUNTIME_ID@": m["runtime_id"]}.items():
+        stub = stub.replace(k, str(v))
+    # The token is 12 chars; the value is padded to 12, so filling it in cannot change the stub length it records.
+    stub = stub.replace("@STUB_BYTES@", str(len(stub.encode())).ljust(12))
     run = out / f"Keyloom-{vid}-linux-x86_64.run"
     with open(run, "wb") as f:
         f.write(stub.encode())
-        with open(tgz, "rb") as p:
-            shutil.copyfileobj(p, f, 1 << 20)
+        for tgz, _, _ in (boot, app, rt):
+            with open(tgz, "rb") as p:
+                shutil.copyfileobj(p, f, 1 << 20)
+            tgz.unlink()
     run.chmod(0o755)
-    tgz.unlink()
     (out / (run.name + ".sha256")).write_text(f"{sha256_file(run)}  {run.name}\n")
     return run
 
@@ -469,13 +559,107 @@ def find_iscc(explicit: str | None) -> str:
                      "(https://jrsoftware.org/isinfo.php) or pass --iscc PATH. No Windows installer was built.")
 
 
-def render_iss(stage: Path, out: Path) -> Path:
+SHARD_WORKERS = 8   # bounded compression pool (8..16); one task per shard, never per file
+SHARD_CAP = PART_BYTES - (64 << 20)   # uncompressed bytes per shard: leaves headroom so the .tgz stays <= PART_BYTES
+
+
+def runtime_companion_names(vid: str) -> tuple[str, str]:
+    stem = f"Keyloom-{vid}-windows-x86_64-runtime"
+    return stem + ".json", stem + ".sha256"
+
+
+def shard_name(vid: str, i: int) -> str:
+    return f"Keyloom-{vid}-windows-x86_64-runtime-{i:03d}.tgz"
+
+
+def plan_runtime_shards(files: dict, workers: int = SHARD_WORKERS, cap: int = SHARD_CAP) -> list:
+    """Deterministic partition of the manifest's runtime/ files into DISJOINT shards (sorted paths, greedy fill). The target size
+    is total/workers (at most `cap`) so the shards can be extracted in parallel; an independently compressed shard is the only
+    thing that can be decompressed alone - pieces of one gzip stream cannot."""
+    rt = sorted((k, v) for k, v in files.items() if k.startswith("runtime/"))
+    if not rt:
+        raise SystemExit("the manifest lists no runtime/ files")
+    if any("symlink" in v for _, v in rt):
+        raise SystemExit("the runtime contains symlinks, which the Windows runtime companion does not carry")
+    total = sum(v["size"] for _, v in rt)
+    target = min(cap, max(64 << 20, -(-total // max(workers, 1))))
+    shards, cur, size = [], [], 0
+    for k, v in rt:
+        if v["size"] > cap:
+            raise SystemExit(f"{k} is {v['size']} bytes: larger than one {cap}-byte shard can hold")
+        if cur and size + v["size"] > target:
+            shards.append(cur)
+            cur, size = [], 0
+        cur.append(k)
+        size += v["size"]
+    if cur:
+        shards.append(cur)
+    return shards
+
+
+def make_runtime_companion(stage: Path, out: Path, part_bytes: int = PART_BYTES) -> Path:
+    """Windows offline: the multi-GB runtime is NOT part of the Inno compressed set. The SAME stage/runtime (same runtime_id as
+    the manifest) is written as independently compressed tar.gz SHARDS over disjoint manifest-listed files
+    (`Keyloom-<id>-windows-x86_64-runtime-NNN.tgz`, each <= part_bytes = GitHub's per-asset limit), compressed in parallel by a
+    bounded pool; `<stem>.json` (schema 2: runtime_id, ordered shards with size, sha256 and the exact files each owns) and
+    `<stem>.sha256` (meta + shards). Because every shard is a complete gzip stream they can also be extracted in parallel.
+    The meta file's own sha256 and the runtime_id are built into the setup program, so a modified companion cannot change what
+    is accepted. Returns the metadata path."""
     m = json.loads((stage / "install-manifest.json").read_text())
-    text = (REPO / "packaging/windows/corridorkey.iss.in").read_text()
+    vid = m["version_id"]
+    meta_name, sums_name = runtime_companion_names(vid)
+    if not (stage / "runtime").is_dir() or not m.get("runtime_id"):
+        raise SystemExit("stage has no runtime/ or the manifest has no runtime_id: cannot build the runtime companion")
+    if m["runtime_id"] != runtime_id(m["files"]):
+        raise SystemExit("manifest runtime_id does not match its runtime/ entries")
+    plan = plan_runtime_shards(m["files"], SHARD_WORKERS, min(SHARD_CAP, part_bytes))
+    sizes = [sum(m["files"][r]["size"] for r in rels) for rels in plan]
+    workers = min(max(SHARD_WORKERS, 8), 16, len(plan))
+    prog = [0] * len(plan)   # uncompressed bytes added per shard (each slot is written by its own worker only)
+    stop, t0 = threading.Event(), time.monotonic()
+
+    def tick():
+        while not stop.wait(1):
+            el, done = time.monotonic() - t0, sum(prog)
+            print(f"[runtime-companion] {done >> 20}/{sum(sizes) >> 20} MiB compressed-in by {workers} worker(s), "
+                  f"{done / 1048576 / max(el, 1e-9):.1f} MiB/s, elapsed {el:.0f}s; per shard MiB "
+                  + " ".join(f"{i + 1:03d}:{prog[i] >> 20}/{sizes[i] >> 20}" for i in range(len(plan))), flush=True)
+
+    def pack(i):
+        path = out / shard_name(vid, i + 1)
+        with tarfile.open(path, "w:gz", compresslevel=3) as t:
+            for rel in plan[i]:   # sorted manifest order: deterministic member order
+                t.add(stage / rel, arcname=rel, recursive=False)
+                prog[i] += m["files"][rel]["size"]
+        if path.stat().st_size > part_bytes:
+            raise SystemExit(f"{path.name} is {path.stat().st_size} bytes, over the {part_bytes}-byte asset limit")
+        return {"name": path.name, "size": path.stat().st_size, "sha256": sha256_file(path), "bytes": sizes[i], "files": plan[i]}
+    print(f"compressing runtime companion: {len(plan)} independent shard(s), {workers} worker(s)", flush=True)
+    threading.Thread(target=tick, daemon=True).start()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            shards = list(pool.map(pack, range(len(plan))))   # results come back in shard order whatever finishes first
+    finally:
+        stop.set()
+    owned = [r for s in shards for r in s["files"]]
+    if len(owned) != len(set(owned)) or set(owned) != {k for k in m["files"] if k.startswith("runtime/")}:
+        raise SystemExit("runtime shards do not cover the manifest's runtime files exactly once")
+    meta = out / meta_name
+    meta.write_text(json.dumps({"schema": 2, "version_id": vid, "runtime_id": m["runtime_id"], "shards": shards}, indent=1))
+    (out / sums_name).write_text(f"{sha256_file(meta)}  {meta.name}\n" + "".join(f"{s['sha256']}  {s['name']}\n" for s in shards))
+    return meta
+
+
+def render_iss(stage: Path, out: Path, meta: Path) -> Path:
+    m = json.loads((stage / "install-manifest.json").read_text())
+    text = (REPO / "packaging/windows/keyloom.iss.in").read_text()
+    boot = make_boot_dir(stage, out / "bw")
     for k, v in {"@VERSION_ID@": m["version_id"], "@APP_VERSION@": m["app_version"],
-                 "@STAGE@": str(stage), "@OUT@": str(out)}.items():
+                 "@STAGE@": str(stage), "@OUT@": str(out), "@BOOT@": str(boot),
+                 "@RUNTIME_ID@": m["runtime_id"], "@RUNTIME_META@": meta.name,
+                 "@RUNTIME_META_SHA256@": sha256_file(meta)}.items():
         text = text.replace(k, v)
-    iss = out / "corridorkey.iss"
+    iss = out / "keyloom.iss"
     iss.write_text(text, encoding="utf-8-sig")
     return iss
 
@@ -485,8 +669,10 @@ def make_windows_exe(stage: Path, out: Path, iscc: str | None) -> Path:
         raise SystemExit("The Windows runtime/installer must be built on Windows (the bundle contains "
                          "Windows wheels and an Inno Setup compile). Nothing was built.")
     exe = find_iscc(iscc)
-    iss = render_iss(stage, out)
+    meta = make_runtime_companion(stage, out)  # before ISCC: the setup program embeds the metadata's sha256 and the runtime_id
+    iss = render_iss(stage, out, meta)
     subprocess.run([exe, "/Q", str(iss)], check=True)
+    shutil.rmtree(out / "bw", ignore_errors=True)
     built = sorted(out.glob("Keyloom-*-setup.exe"))
     if not built:
         raise SystemExit("ISCC finished but produced no setup exe")
@@ -571,7 +757,19 @@ def find_wheel(name: str, version: str, tags: set, hashes: set) -> tuple[str, st
     raise SystemExit(f"no public wheel for {name}=={version} {sorted(tags)} matches a hash in {PLATFORM}.txt on {INDEXES}")
 
 
+_FETCH_GUARD = threading.Lock()
+_FETCH_LOCKS: dict = {}
+
+
 def fetch_wheel(url: str, sha: str, cache: Path) -> Path:
+    """One writer per cache file: concurrent callers for the same sha256 queue on that sha's lock (the second finds the verified file)."""
+    with _FETCH_GUARD:
+        lock = _FETCH_LOCKS.setdefault(sha, threading.Lock())
+    with lock:
+        return _fetch_wheel(url, sha, cache)
+
+
+def _fetch_wheel(url: str, sha: str, cache: Path) -> Path:
     cache.mkdir(parents=True, exist_ok=True)
     dest = cache / f"{sha}.whl"
     if dest.is_file() and sha256_file(dest) == sha:
@@ -613,7 +811,7 @@ def wheel_sources(stage: Path, cache: Path) -> tuple[dict, set]:
     site = _site_packages(stage)
     site_rel = site.relative_to(stage).as_posix()
     pins = lock_pins()
-    wheels, mapped, problems = [], set(), []
+    jobs = []   # stage 1 (serial, local reads only): which distributions need a public wheel, in sorted dist-info order
     for di in sorted(site.glob("*.dist-info")):
         meta = email.parser.Parser().parsestr((di / "METADATA").read_text(encoding="utf-8", errors="replace"), headersonly=True)
         name, version = _norm(meta["Name"] or ""), meta["Version"] or ""
@@ -636,8 +834,16 @@ def wheel_sources(stage: Path, cache: Path) -> tuple[dict, set]:
         pin = pins.get(name)
         if not pin or pin[0].lower() != version.lower():
             raise SystemExit(f"{name} {version} is not pinned with that version in {PLATFORM}.txt")
-        url, sha = find_wheel(name, version, tags, pin[1])
+        jobs.append((name, version, tags, pin[1], big))
+
+    def run(job):
+        """Stage 2, one independent task per distribution on ONE bounded pool: index lookup (pinned-hash check inside find_wheel),
+        download to its own sha-named cache file (one writer per file, see fetch_wheel) and byte-for-byte hash of the mapped files.
+        Returns (wheel record, problems); shared state is only read."""
+        name, version, tags, hashes, big = job
+        url, sha = find_wheel(name, version, tags, hashes)
         whl = fetch_wheel(url, sha, cache)
+        problems, entries = [], {}
         with zipfile.ZipFile(whl) as z:
             zmap = {}
             for info in z.infolist():
@@ -651,37 +857,79 @@ def wheel_sources(stage: Path, cache: Path) -> tuple[dict, set]:
                     n_site = n
                 if not info.is_dir() and ".." not in n_site.split("/"):
                     zmap[posixpath.join(site_rel, n_site)] = info
-            entries = {}
             for rel in big:
                 info, want = zmap.get(rel), files.get(rel)
-                if rel in mapped:
-                    problems.append(f"{rel}: claimed by two wheels")
-                elif info is None:
+                if info is None:
                     problems.append(f"{rel}: not in {whl.name}")
                 elif not want or "sha256" not in want:
                     problems.append(f"{rel}: not a regular file in the install manifest")
                 else:
                     h, size = hashlib.sha256(), 0
                     with z.open(info) as src:
-                        for c in iter(lambda: src.read(1 << 20), b""):
+                        for c in iter(lambda: src.read(1 << 20), b""):  # 1 MiB at a time: bounded memory per worker
                             h.update(c)
                             size += len(c)
                     if (h.hexdigest(), size) != (want["sha256"], want["size"]):
                         problems.append(f"{rel}: bytes differ from {whl.name}:{info.filename}")
                     else:
                         entries[rel] = info.filename
-        mapped.update(entries)
-        wheels.append({"url": url, "sha256": sha, "size": whl.stat().st_size, "files": entries})
+        return {"url": url, "sha256": sha, "size": whl.stat().st_size, "files": entries}, problems
+    with ThreadPoolExecutor(max_workers=min(SHARD_WORKERS, max(len(jobs), 1))) as pool:
+        results = list(pool.map(run, jobs))   # job (sorted dist-info) order, whatever finished first
+    wheels, mapped, problems = [], set(), []
+    for rec, probs in results:   # stage 3 (serial): file ownership is decided in this fixed order, never by completion order
+        problems += probs
+        for rel in rec["files"]:
+            if rel in mapped:
+                problems.append(f"{rel}: claimed by two wheels")
+        mapped.update(rec["files"])
+        wheels.append(rec)
     if problems:
         raise SystemExit("heavy files not reproducible from public wheels:\n  " + "\n  ".join(problems))
     return {"schema": 1, "version_id": manifest["version_id"], "wheels": wheels}, mapped
 
 
 def make_slim(stage: Path, dest: Path, mapped: set) -> Path:
-    """Copy (hardlink where possible) the stage keeping symlinks, omitting ONLY the mapped regular files."""
-    def ignore(d, names):
-        return {n for n in names if (Path(d) / n).relative_to(stage).as_posix() in mapped}
-    shutil.copytree(stage, dest, symlinks=True, ignore=ignore, copy_function=_link_or_copy)
+    """Copy (hardlink where possible) the stage keeping symlinks, omitting ONLY the mapped regular files.
+    Ordered by dependency, not serialised: (1) directories are created serially, parents first; (2) the independent file/symlink
+    writes, each to its own distinct destination, run in chunks on ONE bounded pool (SHARD_WORKERS threads, one task per chunk of
+    >=256 entries, so in-flight work is a few hundred small tuples, never one task per file); (3) directory metadata is restored
+    serially afterwards, deepest first (a read-only directory must not block the file writes)."""
+    dirs, ops = [], []
+    for root, dnames, fnames in os.walk(stage):
+        dnames.sort()
+        r = Path(root)
+        dest_dir = dest / r.relative_to(stage)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dirs.append((r, dest_dir))
+        for n in dnames:
+            if (r / n).is_symlink():
+                ops.append((r / n, dest_dir / n))
+        for n in sorted(fnames):
+            if (r / n).relative_to(stage).as_posix() not in mapped:
+                ops.append((r / n, dest_dir / n))
+    cancel = threading.Event()
+
+    def one(src: Path, dst: Path) -> None:
+        if cancel.is_set():
+            return
+        if src.is_symlink():
+            os.symlink(os.readlink(src), dst)
+        else:
+            _link_or_copy(src, dst)
+
+    def chunk(part):
+        try:
+            for src, dst in part:
+                one(src, dst)
+        except BaseException:
+            cancel.set()  # a failing worker stops the others at their next entry
+            raise
+    step = max(256, -(-len(ops) // (SHARD_WORKERS * 8)))
+    with ThreadPoolExecutor(max_workers=SHARD_WORKERS) as pool:
+        list(pool.map(chunk, [ops[i:i + step] for i in range(0, len(ops), step)]))
+    for r, d in reversed(dirs):
+        shutil.copystat(r, d, follow_symlinks=False)
     files = json.loads((stage / "install-manifest.json").read_text())["files"]
     gone = [r for r in files if r not in mapped and not os.path.lexists(dest / r)]
     if gone or any(os.path.lexists(dest / r) for r in mapped):
@@ -707,21 +955,21 @@ def make_wrapper(stage: Path, out: Path, cache: Path, smoke: bool) -> Path:
 def make_online_run(stage: Path, out: Path, cache: Path, smoke: bool) -> Path:
     vid = json.loads((stage / "install-manifest.json").read_text())["version_id"]
     wrap = make_wrapper(stage, out, cache, smoke)
-    print("compressing online payload", flush=True)
-    tgz = out / "online-payload.tar.gz"
-    with tarfile.open(tgz, "w:gz", compresslevel=3) as t:
-        t.add(wrap, arcname="keyloom-online")
+    print("compressing online payload (bootstrap + online segments)", flush=True)
+    segs = []
+    for name, add in (("boot", lambda t: add_bootstrap(t, stage)), ("online", lambda t: t.add(wrap, arcname="keyloom-online"))):
+        tgz = out / f"{name}.tar.gz"
+        with tarfile.open(tgz, "w:gz", compresslevel=3) as t:
+            add(t)
+        segs.append((tgz, tgz.stat().st_size, sha256_file(tgz)))
     shutil.rmtree(wrap.parent)
-    sha = sha256_file(tgz)
-    stub = (REPO / "packaging/linux/online-stub.sh").read_text().replace("@PAYLOAD_SHA256@", sha).replace("@VERSION_ID@", vid)
+    (_, bl, bs), (_, ol, os_) = segs
+    stub = (REPO / "packaging/linux/online-stub.sh").read_text()
+    for k, v in {"@VERSION_ID@": vid, "@BOOT_OFFSET@": 0, "@BOOT_LEN@": bl, "@BOOT_SHA256@": bs,
+                 "@ONLINE_OFFSET@": bl, "@ONLINE_LEN@": ol, "@ONLINE_SHA256@": os_}.items():
+        stub = stub.replace(k, str(v))
     run = out / f"Keyloom-online-{vid}-linux-x86_64.run"
-    with open(run, "wb") as f:
-        f.write(stub.encode())
-        with open(tgz, "rb") as p:
-            shutil.copyfileobj(p, f, 1 << 20)
-    run.chmod(0o755)
-    tgz.unlink()
-    (out / (run.name + ".sha256")).write_text(f"{sha256_file(run)}  {run.name}\n")
+    _assemble_run(stub, segs, run)
     return run
 
 
@@ -733,11 +981,14 @@ def make_online_exe(stage: Path, out: Path, cache: Path, smoke: bool, iscc: str 
     m = json.loads((stage / "install-manifest.json").read_text())
     wrap = make_wrapper(stage, out, cache, smoke)
     text = (REPO / "packaging/windows/keyloom-online.iss.in").read_text()
-    for k, v in {"@VERSION_ID@": m["version_id"], "@APP_VERSION@": m["app_version"], "@WRAP@": str(wrap), "@OUT@": str(out)}.items():
+    boot = make_boot_dir(stage, out / "bw")
+    for k, v in {"@VERSION_ID@": m["version_id"], "@APP_VERSION@": m["app_version"], "@WRAP@": str(wrap), "@OUT@": str(out),
+                 "@BOOT@": str(boot)}.items():
         text = text.replace(k, v)
     iss = out / "keyloom-online.iss"
     iss.write_text(text, encoding="utf-8-sig")
     subprocess.run([exe, "/Q", str(iss)], check=True)
+    shutil.rmtree(boot, ignore_errors=True)
     stem = f"Keyloom-online-{m['version_id']}-windows-x86_64"  # no "-setup": make_windows_exe globs Keyloom-*-setup.exe
     built = out / (stem + ".exe")
     if not built.is_file():

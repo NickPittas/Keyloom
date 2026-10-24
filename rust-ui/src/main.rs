@@ -5,8 +5,22 @@ use ck::ui::{App, AppOptions, Tab};
 use eframe::egui;
 
 fn usage() -> ! {
-    eprintln!("usage: corridorkey-ui [--version | --self-check] [PROJECT_DIR] [--global-output-dir D] [--cache-mb N] [--window WxH]\n       [--open-clip NAME] [--tab media|hint|key|review|deliver] [--view input|hint|fg|matte|comp|processed]\n       [--ab VIEW] [--frame N] [--play] [--data-dir D (new projects go in D/Projects)] [--import FILE]... [--import-folder DIR]... [--auto-confirm]  (the last three: QA) [--keys i,o,Shift+Right,click:605x66,rclick:605x66 (synthetic egui events, QA)] [--screenshot FILE.png [--screenshot-after SECS]] [--metrics-fixture FILE.jsonl]  (dev/evidence options)");
+    eprintln!("usage: keyloom-ui [--version | --self-check] [PROJECT_DIR] [--global-output-dir D] [--cache-mb N] [--window WxH]\n       [--open-clip NAME] [--tab media|hint|key|review|deliver] [--view input|hint|fg|matte|comp|processed]\n       [--ab VIEW] [--frame N] [--play] [--data-dir D (new projects go in D/Projects)] [--import FILE]... [--import-folder DIR]... [--auto-confirm]  (the last three: QA) [--keys i,o,Shift+Right,click:605x66,rclick:605x66 (synthetic egui events, QA)] [--screenshot FILE.png [--screenshot-after SECS]] [--metrics-fixture FILE.jsonl]  (dev/evidence options)");
     std::process::exit(2)
+}
+
+/// The approved Keyloom icon (256 px conversion of the selected master, `ui/theme/keyloom-256.png`).
+fn window_icon() -> egui::IconData {
+    let bytes = include_bytes!("../../ui/theme/keyloom-256.png");
+    let mut r = png::Decoder::new(std::io::Cursor::new(&bytes[..])).read_info().expect("embedded icon is a PNG");
+    let mut buf = vec![0; r.output_buffer_size().expect("icon size")];
+    let info = r.next_frame(&mut buf).expect("embedded icon decodes");
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
+        png::ColorType::Rgb => buf[..info.buffer_size()].chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        other => panic!("unexpected icon colour type {other:?}"),
+    };
+    egui::IconData { rgba, width: info.width, height: info.height }
 }
 
 fn view(s: &str) -> View {
@@ -21,7 +35,7 @@ fn view(s: &str) -> View {
 fn headless(a: &[String]) -> Option<i32> {
     let version = env!("CARGO_PKG_VERSION");
     if a.iter().any(|x| x == "--version" || x == "-V") {
-        println!("corridorkey-ui {version}");
+        println!("keyloom-ui {version}");
         return Some(0);
     }
     if !a.iter().any(|x| x == "--self-check") {
@@ -41,7 +55,7 @@ fn headless(a: &[String]) -> Option<i32> {
     println!(
         "{}",
         serde_json::json!({
-            "app": "corridorkey-ui", "version": version, "ok": ok,
+            "app": "keyloom-ui", "version": version, "ok": ok,
             "installed": l.install.is_some(),
             "repo": l.repo, "python": python, "worker_module": helper_ok, "python_found": py_ok,
             "problem": l.problem,
@@ -132,12 +146,14 @@ fn main() -> eframe::Result {
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Keyloom — powered by CorridorKey")
+            .with_app_id("keyloom-ui")
+            .with_icon(window_icon())
             .with_inner_size([size.0, size.1])
             .with_min_inner_size([700.0, 660.0]),
         ..Default::default()
     };
     let result = eframe::run_native(
-        "corridorkey-ui",
+        "keyloom-ui",
         native,
         Box::new(move |cc| {
             #[cfg(windows)]

@@ -543,7 +543,7 @@ fn trunc(s: &str) -> String {
     }
 }
 
-pub const NO_REPO: &str = "No worker is configured: no CorridorKey installation or checkout was found next to the program or in the working folder, and none is set. Add a local target in Settings > AI worker targets, or install/repair the packaged runtime.";
+pub const NO_REPO: &str = "No worker is configured: no Keyloom installation or checkout was found next to the program or in the working folder, and none is set. Add a local target in Settings > AI worker targets, or install/repair the packaged runtime.";
 
 /// Saved targets, or one local GPU-0 worker on `repo` (explicit option) or the resolved runtime —
 /// `CK_REPO`, then the install descriptor, then developer checkout discovery (`crate::runtime::launch`).
@@ -599,7 +599,7 @@ fn setup_problems(
                 .clone()
                 .unwrap_or_else(|| crate::import::python(repo));
             let why = if !repo.join("backend/worker/__main__.py").is_file() {
-                Some(format!("{}: {} is not a CorridorKey checkout (no backend/worker). Fix the repo folder in Settings > AI worker targets.", t.id, repo.display()))
+                Some(format!("{}: {} is not a Keyloom checkout (no backend/worker). Fix the repo folder in Settings > AI worker targets.", t.id, repo.display()))
             } else if !py.is_file() {
                 Some(if python.is_some() {
                     format!("{}: the configured Python does not exist at {}. Fix Python in Settings > AI worker targets, or repair the installation.", t.id, py.display())

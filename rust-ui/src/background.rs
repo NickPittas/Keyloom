@@ -6,13 +6,17 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
-const OWNER: &str = "corridorkey-ui"; // show-request payload only
+const OWNER: &str = "keyloom-ui"; // show-request payload only
 #[cfg(not(windows))]
-const ENTRY: &str = "corridorkey.desktop";
+const ENTRY: &str = "keyloom.desktop";
+#[cfg(not(windows))]
+const OLD_ENTRY: &str = "corridorkey.desktop"; // pre-rename login entry, migrated when this installation owns it
 #[cfg(windows)]
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
-const RUN_VALUE: &str = "CorridorKey";
+const RUN_VALUE: &str = "Keyloom";
+#[cfg(windows)]
+const OLD_RUN_VALUE: &str = "CorridorKey"; // pre-rename value, migrated when it points into this installation
 
 pub enum Instance {
     /// This process owns the lock for as long as the value lives.
@@ -85,16 +89,16 @@ pub fn watch_windows(cc: &eframe::CreationContext<'_>, dir: PathBuf, start_hidde
     }).map(|_| ()).map_err(|e| format!("background window watcher: {e}"))
 }
 
-/// The installed stable shim `PREFIX/bin/corridorkey[.cmd]` and its PREFIX: `CK_LAUNCHER` when the installer
+/// The installed stable shim `PREFIX/bin/keyloom[.cmd]` and its PREFIX: `CK_LAUNCHER` when the installer
 /// exports it, else found above this exe. A source/dev run has none, and then no login entry is managed.
 fn launcher() -> Result<(PathBuf, PathBuf), String> {
-    let name = if cfg!(windows) { "corridorkey.cmd" } else { "corridorkey" };
+    let name = if cfg!(windows) { "keyloom.cmd" } else { "keyloom" };
     let shim = match std::env::var_os("CK_LAUNCHER").filter(|v| !v.is_empty()) {
         Some(p) => Some(PathBuf::from(p)),
         None => std::env::current_exe().ok().and_then(|e| e.ancestors().skip(1).map(|d| d.join("bin").join(name)).find(|c| c.is_file())),
     };
     let prefix = shim.as_ref().and_then(|s| s.parent()?.parent().map(Path::to_path_buf));
-    shim.zip(prefix).ok_or_else(|| "this copy was not installed by the CorridorKey installer, so there is no stable launcher to start at sign-in".into())
+    shim.zip(prefix).ok_or_else(|| "this copy was not installed by the Keyloom installer, so there is no stable launcher to start at sign-in".into())
 }
 
 /// Make the per-user login entry match `enabled`. Only the entry this app owns is created, rewritten or removed.
@@ -116,13 +120,22 @@ mod platform {
         let (shim, prefix) = launcher()?;
         // Installer's owner id: first 16 hex of sha256 of the prefix path.
         let owner = &crate::sha256::hex(prefix.to_string_lossy().as_bytes())[..16];
-        let marker = format!("X-CorridorKey-Owner={owner}");
-        let ours = std::fs::read_to_string(&path).is_ok_and(|t| t.lines().any(|l| l == marker));
+        let marker = format!("X-Keyloom-Owner={owner}");
+        let old_marker = format!("X-CorridorKey-Owner={owner}");
+        let owned = |p: &Path| std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l == marker || l == old_marker));
+        let ours = owned(&path);
+        let old_path = path.with_file_name(OLD_ENTRY);
+        let old_ours = owned(&old_path);
         if !enabled {
-            return if ours { std::fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.display())) } else { Ok(()) };
+            for (p, mine) in [(&path, ours), (&old_path, old_ours)] {
+                if mine {
+                    std::fs::remove_file(p).map_err(|e| format!("cannot remove {}: {e}", p.display()))?;
+                }
+            }
+            return Ok(());
         }
         if path.exists() && !ours {
-            return Err(format!("{} exists and is not managed by CorridorKey; not overwriting it", path.display()));
+            return Err(format!("{} exists and is not managed by Keyloom; not overwriting it", path.display()));
         }
         let exe = shim.to_str().ok_or("launcher path is not valid UTF-8")?;
         // Exec quoting (escape " \ $ `, then % as %%), then the key-file layer doubles every backslash.
@@ -131,7 +144,10 @@ mod platform {
             '%' => vec!['%', '%'],
             _ => vec![c],
         }).collect::<String>().replace('\\', "\\\\");
-        let text = format!("[Desktop Entry]\nType=Application\nName=CorridorKey\nComment=Keeps the CorridorKey network client available\nExec=\"{quoted}\" --background\nTerminal=false\n{marker}\n");
+        let text = format!("[Desktop Entry]\nType=Application\nName=Keyloom\nComment=Keeps the Keyloom network client available\nExec=\"{quoted}\" --background\nTerminal=false\n{marker}\n");
+        if old_ours {
+            let _ = std::fs::remove_file(&old_path); // replaced by the Keyloom entry, never left as a second client
+        }
         if std::fs::read_to_string(&path).is_ok_and(|t| t == text) {
             return Ok(());
         }
@@ -150,26 +166,39 @@ mod platform {
     }
     pub fn sync(enabled: bool) -> Result<(), String> {
         let (_, prefix) = launcher()?;
-        let q = reg(&["query", RUN_KEY, "/v", RUN_VALUE])?;
-        let old = String::from_utf8_lossy(&q.stdout).to_lowercase();
-        let owned = ["bin", "versions"].iter().any(|d| old.contains(
-            &format!("\"{}\\", prefix.join(d).display()).to_lowercase()
-        ));
+        let owned_value = |name: &str| -> Result<(bool, bool), String> {
+            let q = reg(&["query", RUN_KEY, "/v", name])?;
+            let old = String::from_utf8_lossy(&q.stdout).to_lowercase();
+            let owned = ["bin", "versions"].iter().any(|d| old.contains(
+                &format!("\"{}\\", prefix.join(d).display()).to_lowercase()
+            ));
+            Ok((q.status.success(), owned))
+        };
+        let delete = |name: &str| -> Result<(), String> {
+            let o = reg(&["delete", RUN_KEY, "/v", name, "/f"])?;
+            if o.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_owned()) }
+        };
+        let (exists, owned) = owned_value(RUN_VALUE)?;
+        let (old_exists, old_owned) = owned_value(OLD_RUN_VALUE)?;
         if !enabled {
-            // Remove only a value that points into this installation.
-            if !q.status.success() || !owned {
-                return Ok(());
-            }
-            let o = reg(&["delete", RUN_KEY, "/v", RUN_VALUE, "/f"])?;
-            return if o.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_owned()) };
+            // Remove only values that point into this installation.
+            if exists && owned { delete(RUN_VALUE)?; }
+            if old_exists && old_owned { delete(OLD_RUN_VALUE)?; }
+            return Ok(());
         }
-        if q.status.success() && !owned {
-            return Err("The CorridorKey sign-in entry belongs to another installation; it was left unchanged".into());
+        if exists && !owned {
+            return Err("The Keyloom sign-in entry belongs to another installation; it was left unchanged".into());
         }
         // A GUI exe avoids a console at login. The installer rewrites this on activation/rollback.
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let data = format!("\"{}\" --background", exe.display());
         let o = reg(&["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &data, "/f"])?;
-        if o.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_owned()) }
+        if !o.status.success() {
+            return Err(String::from_utf8_lossy(&o.stderr).trim().to_owned());
+        }
+        if old_exists && old_owned {
+            delete(OLD_RUN_VALUE)?; // moved to the Keyloom value, not duplicated
+        }
+        Ok(())
     }
 }

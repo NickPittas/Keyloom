@@ -1,4 +1,4 @@
-//! CorridorKey native app core and UI-independent project utilities (see `ui`).
+//! Keyloom native app core and UI-independent project utilities (see `ui`).
 pub mod background;
 pub mod contracts;
 pub mod decode;

@@ -134,7 +134,7 @@ impl Runtime {
                 .clone()
                 .map(|p| format!("Installed runtime is unusable: {p}"))
                 .unwrap_or_else(|| {
-                    "No CorridorKey runtime was found; install the app or select a checkout.".into()
+                    "No Keyloom runtime was found; install the app or select a checkout.".into()
                 })
         })?;
         let python = std::env::var_os("CK_PYTHON")

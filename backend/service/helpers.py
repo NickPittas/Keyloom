@@ -84,7 +84,7 @@ def export_masks_headless(clip) -> str | None:
     Returns:
         Path to VideoMamaMaskHint directory, or None if no annotations found.
     """
-    from ui.widgets.annotation_overlay import AnnotationModel
+    from ..annotations import AnnotationModel
     from ..frame_io import read_image_frame
 
     model = AnnotationModel()

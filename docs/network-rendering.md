@@ -2,44 +2,35 @@
 
 Keyloom — powered by CorridorKey can send work to other Windows and Linux PCs on your LAN or Tailscale network. Network setup is in **Clients**; no terminal commands are needed.
 
-Every installation can submit work, receive work, and host a network. One PC hosts each network's shared machine list and queue. All PCs that join that network see all its members. The host can render too. Creating a separate host creates a separate network; it does not merge two queues.
+Every installation hosts its own network service, can submit work, and can receive work. There is nothing to type: no host address, port or "Add network" form.
 
-Hosting is independent of the networks a PC joins. A PC can host its own network **and** stay connected to other hosts' networks at the same time: **Add network** adds a connection and never replaces or disconnects the ones you already have. Each saved network keeps its own credentials, session and controls (connect, receive work), and joining the same network again reuses the saved identity instead of registering the PC twice.
+**This PC** (top of **Clients**) shows the PC name, the addresses the service answers on (every LAN, Tailscale and ZeroTier interface at once), whether it is running, and four buttons: **Start**, **Stop**, **Remove** (click twice) and **Refresh**. **Save** next to the name is the only thing that changes the global PC name; it is sent to every connected PC.
 
-**This computer's name** is a single setting. Press **Save** and the new name is sent to every connected host; disconnected hosts receive it when they reconnect. Older hosts must update Keyloom to accept name changes. Existing names are kept until you explicitly save a name.
+**Other PCs** lists the Keyloom PCs found on the network. Keyloom scans once when Clients is first opened and again only when you press **ReScan** (there is an elapsed timer and **Cancel**; a scan is cut off after 35 s). Each row shows the name, all of the PC's addresses, the network type (LAN, Tailscale, ZeroTier), reachability, and status. Tick the checkbox to use that PC; untick it to stop using it (saved files, attempts and jobs are kept). A PC saved earlier but not found in the last scan stays in the list as *not found*. Rows are told apart by certificate fingerprint (hover for the full value), never by name, so two PCs may have the same name.
 
-## 1. Choose the host
+## 1. Hosting happens automatically
 
-Use a PC that will normally stay on. Normal setup needs no terminal. In **Clients → Network setup → Host on THIS PC**:
+The first time Keyloom starts it installs this PC's per-user service (a `systemd --user` unit on Linux, a per-user logon task on Windows, with an HKCU Run entry as fallback) and joins this PC to its own network with **Accept work when GPU idle** on. The service starts at sign-in, needs no administrator rights, and runs separately from the Keyloom window. It only coordinates the machine list and queue; it does not render. Rendering is done by that PC's Keyloom client, which must be open or running in [background mode](user-guide.md#background-running). The **Receiver** line therefore reports the service coordinator only: *offline* means the app is not receiving, even if the service is up.
 
-1. Enter an **Address** that **every PC can actually reach**, and a **Port** (normally `8443`). Use the LAN IPv4 address if all PCs can route to it; if they cannot (different subnets, VPN, remote sites), use the host's Tailscale IP instead. The host's certificate is created for this address and PCs that join pin it, so Keyloom never regenerates it: if you later need another address, only addresses the certificate already covers work (see Troubleshooting).
-2. Tick **Trusted network: allow joining by address** if joining by IP and port is acceptable on your trusted LAN/Tailscale network. Leave it off to require an invitation file.
-3. Press **Install and start**.
-4. On the host PC, press **Also join this PC’s own network from this PC**, then tick **Accept work when GPU idle** if the host should render too. This only adds the connection; joining another PC's network is done separately under **Add network**.
+- **Stop** stops the service and Keyloom does not restart it during that run. It returns with **Start** or the next OS sign-in.
+- **Remove** removes the service and remembers that you did; Keyloom does not install it again until you press **Start**. Its database keeps the network identity, so starting again changes nothing for other PCs.
+- Every request has a 45 s limit. If it passes, the state shows as *unknown*; press **Refresh** before trying again.
 
-**Host service and client are different processes.** Installing the service creates a per-user service: a `systemd --user` unit on Linux, or a per-user logon task on Windows (with an HKCU Run entry as fallback if Windows refuses the task without elevation). It starts when you sign in, needs no administrator rights, and runs separately from the Keyloom window, so quitting the GUI does not stop it. Use **Stop** to stop it or **Remove** (click twice) to remove its sign-in entry; its local database keeps the network's identity and members. The service only coordinates the machine list and queue; it does not render. Rendering is done by that PC's Keyloom client, which must be running. Turn on [background running](user-guide.md#background-running) to keep the client alive when its window is closed.
-
-The first run may bring up an OS firewall prompt: allow it on your trusted/private network only. On Linux Keyloom does not open the firewall for you; if a firewall blocks the port, permit it for your LAN/Tailscale peers yourself.
+The first run may show an OS firewall prompt: allow it on your trusted/private network only. On Linux Keyloom does not open the firewall for you.
 
 ![Clients and network setup](screenshots/native/13-pairing.png)
 
-## 2. Add connections to other hosts
+## 2. Use other PCs
 
-On each PC, open **Clients → Network setup → Add network**. Enter the host's address and port, then press **Join by address**. The host must allow joining by address; otherwise use an invitation as described below. Repeat for each host you want this PC to use. Hosting on this PC does not disconnect these connections.
+Tick a PC in **Other PCs**. If its owner allows joining without an invitation, Keyloom connects to it using the certificate fingerprint the scan showed; a changed certificate is refused. A PC that requires an invitation shows *Needs invitation* (see below). Addresses are refreshed on every scan, so a PC that moves between LAN and Tailscale keeps working without re-joining. Connections created before this version keep working and keep offering every member PC; new ones offer only the PC you ticked.
 
-Each joined network has its own **Connect** and receive-work controls. **Default for Batch** chooses the preferred network for automatic placement; if it is disconnected, automatic placement uses a connected network. Assigning a particular PC keeps that network and PC as the destination. Keyloom accepts work from one network at a time so separate hosts cannot reserve the same GPU concurrently.
-
-**Remove** disconnects a network from this PC's list and preserves its saved identity and history for rejoining. It is unavailable while that connection has unfinished work or an unresolved attempt. Removing a connection does not remove the host service.
-
-The setup screenshot above predates the multiple-connection controls; the written steps describe the updated interface.
+Under **Connection details (advanced)** each saved connection keeps its own **Connect**, **Accept work when GPU idle**, **Default for Batch** and **Remove** controls. **Default for Batch** chooses the preferred network for automatic placement. Assigning a particular PC keeps that network and PC as the destination. Keyloom accepts work from one network at a time so separate hosts cannot reserve the same GPU concurrently. **Remove** is unavailable while that connection has unfinished work or an unresolved attempt.
 
 ## 3. Use an invitation instead (optional)
 
-A connected member opens **Invite other PCs**, picks which of their connected networks the invitation is for, chooses **Save invitation to**, and presses **Create invitation**. Give that **same file** to each PC you want to add; on each PC pick it under **Invitation file (optional)** and press **Join with invitation**.
+Tick **Use invitation** under **This PC**. Other PCs can then join only with an invitation file: choose **Save invitation to**, press **Create invitation**, and give that same file to each PC. On each of those PCs tick **Use invitation**, pick the file under **Import invitation** and press **Join with invitation**. Leave the box off and any PC that can reach this one on your LAN, Tailscale or ZeroTier network may join by address. The change applies to the running service within a second and does not interrupt jobs; services that already had a policy keep it until you change this box.
 
-The invitation points to the same network and includes its certificate identity. It is reusable for seven days. Every joining PC receives its own private credentials and sees the shared machine list. It is not a connection only to the PC that saved the file. Keep the invitation private while it is valid.
-
-Previously created one-use invitations still keep their original expiry and one-use rule.
+The invitation points to the same network and includes its certificate identity. It is reusable for seven days; keep it private while it is valid. Previously created one-use invitations keep their original rule.
 
 ## 4. Map shared storage on each PC
 
@@ -85,11 +76,19 @@ Cancelling is cooperative and keeps frames already written. An offline PC keeps 
 | Symptom | Check |
 |---|---|
 | Service will not start | Read the UI error: address/port in use, unavailable user service manager, or permissions. Do not start a second host on the same port. |
-| Cannot join by address | The host service must be running, permit address joining, and be reachable through the firewall. |
+| Cannot join / *Needs invitation* | The other PC's service must be running, reachable through its firewall, and have **Use invitation** off; otherwise import an invitation. ReScan if its addresses changed. |
 | Invitation rejected | Check expiry. Older invitations may be single-use. Create a new reusable invitation from the UI. |
 | Different or incomplete machine list | Check that every PC joined the same host/network, rather than creating separate networks. |
 | PC visible but not receiving | Enable receiving work, keep its client running, and confirm its GPU is idle and models are ready. |
 | Shared files unavailable | Open the share as the desktop user and test the mapping in Keyloom. |
-| Certificate does not cover the address (`cert_mismatch`) | The host's existing certificate is kept because joined PCs trust it. Under **Host on THIS PC** press one of the **Use address** buttons (the addresses the certificate covers), then **Apply and start**. Do not delete the service folder; that would create a different network and orphan every joined PC. |
+| PC missing from the list | ReScan. Check that Keyloom is running there and the PCs share a network (LAN, Tailscale or ZeroTier). Do not delete a service folder: that would create a different network and orphan every joined PC. |
 
 Pairing credentials and the service database stay on local disk, outside projects. Keep their tokens private. Renaming the app preserves the existing settings and model locations.
+
+## Limits
+
+- Every PC must run Keyloom 2.4 or newer to be found; earlier versions have no discovery and must be updated (or joined with an invitation file).
+- The OS firewall must allow the Keyloom service (TCP 8443-8452 and UDP 44554); Keyloom never opens ports itself.
+- Discovery uses LAN broadcast plus Tailscale's peer list and known addresses. Networks that block broadcast or Tailscale ACLs that block the ports hide PCs from the list; join those with an invitation.
+- The background service is separate from the Keyloom window: **Stop** keeps it stopped until **Start** or the next sign-in.
+- If the host's identity was revoked, Keyloom reports "identity revoked" and leaves your state untouched. There is no automatic re-issue: restore the host database or recover the identity manually; a new invitation alone does not restore it.

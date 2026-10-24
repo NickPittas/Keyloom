@@ -192,6 +192,16 @@ class Store:
             raise ApiError(401, "unauthorized", "invalid credentials")
         return dict(row)
 
+    def installation_active(self, installation_id):
+        with self._lock:
+            return self.db.execute("SELECT 1 FROM installations WHERE id=? AND revoked_at IS NULL", (installation_id,)).fetchone() is not None
+
+    def session_online(self, installation_id):
+        """True while this installation's session has called in within SESSION_TTL (honest receiver/app presence)."""
+        with self._lock:
+            row = self.db.execute("SELECT last_seen FROM sessions WHERE installation_id=?", (installation_id,)).fetchone()
+        return row is not None and self.clock() - row["last_seen"] < SESSION_TTL
+
     def revoke(self, installation_id):
         """Returns the STARTED attempts that stay fenced: revoking credentials proves nothing about a running writer."""
         now = self.clock()

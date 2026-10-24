@@ -1,6 +1,6 @@
 # Network coordinator (protocol v1) — control-plane foundation
 
-**User setup is in Keyloom → Clients:** install/start/stop the per-user host service, join by IP/port, or create/use an optional reusable invitation. See [the network guide](../../docs/network-rendering.md). The sections below document the developer CLI and protocol.
+**User setup is in Keyloom → Clients:** every installation hosts automatically; press Rescan to list PCs (name + addresses) and tick the ones to connect, Start/Stop/Remove/Refresh the service, or tick *Use invitation* for the optional save/browse/create/import flows. See [the network guide](../../docs/network-rendering.md). The sections below document the developer CLI and protocol.
 
 Python stdlib `ssl`/`http.server`/`sqlite3` plus `cryptography`; no new dependency.
 The coordinator records who owns which attempt. It never runs a worker, never resolves a client path and never
@@ -16,7 +16,10 @@ and the operator commands below. One process owns a state dir (lock file). State
 Trust note: the certificate and fingerprint inside an invitation only prove each other are consistent; they do not authenticate the server. Trust comes from delivering the invitation file over a channel you trust, optionally comparing the fingerprint `serve` prints (and `pair` prints) with the one you expect. The certificate is valid 365 days; there is no renewal/rotation yet (regenerate by hand and re-pair).
 Invitation (private file, 0600): URL, certificate PEM, SHA-256 fingerprint, one-time code (10 min, ~50 bit,
 hash stored, 10 failures/min/IP and 30/5 min global throttle). The client verifies the fingerprint offline, then uses that
-certificate as the sole anchor with hostname/SAN checking (SAN = explicit advertised hosts; wildcard bind refused).
+certificate as the sole anchor (CERT_REQUIRED, no host-name check) and compares the leaf SHA-256 right after every handshake,
+before any request byte. The identity is the pinned certificate, not an address, so the same identity works over LAN, Tailscale,
+ZeroTier and loopback and survives address changes with no re-keying; SANs are cosmetic (current interfaces + loopback at creation)
+and an existing certificate/key/token is never regenerated.
 Tokens: 256-bit, per installation, server stores SHA-256 only, constant-time compare, revocable (`Store.revoke`).
 Credential/key files: created `O_EXCL` (never overwritten), 0600 verified on every read; Windows uses `icacls`
 owner-only ACL read back (logic unit-tested with a fake runner only — **not exercised on real Windows**).
@@ -29,6 +32,15 @@ its own peers; accepted on a LAN).
 No long-poll: clients poll. Claim/start/reject/events/stats need the installation's current `session_id`.
 `/v1/session` accepts an optional `name` (1-64 characters, no control characters) that renames the same installation row; it never creates an identity or token, and callers that omit it keep their stored name. A PC joined to several networks sends its one name to each host.
 The service status (`netlink service_status`) lists `certificate_addresses`; an existing certificate is never regenerated (joined PCs pin it), so a `cert_mismatch` is fixed by hosting on a covered address.
+
+## Addressing, hello and discovery
+- `GET /v1/hello` (unauthenticated, read-only, no secrets, rate-capped): `{protocol, fingerprint_sha256, network_id, name, host_installation_id, receiver_online, join, endpoints[{url,kind}] (<=16)}`.
+  `receiver_online` is the host PC's own app session being online (service coordinator only; receiving needs the app/background mode, not the service alone).
+- `POST /v1/local-identity` (loopback + private token): tells the host which existing installation is this PC (written to `local-installation.json`); `/v1/local-join` records it automatically.
+- The server listens dual-stack (IPv6 wildcard with IPv4 fallback) on one of 8443..8452 (existing port kept) on all interfaces. Interfaces are re-read live every 30 s.
+- Clients hold an ordered endpoint list (last working first). Fail-over happens only on connect / TLS / pin failure before any request byte; a sent request is never retried. Per-address connect is <= 3 s and one call (incl. body) <= its timeout (15 s).
+- UDP discovery listens on the FIXED port 44554 (independent of the API port) and answers a probe with a unicast datagram <= 1200 bytes, rate-limited. Datagrams are hints: every candidate is verified by a handshake fingerprint match plus a pinned hello. The scan (`netlink discover`) also reads Tailscale peers, the OS neighbour table and known URLs, probes 8443..8452 only on those candidates (<= 512, <= 32 workers, hard 20 s), and reports `sources` / `partial` instead of claiming full coverage. Two PCs may share a name: rows are keyed by full fingerprint, never by name.
+- Service config `service.json` keeps the strict v1 shape (`address` is cosmetic); PC name lives in `service-meta.json`; `service_configure` changes policy/name live. Remove writes `host-removed.marker`; only Start clears it.
 
 - **Submit**: `submission_id` + frozen `spec` + `target` (installation id or null=automatic). Same id+same canonical
   payload → original response; different payload → 409. Spec is an exact schema (`schema.validate_spec`): kind `key` (Key only, the

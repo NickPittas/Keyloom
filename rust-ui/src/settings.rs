@@ -131,6 +131,10 @@ pub struct Network {
     pub default_submit: String,
     /// This PC's name on every joined network (empty = the computer's host name).
     pub name: String,
+    /// The user removed this PC's own host service: it is not installed again at startup (Start clears it).
+    pub host_removed: bool,
+    /// Hosting requires an invitation (inverse of the local service's `allow_address_join`).
+    pub use_invitation: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -142,6 +146,15 @@ pub struct Connection {
     pub credentials: String,
     pub enabled: bool,
     pub receive: bool,
+    /// Last known https addresses of the host (tried in order on connect; refreshed by Rescan).
+    pub endpoints: Vec<String>,
+    /// Certificate fingerprint of the network (empty = learn it from the connection).
+    pub network_id: String,
+    /// Exact host installation this connection targets (empty = legacy: every member).
+    pub host_installation_id: String,
+    pub host_name: String,
+    /// This PC's own service (joined automatically, receives work by default).
+    pub local_host: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -157,7 +170,7 @@ impl Network {
             "" => settings_path.and_then(std::path::Path::parent).map(|d| d.join("network").join("credentials.json")),
             c => Some(std::path::PathBuf::from(c)),
         };
-        path.filter(|p| p.exists()).map(|p| Connection { credentials: p.display().to_string(), enabled: self.enabled, receive: self.receive, extra: Map::new() }).into_iter().collect()
+        path.filter(|p| p.exists()).map(|p| Connection { credentials: p.display().to_string(), enabled: self.enabled, receive: self.receive, ..Default::default() }).into_iter().collect()
     }
     /// Make the list the source of truth (keeps the legacy fields as they were).
     pub fn materialize(&mut self, settings_path: Option<&std::path::Path>) {
@@ -367,7 +380,18 @@ pub fn default_path() -> Option<PathBuf> {
     }
 }
 
-/// `%APPDATA%\corridorkey-native\settings.json`, else `%LOCALAPPDATA%\…`, else `None`.
+/// `<base>/keyloom`, unless only the pre-rename `<base>/corridorkey-native` exists: existing settings, pinned
+/// certificates, network state and the single-instance lock stay where they are (old and new builds share them).
+pub fn config_dir(base: PathBuf) -> PathBuf {
+    let old = base.join("corridorkey-native");
+    if old.is_dir() && !base.join("keyloom").exists() {
+        old
+    } else {
+        base.join("keyloom")
+    }
+}
+
+/// `%APPDATA%\keyloom\settings.json`, else `%LOCALAPPDATA%\…`, else `None`.
 pub fn windows_path(
     appdata: Option<std::ffi::OsString>,
     local: Option<std::ffi::OsString>,
@@ -375,14 +399,10 @@ pub fn windows_path(
     let base = appdata
         .filter(|v| !v.is_empty())
         .or_else(|| local.filter(|v| !v.is_empty()))?;
-    Some(
-        PathBuf::from(base)
-            .join("corridorkey-native")
-            .join("settings.json"),
-    )
+    Some(config_dir(PathBuf::from(base)).join("settings.json"))
 }
 
-/// `$XDG_CONFIG_HOME/corridorkey-native/settings.json`, else `~/.config/corridorkey-native/…`.
+/// `$XDG_CONFIG_HOME/keyloom/settings.json`, else `~/.config/keyloom/…`.
 pub fn unix_path(
     xdg: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -391,7 +411,7 @@ pub fn unix_path(
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| home.map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("corridorkey-native").join("settings.json"))
+    Some(config_dir(base).join("settings.json"))
 }
 
 /// Saved settings plus the file they came from. Cloning `saved()` gives an editable draft.
@@ -537,7 +557,7 @@ mod tests {
             windows_path(Some(ad.clone()), Some(la.clone())),
             Some(
                 PathBuf::from(r"C:\Users\u\AppData\Roaming")
-                    .join("corridorkey-native")
+                    .join("keyloom")
                     .join("settings.json")
             )
         );
@@ -546,7 +566,7 @@ mod tests {
             windows_path(None, Some(la.clone())),
             Some(
                 PathBuf::from(r"C:\Users\u\AppData\Local")
-                    .join("corridorkey-native")
+                    .join("keyloom")
                     .join("settings.json")
             )
         );
@@ -555,17 +575,28 @@ mod tests {
     }
 
     #[test]
+    fn existing_prerelease_settings_dir_is_kept() {
+        let d = dir("legacy-config");
+        std::fs::create_dir_all(d.join("corridorkey-native")).unwrap();
+        assert_eq!(config_dir(d.clone()), d.join("corridorkey-native"));
+        std::fs::create_dir_all(d.join("keyloom")).unwrap();
+        assert_eq!(config_dir(d.clone()), d.join("keyloom"));
+        let fresh = dir("fresh-config");
+        assert_eq!(config_dir(fresh.clone()), fresh.join("keyloom"));
+    }
+
+    #[test]
     fn unix_settings_path_prefers_xdg() {
         let x = std::ffi::OsString::from("/xdg");
         let h = std::ffi::OsString::from("/home/u");
         assert_eq!(
             unix_path(Some(x.clone()), Some(h.clone())),
-            Some(PathBuf::from("/xdg/corridorkey-native/settings.json"))
+            Some(PathBuf::from("/xdg/keyloom/settings.json"))
         );
         assert_eq!(
             unix_path(None, Some(h.clone())),
             Some(PathBuf::from(
-                "/home/u/.config/corridorkey-native/settings.json"
+                "/home/u/.config/keyloom/settings.json"
             ))
         );
         assert_eq!(unix_path(None, None), None);

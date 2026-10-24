@@ -1,27 +1,55 @@
 # Standalone installers (L7)
 
 Private, local-only build pipeline. No publishing or redistribution clearance is implied
-(see `docs/design/rust-ui/standalone-release-plan.md` §8). No listeners, services or firewall
-rules are created; network use is the explicit model step and, for the online installers only, the large public wheels.
+(see `docs/design/rust-ui/standalone-release-plan.md` §8). Activation configures the per-user network host automatically
+unless the user removed it. Firewall permissions remain OS-managed. Online installers also fetch the large public wheels.
 
 ## What a bundle contains
-`bin/corridorkey-ui` (Rust UI) · `app/` (Python helper tree: backend, engines, `scripts/setup_models.py`,
+`bin/keyloom-ui` (Rust UI) · `app/` (Python helper tree: backend, engines, `scripts/setup_models.py`,
 `rust-ui/tools/ck_import.py`, `packaging/`) · `app/tools/ffmpeg/bin/{ffmpeg,ffprobe}` (where
 `backend/ffmpeg_tools` already looks) · `runtime/python` (uv-managed relocatable CPython 3.11 + the
-hash-pinned lock `packaging/locks/<os>-x86_64.txt`, torch 2.9.1+cu128) · `corridorkey-install.json`
+hash-pinned lock `packaging/locks/<os>-x86_64.txt`, torch 2.9.1+cu128) · `keyloom-install.json`
 (descriptor; models/cache/scratch/user_data = null → platform defaults, shared by all versions) ·
 `install-manifest.json` (sha256 of every file). **No model weights.**
 
-## Build (build host = target OS)
-Linux, all unprivileged and resumable (long steps run in the background; each rerun resumes from caches):
+## Build: one canonical command (build host = target OS)
+**Every installer build — by any person or agent — is exactly this command, on the target OS** (Linux builds Linux, Windows builds Windows; no cross-compiling):
 ```
-sh packaging/linux/build-ui-old-glibc.sh           # zig-based glibc-2.31-target UI build (floor 2.30), ~1 min warm
-sh packaging/linux/fetch-ffmpeg.sh                 # pinned static FFmpeg 7.0.2 (sha256-checked); prints the --ffmpeg-dir
-python packaging/bundle.py linux --out DIR --ffmpeg-dir <bin> \
-  --ui-binary rust-ui/target-oldglibc/x86_64-unknown-linux-gnu/release/corridorkey-ui \
-  [--reuse-runtime <stage>/runtime/python]          # omit to build the runtime with uv from the lock
-python packaging/bundle.py windows --out DIR --ffmpeg-dir C:\ffmpeg\bin --build-ui   # on Windows only
+python packaging/build_release.py            # Linux: .venv/bin/python;  Windows: the bundled/known Python
 ```
+It builds the UI, ONE stage (one manifest, one launch self-check of Python + UI), a **helper-load gate** (the staged runtime Python, `-I -B` from an unrelated CWD, imports `lifecycle` and loads `firewall.py` through `lifecycle._firewall()` and requires callable `run`/`remove`/`main`; import-only, no firewall calls, Linux only; a missing module fails the build before any installer is packed), then the **offline and online installers from that same
+stage** (same `version_id`), verifies every output, and prints `OK`/`FAILED: <reason>` plus the log and result paths. Exit 0 only when all
+artifacts exist, are complete and match their sha256. Do not compose `bundle.py` steps by hand, do not rerun its checks separately, and do not
+inspect the intermediate files: read the final line and `build-result.json`. A full run takes tens of minutes (compression); run it once and wait for its exit.
+Output (`packaging/dist/<timestamp>/`, git-ignored; `--out-root DIR` or config `out_root` to move it): `build.log` (all phase output, written even
+when preflight fails), `build-result.json` (status, failed phase, source commit + dirty flag + source-file fingerprint, Cargo.lock/packaging-lock/pyproject
+hashes, tool versions, platform, payload `version_id`, and name/size/sha256 of every artifact; artifacts are empty on failure), `stage/` (kept on
+failure and success for inspection or reuse; delete when done), the installers and their `.sha256` files.
+`--preflight-only` validates config/tools/runtime without building. Phases are bounded (config `timeouts`, `deadline_seconds`); on timeout or Ctrl-C/SIGTERM the
+child process tree is killed.
+
+One-time machine config (optional on Linux; required keys on Windows): `~/.config/keyloom-build.json` (or `--config FILE`), see
+`packaging/build-config.example.json`. Keys: `runtime_dir` (a validated `<stage>/runtime/python`; omit to build with `uv`), `ffmpeg_dir`
+(Linux default `~/.cache/ck-ffmpeg-pinned/bin`, create with `sh packaging/linux/fetch-ffmpeg.sh`), `wheel_cache` (Linux default
+`~/.cache/ck-toolchain/public-wheels-linux`), `iscc`, `cargo_target_dir` (Windows warmed target), `out_root`, `python_version`, `split`
+(Linux `.run` also written as <=1900 MiB parts), `timeouts`, `deadline_seconds`. Unknown keys fail the build.
+Linux UI is built by `packaging/linux/build-ui-old-glibc.sh` with `PATH=/usr/bin:/bin RUSTC=/usr/bin/rustc CK_CARGO_FLAGS='--locked --offline'`;
+Windows runs `cargo build --release --locked`. The binary must be an ELF (Linux) / PE (Windows) file.
+Known limits: the payload identity (`version_id`) is deterministic for the same source, locks and runtime, but installer bytes are not promised identical
+(gzip/Inno timestamps). The build reads the live checkout, so it fingerprints the source before and after and fails if it changed (no isolated copy).
+`version_id` differs between Linux and Windows. Nothing is published, installed or launched, and no models or drivers are bundled.
+The build-time staged self-check (`bundle.BUILD_SELFCHECK_TIMEOUT`, 300 s) is deliberately longer than the installer's `lifecycle.PHASE_TIMEOUT` (10 s), which stays unchanged for installs.
+
+**Windows workflow (Kamino3 only).** Commit and push on the dev machine, then `git pull` in the single persistent Kamino3 checkout; never ship source by archive,
+snapshot, scp/rsync/SSH pipe or a second checkout, and never copy a runtime, model or artifact over 100 MB. Pinned build dependencies (Python, wheels, FFmpeg,
+Rust/Inno) are downloaded once into one persistent git-ignored build folder outside Git (`runtime_dir`, `wheel_cache`, `iscc`, `cargo_target_dir` in the build config) and
+updated only when a pin changes. No Windows build or test on Kamino1, and the build never installs, launches or alters an installed app.
+
+### Internal: `packaging/bundle.py`
+The low-level toolbox that `build_release.py` calls (`build_stage`, `make_linux_run`, `split_linux_run`, `make_windows_exe`, `make_online_*`, `validate_reused_runtime`).
+Its CLI (`python packaging/bundle.py linux|windows|online-linux|online-windows|bundle --out DIR --ffmpeg-dir ...`) is for developing the build itself, not for routine builds.
+Regarding build prerequisites (`uv`, system `rustc`/`cargo`, network for wheels/zig/FFmpeg/CUDA parts, Inno Setup 6 on Windows): see below.
+
 The bundle's **glibc floor is computed from every ELF** and refused above `--max-glibc` (default 2.31, recorded in the
 manifest; the installer refuses older systems). Current floor: 2.30 (the zig-built UI; the runtime is <= 2.28).
 sam-2's CUDA extension (`sam2/_C.so`) is rebuilt by `stage_runtime` with `--no-cache` (never a cached wheel) against the
@@ -39,38 +67,58 @@ Regenerate a lock after editing `runtime.in`:
 
 ## Linux: `Keyloom-<id>-linux-x86_64.run`
 Needs only sh/tar/gzip/awk/sha256sum. `./X.run [--prefix DIR] [--models full|skip] [--model-arg ARG]... [--repair]`
-(default prefix `~/.local/opt/CorridorKey`). Each `--model-arg` takes ONE argument, forwarded verbatim (spaces/globs
+(default prefix `~/.local/opt/Keyloom`). Each `--model-arg` takes ONE argument, forwarded verbatim (spaces/globs
 preserved) to `scripts/setup_models.py`, e.g. `--model-arg --hf-cache --model-arg "/my cache"`. Those are the manager's
 path overrides (`--data-dir/--v2-models-dir/--hf-cache/--cache-dir`); there is no separate offline-bundle importer in
 the installer — an existing model tree is used by pointing these at it (the manager verifies by hash).
-The prefix must be new/empty or an existing CorridorKey install; any other non-empty folder is refused.
+The prefix must be new/empty or an existing Keyloom install; any other non-empty folder is refused.
 Flow: verify payload sha → extract into `PREFIX/.staging.*` → journal → bundled python validates manifest, glibc
 floor and launches (imports + UI `--self-check`) → atomic `current` symlink switch → `~/.local/share/applications/
-corridorkey.desktop` (Exec scrubs PYTHONPATH/PYTHONHOME), `PREFIX/bin/{corridorkey,corridorkey-setup}`, `receipt.json`
+keyloom.desktop` (Exec scrubs PYTHONPATH/PYTHONHOME), `PREFIX/bin/{keyloom,keyloom-setup}`, `receipt.json`
 → full models (`setup_models.py --download --profile full`, then `--verify`). Any failure or Ctrl-C restores the previous
 version/pointer/shortcuts (or removes everything on a first install); a crash leaves a journal that the next run
-(`corridorkey-setup recover`, also automatic) finishes.
+(`keyloom-setup recover`, also automatic) finishes.
 Exit 0 = everything Ready; **3 = app installed but models incomplete/skipped**; 2 = refused/failed; 130 = interrupted.
 Release upload (GitHub 2 GiB/asset limit): add `--split` to `bundle.py linux` to also write `X.run.partNNN` (<=1900 MiB each) +
 `X.run.parts.sha256`. User: `sha256sum -c X.run.parts.sha256 && cat X.run.part[0-9][0-9][0-9] > X.run && sha256sum -c X.run.sha256 && chmod +x X.run`. The unsplit `.run` is unchanged.
 **OS prerequisites (not bundled; checked before install, with an apt hint for Debian/Ubuntu/Mint):** GL/EGL, X11 or Wayland client,
 xkbcommon, fontconfig, freetype, glib, dbus, libstdc++, and the proprietary NVIDIA driver (`libcuda.so.1`; a missing driver only warns,
 since models can still be installed). Python, Rust, FFmpeg, the CUDA toolkit and GCC are NOT needed on the target.
-Later: `PREFIX/bin/corridorkey-setup {status [--verify] | models | repair | rollback | recover | uninstall}`;
-server mode: `PREFIX/bin/corridorkey-coordinator {serve|pair|revoke|abandon} ...` (runs the bundled `backend.coordinator`; `serve` only listens when started, loopback by default);
+Later: `PREFIX/bin/keyloom-setup {status [--verify] | models | repair | rollback | recover | uninstall}`;
+server mode: `PREFIX/bin/keyloom-coordinator {serve|pair|revoke|abandon} ...` (runs the bundled `backend.coordinator`; `serve` only listens when started, loopback by default);
 `X.run --repair` restores damaged files from the payload (models re-verified only with `--models full`).
 Two versions are kept (active + previous). Concurrent installers on one prefix are not supported.
 
 ## Windows: `Keyloom-<id>-windows-x86_64-setup.exe` (Inno Setup, per-user by default)
-Installs to `%LOCALAPPDATA%\Programs\CorridorKey\versions\<id>`, then runs the same `lifecycle.py`
+Installs to `%LOCALAPPDATA%\Programs\Keyloom\versions\<id>`, then runs the same `lifecycle.py`
 (validation, Start Menu shortcut, receipt, optional full models task with a visible console). Drive-root folders and an
 already-installed identical build are refused; a failed launch validation sets a nonzero setup exit code
 (`GetCustomSetupExitCode`) and the previous version's shim runs `recover` to delete the failed one. Windows needs no VC++ Redistributable: the Microsoft VC runtime DLLs are bundled beside python.exe and the UI. The NVIDIA driver
 is the only prerequisite (missing driver warns). Per-user only (no elevation prompt). Inno slices are 1900 MiB: upload the exe plus every `-N.bin` and
 the `.sha256` (one line per file); all must be in one folder to install.
+**Runtime companion (offline Windows only).** The multi-GB `runtime/` is NOT inside the Inno set. It ships beside the setup exe as
+`Keyloom-<id>-windows-x86_64-runtime.json` (schema 2: `runtime_id`, ordered shards with size, sha256 and the exact runtime files each owns; no path may
+belong to two shards), `Keyloom-<id>-windows-x86_64-runtime-001.tgz`, `-002.tgz`, ... (INDEPENDENTLY compressed tar.gz shards over disjoint files of the SAME
+stage `runtime/`, each <= 1900 MiB; pieces of one gzip stream could not be decompressed independently) and `...-runtime.sha256` (one line per file). Put the exe,
+every `-N.bin` and all companion files in one folder. The setup embeds the metadata file's sha256 and the `runtime_id`, so a modified companion is refused. Shards are
+compressed by a bounded pool of 8 workers (never more than 16; one task per shard) and extracted by the same bounded pool (`installer_payload.py runtime-extract
+--workers N`, clamped to 8..16), with a combined and per-shard MiB/speed/elapsed line each second; directory pre-creation, the final rename to `runtime`, activation,
+receipt/pointer updates and rollback stay serial after the workers. At install time,
+after the new manifest and `lifecycle.py` are on disk and before activation, ONE decision runs (`runtime-available`): exit 0 attaches the installed runtime
+as a whole directory (no companion file is opened, hashed or read); exit 1 (fresh install / really different runtime) runs the supervised extraction
+(`installer_payload.py runtime-extract`: verifies each shard's size and sha256 while streaming into a private holder inside the new version folder, accepting only
+the files the metadata assigns to that shard,
+renames it to `runtime` only after everything verified, deadline min(10 s, rest of the 30 s budget) shared by all workers, any worker error or the deadline cancels the rest, process tree killed
+and holder discarded on failure); exit 3 (identical but untrusted) and any other result stop visibly with no fallback; a missing companion stops visibly.
+Installation discovery (online Windows wrapper) is one read-only `installer_payload.py discover` run: HKCU/HKLM keys and the two candidate receipts are probed in parallel,
+then the registry-named folder is checked; precedence /PREFIX > HKCU > HKLM > default is fixed in code. The offline setup's folder choice stays in Inno Pascal because it
+runs before any bundled Python exists.
+A real multi-GB runtime is not expected to extract within 10 s, so a fresh/changed-runtime Windows install is expected to fail that timing gate until the
+user changes the policy. The remaining native Inno copy is the app files and the small bootstrap; it cannot be pre-empted and is only measured afterwards
+against the same 10 s / 30 s limits. The Linux `.run` keeps its runtime in-file (separate gzip segment). Online installers never use this companion.
 Add/Remove Programs
-and the uninstaller come from Inno. Uninstall deletes only the exact version dir Inno created plus receipt-validated
-versions carrying our own manifest; the running version is removed by a detached `cmd`. The Start Menu shortcut targets
+and the uninstaller come from Inno. Uninstall removes only the individual files Inno copied (no recursive directory entry, so an attached runtime link is never
+traversed) plus, through the lifecycle's safe-unlink logic, the receipt-validated versions carrying our own manifest; the running version is removed by a detached `cmd`. The Start Menu shortcut targets
 the exe directly, so it does not scrub PYTHONPATH (the Rust side must). Repair of damaged files on Windows =
 reinstall after uninstall. `/TASKS="!models"` makes a silent app-only install. Native build and installation checks are recorded in the acceptance document below.
 
@@ -107,17 +155,22 @@ without network; settings, models, credentials, certificates and jobs are untouc
 executables extracted from wheels get their mode from the zip entry (done by `online.py`); copied payload files keep theirs. Exit 0 = installed/up to date, 2 failed (old install
 intact), 4 Keyloom running (quit it with File > Quit), 130 cancelled.
 
-Linux: `X.run [--prefix DIR] [--repair]` (default `~/.local/opt/CorridorKey`; needs only sh/tar/gzip/awk/sha256sum). The payload is extracted
+Linux: `X.run [--prefix DIR] [--repair]` (default `~/.local/opt/Keyloom`; needs only sh/tar/gzip/awk/sha256sum). The payload is extracted
 into `PREFIX/.staging.*` (same filesystem, not a small `/tmp`).
 Windows: per-user Inno exe (1900 MiB slices like the full installer: keep the exe and every `-N.bin` together; `.sha256` lists all); unpacks to `{tmp}`
 with a visible console. `/PREFIX=DIR` and `/REPAIR=1` are accepted; otherwise an existing full-installer location is read from its Inno
-registry key (`Inno Setup: App Path`), else `%LOCALAPPDATA%\Programs\CorridorKey`. It has its own AppId, `Uninstallable=no` and no Add/Remove Programs
-entry, so it never touches the full installer's entry; remove an online-only install with `<prefix>\bin\corridorkey-setup.cmd uninstall`.
+registry key (`Inno Setup: App Path`), else `%LOCALAPPDATA%\Programs\Keyloom`. It has its own AppId, `Uninstallable=no` and no Add/Remove Programs
+entry, so it never touches the full installer's entry; remove an online-only install with `<prefix>\bin\keyloom-setup.cmd uninstall`.
 
 ## Background autostart contract (written by the app, removed by uninstall)
-Linux launches the stable shim `PREFIX/bin/corridorkey`. Windows launches the GUI exe directly; activation and rollback rewrite an existing owned entry. Linux:
-`$XDG_CONFIG_HOME/autostart/corridorkey.desktop` containing `X-CorridorKey-Owner=<sha256(str(PREFIX))[:16]>` (`lifecycle.owner_id`).
-Windows: `HKCU\\...\\Run` value `CorridorKey` whose command points into this prefix. `lifecycle.remove_autostart` deletes only a matching entry.
+The network host is configured during activation using the installed version's full Python runtime with a 90-second
+deadline. Existing identities, service state and explicit removal choices are preserved. Setup failures leave the app
+installed and report that **Clients → Start / Refresh** is needed. This host coordinates discovery and queues; the rendering
+client still needs Keyloom running, visibly or in its existing background mode.
+
+Linux launches the stable shim `PREFIX/bin/keyloom`. Windows launches the GUI exe directly; activation and rollback rewrite an existing owned entry. Linux:
+`$XDG_CONFIG_HOME/autostart/keyloom.desktop` containing `X-Keyloom-Owner=<sha256(str(PREFIX))[:16]>` (`lifecycle.owner_id`).
+Windows: `HKCU\\...\\Run` value `Keyloom` whose command points into this prefix. `lifecycle.remove_autostart` deletes only a matching entry.
 
 ## Preserved on uninstall/update/repair
 Projects, outputs, models, HF cache and settings live outside the install prefix and are never
@@ -129,3 +182,40 @@ removed. Uninstall trusts only `receipt.json` and refuses a prefix without one.
 
 ## Acceptance evidence
 See [local workflow acceptance](../docs/design/rust-ui/local-workflow-acceptance.md) for the exact installer builds, installed-file checks, model verification and real GPU workflow results. Unit tests use tiny fixtures; they are not the evidence for native installation or GPU acceptance.
+
+## Rename migration (CorridorKey -> Keyloom)
+
+New names: `keyloom-ui[.exe]`, `keyloom[-setup|-coordinator][.cmd]`, `keyloom-install.json`, `keyloom.desktop`, Run value
+`Keyloom`, unit `keyloom-network.service`, task `Keyloom Network Service`, default prefix `.../Keyloom`.
+Existing installs are upgraded in place (same prefix, receipt `app` value, Inno AppId and owner id). Readers accept the
+old descriptor, receipt app id, exe name, owner markers and settings/user-data folders; owned shims, desktop entry,
+autostart entry and network service are migrated by `lifecycle.activate` / `network_service.ensure_default`, and the old
+`corridorkey*` shims remain as forwarders only where they already existed. See `docs/branding-migration-validation.md`.
+
+## Monitored commands (`run_monitored.py`)
+`python packaging/run_monitored.py --deadline SECS [--label NAME] [--phase NAME] -- cmd arg...` supervises one foreground command: required
+deadline, flushed `| line` streaming of stdout+stderr, a one-second `heartbeat` (the supervisor is alive and how long the child has been quiet; it is not
+child progress), final `exit code=N elapsed=Ts`, exit 124 on deadline after killing the child's process tree (also swept after a normal exit);
+SIGTERM/SIGHUP/Ctrl-C clean up the same way (exit 143/129/130). The argv and environment are never printed (`--label` is the display name); the child's
+own output is passed through unredacted.
+Default mode (Linux): stdin is `/dev/null`, the child gets its own session, and cleanup SIGSTOP/SIGKILLs every descendant found via `/proc` PPid (even
+after `setsid()`) plus the child's process group. A descendant already reparented to init before the scan cannot be found.
+`--interactive` (Linux only; refused on Windows): the child inherits stdin and stays in the caller's session/process group, so it keeps the controlling
+terminal and can prompt (e.g. `sudo`, UFW) on `/dev/tty` itself. The tool never reads, forwards, logs or stores input, and does not use `killpg` in this mode
+(only the child's own descendants are signalled). It has only been tested with pipes, never with a real terminal. Do not feed passwords through
+pipes or `sudo -S`. Windows cleanup (`taskkill /T /F`) is untested best effort and prints a warning. Tests: `tests/test_run_monitored.py`.
+
+### Canonical build reporting and timing policy
+`build_release.py` runs every phase child through `run_monitored.run`: child stdout+stderr stream live to the console AND `build.log` as `| line`
+(unterminated output is shown at the next heartbeat), with a one-second `heartbeat phase=... quiet Ns` line (supervisor liveness, not child progress)
+and a final `exit code=N elapsed=Ts`; a phase timeout kills the whole child tree and fails the build (a child that itself exits 124 is a plain exit-code
+failure). Command argv is no longer echoed to the console or log (display label = program name); `build-result.json` is unchanged and still lists each
+phase command.
+
+**Build phase deadlines (user-approved exception to the 10 s ordinary-command gate).** `Build.run` gives each phase child the effective deadline
+min(that phase's configured budget in `timeouts`, what is left of the finite `deadline_seconds`); there is no other cap, nothing is lengthened silently, and
+the start of `build.log` prints the budgets in force (defaults in `build_release.py` `TIMEOUTS`; `deadline_seconds` default 14400 s). Output is live with a
+one-second heartbeat in the console and `build.log`. The only checks are the staged app self-check, the firewall-helper import gate, `online.py --help`
+and artifact sha256 verification; the build runs no tests and does no test discovery (the source fingerprint prunes test directories before traversing).
+This policy applies to build phases only; installer/local runtime phases keep 10 s per phase and 30 s total (excluding transfers and consent).
+Windows `taskkill` cleanup is unproven.

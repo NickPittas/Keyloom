@@ -1,16 +1,16 @@
 [package]
-name = "corridorkey-ui"
-version = "2.3.0"
+name = "keyloom-ui"
+version = "2.4.0"
 edition = "2021"
-default-run = "corridorkey-ui"
-description = "Native CorridorKey project viewer: imports footage into new projects (first slice, provisional toolkit)"
+default-run = "keyloom-ui"
+description = "Keyloom native project viewer: imports footage into new projects (first slice, provisional toolkit)"
 
 [lib]
 name = "ck"
 path = "src/lib.rs"
 
 [[bin]]
-name = "corridorkey-ui"
+name = "keyloom-ui"
 path = "src/main.rs"
 
 [[bin]]

@@ -337,7 +337,7 @@ impl Page {
             row(ui, "Background", |ui| {
                 theme::checkbox(ui, &mut d.interface.background, "Keep running when the window is closed");
             });
-            dim(ui, "Closing the window hides it so the network client stays available. File > Quit still quits. Starting CorridorKey again shows the running window.");
+            dim(ui, "Closing the window hides it so the network client stays available. File > Quit still quits. Starting Keyloom again shows the running window.");
             if !d.interface.background {
                 d.interface.launch_at_login = false;
             }
@@ -346,7 +346,7 @@ impl Page {
                     theme::checkbox(ui, &mut d.interface.launch_at_login, "Start in the background when I sign in to this computer");
                 });
             });
-            dim(ui, "Starts only after you sign in to this user account (not at boot), so your mapped drives are available. Turning it off removes only the entry CorridorKey created.");
+            dim(ui, "Starts only after you sign in to this user account (not at boot), so your mapped drives are available. Turning it off removes only the entry Keyloom created.");
         });
     }
 
@@ -586,7 +586,7 @@ fn targets_ui(ui: &mut Ui, targets: &mut Vec<Target>) {
                     let mut pt = port.unwrap_or(0);
                     ui.add(egui::DragValue::new(&mut pt).range(0..=65535).prefix("Port (0 = default) "));
                     *port = (pt != 0).then_some(pt);
-                    let hint = if *os == RemoteOs::Windows { r"absolute path, e.g. C:\CorridorKey" } else { "absolute path, e.g. /opt/CorridorKey" };
+                    let hint = if *os == RemoteOs::Windows { r"absolute path, e.g. C:\Keyloom" } else { "absolute path, e.g. /opt/Keyloom" };
                     text(ui, &format!("Repo folder on the worker ({hint})"), repo);
                     text(ui, "Python on the worker (absolute path)", python);
                 }

@@ -284,7 +284,7 @@ class AutoPipelinesMixin:
         }
 
         # Load holdout mask (static per-clip, rasterized once we know dimensions)
-        from ui.widgets.annotation_overlay import AnnotationModel
+        from backend.annotations import AnnotationModel
         _holdout_model = AnnotationModel(filename="holdout_strokes.json")
         _holdout_model.load(clip.root_path)
         _holdout_needs_raster = _holdout_model.has_annotations(0)

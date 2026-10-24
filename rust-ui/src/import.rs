@@ -192,7 +192,7 @@ impl Job {
         };
         let Some(repo) = launch.repo else {
             return Err(launch.problem.map(|p| format!("The installed runtime is unusable: {p}")).unwrap_or_else(|| {
-                "No CorridorKey runtime was found: pass --repo, set CK_REPO or CK_INSTALL, install the packaged runtime, or run from a checkout.".into()
+                "No Keyloom runtime was found: pass --repo, set CK_REPO or CK_INSTALL, install the packaged runtime, or run from a checkout.".into()
             }));
         };
         let helper = repo.join("rust-ui/tools/ck_import.py");

@@ -60,6 +60,9 @@ pub enum Op {
     JoinAddress,
     NetworkInvite,
     ServiceLocalJoin,
+    Discover,
+    Endpoints,
+    ServiceConfigure,
 }
 
 impl Op {
@@ -87,6 +90,9 @@ impl Op {
             Op::JoinAddress => "join_address",
             Op::NetworkInvite => "network_invite",
             Op::ServiceLocalJoin => "service_local_join",
+            Op::Discover => "discover",
+            Op::Endpoints => "endpoints",
+            Op::ServiceConfigure => "service_configure",
         }
     }
 }

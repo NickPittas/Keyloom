@@ -56,7 +56,7 @@ pub fn ui(
 ) -> Option<Placement> {
     let mut want = None;
     ui.horizontal(|ui| {
-        ui.heading("Render clients");
+        ui.heading("This computer's render client");
         if ui.button("Check workers").clicked() { ai.probe_workers(); }
     });
     ui.add_space(8.0);
@@ -64,7 +64,7 @@ pub fn ui(
     egui::Grid::new("client_availability").num_columns(5).striped(true).spacing(egui::vec2(24.0, 10.0)).show(ui, |ui| {
         for heading in ["Client", "Connection", "GPU", "Status", ""] { ui.label(RichText::new(heading).strong()); }
         ui.end_row();
-        for t in &targets {
+        for t in targets.iter().filter(|t| t.local) {
             let (state, colour) = state_text(t);
             ui.label(if t.local { "This computer" } else { &t.id });
             ui.label(if t.local { "Local" } else { "SSH" });
@@ -92,6 +92,20 @@ pub fn ui(
             ui.end_row();
         }
     });
+    if targets.iter().any(|t| !t.local) {
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Legacy SSH workers (advanced)").show(ui, |ui| {
+            for t in targets.iter().filter(|t| !t.local) {
+                let (state, colour) = state_text(t);
+                ui.horizontal(|ui| {
+                    ui.label(&t.id);
+                    ui.colored_label(colour, state);
+                    if let TargetStatus::Refused(reason) | TargetStatus::Down(reason) = &t.status { ui.colored_label(BAD, reason); }
+                    if t.busy_with.is_none() && ui.small_button("Recheck").clicked() { ai.scheduler_mut().reset_target(&t.id); }
+                });
+            }
+        });
+    }
     ui.add_space(12.0);
     egui::CollapsingHeader::new("Default assignment").show(ui, |ui| {
         let mut cur = default.clone();

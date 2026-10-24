@@ -1,4 +1,4 @@
-# corridorkey-ui — native viewer + importer (first slice)
+# keyloom-ui — native viewer + importer (first slice)
 
 A native Rust window (eframe/egui, wgpu backend — **provisional toolkit**, final choice is milestone R1) that imports
 footage or opens an existing CorridorKey project and shows its source and existing outputs in the selected layout:
@@ -65,7 +65,7 @@ bash tools/isolated-test.sh /usr/bin/env CARGO=/usr/bin/cargo /usr/bin/cargo-fmt
 bash tools/isolated-test.sh /usr/bin/env CARGO=/usr/bin/cargo /usr/bin/cargo-clippy clippy --offline --all-targets -- -D warnings
 bash tools/isolated-test.sh /usr/bin/cargo test --offline
 bash tools/isolated-test.sh /usr/bin/env CK_PREVIEW_PROJECT=../Projects/<p> /usr/bin/cargo test --release --offline --test real_preview -- --ignored --nocapture
-bash tools/virtual-display-test.sh /usr/bin/timeout 30 target/release/corridorkey-ui --screenshot target/test.png --screenshot-after 2
+bash tools/virtual-display-test.sh /usr/bin/timeout 30 target/release/keyloom-ui --screenshot target/test.png --screenshot-after 2
 ```
 
 The virtual-display wrapper runs a private Xvfb at 1440x900; `CK_DISPLAY_SIZE=2400x1500` (still private, still
@@ -119,7 +119,7 @@ A target is a local checkout (repo folder, optional Python, GPU index) or a remo
 `ssh` (Linux; Windows selectable but flagged untested in-app), with per-target path-mapping rows; an empty list =
 one implicit local worker on GPU 0 found via `$CK_REPO` or near the program/working folder. All targets are assumed
 to see the same shared storage (no transfer copies); a remote job needs the local worker's verified model digest first.
-Preferences live in `$XDG_CONFIG_HOME/corridorkey-native/settings.json` (never in project data). UI scale applies on Apply; RAM, workers
+Preferences live in `$XDG_CONFIG_HOME/keyloom/settings.json` (never in project data). UI scale applies on Apply; RAM, workers
 and looping apply to the next clip you open, and `--cache-mb` overrides the saved RAM budget. Back/Esc/Cancel discard unsaved edits.
 
 ## Hint, Media, Deliver and recovery (implemented; Linux only so far)

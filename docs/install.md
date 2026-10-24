@@ -1,6 +1,6 @@
 # Installing Keyloom — powered by CorridorKey
 
-Keyloom installs for your own user account. Installing the app does not enable network hosting. Use **Clients** to install and start the optional per-user network service, or join an existing network. See [Network rendering](network-rendering.md).
+Keyloom installs for your own user account. The networking rework configures the per-user host automatically across detected interfaces; an explicit **Remove** choice is preserved. In **Clients**, use **ReScan** and check the PCs you want to send work to. The host coordinates discovery and queues; rendering needs Keyloom open or running in background mode. See [Network rendering](network-rendering.md). This automatic setup is under development and is not part of the published 2.3.0 installers below.
 
 ## What you need
 
@@ -57,15 +57,15 @@ Download the [Windows release](https://github.com/NickPittas/Keyloom/releases/ta
 
    Every line must say `OK`. Stop if PowerShell reports an error; re-download the missing or mismatched file.
 3. Double-click the `.exe`. Untick **Download and verify ALL models now**; download models from the app after installation.
-4. Setup installs to `%LOCALAPPDATA%\Programs\CorridorKey`, checks the bundled runtime and adds a Start Menu shortcut. Open Keyloom and download the models you need from **Models & runtime…**.
+4. Setup installs to `%LOCALAPPDATA%\Programs\Keyloom`, checks the bundled runtime and adds a Start Menu shortcut. Open Keyloom and download the models you need from **Models & runtime…**.
 
 If a problem appears, the **previous** version is restored, or on a first install everything is removed.
 
 Command-line helpers (PowerShell):
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\CorridorKey\bin\corridorkey-setup.cmd" status
-& "$env:LOCALAPPDATA\Programs\CorridorKey\bin\corridorkey-setup.cmd" models
+& "$env:LOCALAPPDATA\Programs\Keyloom\bin\keyloom-setup.cmd" status
+& "$env:LOCALAPPDATA\Programs\Keyloom\bin\keyloom-setup.cmd" models
 ```
 
 ## Linux offline installer
@@ -95,29 +95,30 @@ Use the numeric pattern `part[0-9][0-9][0-9]`. A plain `part*` would also match 
 ### Run the installer
 
 ```sh
-./Keyloom-2.3.0-1b3b546391-linux-x86_64.run --models skip
+./Keyloom-2.4.0-<id>-linux-x86_64.run
 ```
 
-It installs to `~/.local/opt/CorridorKey` by default, adds a desktop entry, installs the `corridorkey`, `corridorkey-setup` and `corridorkey-coordinator` commands under `~/.local/opt/CorridorKey/bin`, and leaves model downloads to the app when run with `--models skip`.
+It installs to `~/.local/opt/Keyloom` by default, adds a desktop entry, installs the `keyloom`, `keyloom-setup` and `keyloom-coordinator` commands under `~/.local/opt/Keyloom/bin`, and leaves model downloads to the app when run with `--models skip`.
 
 Options:
 
 | Option | Meaning |
 |---|---|
-| `--prefix DIR` | Install somewhere else. The folder must be new/empty or an existing CorridorKey install. |
-| `--models skip` | Install the app only; models later with `corridorkey-setup models`. |
+| `--prefix DIR` | Install somewhere else. The folder must be new/empty or an existing Keyloom install. |
+| `--models full` | Explicitly download and verify ALL models now. The default is `skip`: installing, updating or repairing never downloads models. Models come from the app's Models page or `keyloom-setup models`. |
 | `--repair` | Restore damaged program files from this installer (models are re-verified only with `--models full`). |
+| `--firewall ask\|skip` | `ask` (default): if UFW is active, ask once before using `sudo` for the network firewall rules ([below](#linux-firewall-ufw)). `skip`: never ask; the step is left pending. |
 
 Do not run two installers on the same folder at once.
 
 Later commands:
 
 ```sh
-~/.local/opt/CorridorKey/bin/corridorkey-setup status --verify
-~/.local/opt/CorridorKey/bin/corridorkey-setup models
-~/.local/opt/CorridorKey/bin/corridorkey-setup repair
-~/.local/opt/CorridorKey/bin/corridorkey-setup rollback
-~/.local/opt/CorridorKey/bin/corridorkey-setup uninstall
+~/.local/opt/Keyloom/bin/keyloom-setup status --verify
+~/.local/opt/Keyloom/bin/keyloom-setup models
+~/.local/opt/Keyloom/bin/keyloom-setup repair
+~/.local/opt/Keyloom/bin/keyloom-setup rollback
+~/.local/opt/Keyloom/bin/keyloom-setup uninstall
 ```
 
 ## Online installer
@@ -129,7 +130,10 @@ Recommended when internet access is available. Alongside the offline installers 
 - **Every file is verified.** Each file of the finished install is checked against the install manifest (SHA-256 and size) before anything is activated; every downloaded wheel is checked against its pinned size and SHA-256, and only the entries the manifest names are extracted. The normal installer step then runs (OS-library check, validation, shortcuts, receipt, rollback).
 - **First install:** downloads only the wheels (several GiB; the size is printed before it starts), assembles a complete copy under the install folder and installs it.
 - **Update:** finds the existing install from its `receipt.json`. Files identical to the current or previous version are copied from the installed copy, the rest comes from the installer, and a wheel is downloaded only if a file it provides is still missing. If this exact build is already installed and every file verifies, it says so and exits without any network access.
-- **Repair:** `--repair` rebuilds the current version the same way and restores damaged files.
+- **Fast update (unchanged runtime):** when the new build's `runtime_id` (a SHA-256 over its `runtime/` manifest entries) equals that of the runtime in an install Keyloom itself activated (this folder, or the one being taken over), the update links that runtime directory by reference. No runtime file is read, hashed, copied or downloaded; only the changed application files are staged and checked. "Already installed" is one local check (application files hashed once, the runtime is trusted from the install record, not re-read) and needs no network. If the same runtime exists but cannot be reused safely, a normal update stops and asks for **Repair** instead of silently spending minutes copying it. The trust is a same-user install record, not protection against the account owner.
+- **Runtime changed or first install:** only the new runtime is extracted and, if files are missing, downloaded. While a wheel downloads, verifies or extracts, a line is printed every second with the phase, bytes done/total, speed and elapsed time; `WAITING` means no new bytes arrived in that second (liveness, not progress). A silent server fails after 20 s (`stalled: no data for 20s`, or `connect timed out`), the download resumes on retry, and a failing local step is never repeated unchanged.
+- **Time limits:** every path (fresh install, changed runtime, update) shares one 30 s counted local budget, and each automatic local phase (copying, hashing, extracting) is limited to 10 s. Only an actual wheel download and your own firewall consent pause that clock; hashing, copying, extraction and checks never do. On expiry the staging area is removed (or the installer is stopped and rolls back), nothing is activated and the run exits with `2`; the settings-folder rename step is limited to 10 s. The wrapper must export `KEYLOOM_WAIT_FILE` for the consent pause to work. Independent work runs on one bounded pool of 8 workers (never more than 16): wheel downloads, file copies and the read-only discovery probes (existing-install candidates and installed manifests). Each wheel is handled by exactly one worker, symlinks are created only after all file workers finish, and results never depend on completion order. The 30 s and 10 s budgets are shared by all workers; the clock pauses only while every active worker is in a network transfer, never while any worker hashes, copies or extracts. The console shows, every second, bytes, MiB/s, active and finished workers, phase and elapsed time. Fewer wheels are fetched at once when free disk space is tight, and any error cancels the remaining work before anything is activated. Each wheel transfer runs in its own short-lived helper process, so a stop (an error elsewhere, Ctrl-C or an expired budget) kills a stuck connection immediately instead of waiting for a network timeout; partial downloads are kept and resume on the next run. These are limits, not measured timings.
+- **Repair:** `--repair` rebuilds the current version the same way and fully re-verifies every file, including the runtime.
 - **Resume:** an interrupted download resumes from `.staging.dl` in the install folder (kept up to 6 hours, removed after a successful install).
 - **Keep:** projects, settings, credentials, network identities and certificates, jobs and models live outside the install folder and are never touched. Models and the NVIDIA display driver are **not** installed by the installer; the app offers models in **Settings → Models & runtime…**. A previously verified model state is kept on update. No compiler is needed on the PC.
 - **Quit Keyloom first.** The installer holds the same per-user instance lock as the app for the whole run. If Keyloom (even hidden) is running, it stops with exit code 4; choose **File → Quit** and run it again. It never launches Keyloom.
@@ -143,8 +147,45 @@ Options of the shared client (`packaging/online.py`), normally supplied by the w
 | `--sources PATH` | `wheel-sources.json`: version, and the public wheel URLs with size, SHA-256 and the files each provides |
 | `--prefix DIR` | Install somewhere else (default as above); an existing install there is detected by its receipt |
 | `--repair` | Rebuild and verify the current version |
+| `--firewall ask\|skip` | Same as the offline installer: see [Linux firewall](#linux-firewall-ufw). |
 
 Exit codes: `0` installed or already up to date, `2` failed (the previous install is untouched), `4` Keyloom is running, `130` interrupted. Allow free space for the new version plus the wheels being downloaded, and room for the activation step: about three times the size of the app on first install (see *What you need*).
+
+## Windows firewall
+
+Windows allows incoming connections per **program path**. Each Keyloom version runs its network service from its own
+`pythonw.exe`, so a new version (or the move to the `Keyloom` folder) needs its own Allow rule or Windows shows a
+"Python" prompt and other PCs cannot reach this one until it is answered.
+
+- The installer first **reads** the firewall (no administrator needed). If an enabled inbound Allow rule already exists for the
+  new `pythonw.exe` (yours or ours), nothing is added.
+- Otherwise it explains and asks once. On yes, Windows shows **one administrator (UAC) prompt**, and exactly two rules are added:
+  TCP 8443-8452 and UDP 44554 for that `pythonw.exe`, Private and Public profiles, only from the local subnet, Tailscale
+  (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) and ZeroTier (`192.168.195.0/24`). The rules are named `Keyloom network ... (<version>)`,
+  grouped `Keyloom`, and recorded in the install receipt. The firewall is never disabled and no other rule is touched.
+- Silent installs (`/SILENT`, `/VERYSILENT`), a declined prompt or a cancelled UAC never add rules: the installer prints the exact
+  PowerShell command (run it as Administrator) and the status stays `pending`.
+- Rules from older versions stay (they are not ours to delete); uninstall offers to remove only the recorded rules.
+
+## Linux firewall (UFW)
+
+Both Linux installers (offline and online) run the same step after the app is installed. It matters only if **UFW is installed and enabled**; otherwise nothing is asked and no `sudo` is used. The installer never installs, enables or disables a firewall, never adds a blanket allow rule and never touches `sudoers`.
+
+- **What it opens:** TCP 8443-8452 (the network service picks a port in that range) and UDP 44554 (discovery), only *from* the networks this PC is on right now: its private LAN subnets, ZeroTier subnets, and Tailscale (`100.64.0.0/10` and `fd7a:115c:a1e0::/48`). Loopback, public, link-local, multicast, and Docker/VM bridge adapters (`docker*`, `br-*`, `veth*`, `virbr*`, `vboxnet*`, `vEthernet*`) are never included. Every network is validated before anything is elevated.
+- **How it asks:** it lists the networks and asks `[Y/n]` on the terminal. On yes, `sudo` asks for your password at the terminal (never in chat, arguments, environment or logs), reads `ufw status`, and adds only the rules that are missing. Only `ufw` runs as root. The read also needs `sudo`, because UFW only shows its rules to root.
+- **Your own rules count.** A rule you added (any comment) that already allows these ports from a network is enough, and is never changed or removed. Rules the installer adds are commented `Keyloom installer: service` / `Keyloom installer: discovery` and listed in the receipt (`firewall.owned`). Reinstalling or updating asks nothing again while the networks are the same.
+- **Declined, no terminal, `--firewall skip`, wrong password, sudo timeout:** the app is still installed. The installer prints `NETWORK FIREWALL SETUP PENDING` with the exact `sudo ufw ...` commands and saves them in `receipt.json` (`firewall.status: "pending"`); `install-result.json` carries the status. The exit code does not change (0/3 still describe the models). Other PCs may not reach this one until you run them. Silent or scripted installs have no terminal, so they never prompt or hang; pass `--firewall skip` to make that explicit.
+- **Not covered:** firewalld (reported `unsupported`) and raw iptables/nftables rules are not managed or inspected. Network readiness is never claimed in those cases; the installer says so.
+- **Uninstall** (`keyloom-setup uninstall`) offers to remove only the rules recorded as added by the installer, after asking and with `sudo`. If you decline or there is no terminal, it prints the delete commands and leaves them. `repair` (installer `--repair` or `keyloom-setup repair`) repeats the same check and ask; rollback never changes the firewall. Rules for networks you leave stay until uninstall.
+
+Fallback by hand (replace the network with yours, e.g. `192.168.100.0/24`):
+
+```sh
+sudo ufw allow from 192.168.100.0/24 to any port 8443:8452 proto tcp comment 'Keyloom service (LAN)'
+sudo ufw allow from 192.168.100.0/24 to any port 44554 proto udp comment 'Keyloom discovery (LAN)'
+```
+
+The Windows installers are unchanged by this step.
 
 ## Models
 
@@ -157,7 +198,7 @@ These codes apply to the Linux installer and setup command. Windows Setup can co
 | Exit code | Meaning |
 |---|---|
 | 0 | Installed and all models are ready |
-| 3 | The app is installed, but models are missing, skipped or incomplete. Run `corridorkey-setup models` to finish. Some workflows stay unavailable until then. |
+| 3 | The app is installed, but models are missing, skipped or incomplete. Run `keyloom-setup models` to finish. Some workflows stay unavailable until then. |
 | 2 | Refused or failed; nothing was left half-installed |
 | 130 | Interrupted (Ctrl-C). The previous state is restored. |
 
@@ -167,14 +208,52 @@ If the download is interrupted, run the command again. It resumes.
 
 - **Quit Keyloom first.** Closing the window only *hides* it when background mode is on (see [Settings → Interface](user-guide.md#background-running)). Choose **File → Quit**, and check your task list for a hidden older copy (there is no tray icon) before you update.
 - **Update:** run the new installer. Two versions are kept (current and previous) so a failed update rolls back.
-- **Repair:** Linux `…run --repair`, or `corridorkey-setup repair`. On Windows, uninstall and reinstall.
-- **Uninstall:** Windows *Settings → Apps*, or Linux `corridorkey-setup uninstall`.
+- **Repair:** Linux `…run --repair`, or `keyloom-setup repair`. On Windows, uninstall and reinstall.
+- **Uninstall:** Windows *Settings → Apps*, or Linux `keyloom-setup uninstall`.
 
 Projects, outputs, models, the download cache and your settings live **outside** the install folder and are kept through repair, update and uninstall.
+
+### Moving to the Keyloom folder
+
+When an install in the old default folder (`~/.local/opt/CorridorKey`, `%LOCALAPPDATA%\Programs\CorridorKey`) is found, the
+installers put the new version in `.../Keyloom` and **take the old install over**: unchanged runtime files are hard-linked (no
+second copy, no re-download), the launcher, application menu entry, sign-in entry and network service move to the new folder
+(same service identity, certificate and database), models verified before stay verified, and the old folder is kept as an inert
+rollback holder. Remove it later with its own `corridorkey-setup uninstall` once you are happy. A folder you chose yourself is
+updated in place. The settings folder `corridorkey-native` is **not** renamed: renaming it is deferred on every platform, nothing is moved, and
+Keyloom keeps using the existing folder (new installs use `keyloom`). Only an unfinished rename left by an earlier version is
+completed or undone. If that state is ambiguous (for example both folders exist), or the check itself fails, times out or gives
+no usable answer, the installer stops with exit code 2 before anything is staged or downloaded. The check may already have
+completed or undone part of an earlier rename and keeps its recovery journal, so run the installer again after resolving it. The model/data folder `CorridorKey` is not renamed: it can hold very large models and model receipts with absolute
+paths, so it keeps working under its old name until you move it yourself.
+
+### Reinstalling and updating never resets anything
+
+- Running the installer for the **exact build that is already installed and verified** changes nothing: no new
+  version, no shortcut, service, setting or model touched. It prints "already installed and verified". The Linux
+  offline installer checks this before unpacking; the Windows installer checks it before writing files; the online
+  installer checks it before downloading. Use `repair` to restore damaged files.
+- Your settings file (including keys this version does not know), custom model and data folders, network name,
+  connections, "hosting removed" choice, certificates and jobs are never written by an installer.
+- Updating reuses the active version's runtime files when they are byte-identical (Linux offline: hard links, counted
+  in `install-result.json` as `runtime_reuse`; online: the existing files and wheel cache). Nothing is `pip`-installed
+  on your machine.
+- Models are never downloaded by install/update/repair unless you ask (`--models full`, the Windows "Download ALL
+  models" box which is off by default, the app's Models page, or `keyloom-setup models`). If the model catalog changed,
+  your existing models are kept and marked "unverified" until you re-check them.
+
+### Upgrading from an install made before the Keyloom rename
+
+Everything you created is kept: models, projects, presets, settings (including keys this version does not know), pinned
+certificates, network identity, jobs, service state and the "removed hosting" choice. Entries that belong to someone else are
+never touched. The launcher, application menu entry, sign-in entry and network service this installation created are replaced by
+their Keyloom names (`keyloom`, `keyloom-setup`, `keyloom-coordinator`, `keyloom-network.service` / "Keyloom Network Service");
+the old `corridorkey*` commands keep working as forwarders in the old folder. The old version stays as the rollback target, and
+rolling back still launches it.
 
 ## Starting the app
 
 - Windows: Start Menu → Keyloom.
-- Linux: your application menu → Keyloom, or `~/.local/opt/CorridorKey/bin/corridorkey`.
+- Linux: your application menu → Keyloom, or `~/.local/opt/Keyloom/bin/keyloom`.
 
 Optional: have Keyloom start hidden when you sign in (needed for always-on network rendering). See [Background running](user-guide.md#background-running).

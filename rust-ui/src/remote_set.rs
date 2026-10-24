@@ -24,7 +24,7 @@ fn conn_of(s: &Settings, sp: Option<&Path>) -> Vec<(Conn, bool)> {
     s.network.effective_connections(sp).into_iter().filter(|c| !c.credentials.trim().is_empty() && seen.insert(c.credentials.trim().to_owned())).map(|c| {
         let key = c.credentials.trim().to_owned();
         let default = s.network.default_submit.trim() == key;
-        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), may_claim: false }, default)
+        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), may_claim: false, endpoints: c.endpoints.clone(), target_host: c.host_installation_id.trim().to_owned(), local_host: c.local_host }, default)
     }).collect()
 }
 
@@ -129,7 +129,7 @@ impl RemoteSet {
 
     /// What Setup needs to name and offer each connection (invitations pick one explicitly).
     pub fn infos(&self) -> Vec<ConnectionInfo> {
-        self.remotes.iter().map(|r| ConnectionInfo { credentials: r.key.clone(), label: r.label(), network_id: r.ns(), online: r.online() }).collect()
+        self.remotes.iter().map(|r| ConnectionInfo { credentials: r.key.clone(), label: r.label(), network_id: r.ns(), online: r.online(), url: r.url() }).collect()
     }
     /// `false` = that connection is no longer set up, so nothing was written.
     pub fn invite(&mut self, creds: &str, path: String) -> bool {

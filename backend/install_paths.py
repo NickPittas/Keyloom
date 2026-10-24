@@ -1,6 +1,6 @@
 """Installed-runtime descriptor: the one JSON contract shared with ``rust-ui/src/runtime.rs``.
 
-A packaged install is relocatable: every root in ``corridorkey-install.json`` resolves against the
+A packaged install is relocatable: every root in ``keyloom-install.json`` resolves against the
 descriptor's own folder at run time (lexical normalization only, no ``~`` expansion, no symlink
 resolution — the Rust side behaves identically). A developer checkout keeps working unchanged;
 a descriptor, once present, wins over checkout discovery, and a BROKEN descriptor raises
@@ -14,13 +14,28 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-DESCRIPTOR_NAME = "corridorkey-install.json"
+DESCRIPTOR_NAME = "keyloom-install.json"
+LEGACY_DESCRIPTOR_NAME = "corridorkey-install.json"  # installs made before the Keyloom rename
 CK_INSTALL_ENV = "CK_INSTALL"
 MODELS_DIR_ENV = "CORRIDORKEY_V2_MODELS_DIR"
 SCHEMA = 1
 
 _ALLOWED_TOP = frozenset({"schema", "app_name", "app_version", "roots"})
 _ALLOWED_ROOTS = frozenset({"python", "helper", "models", "cache", "scratch", "user_data"})
+
+
+def descriptor_in(directory: Path) -> Path:
+    """The descriptor in `directory`: the Keyloom name, else a pre-rename one, else the Keyloom path."""
+    legacy = directory / LEGACY_DESCRIPTOR_NAME
+    if not (directory / DESCRIPTOR_NAME).is_file() and legacy.is_file():
+        return legacy
+    return directory / DESCRIPTOR_NAME
+
+
+def user_area(base: Path, sub: str = "") -> Path:
+    """`base/Keyloom[/sub]`, unless only the pre-rename `base/CorridorKey` exists (models/data stay where they are)."""
+    old = base / "CorridorKey"
+    return (old if old.is_dir() and not (base / "Keyloom").exists() else base / "Keyloom") / sub
 
 
 class InstallDescriptorError(RuntimeError):
@@ -68,7 +83,7 @@ def load(path: str | Path) -> InstallPaths:
     unknown_top = sorted(set(raw) - _ALLOWED_TOP)
     if unknown_top:
         raise InstallDescriptorError(
-            f'unknown field "{", ".join(unknown_top)}" in {path}: this CorridorKey is older '
+            f'unknown field "{", ".join(unknown_top)}" in {path}: this Keyloom is older '
             f"than the install; update the app (or point {CK_INSTALL_ENV} at a matching install)."
         )
     schema = raw.get("schema")
@@ -80,7 +95,7 @@ def load(path: str | Path) -> InstallPaths:
     if schema != SCHEMA:
         raise InstallDescriptorError(
             f"schema version {schema} in {path}, this build reads {SCHEMA}: the install was made "
-            f"by a newer CorridorKey; update the app (or point {CK_INSTALL_ENV} at a matching install)."
+            f"by a newer Keyloom; update the app (or point {CK_INSTALL_ENV} at a matching install)."
         )
     for key in ("app_name", "app_version"):
         if key in raw and not isinstance(raw[key], str):
@@ -91,7 +106,7 @@ def load(path: str | Path) -> InstallPaths:
     unknown_roots = sorted(set(roots) - _ALLOWED_ROOTS)
     if unknown_roots:
         raise InstallDescriptorError(
-            f'unknown roots field "{", ".join(unknown_roots)}" in {path}: this CorridorKey is '
+            f'unknown roots field "{", ".join(unknown_roots)}" in {path}: this Keyloom is '
             "older than the install; update the app."
         )
 
@@ -150,7 +165,7 @@ def discover(search_from: Path | None = None) -> InstallPaths | None:
     env = os.environ.get(CK_INSTALL_ENV)
     if env:
         p = Path(env)
-        cand = p if p.is_file() else p / DESCRIPTOR_NAME
+        cand = p if p.is_file() else descriptor_in(p)
         if not cand.is_file():
             raise InstallDescriptorError(
                 f"{CK_INSTALL_ENV} points at {p}, but there is no {DESCRIPTOR_NAME} there; fix "
@@ -159,7 +174,7 @@ def discover(search_from: Path | None = None) -> InstallPaths | None:
         return load(cand)
     start = _default_search_start() if search_from is None else Path(search_from)
     for directory in _ancestors(start, 4):
-        cand = directory / DESCRIPTOR_NAME
+        cand = descriptor_in(directory)
         if cand.is_file():
             return load(cand)
     return None
@@ -183,15 +198,15 @@ def setup_helper_env(base: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def windows_user_data(appdata: str | None, local: str | None) -> Path | None:
-    """Windows user area, no HOME involved: roaming APPDATA, then LOCALAPPDATA, then `CorridorKey`."""
+    """Windows user area, no HOME involved: roaming APPDATA, then LOCALAPPDATA, then `Keyloom`."""
     base = appdata or local
-    return Path(base) / "CorridorKey" if base else None
+    return user_area(Path(base)) if base else None
 
 
 def unix_user_data(xdg: str | None, home: str | None) -> Path | None:
     if xdg:
-        return Path(xdg) / "CorridorKey"
-    return Path(home) / ".local/share/CorridorKey" if home else None
+        return user_area(Path(xdg))
+    return user_area(Path(home) / ".local/share") if home else None
 
 
 def platform_user_data() -> Path | None:
@@ -205,13 +220,13 @@ def platform_user_data() -> Path | None:
 
 def windows_cache(local: str | None, appdata: str | None) -> Path | None:
     base = local or appdata
-    return Path(base) / "CorridorKey/cache" if base else None
+    return user_area(Path(base), "cache") if base else None
 
 
 def unix_cache(xdg: str | None, home: str | None) -> Path | None:
     if xdg:
-        return Path(xdg) / "CorridorKey"
-    return Path(home) / ".cache/CorridorKey" if home else None
+        return user_area(Path(xdg))
+    return user_area(Path(home) / ".cache") if home else None
 
 
 def platform_cache() -> Path | None:

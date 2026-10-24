@@ -1,10 +1,10 @@
-# Contributing to EZ-CorridorKey
+# Contributing to Keyloom
 
-Thanks for your interest in improving EZ-CorridorKey! Whether you're a VFX artist, a pipeline TD, or a developer, contributions of all kinds are welcome — bug reports, feature ideas, documentation fixes, and code.
+Thanks for your interest in improving Keyloom! Whether you're a VFX artist, a pipeline TD, or a developer, contributions of all kinds are welcome — bug reports, feature ideas, documentation fixes, and code.
 
 ## Legal Agreement
 
-EZ-CorridorKey is a GUI built on top of [Niko Pueringer's CorridorKey](https://github.com/nikopueringer/CorridorKey). By contributing to this project, you agree that your contributions will be licensed under the same terms as the upstream project's **[CorridorKey Licence](https://github.com/nikopueringer/CorridorKey/blob/main/LICENSE)**.
+Keyloom is a GUI built on top of [Niko Pueringer's CorridorKey](https://github.com/nikopueringer/CorridorKey). By contributing to this project, you agree that your contributions will be licensed under the same terms as the upstream project's **[CorridorKey Licence](https://github.com/nikopueringer/CorridorKey/blob/main/LICENSE)**.
 
 ## Getting Started
 
@@ -18,7 +18,7 @@ EZ-CorridorKey is a GUI built on top of [Niko Pueringer's CorridorKey](https://g
 
 ```bash
 git clone https://github.com/edenaion/EZ-CorridorKey.git
-cd EZ-CorridorKey
+cd Keyloom
 python -m venv .venv
 .venv/Scripts/activate      # Windows
 source .venv/bin/activate    # macOS / Linux
@@ -27,10 +27,9 @@ pip install -e ".[dev]"
 
 ### Running the App
 
-```bash
-python main.py --gui         # launch the desktop GUI
-python main.py --cli         # original CLI wizard (upstream compatible)
-```
+The desktop app is the native Rust program in `rust-ui/` (`cargo build --release`, binary `keyloom-ui`); the Python code
+under `backend/` is its worker and network service. Installers are built only with `python packaging/build_release.py`
+(see `packaging/README.md`).
 
 ### Running Tests
 
@@ -67,7 +66,7 @@ In your PR description, focus on **why** you made the change, not just what chan
 - **Tests** — more coverage is always welcome, particularly for the inference pipeline and clip management
 - **Documentation** — better explanations, usage examples, or clarifying comments
 - **Performance** — reducing VRAM usage, speeding up frame processing, or optimizing I/O
-- **UI/UX** — improvements to the PySide6 GUI, accessibility, or workflow ergonomics
+- **UI/UX** — improvements to the native Rust interface, accessibility, or workflow ergonomics
 
 ### Code Style
 

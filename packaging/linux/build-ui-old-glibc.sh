@@ -3,7 +3,7 @@
 # C compiler/linker with a glibc 2.31 target, so no docker/root/sysroot is needed. The UI links only
 # libc/libm/libgcc_s (wgpu/wayland/x11 are dlopen'd at run time), so no native -dev packages are required.
 #   sh packaging/linux/build-ui-old-glibc.sh            # resumable: rerun after any interruption/timeout
-#   -> rust-ui/target-oldglibc/x86_64-unknown-linux-gnu/release/corridorkey-ui  (+ glibc floor check)
+#   -> rust-ui/target-oldglibc/x86_64-unknown-linux-gnu/release/keyloom-ui  (+ glibc floor check)
 # Env: CK_TOOLCHAIN (default ~/.cache/ck-toolchain), CK_GLIBC (default 2.31), CK_CARGO_FLAGS (default --locked).
 set -eu
 ZIG_VER=0.14.1
@@ -31,8 +31,8 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$TC/zigcc"
 export CC_x86_64_unknown_linux_gnu="$TC/zigcc"
 export RUSTC="${RUSTC:-/usr/bin/rustc}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 # shellcheck disable=SC2086
-/usr/bin/cargo build --release --target x86_64-unknown-linux-gnu --bin corridorkey-ui ${CK_CARGO_FLAGS:---locked}
-OUT="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/corridorkey-ui"
+/usr/bin/cargo build --release --target x86_64-unknown-linux-gnu --bin keyloom-ui ${CK_CARGO_FLAGS:---locked}
+OUT="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/keyloom-ui"
 python3 - "$OUT" "$GLIBC" "$REPO/packaging" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[3])
