@@ -32,7 +32,6 @@ DisableWelcomePage=yes
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
-DisableFinishedPage=yes
 SetupMutex=KeyloomOnlineSetupMutex
 CloseApplications=no
 
