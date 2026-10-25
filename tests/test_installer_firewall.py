@@ -238,7 +238,7 @@ def installed_tree(tmp_path, rec_json=None):
 def test_real_package_load_path_runs_in_the_installed_interpreter(monkeypatch, tmp_path, capsys):
     """Regression for the 2.4.0-99b6a39c52 failure: the staged payload (and its Python) is renamed before the step, so the
     step must run in a fresh `python -I -B` of the INSTALLED tree. --firewall skip: no prompt, no sudo, no rule change."""
-    vdir = installed_tree(tmp_path)
+    installed_tree(tmp_path)
     monkeypatch.setattr(lifecycle, "IS_WIN", False)
     status = lifecycle.firewall_step(tmp_path, "skip")
     saved = json.loads((tmp_path / lifecycle.RECEIPT).read_text())

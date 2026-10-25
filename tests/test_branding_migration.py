@@ -150,7 +150,6 @@ def test_state_file_read_survives_a_concurrent_replace(tmp_path, monkeypatch):
 
 
 def test_annotation_model_is_backend_and_qt_free(tmp_path):
-    import importlib
     import subprocess
     code = ("import sys; from backend.annotations import AnnotationModel; "
             "assert not any(m.startswith('PySide6') for m in sys.modules), 'Qt imported'")
