@@ -16,6 +16,8 @@ UsePreviousAppDir=no
 DisableProgramGroupPage=yes
 DisableDirPage=no
 PrivilegesRequired=lowest
+; Per-user install: RedirectionGuard would block the runtime junction the installer itself creates (WinError 448).
+RedirectionGuard=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=@OUT@
