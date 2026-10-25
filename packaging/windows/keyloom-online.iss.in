@@ -121,7 +121,7 @@ var
   Rc: Integer;
 begin
   Result := True;
-  PreLog := AddBackslash(GetEnv('TEMP')) + 'Keyloom-setup-{#VID}-' + GetDateTimeString('yyyymmdd-hhnnss', '', '') + '.log';
+  PreLog := AddBackslash(GetEnv('TEMP')) + 'Keyloom-setup-{#VID}-' + GetDateTimeString('yyyymmdd-hhnnss', #0, #0) + '.log';
   if ExpandConstant('{param:REPAIR|0}') = '1' then exit;
   P := ExpandConstant('{param:PREFIX|}');
   if P = '' then

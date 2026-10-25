@@ -205,7 +205,7 @@ var
   Rc: Integer;
 begin
   Result := True;
-  PreLog := AddBackslash(GetEnv('TEMP')) + 'Keyloom-setup-{#VID}-' + GetDateTimeString('yyyymmdd-hhnnss', '', '') + '.log';
+  PreLog := AddBackslash(GetEnv('TEMP')) + 'Keyloom-setup-{#VID}-' + GetDateTimeString('yyyymmdd-hhnnss', #0, #0) + '.log';
   Dir := DefaultDir('');
   if (PrevAppPath <> '') and (Dir = PrevAppPath) then LogLine('install folder: ' + Dir + ' (recorded)')
   else LogLine('install folder: ' + Dir + ' (default)');
