@@ -6,7 +6,6 @@ import sys
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-APP_DATA_NAME = "EZ-CorridorKey2"
 V2_ASSET_SUBDIR = "CorridorKeyV2"
 MODELS_DIR_ENV = "CORRIDORKEY_V2_MODELS_DIR"
 
@@ -48,7 +47,7 @@ def get_v2_models_dir() -> Path:
     d = _install_descriptor_models_dir()
     if d is not None:
         return d
-    return _app_data_base() / APP_DATA_NAME / V2_ASSET_SUBDIR
+    return _app_data_base() / "Keyloom" / "EngineV2"
 
 
 def _install_descriptor_models_dir() -> Path | None:

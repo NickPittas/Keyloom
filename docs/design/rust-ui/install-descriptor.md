@@ -2,14 +2,14 @@
 
 Status: implemented 2026-10-22 in `rust-ui/src/runtime.rs` (authoritative Rust) and
 `backend/install_paths.py` (authoritative Python, stdlib only). Shared schema fixture:
-`rust-ui/tests/fixtures/install/corridorkey-install.json` — parsed and asserted by BOTH
+`rust-ui/tests/fixtures/install/keyloom-install.json` — parsed and asserted by BOTH
 languages' tests (`runtime::tests` in `rust-ui/src/runtime.rs`, `tests/test_install_paths.py`),
 so a contract drift fails CI on one side or the other. This document is the handoff for
 downstream consumers (model manager / installer / setup helper); it changes nothing by itself.
 
 ## File and discovery
 
-One `corridorkey-install.json` per install, in the **install root** (next to/near the app
+One `keyloom-install.json` per install, in the **install root** (next to/near the app
 binary; the packaged helper tree sits below it). Discovery, first match wins:
 
 1. `CK_INSTALL` env — explicit path to the descriptor **file or its folder**. If it points
@@ -24,7 +24,7 @@ Never the CWD: a packaged release must launch from any folder. Resolution is lex
 ```json
 {
   "schema": 1,
-  "app_name": "CorridorKey",
+  "app_name": "Keyloom",
   "app_version": "2.1.5",
   "roots": {
     "python": "runtime/python/bin/python3",
@@ -46,8 +46,7 @@ Never the CWD: a packaged release must launch from any folder. Resolution is lex
   roots, invalid JSON → **hard error naming file + field + remedy** ("update the app",
   "reinstall or repair", "fix/unset CK_INSTALL"). A found-but-broken descriptor disables the
   runtime actions; it NEVER falls back to a developer checkout or platform defaults.
-- `null` optional roots mean "use the platform default", which **preserves existing model
-  locations** — no moves, no deletes.
+- `null` optional roots mean "use the platform default" — no moves, no deletes.
 
 ## Root precedence (single order, both languages)
 
@@ -55,8 +54,8 @@ Never the CWD: a packaged release must launch from any folder. Resolution is lex
 | --- | --- |
 | repo/helper + python (import, AI worker) | `--repo`/caller argument → valid `CK_REPO` → descriptor (`helper`+`python`) → developer checkout discovery (exe/CWD ancestors with `backend/worker/__main__.py`) |
 | interpreter | target's explicit python (settings) → `CK_PYTHON` env → descriptor `python` → `<repo>/.venv` |
-| models root (`backend.v2_paths.get_v2_models_dir`) | `CORRIDORKEY_V2_MODELS_DIR` env → descriptor `models` → existing platform default (`~/.local/share/EZ-CorridorKey2/CorridorKeyV2` / `%LOCALAPPDATA%\…`) — unchanged when no descriptor |
-| settings file | unchanged (`corridorkey-native/settings.json` under XDG/`~/.config`; Windows now `%APPDATA%` then `%LOCALAPPDATA`, no `HOME` needed) |
+| models root (`backend.v2_paths.get_v2_models_dir`) | `CORRIDORKEY_V2_MODELS_DIR` env → descriptor `models` → platform default (`~/.local/share/Keyloom/EngineV2` / `%LOCALAPPDATA%\Keyloom\EngineV2`) when no descriptor |
+| settings file | `keyloom/settings.json` under XDG/`~/.config`; Windows now `%APPDATA%` then `%LOCALAPPDATA`, no `HOME` needed |
 | default new-projects dir | `--data-dir` → descriptor `user_data` → repo root (dev) → platform user data |
 
 ## Environment contract for child processes
@@ -73,11 +72,11 @@ overriding explicit values.
 
 ## Platform defaults when roots are `null`
 
-- `user_data`: `%APPDATA%\CorridorKey` (else `%LOCALAPPDATA%`) / `$XDG_DATA_HOME` or
-  `~/.local/share` + `/CorridorKey`. No `HOME` required on Windows.
-- `cache`: `%LOCALAPPDATA%\CorridorKey\cache` (else APPDATA) / `$XDG_CACHE_HOME` or `~/.cache` + `/CorridorKey`.
+- `user_data`: `%APPDATA%\Keyloom` (else `%LOCALAPPDATA%\Keyloom`) / `$XDG_DATA_HOME` or
+  `~/.local/share` + `/Keyloom`. No `HOME` required on Windows.
+- `cache`: `%LOCALAPPDATA%\Keyloom\cache` (else `%APPDATA%\Keyloom\cache`) / `$XDG_CACHE_HOME` or `~/.cache` + `/Keyloom`.
 - `scratch`: `<user_data>/scratch`.
-- models: unchanged v2 platform default (see table above).
+- models: the platform default (see table above).
 
 The app root may be **read-only**: nothing resolves from, or writes into, it at run time;
 user settings/cache/scratch live outside it.

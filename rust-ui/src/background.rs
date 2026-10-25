@@ -9,14 +9,10 @@ use std::path::{Path, PathBuf};
 const OWNER: &str = "keyloom-ui"; // show-request payload only
 #[cfg(not(windows))]
 const ENTRY: &str = "keyloom.desktop";
-#[cfg(not(windows))]
-const OLD_ENTRY: &str = "corridorkey.desktop"; // pre-rename login entry, migrated when this installation owns it
 #[cfg(windows)]
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
 const RUN_VALUE: &str = "Keyloom";
-#[cfg(windows)]
-const OLD_RUN_VALUE: &str = "CorridorKey"; // pre-rename value, migrated when it points into this installation
 
 pub enum Instance {
     /// This process owns the lock for as long as the value lives.
@@ -121,16 +117,11 @@ mod platform {
         // Installer's owner id: first 16 hex of sha256 of the prefix path.
         let owner = &crate::sha256::hex(prefix.to_string_lossy().as_bytes())[..16];
         let marker = format!("X-Keyloom-Owner={owner}");
-        let old_marker = format!("X-CorridorKey-Owner={owner}");
-        let owned = |p: &Path| std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l == marker || l == old_marker));
+        let owned = |p: &Path| std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l == marker));
         let ours = owned(&path);
-        let old_path = path.with_file_name(OLD_ENTRY);
-        let old_ours = owned(&old_path);
         if !enabled {
-            for (p, mine) in [(&path, ours), (&old_path, old_ours)] {
-                if mine {
-                    std::fs::remove_file(p).map_err(|e| format!("cannot remove {}: {e}", p.display()))?;
-                }
+            if ours {
+                std::fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
             }
             return Ok(());
         }
@@ -145,9 +136,6 @@ mod platform {
             _ => vec![c],
         }).collect::<String>().replace('\\', "\\\\");
         let text = format!("[Desktop Entry]\nType=Application\nName=Keyloom\nComment=Keeps the Keyloom network client available\nExec=\"{quoted}\" --background\nTerminal=false\n{marker}\n");
-        if old_ours {
-            let _ = std::fs::remove_file(&old_path); // replaced by the Keyloom entry, never left as a second client
-        }
         if std::fs::read_to_string(&path).is_ok_and(|t| t == text) {
             return Ok(());
         }
@@ -179,11 +167,9 @@ mod platform {
             if o.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_owned()) }
         };
         let (exists, owned) = owned_value(RUN_VALUE)?;
-        let (old_exists, old_owned) = owned_value(OLD_RUN_VALUE)?;
         if !enabled {
             // Remove only values that point into this installation.
             if exists && owned { delete(RUN_VALUE)?; }
-            if old_exists && old_owned { delete(OLD_RUN_VALUE)?; }
             return Ok(());
         }
         if exists && !owned {
@@ -195,9 +181,6 @@ mod platform {
         let o = reg(&["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &data, "/f"])?;
         if !o.status.success() {
             return Err(String::from_utf8_lossy(&o.stderr).trim().to_owned());
-        }
-        if old_exists && old_owned {
-            delete(OLD_RUN_VALUE)?; // moved to the Keyloom value, not duplicated
         }
         Ok(())
     }

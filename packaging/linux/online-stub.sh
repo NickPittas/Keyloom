@@ -1,5 +1,5 @@
 #!/bin/sh
-# Keyloom (powered by CorridorKey) @VERSION_ID@ online installer for Linux (needs only sh, tar, gzip, head, tail, sha256sum).
+# Keyloom @VERSION_ID@ online installer for Linux (needs only sh, tar, gzip, head, tail, sha256sum).
 # Carries Keyloom itself (app, UI, FFmpeg, bundled Python and every small dependency). Only the large public wheels
 # (torch, triton, NVIDIA CUDA libraries) are downloaded from PyPI / download.pytorch.org: no account, no sign-in.
 # No root (only an optional, asked-for sudo for UFW rules). Configures a per-user network host. Models download from the app.
@@ -10,11 +10,7 @@ set -eu
 STUB_BYTES=@STUB_BYTES@;
 BOOT_OFFSET=@BOOT_OFFSET@; BOOT_LEN=@BOOT_LEN@; BOOT_SHA256="@BOOT_SHA256@"
 ONLINE_OFFSET=@ONLINE_OFFSET@; ONLINE_LEN=@ONLINE_LEN@; ONLINE_SHA256="@ONLINE_SHA256@"
-# A pre-rename install is upgraded in place; only a fresh machine gets the Keyloom folder.
-# A pre-rename install (~/.local/opt/CorridorKey) is taken over: Keyloom installs into ~/.local/opt/Keyloom, reuses the installed
-# files, moves the startup entry/launcher/network service across and leaves the old folder as the rollback holder.
-OLD="$HOME/.local/opt/CorridorKey"; ADOPT=""; PREFIX_SET=0
-PREFIX="${KEYLOOM_PREFIX:-${CORRIDORKEY_PREFIX:-$HOME/.local/opt/Keyloom}}"; REPAIR=""; FIREWALL=yes
+PREFIX="${KEYLOOM_PREFIX:-$HOME/.local/opt/Keyloom}"; REPAIR=""; FIREWALL=yes
 usage() { cat <<U
 Usage: $(basename "$0") [--prefix DIR] [--repair] [--firewall yes|skip | --no-firewall]
   default       install or update Keyloom @VERSION_ID@ into PREFIX ($PREFIX); files of the installed versions
@@ -30,16 +26,16 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --repair) REPAIR=1; shift;;
     --no-firewall) FIREWALL=skip; shift;;
-    --prefix) [ $# -ge 2 ] || { echo "--prefix needs a value" >&2; exit 64; }; PREFIX="$2"; PREFIX_SET=1; shift 2;;
+    --prefix) [ $# -ge 2 ] || { echo "--prefix needs a value" >&2; exit 64; }; PREFIX="$2"; shift 2;;
     --firewall) [ $# -ge 2 ] || { echo "--firewall needs a value" >&2; exit 64; }; FIREWALL="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "unknown option $1" >&2; usage >&2; exit 64;;
   esac
 done
-if [ "$PREFIX_SET" = 0 ] && [ -z "${KEYLOOM_PREFIX:-}${CORRIDORKEY_PREFIX:-}" ] && [ -f "$OLD/receipt.json" ] && [ ! -f "$PREFIX/receipt.json" ]; then ADOPT="$OLD"; fi
 case "$FIREWALL" in yes|skip|ask) ;; *) echo "--firewall must be yes or skip" >&2; exit 64;; esac
 [ "$(uname -m)" = x86_64 ] || { echo "ERROR: x86_64 Linux only" >&2; exit 1; }
 SELF=$(readlink -f "$0")
+_log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$*" >> "$PREFIX/install.log" || echo "WARNING: cannot write $PREFIX/install.log" >&2; }
 mkdir -p "$PREFIX"
 STAGE=$(mktemp -d "$PREFIX/.staging.XXXXXX")  # same filesystem as PREFIX (not a possibly small tmpfs /tmp); private to this run
 trap '[ -z "${_P:-}" ] || _killtree "$_P"; rm -rf "$STAGE"' EXIT  # a signal also stops the supervised child tree
@@ -97,7 +93,7 @@ echo "Unpacking bootstrap ..."
 PF="$STAGE/boot.tgz"
 sup bootstrap sh -c 'tail -c +"$1" "$2" | head -c "$3" > "$4/boot.tgz" && [ "$(sha256sum < "$4/boot.tgz" | cut -d" " -f1)" = "$5" ] \
   && tar -xzf "$4/boot.tgz" -C "$4" && rm -f "$4/boot.tgz"' sh "$((STUB_BYTES + BOOT_OFFSET + 1))" "$SELF" "$BOOT_LEN" "$STAGE" "$BOOT_SHA256" \
-  || { echo "ERROR: bootstrap could not be unpacked or its checksum differs (download damaged?)" >&2; exit 1; }
+  || { _BR=$?; _log "ERROR: bootstrap failed, exit $_BR (124 = no progress for ${STALL_S}s; otherwise unpack or checksum error)"; echo "ERROR: bootstrap could not be unpacked or its checksum differs (download damaged?)" >&2; exit 1; }
 PF=""
 PY="$STAGE/boot/python/bin/python3"; IP="$STAGE/boot/installer_payload.py"   # outside keyloom-online/payload: survives every move
 # Same build already installed and verified? Decided BEFORE the heavy payload is unpacked: the installed, owned lifecycle checks the
@@ -105,19 +101,18 @@ PY="$STAGE/boot/python/bin/python3"; IP="$STAGE/boot/installer_payload.py"   # o
 # import, no GPU probe). Supervised like every other automatic step. A negative or failed probe just continues to the normal path.
 if [ -z "$REPAIR" ] && [ -x "$PREFIX/current/runtime/python/bin/python3" ] && [ -f "$PREFIX/current/app/packaging/lifecycle.py" ]; then
   _CR=0
-  "$PY" -I -B "$IP" run --label check -- "$PREFIX/current/runtime/python/bin/python3" -I -B \
-    "$PREFIX/current/app/packaging/lifecycle.py" --prefix "$PREFIX" check --version "@VERSION_ID@" || _CR=$?
+  "$PY" -I -B "$IP" run --label check --log "$PREFIX/install.log" --log-title "Keyloom linux-online installer" -- \
+    "$PREFIX/current/runtime/python/bin/python3" -I -B "$PREFIX/current/app/packaging/lifecycle.py" --prefix "$PREFIX" check --version "@VERSION_ID@" || _CR=$?
   if [ "$_CR" = 0 ]; then
     echo "Nothing to do: Keyloom @VERSION_ID@ is already installed and verified. Use --repair to restore damaged files."; exit 0
   fi
 fi
 "$PY" -I -B "$IP" extract --run "$SELF" --base "$STUB_BYTES" --label online --offset "$ONLINE_OFFSET" --len "$ONLINE_LEN" \
-  --sha256 "$ONLINE_SHA256" --dest "$STAGE" --require keyloom-online
+  --sha256 "$ONLINE_SHA256" --dest "$STAGE" --require keyloom-online --log "$PREFIX/install.log" --log-title "Keyloom linux-online installer"
 W="$STAGE/keyloom-online"
 set -- --payload-dir "$W/payload" --sources "$W/wheel-sources.json" --prefix "$PREFIX" --firewall "$FIREWALL"
 [ -z "$REPAIR" ] || set -- "$@" --repair
-[ -z "$ADOPT" ] || set -- "$@" --adopt-from "$ADOPT"
-# online.py owns the reuse/attach decision (and passes --attach-runtime/--runtime-src through the lifecycle itself); it is
+# online.py owns the reuse/attach decision (and passes --attach-runtime through the lifecycle itself); it is
 # supervised like every other automatic step. Its download phases (visible bytes/speed) and the sudo consent count as progress
 # through $KEYLOOM_WAIT_FILE.
 KEYLOOM_WAIT_FILE="$STAGE/waiting-for-user"; export KEYLOOM_WAIT_FILE

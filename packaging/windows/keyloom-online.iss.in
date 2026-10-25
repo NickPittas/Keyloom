@@ -1,4 +1,4 @@
-; Keyloom (powered by CorridorKey) Windows ONLINE installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
+; Keyloom Windows ONLINE installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
 ; Per-user, no admin or automatic firewall rule, no account or sign-in. Activation configures the network host. This exe carries Keyloom itself
 ; (app, UI, FFmpeg, bundled Python and every small dependency) unpacked into {tmp} (deleted when Setup exits); online.py
 ; then downloads only the large public wheels (torch, triton, NVIDIA CUDA libraries) from PyPI / download.pytorch.org,
@@ -12,7 +12,8 @@
 AppId={{E4A7B1C3-6D2F-4B8A-9C15-3F0D7A52E964}
 AppName=Keyloom Online Setup
 AppVersion=@APP_VERSION@
-AppPublisher=Keyloom (powered by CorridorKey)
+AppPublisher=Keyloom
+SetupIconFile=@ICON@
 CreateAppDir=no
 Uninstallable=no
 PrivilegesRequired=lowest
@@ -46,38 +47,72 @@ Source: "@WRAP@\*"; DestDir: "{tmp}\k"; Flags: recursesubdirs createallsubdirs i
 [Code]
 var
   FailCode: Integer;
+  LogFile: String;  { <prefix>\install.log once the install folder is discovered }
+  PreLog: String;   { %TEMP% log from the start of setup; AttachPreLog copies it into LogFile; kept afterwards }
+  LogWriteFailed: Boolean;
 
 function GetCustomSetupExitCode: Integer;
 begin
   Result := FailCode;  { nonzero => the setup process itself reports failure }
 end;
 
+procedure LogLine(Msg: String);
+var
+  Line: String;
+begin
+  Line := GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + ' ' + Msg;
+  if LogFile = '' then SaveStringToFile(PreLog, Line + #13#10, True)
+  else if not SaveStringToFile(LogFile, Line + #13#10, True) then
+  begin
+    LogWriteFailed := True;
+    SaveStringToFile(PreLog, Line + ' (install.log not writable: ' + LogFile + ')' + #13#10, True);
+  end;
+end;
+
+procedure AttachPreLog;
+var
+  Pre: AnsiString;
+begin
+  ForceDirectories(ExtractFilePath(LogFile));
+  if not LoadStringFromFile(PreLog, Pre) or not SaveStringToFile(LogFile, Pre, True) then LogWriteFailed := True;
+end;
+
+function LogHint: String;
+begin
+  Result := '';
+  if LogWriteFailed then Result := ' Log: ' + PreLog;
+end;
+
 { One supervised Python step in a VISIBLE console: installer_payload.py runs the command as its own process tree, prints a
   heartbeat every second, kills and reaps the tree after 300 s without any output (exit 124) and exports the private wait file path to it as
   KEYLOOM_WAIT_FILE (online.py creates it only around real downloads/consent). The path is inside Setup's private tmp folder. }
+function RunPyV(Interp, Verb, StepName, Extra: String; var Rc: Integer): Boolean;
 var
-  LogArg: String;  { --log <prefix>\install.log, known once the install folder is discovered }
+  IP, LogArg: String;
+begin
+  LogArg := ' --log "' + PreLog + '"';
+  if LogFile <> '' then LogArg := ' --log "' + LogFile + '" --log-title "Keyloom {#VID} windows-online installer"';
+  IP := ExpandConstant('{tmp}\installer_payload.py');  { extracted by InitializeSetup; the bootstrap copy is the fallback }
+  if not FileExists(IP) then IP := ExpandConstant('{tmp}\kb\installer_payload.py');
+  Result := Exec(Interp, '-I -B "' + IP + '" ' + Verb + ' --label ' + StepName + LogArg + Extra, '', SW_SHOW, ewWaitUntilTerminated, Rc);
+  if not Result then
+  begin
+    LogLine('cannot start ' + Interp + ': ' + SysErrorMessage(Rc) + ' (' + IntToStr(Rc) + ')');
+    Rc := 2;
+  end;
+end;
 
 function RunPy(Interp, StepName, Cmd: String; var Rc: Integer): Boolean;
 begin
-  Result := Exec(Interp, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" run --label ' + StepName + LogArg +
-                 ' --wait-file "' + ExpandConstant('{tmp}\waiting-for-user') + '" -- ' + Cmd, '', SW_SHOW, ewWaitUntilTerminated, Rc);
-  if not Result then Rc := 2;
+  Result := RunPyV(Interp, 'run', StepName, ' --wait-file "' + ExpandConstant('{tmp}\waiting-for-user') + '" -- ' + Cmd, Rc);
 end;
-
-{ Where the install lives is decided by the bundled helper's one parallel read-only `discover` run at ssPostInstall: /PREFIX=DIR
-  wins, else the folder the full Inno installer recorded (HKCU before HKLM), else an existing pre-rename %LOCALAPPDATA%\Programs\CorridorKey
-  (adopted), else %LOCALAPPDATA%\Programs\Keyloom. It never ends in a backslash (it goes into a quoted command line). }
-var
-  AdoptDir: String;  { pre-rename install this one takes over (its settings, models, shortcut, startup entry and service move across) }
-
 
 procedure ExitProcess(uExitCode: Cardinal); external 'ExitProcess@kernel32.dll stdcall';
 
 { Same build already installed and verified? Decided in InitializeSetup, BEFORE Inno unpacks the heavy payload: the installed, owned
   lifecycle checks the exact version id built into this setup (fast ordinary check: no runtime rehash, no engine import, no GPU
   probe), under the supervisor with a visible console. Candidate folder: /PREFIX, else the full installer's
-  recorded folder (HKCU before HKLM), else the default; the authoritative parallel `discover` run still happens later. A negative or
+  recorded folder (HKCU before HKLM), else the default; the authoritative `discover` run still happens later. A negative or
   failed probe simply continues to the normal install. Nothing is written. /REPAIR=1 skips it. }
 function InitializeSetup: Boolean;
 var
@@ -86,13 +121,14 @@ var
   Rc: Integer;
 begin
   Result := True;
+  PreLog := AddBackslash(GetEnv('TEMP')) + 'Keyloom-setup-{#VID}-' + GetDateTimeString('yyyymmdd-hhnnss', '', '') + '.log';
   if ExpandConstant('{param:REPAIR|0}') = '1' then exit;
   P := ExpandConstant('{param:PREFIX|}');
   if P = '' then
   begin
-    Raw2 := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{7C1E6C52-3B0F-4D5A-9E57-2D6C7A0B7E21}_is1';
+    Raw2 := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{3F9A2C71-8E4B-4D6F-B1A5-7C0E92D4A6B3}_is1';
     if RegQueryStringValue(HKCU, Raw2, 'Inno Setup: App Path', S) or RegQueryStringValue(HKLM, Raw2, 'Inno Setup: App Path', S) then
-      if DirExists(S) then P := S;
+      if DirExists(S) and FileExists(S + '\receipt.json') then P := S;
   end;
   if P = '' then P := ExpandConstant('{localappdata}\Programs\Keyloom');
   P := RemoveBackslashUnlessRoot(P);
@@ -102,9 +138,11 @@ begin
   Lc := P + '\versions\' + Trim(String(Raw)) + '\app\packaging\lifecycle.py';
   if (Trim(String(Raw)) = '') or not FileExists(Py) or not FileExists(Lc) then exit;
   ExtractTemporaryFile('installer_payload.py');
-  if Exec(Py, '-I -B "' + ExpandConstant('{tmp}\installer_payload.py') + '" run --label check -- "' + Py +
-          '" -I -B "' + Lc + '" --prefix "' + P + '" check --version {#VID}', '', SW_SHOW, ewWaitUntilTerminated, Rc) and (Rc = 0) then
+  RunPyV(Py, 'run', 'check', ' -- "' + Py + '" -I -B "' + Lc + '" --prefix "' + P + '" check --version {#VID}', Rc);
+  LogLine('fast check: ' + P + ' rc=' + IntToStr(Rc));
+  if Rc = 0 then
   begin
+    LogLine('already installed and verified; nothing was changed');
     SuppressibleMsgBox('Keyloom {#VID} is already installed and verified. Nothing was changed (settings, models and services are untouched). Use /REPAIR=1 to restore damaged files.', mbInformation, MB_OK, IDOK);
     ExitProcess(0);
   end;
@@ -112,7 +150,7 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  Boot, Prefix, Args, Bpy, DiscFile: String;
+  Boot, Prefix, Src, Args, Bpy, DiscFile, Reason: String;
   DiscLines: TArrayOfString;
   Rc: Integer;
 begin
@@ -120,46 +158,56 @@ begin
   if CurStep <> ssPostInstall then exit;
   Boot := ExpandConstant('{tmp}\k');
   Bpy := ExpandConstant('{tmp}\kb\python.exe');
-  { ONE read-only discovery (HKCU/HKLM keys and both candidate receipts probed in parallel by the bundled helper's bounded pool,
-    precedence fixed in code: /PREFIX > HKCU > HKLM > default). No second Python process, no console per probe; nothing is written. }
+  { ONE read-only discovery (HKCU/HKLM keys, then the recorded Keyloom folder's receipt.json, then the default; read by the bundled
+    helper, precedence fixed in code: /PREFIX > recorded folder > default). No second Python process, no console per probe; nothing is written. }
   DiscFile := ExpandConstant('{tmp}\discovered.txt');
   DeleteFile(DiscFile);
-  if not Exec(Bpy, '-I -B "' + ExpandConstant('{tmp}\kb\installer_payload.py') + '" discover --label discover' +
-              ' --prefix-param "' + ExpandConstant('{param:PREFIX|}') + '" --out "' + DiscFile + '"', '', SW_SHOW, ewWaitUntilTerminated, Rc) then
-    Rc := 2;
-  if (Rc <> 0) or not LoadStringsFromFile(DiscFile, DiscLines) or (GetArrayLength(DiscLines) < 1) then
+  RunPyV(Bpy, 'discover', 'discover', ' --prefix-param "' + ExpandConstant('{param:PREFIX|}') + '" --out "' + DiscFile + '"', Rc);
+  Reason := '';
+  if Rc <> 0 then Reason := 'discover exited with code ' + IntToStr(Rc)
+  else if not FileExists(DiscFile) then Reason := 'discover wrote no output file'
+  else if not LoadStringsFromFile(DiscFile, DiscLines) then Reason := 'discover output file could not be read'
+  else if GetArrayLength(DiscLines) < 1 then Reason := 'discover output file is empty';
+  if Reason <> '' then
   begin
     FailCode := 14;
-    SuppressibleMsgBox('Setup could not determine the install folder (code ' + IntToStr(Rc) + '). Nothing was installed or changed.', mbError, MB_OK, IDOK);
+    LogLine('discover failed: ' + Reason);
+    SuppressibleMsgBox('Setup could not determine the install folder: ' + Reason + '. Nothing was installed or changed.' + LogHint, mbError, MB_OK, IDOK);
     exit;
   end;
   Prefix := Trim(DiscLines[0]);
-  AdoptDir := '';
-  if GetArrayLength(DiscLines) > 1 then AdoptDir := Trim(DiscLines[1]);
+  Src := '';
+  if GetArrayLength(DiscLines) > 1 then Src := Trim(DiscLines[1]);
+  LogLine('install folder: ' + Prefix + ' (' + Src + ')');
   if Length(Prefix) <= 3 then
   begin
     FailCode := 5;
-    SuppressibleMsgBox('The install folder cannot be a drive root (for example use D:\Apps\Keyloom).', mbError, MB_OK, IDOK);
+    LogLine('install folder is a drive root: ' + Prefix);
+    SuppressibleMsgBox('The install folder cannot be a drive root (for example use D:\Apps\Keyloom).' + LogHint, mbError, MB_OK, IDOK);
     exit;
   end;
-  LogArg := ' --log "' + Prefix + '\install.log" --log-title "Keyloom {#VID} windows-online installer"';
+  LogFile := Prefix + '\install.log';
+  AttachPreLog;
   Args := '"' + Bpy + '" -I -B "' + Boot + '\payload\app\packaging\online.py" --payload-dir "' + Boot + '\payload" --sources "' +
           Boot + '\wheel-sources.json" --prefix "' + Prefix + '"';
   if ExpandConstant('{param:REPAIR|0}') = '1' then Args := Args + ' --repair';
-  if AdoptDir <> '' then Args := Args + ' --adopt-from "' + AdoptDir + '"';
   if WizardIsTaskSelected('firewall') then Args := Args + ' --firewall yes' else Args := Args + ' --firewall skip';
-  { online.py owns the reuse/attach decision and passes --attach-runtime/--runtime-src through the lifecycle itself. Visible,
-    supervised console: heartbeat each second plus the client's real download/verify progress. }
+  { online.py owns the reuse/attach decision. Visible, supervised console: heartbeat each second plus the client's real download/verify progress. }
   RunPy(Bpy, 'online', Args, Rc);
   if Rc = 0 then exit;
   FailCode := Rc;
-  SaveStringToFile(Prefix + '\install.log', GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + ' Setup failed with code ' + IntToStr(Rc) + #13#10, True);
+  LogLine('Setup failed with code ' + IntToStr(Rc));
   if Rc = 124 then
-    SuppressibleMsgBox('Keyloom setup STOPPED: a step showed no progress for 5 minutes and was ended. The previous install (if any) is unchanged.', mbError, MB_OK, IDOK)
+    SuppressibleMsgBox('Keyloom setup STOPPED: a step showed no progress for 5 minutes and was ended. The previous install (if any) is unchanged.' + LogHint, mbError, MB_OK, IDOK)
   else if Rc = 4 then
-    SuppressibleMsgBox('Keyloom is running. Quit it with File > Quit (a background network service does not need to be stopped) and run setup again. Nothing was changed.', mbError, MB_OK, IDOK)
+    SuppressibleMsgBox('Keyloom is running. Quit it with File > Quit (a background network service does not need to be stopped) and run setup again. Nothing was changed.' + LogHint, mbError, MB_OK, IDOK)
   else if Rc = 130 then
-    SuppressibleMsgBox('Setup was cancelled. The previous Keyloom install (if any) is unchanged.', mbInformation, MB_OK, IDOK)
+    SuppressibleMsgBox('Setup was cancelled. The previous Keyloom install (if any) is unchanged.' + LogHint, mbInformation, MB_OK, IDOK)
   else
-    SuppressibleMsgBox('Keyloom setup FAILED (code ' + IntToStr(Rc) + '). The previous install (if any) is unchanged. Run setup from a Command Prompt to keep the console output, then try again.', mbError, MB_OK, IDOK);
+    SuppressibleMsgBox('Keyloom setup FAILED (code ' + IntToStr(Rc) + '). The previous install (if any) is unchanged. Run setup from a Command Prompt to keep the console output, then try again.' + LogHint, mbError, MB_OK, IDOK);
+end;
+
+procedure DeinitializeSetup;
+begin
+  LogLine('Setup finished with code ' + IntToStr(FailCode));
 end;

@@ -35,8 +35,10 @@ import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -259,10 +261,7 @@ def settings_dir() -> Path | None:
         base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
     else:
         base = os.environ.get("XDG_CONFIG_HOME") or (str(Path(os.environ["HOME"]) / ".config") if os.environ.get("HOME") else None)
-    if not base:
-        return None
-    old = Path(base) / "corridorkey-native"  # existing settings stay where they are (shared with the app and service)
-    return old if old.is_dir() and not (Path(base) / "keyloom").exists() else Path(base) / "keyloom"
+    return Path(base) / "keyloom" if base else None
 
 
 class InstanceLock:
@@ -339,7 +338,7 @@ def load_small_json(path: Path, what: str) -> tuple[dict, bytes]:
         raw = path.read_bytes()
         return json.loads(raw), raw
     except (OSError, ValueError) as e:
-        raise Fail(f"{what} is unreadable ({type(e).__name__}); the installer is damaged, download it again")
+        raise Fail(f"{what} is unreadable ({type(e).__name__}: {e}); the installer is damaged, download it again")
 
 
 def validate_manifest(m) -> dict:
@@ -472,7 +471,7 @@ class Fetcher:
         except NET_ERRORS as e:
             if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
                 raise Transient(f"connect timed out after {READ_TIMEOUT}s")
-            raise Transient(type(e).__name__)
+            raise Transient(f"{type(e).__name__}: {e}")
 
 
 _PHASE = ["local"]  # CHILD side only: "net" while connecting/transferring, "local" while hashing/renaming
@@ -533,7 +532,7 @@ def fetch_once(fx: Fetcher, w: dict, cache: Path) -> Path:
                     except (TimeoutError, socket.timeout):
                         raise Transient(f"stalled: no data for {READ_TIMEOUT}s")  # a timed-out read is never resumed in place
                     except NET_ERRORS as e:
-                        raise Transient(type(e).__name__)
+                        raise Transient(f"{type(e).__name__}: {e}")
                     if not b:
                         break
                     have += len(b)
@@ -590,7 +589,8 @@ def fetch_child() -> int:
     except Fail as e:
         code, err = 10, str(e)
     except BaseException as e:
-        code, err = 10, type(e).__name__
+        sys.stderr.write(traceback.format_exc())  # the parent relays this to install.log
+        code, err = 10, f"{type(e).__name__}: {e}"
     end.set()
     try:
         publish({"p": "done", "err": err})
@@ -614,8 +614,13 @@ def run_fetch_child(tls_base: Path, w: dict, cache: Path) -> tuple[int, str]:
     status = cache / f"{w['sha256']}.status"
     status.unlink(missing_ok=True)
     env = {k: v for k, v in L.clean_env().items() if k != "KEYLOOM_WAIT_FILE"}  # only the parent owns the wait file
-    p = subprocess.Popen([sys.executable, "-I", "-B", "-c", _FETCH_CODE, str(Path(__file__).resolve())], stdin=subprocess.PIPE,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    errf = tempfile.TemporaryFile()  # a pipe would deadlock the child once its stderr buffer fills
+    try:
+        p = subprocess.Popen([sys.executable, "-I", "-B", "-c", _FETCH_CODE, str(Path(__file__).resolve())], stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=errf, env=env)
+    except BaseException:
+        errf.close()
+        raise
     cm, cur, seen, quiet, early = None, None, 0, time.monotonic(), None
     try:
         try:
@@ -650,6 +655,10 @@ def run_fetch_child(tls_base: Path, w: dict, cache: Path) -> tuple[int, str]:
             return early
         if rc == 0:
             return 0, ""
+        errf.seek(0)
+        data = errf.read(65536)
+        for line in data.decode("utf-8", "replace").splitlines():
+            say(f"[wheel-worker] stderr| {line}")
         err = _read_status(status).get("err")
         return (rc, err or "transfer failed") if rc in (10, 20) else (10, "the transfer process ended unexpectedly")
     finally:
@@ -661,6 +670,7 @@ def run_fetch_child(tls_base: Path, w: dict, cache: Path) -> tuple[int, str]:
             pass
         if cm is not None:
             cm.__exit__(None, None, None)
+        errf.close()
         status.unlink(missing_ok=True)
 
 
@@ -780,7 +790,7 @@ def extract_wheel(path: Path, w: dict, regular: dict, tree: Path, staged, prog: 
     except Fail:
         raise
     except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, RuntimeError) as e:
-        raise Fail(f"{wheel_name(w)}: damaged wheel ({type(e).__name__})")
+        raise Fail(f"{wheel_name(w)}: damaged wheel ({type(e).__name__}: {e})") from e
     return got
 
 
@@ -808,7 +818,7 @@ _MEMO_LOCK = threading.Lock()
 
 
 def build_tree(tls_base: Path | None, prefix: Path, rec: dict | None, stage: Path, cache: Path, pdir: Path,
-               mani: dict, raw_manifest: bytes, wheels: list, bundled: set, hint_prefix: Path | None = None,
+               mani: dict, raw_manifest: bytes, wheels: list, bundled: set,
                attach: bool = False, trust_installed: bool = True) -> Path:
     """Assemble the payload tree. attach=True: lifecycle attaches the trusted existing runtime/ as a whole directory, so no
     runtime/ file is staged here at all. Otherwise a file identical (manifest metadata) to one in an OWNED, previously activated
@@ -822,17 +832,17 @@ def build_tree(tls_base: Path | None, prefix: Path, rec: dict | None, stage: Pat
     (tree / L.MANIFEST).write_bytes(raw_manifest)  # the original manifest, byte for byte
 
     hints = []  # installed versions whose identical files may be reused: (resolved dir, its manifest files)
-    hp, hr = (hint_prefix, L.read_receipt(hint_prefix)) if hint_prefix else (prefix, rec)
+    hr = rec
     cands = []  # stage 1 (serial: needs the receipt's version ids): candidate dirs, current before previous
     try:
-        owned = bool(hr) and L.load_json(hp / L.RECEIPT).get("app") in (L.APP_ID, L.LEGACY_APP_ID) and bool(hr.get("activated_at"))
+        owned = bool(hr) and L.load_json(prefix / L.RECEIPT).get("app") == L.APP_ID and bool(hr.get("activated_at"))
     except (L.InstallError, AttributeError, OSError):
         owned = False
     if not owned:
         hr = None  # not an owned, previously activated install: nothing in it is trusted as a source
     for v in (hr or {}).get("current"), (hr or {}).get("previous"):
         try:
-            d = L.vpath(hp, v) if v else None
+            d = L.vpath(prefix, v) if v else None
             if d and d.is_dir() and d.resolve() not in [c.resolve() for c in cands]:
                 cands.append(d)
         except L.InstallError:
@@ -841,8 +851,7 @@ def build_tree(tls_base: Path | None, prefix: Path, rec: dict | None, stage: Pat
     def read_hint(d):  # stage 2 (independent, read-only, shares no state): manifest + the runtime link lifecycle vouches for
         try:
             files_ = L.read_manifest(d)["files"]
-            rt = (d / "runtime").resolve() if L.is_link(d / "runtime") and \
-                L.runtime_trusted(hp, d, [hint_prefix] if hint_prefix else ()) else None
+            rt = (d / "runtime").resolve() if L.is_link(d / "runtime") and L.runtime_trusted(prefix, d) else None
             return d.resolve(), files_, rt
         except (L.InstallError, OSError):
             return None
@@ -927,31 +936,13 @@ def default_prefix() -> Path:
     return (Path(os.environ["LOCALAPPDATA"]) / "Programs" if IS_WIN else Path.home() / ".local/opt") / "Keyloom"
 
 
-def legacy_prefix(prefix: Path) -> Path | None:
-    """The pre-rename default install next to the new default prefix, when `prefix` is that new default and not installed yet."""
-    old = prefix.with_name("CorridorKey")
-    return old if prefix == default_prefix() and not (prefix / L.RECEIPT).is_file() and (old / L.RECEIPT).is_file() else None
-
-
-def peek_receipt(prefix: Path) -> dict | None:
-    """Pre-lock, READ-ONLY look at the receipt (no recover(), no write). Anything unreadable or foreign is None here; the
-    authoritative ownership check and any recovery run in inspect_prefix, under the instance lock."""
-    try:
-        if prefix.is_symlink() or not (prefix / L.RECEIPT).is_file():
-            return None
-        raw = L.load_json(prefix / L.RECEIPT)
-        return L.read_receipt(prefix) if isinstance(raw, dict) and raw.get("app") in (L.APP_ID, L.LEGACY_APP_ID) else None
-    except (L.InstallError, OSError):
-        return None
-
-
 def inspect_prefix(prefix: Path):
     """(receipt or None). Refuses anything that is not empty or a Keyloom install."""
     if prefix.is_symlink() or (prefix.exists() and not prefix.is_dir()):
         raise Fail(f"{prefix} is not a plain folder")
     if (prefix / L.RECEIPT).exists():
         raw = L.load_json(prefix / L.RECEIPT)
-        if not isinstance(raw, dict) or raw.get("app") not in (L.APP_ID, L.LEGACY_APP_ID):
+        if not isinstance(raw, dict) or raw.get("app") != L.APP_ID:
             raise Fail(f"{prefix} has a receipt that is not a Keyloom install; refusing to touch it")
         with L.mutation_lock(prefix, 10):  # brief: released before the lifecycle child, which takes it itself
             L.recover(prefix)
@@ -977,35 +968,36 @@ def up_to_date(prefix: Path, rec: dict | None, mani: dict, deep: bool = True) ->
         if not (d.is_dir() and L.read_manifest(d).get("files") == mani["files"] and L.pointer_ok(prefix, cur)):
             return False
         return not deep or L.current_is(prefix, cur, mani["files"])  # lifecycle's fast check: runtime/ is never hashed
-    except L.InstallError:
+    except L.InstallError as e:
+        say(f"probe failed: {e}; treating the install as not current")
         return False
 
 
-def runtime_ok(prefix: Path, mani: dict, src: Path | None = None) -> dict | None:
+def runtime_ok(prefix: Path, mani: dict) -> dict | None:
     """lifecycle.runtime_available (reads no runtime bytes) -> its dict ONLY when `ok is True` and `rid` is this manifest's
     runtime_id; anything else (failed dict, non-dict, wrong rid, error) is None. Never general truthiness."""
     try:
-        r = L.runtime_available(prefix, mani, src)
+        r = L.runtime_available(prefix, mani)
     except L.InstallError:
         return None
     return r if isinstance(r, dict) and r.get("ok") is True and r.get("rid") == runtime_id(mani["files"]) else None
 
 
-def trusted_runtime(prefix: Path, mani: dict, src: Path | None) -> bool:
+def trusted_runtime(prefix: Path, mani: dict) -> bool:
     """True: attach the existing runtime by reference (payload omits runtime/). False: the runtime is new/different, so the
     payload carries it (downloaded if needed). The identical runtime that cannot be used safely never falls back to a
     copy/extraction on a normal update: it needs Repair."""
-    if runtime_ok(prefix, mani, src):
+    if runtime_ok(prefix, mani):
         return True
     try:
-        r = L.runtime_available(prefix, mani, src)
-    except L.InstallError:
+        r = L.runtime_available(prefix, mani)
+    except L.InstallError as e:
+        say(f"probe failed: {e}; downloading full payload")
         r = None
     if isinstance(r, dict) and r.get("invalid") is True:
         raise Fail(f"install manifest runtime is invalid ({str(r.get('reason'))[:100]})")
-    if isinstance(r, dict) and r.get("same_runtime") is True:
-        raise Fail("the installed runtime is unchanged but cannot be reused safely "
-                   f"({str(r.get('reason'))[:100]}); run Repair once; a normal update will not copy or download it again")
+    if isinstance(r, dict) and r.get("ok") is not True and r.get("reason"):
+        say(f"runtime not reusable ({r.get('reason')}); downloading full payload")
     return False
 
 
@@ -1022,43 +1014,7 @@ def _forward_signal(n, _frame):
         raise KeyboardInterrupt
 
 
-def migrate_settings_folder(pdir: Path, prefix: Path, adopt: Path | None) -> None:
-    """Rename corridorkey-native -> keyloom (see network_service.migrate_settings_dir) BEFORE this run takes the instance lock,
-    because Windows cannot rename a folder that holds our own open lock file. Failure only means 'not renamed yet'."""
-    py = pdir / "runtime/python" / ("python.exe" if IS_WIN else "bin/python3")
-    code = ("import sys,json;sys.path.insert(0,sys.argv[1]);from pathlib import Path;from backend import network_service as s;"
-            "b=s._settings_base();o=[s.owner_id(Path(sys.argv[2]))]+([s.owner_id(Path(sys.argv[3]))] if sys.argv[3] else []);"
-            "print(json.dumps(s.migrate_settings_dir(b,o) if b else None))")
-    try:
-        with InstanceLock():
-            pass  # refuse early (clear message) when the app is running; released before the child takes the app lock itself
-        r = subprocess.run([str(py), "-I", "-B", "-c", code, str(pdir / "app"), str(prefix), str(adopt or "")], env=L.clean_env(),
-                           capture_output=True, text=True, timeout=L.INNER_TIMEOUT)
-        if r.returncode != 0 or not r.stdout.strip():
-            raise ValueError(f"the migration check exited with code {r.returncode} or gave no result")
-        out = json.loads(r.stdout.strip().splitlines()[-1])
-    except Running:
-        raise
-    except Exception as e:  # timeout, start failure, nonzero exit, empty output, unparseable JSON: the state is UNKNOWN
-        raise Fail(f"the settings folder migration state could not be determined ({type(e).__name__}); installation stopped before "
-                   "anything was staged or downloaded. The check may already have completed or undone part of an earlier "
-                   "migration, and its recovery journal is preserved; run the installer again") from None
-    # Shapes the producer (network_service.migrate_settings_dir) returns: None (null), or a dict with a string `message` and
-    # at most one of deferred / pending / blocked set to True. Anything else is malformed, never "clear".
-    if out is None:
-        return
-    flags = [k for k in ("deferred", "pending", "blocked") if k in out] if isinstance(out, dict) else None
-    if (flags is None or not isinstance(out.get("message"), str)
-            or any(not isinstance(out[k], bool) for k in flags) or sum(1 for k in flags if out[k]) > 1):
-        raise Fail("the settings folder migration check returned an unrecognised result; installation stopped before anything "
-                   "was staged or downloaded (its recovery journal is preserved); run the installer again")
-    say(out["message"])
-    if out.get("blocked") is True:  # ambiguous interrupted migration: refuse before any staging or download
-        raise Fail(out["message"] + " (installation stopped before anything was staged or downloaded)")
-    # deferred / pending (or an informative dict with no flag set) continue: settings stay where they are and every resolver finds them
-
-
-def run_lifecycle(prefix: Path, tree: Path, verb: str, firewall: str = "yes", adopt: Path | None = None,
+def run_lifecycle(prefix: Path, tree: Path, verb: str, firewall: str = "yes",
                   attach: bool = False, nonce: str | None = None, script: Path | None = None) -> int:
     """The staged lifecycle.py runs under the separate bootstrap, outside the version being activated.
     attach=True passes `install --attach-runtime` (payload has no runtime/). nonce passes `install --payload-attested NONCE`
@@ -1068,9 +1024,10 @@ def run_lifecycle(prefix: Path, tree: Path, verb: str, firewall: str = "yes", ad
     global CHILD
     cmd = [sys.executable, "-I", "-B", str(script or tree / "app/packaging/lifecycle.py"), "--prefix", str(prefix), verb,
            "--payload", str(tree), "--firewall", firewall] + (["--models", "skip"] if verb == "install" else []) \
-        + (["--adopt-from", str(adopt)] if adopt and verb == "install" else []) \
         + (["--attach-runtime"] if attach and verb == "install" else []) \
         + (["--payload-attested", nonce] if nonce and verb == "install" else [])
+    say(f"[lifecycle] run: {' '.join(L.redact(cmd))}")
+    t0 = time.monotonic()
     CHILD =subprocess.Popen(cmd, env=L.clean_env())
     interrupted = False
     while True:
@@ -1079,6 +1036,7 @@ def run_lifecycle(prefix: Path, tree: Path, verb: str, firewall: str = "yes", ad
             break
         except KeyboardInterrupt:
             interrupted = True  # the terminal sent the child the same SIGINT; wait for its rollback
+    say(f"[lifecycle] exit {rc} after {time.monotonic() - t0:.1f}s")
     return 130 if (interrupted or STOPPED) and rc else rc
 
 
@@ -1096,23 +1054,10 @@ def _install(a) -> int:
     L.check_glibc(mani)
     L.check_system_libs()
     vid = mani["version_id"]
-    # Stage 1: independent READ-ONLY candidate probes share the pool (no writes, before the lock); precedence is fixed below by
-    # position, never by completion order: explicit --adopt-from wins, else the legacy default install, else none.
-    explicit = Path(a.adopt_from).absolute() if a.adopt_from else None
-    legacy, explicit_ok = POOL.map("discovery: install candidates", [
-        lambda: legacy_prefix(prefix) if not a.prefix else None,
-        lambda: bool(explicit and (explicit / L.RECEIPT).is_file())], lambda f: f())
-    adopt = explicit if explicit else legacy
     root, boot = prefix.resolve(), pdir.resolve()
     if root.is_relative_to(boot) or (boot.is_relative_to(root)
             and not boot.relative_to(root).parts[0].startswith(".staging.")):
         raise Fail("the payload must be outside the install folder or inside its temporary installer staging folder")
-    # The rename MUST run before this process takes the instance lock, on every platform: network_service.migrate_settings_dir
-    # takes the app's own flock on instance.lock itself (POSIX; it reports "Keyloom is running" and changes nothing if we held
-    # it) and Windows cannot rename a folder holding our open lock file. The rename is safe without our lock: on POSIX the child
-    # holds the app lock across the rename; on Windows the rename fails while the app has files open.
-    if not a.repair and not up_to_date(prefix, peek_receipt(prefix), mani, deep=False):
-        migrate_settings_folder(pdir, prefix, adopt)
     with InstanceLock():
         rec = inspect_prefix(prefix)
         if not a.repair and up_to_date(prefix, rec, mani):
@@ -1128,13 +1073,8 @@ def _install(a) -> int:
             for x in cache.iterdir():  # leftovers of another wheel set
                 if x.stem not in {w["sha256"] for w in wheels}:
                     x.unlink(missing_ok=True)
-            # Only an owned install may be a trusted source: explicit --adopt-from needs its receipt (explicit_ok); the legacy default
-            # was found by its receipt. build_tree additionally requires the receipt's app id and a recorded activation.
-            hint = adopt if (adopt and not (rec or {}).get("current") and (explicit_ok if explicit else True)) else None
-            # core resolves the reusable-runtime source as --adopt-from (owned receipt required); mirror it exactly here
-            rsrc = adopt if adopt and (explicit_ok if explicit else True) else None  # legacy was found by its receipt
             # Same-target decision BEFORE any attach/download: core's target_state is read-only and reads no runtime content.
-            ts = L.target_state(prefix, mani, rsrc) if (rec and not a.repair) else {"state": "fresh", "reason": ""}
+            ts = L.target_state(prefix, mani) if (rec and not a.repair) else {"state": "fresh", "reason": ""}
             if ts["state"] == "refused":
                 raise Fail(ts["reason"])
             if ts["state"] == "current":
@@ -1142,9 +1082,9 @@ def _install(a) -> int:
                 ok = True
                 return 0
             inplace = ts["state"] == "in-place"  # recorded, inactive, identical: core activates it where it stands, places nothing
-            attach = False if (a.repair or inplace) else trusted_runtime(prefix, mani, rsrc)
+            attach = False if (a.repair or inplace) else trusted_runtime(prefix, mani)
             if attach and ts["state"] == "replace":
-                av = runtime_ok(prefix, mani, rsrc)
+                av = runtime_ok(prefix, mani)
                 if av and Path(str(av.get("path"))).resolve().is_relative_to(L.vpath(prefix, vid).resolve()):
                     raise Fail(f"{vid} is damaged and owns the runtime it would be replaced from; run Repair instead")
             if inplace:
@@ -1153,22 +1093,22 @@ def _install(a) -> int:
                 (tree / L.MANIFEST).write_bytes(raw_manifest)
             else:
                 tree = build_tree(pdir / "runtime/python", prefix, rec, stage, cache, pdir,
-                                  mani, raw_manifest, wheels, bundled, hint, attach, not a.repair)
+                                  mani, raw_manifest, wheels, bundled, attach, not a.repair)
             if shutil.disk_usage(prefix).free < 2 * int(mani.get("total_bytes") or 0) + MARGIN:
                 shutil.rmtree(cache, ignore_errors=True)  # lifecycle needs the room more than a resume cache does
             repairable = False
             if a.repair and (rec or {}).get("current") == vid:  # only an explicit repair does the deep (runtime) verification
                 try:
                     repairable = L.read_manifest(L.vpath(prefix, vid)).get("files") == mani["files"]
-                except L.InstallError:
-                    pass
+                except L.InstallError as e:
+                    say(f"could not read the installed manifest ({e}); switching to install")
             verb = "repair" if repairable else "install"
             for d in {stage, pdir.parents[1]}:
                 if d.parent == prefix and d.name.startswith(".staging."):
                     os.utime(d)  # The lifecycle cleanup must not remove a slow download's live payload or bootstrap.
             say(f"Handing the verified payload to the installer ({verb}) ...")
             nonce = L.write_attestation(tree, mani, "online") if (verb == "install" and not inplace) else None  # core's one writer, after ALL writes
-            rc = run_lifecycle(prefix, tree, verb, a.firewall, adopt, attach, nonce,
+            rc = run_lifecycle(prefix, tree, verb, a.firewall, attach, nonce,
                                Path(L.__file__).resolve() if inplace else None)
             ok = rc in (0, 3)  # 3 = models skipped on purpose; they are offered by the app
             return 0 if ok else (130 if rc == 130 else 2)
@@ -1190,7 +1130,6 @@ def build_parser():
     p.add_argument("--sources", required=True, help="wheel-sources.json")
     p.add_argument("--prefix")
     p.add_argument("--repair", action="store_true")
-    p.add_argument("--adopt-from", help="pre-rename prefix to take over (Linux stub / Windows installer pass it)")
     p.add_argument("--firewall", choices=["yes", "skip", "ask"], default="yes", help="firewall rules: yes (default) or skip; ask is accepted and means yes")
     return p
 
@@ -1209,15 +1148,18 @@ def main(argv=None) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("Interrupted; nothing was changed (run again to resume the download).", file=sys.stderr)
+        print("Interrupted; partial downloads are kept in the cache under the install folder. "
+              "Run setup again to resume.", file=sys.stderr)
         return 130
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else 2
     except OSError as e:  # never print urllib reprs
+        L.log_exc("online setup", e)
         print(f"ERROR: {e.strerror or type(e).__name__} ({e.filename})", file=sys.stderr)
         return 2
     except Exception as e:
-        print(f"ERROR: unexpected {type(e).__name__}", file=sys.stderr)
+        L.log_exc("online setup", e)
+        print(f"ERROR: unexpected {type(e).__name__}: {e}", file=sys.stderr)
         return 2
 
 

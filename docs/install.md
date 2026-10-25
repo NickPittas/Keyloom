@@ -215,19 +215,14 @@ If the download is interrupted, run the command again. It resumes.
 
 Projects, outputs, models, the download cache and your settings live **outside** the install folder and are kept through repair, update and uninstall.
 
-### Moving to the Keyloom folder
+### Old CorridorKey installs
 
-When an install in the old default folder (`~/.local/opt/CorridorKey`, `%LOCALAPPDATA%\Programs\CorridorKey`) is found, the
-installers put the new version in `.../Keyloom` and **take the old install over**: unchanged runtime files are hard-linked (no
-second copy, no re-download), the launcher, application menu entry, sign-in entry and network service move to the new folder
-(same service identity, certificate and database), models verified before stay verified, and the old folder is kept as an inert
-rollback holder. Remove it later with its own `corridorkey-setup uninstall` once you are happy. A folder you chose yourself is
-updated in place. The settings folder `corridorkey-native` is **not** renamed: renaming it is deferred on every platform, nothing is moved, and
-Keyloom keeps using the existing folder (new installs use `keyloom`). Only an unfinished rename left by an earlier version is
-completed or undone. If that state is ambiguous (for example both folders exist), or the check itself fails, times out or gives
-no usable answer, the installer stops with exit code 2 before anything is staged or downloaded. The check may already have
-completed or undone part of an earlier rename and keeps its recovery journal, so run the installer again after resolving it. The model/data folder `CorridorKey` is not renamed: it can hold very large models and model receipts with absolute
-paths, so it keeps working under its old name until you move it yourself.
+Keyloom installs only into its own folder: `%LOCALAPPDATA%\Programs\Keyloom` on Windows, `~/.local/opt/Keyloom` on Linux, or a
+folder you choose with `/PREFIX` or `--prefix`. It never adopts, reads, writes or deletes a CorridorKey folder, so an old
+CorridorKey install is left exactly as it was. Remove it by hand when you no longer need it.
+
+Settings live only in `%APPDATA%\keyloom` on Windows and `~/.config/keyloom` on Linux. Keyloom does not read the old
+`corridorkey-native` settings folder and does not migrate it, so settings start fresh.
 
 ### Reinstalling and updating never resets anything
 
@@ -246,12 +241,11 @@ paths, so it keeps working under its old name until you move it yourself.
 
 ### Upgrading from an install made before the Keyloom rename
 
-Everything you created is kept: models, projects, presets, settings (including keys this version does not know), pinned
-certificates, network identity, jobs, service state and the "removed hosting" choice. Entries that belong to someone else are
-never touched. The launcher, application menu entry, sign-in entry and network service this installation created are replaced by
-their Keyloom names (`keyloom`, `keyloom-setup`, `keyloom-coordinator`, `keyloom-network.service` / "Keyloom Network Service");
-the old `corridorkey*` commands keep working as forwarders in the old folder. The old version stays as the rollback target, and
-rolling back still launches it.
+Projects and outputs stay where they are. Settings and network identity start fresh in `%APPDATA%\keyloom` (or
+`~/.config/keyloom` on Linux); the old settings folder is not read. Engine models are looked for in
+`%LOCALAPPDATA%\Keyloom\EngineV2` (or `~/.local/share/Keyloom/EngineV2` on Linux), and the old
+`%LOCALAPPDATA%\EZ-CorridorKey2\CorridorKeyV2` folder is not read. Copy the models you want across by hand, or download them
+from the Models page. The old CorridorKey commands, shortcuts, sign-in entry and network service are not changed, so remove them by hand.
 
 ## Starting the app
 

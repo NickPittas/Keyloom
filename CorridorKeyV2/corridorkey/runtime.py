@@ -123,7 +123,7 @@ class InferenceConfig:
     low_vram_full_attn_query_chunk_tokens: int = 2048
     stage2_batch: int = 1
     outputs: set[str] = field(default_factory=lambda: {"alpha", "fg"})
-    temp_dir: Path = Path(tempfile.gettempdir()) / "corridorkey_v2"
+    temp_dir: Path = Path(tempfile.gettempdir()) / "keyloom_v2"
     linear_brightness: float = 1.0
     linear_contrast: float = 1.0
     linear_contrast_pivot: float = 0.18

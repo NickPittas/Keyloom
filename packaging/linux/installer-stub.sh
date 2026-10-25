@@ -1,5 +1,5 @@
 #!/bin/sh
-# Keyloom (powered by CorridorKey) @VERSION_ID@ self-extracting Linux user installer (needs only sh, tar, gzip, awk, sha256sum).
+# Keyloom @VERSION_ID@ self-extracting Linux user installer (needs only sh, tar, gzip, awk, sha256sum).
 # No root (only an optional, asked-for sudo for UFW rules). Configures a per-user network host; user data stays outside PREFIX.
 set -eu
 # Layout after this stub: boot.tar.gz, app.tar.gz, runtime.tar.gz (independent gzip streams). Offsets are relative to the first
@@ -8,13 +8,9 @@ STUB_BYTES=@STUB_BYTES@;
 BOOT_OFFSET=@BOOT_OFFSET@; BOOT_LEN=@BOOT_LEN@; BOOT_SHA256="@BOOT_SHA256@"
 APP_OFFSET=@APP_OFFSET@; APP_LEN=@APP_LEN@; APP_SHA256="@APP_SHA256@"
 RUNTIME_OFFSET=@RUNTIME_OFFSET@; RUNTIME_LEN=@RUNTIME_LEN@; RUNTIME_SHA256="@RUNTIME_SHA256@"; RUNTIME_ID="@RUNTIME_ID@"
-# A pre-rename install is upgraded in place; only a fresh machine gets the Keyloom folder.
-# A pre-rename install (~/.local/opt/CorridorKey) is taken over: Keyloom installs into ~/.local/opt/Keyloom, reuses the unchanged
-# runtime files by hard link, moves the startup entry/launcher/network service across, and leaves the old folder as the rollback holder.
-OLD="$HOME/.local/opt/CorridorKey"; ADOPT=""
-PREFIX="${KEYLOOM_PREFIX:-${CORRIDORKEY_PREFIX:-$HOME/.local/opt/Keyloom}}"
-PREFIX_SET=0
+PREFIX="${KEYLOOM_PREFIX:-$HOME/.local/opt/Keyloom}"
 VERB=install; FIREWALL=yes; MODELS=skip; MODELS_SET=0; EXTRACT=""
+TITLE="Keyloom @VERSION_ID@ linux-offline installer"
 usage() { cat <<U
 Usage: $(basename "$0") [--prefix DIR] [--repair] [--models full|skip] [--model-arg ARG]... [--firewall yes|skip | --no-firewall] [--extract-only DIR]
   default       install/update into PREFIX ($PREFIX); previous version kept for rollback. Installing the build that is
@@ -44,7 +40,7 @@ while [ "$I" -lt "$N" ]; do
       [ "$I" -lt "$N" ] || { echo "$A needs a value" >&2; exit 64; }
       V=$1; shift; I=$((I+1))
       case "$A" in
-        --prefix) PREFIX="$V"; PREFIX_SET=1;;
+        --prefix) PREFIX="$V";;
         --models) MODELS="$V"; MODELS_SET=1;;
         --firewall) FIREWALL="$V";;
         --extract-only) EXTRACT="$V";;
@@ -53,14 +49,18 @@ while [ "$I" -lt "$N" ]; do
     *) echo "unknown option $A" >&2; usage >&2; exit 64;;
   esac
 done
-if [ "$PREFIX_SET" = 0 ] && [ -z "${KEYLOOM_PREFIX:-}${CORRIDORKEY_PREFIX:-}" ] && [ -f "$OLD/receipt.json" ] && [ ! -f "$PREFIX/receipt.json" ]; then ADOPT="$OLD"; fi
 case "$MODELS" in full|skip) ;; *) echo "--models must be full or skip" >&2; exit 64;; esac
 case "$FIREWALL" in yes|skip|ask) ;; *) echo "--firewall must be yes or skip" >&2; exit 64;; esac
 [ "$(uname -m)" = x86_64 ] || { echo "ERROR: x86_64 Linux only" >&2; exit 1; }
 SELF=$(readlink -f "$0")
-if [ "$VERB" = install ] && [ -x "$PREFIX/current/runtime/python/bin/python3" ] && [ -z "$EXTRACT" ] && \
-   "$PREFIX/current/runtime/python/bin/python3" -I -B "$PREFIX/current/app/packaging/lifecycle.py" --prefix "$PREFIX" check --version "@VERSION_ID@" 2>/dev/null; then
-  echo "Nothing to do: this exact build is already installed and verified. Use --repair to restore damaged files."; exit 0
+_log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$*" >> "$PREFIX/install.log" || echo "WARNING: cannot write $PREFIX/install.log" >&2; }
+RC=""
+if [ "$VERB" = install ] && [ -x "$PREFIX/current/runtime/python/bin/python3" ] && [ -z "$EXTRACT" ]; then
+  E=$(mktemp); RC=0  # the check's stderr: shown now, or appended to install.log once STAGE exists
+  trap 'rm -f "$E"' EXIT  # an early failure (mkdir, mktemp) must not leave $E; the STAGE trap below replaces this one
+  "$PREFIX/current/runtime/python/bin/python3" -I -B "$PREFIX/current/app/packaging/lifecycle.py" --prefix "$PREFIX" check --version "@VERSION_ID@" 2>"$E" || RC=$?
+  [ "$RC" = 1 ] || cat "$E" >&2
+  if [ "$RC" = 0 ]; then rm -f "$E"; echo "Nothing to do: this exact build is already installed and verified. Use --repair to restore damaged files."; exit 0; fi
 fi
 # STAGE is private to this run (same filesystem as PREFIX so the lifecycle's final move is a rename) and holds
 #   boot/     the bundled minimal Python that runs everything below: it lives OUTSIDE payload/, which the lifecycle renames
@@ -69,6 +69,7 @@ if [ -n "$EXTRACT" ]; then STAGE=$(mktemp -d)
 else mkdir -p "$PREFIX"; STAGE=$(mktemp -d "$PREFIX/.staging.XXXXXX"); fi
 trap '[ -z "${_P:-}" ] || _killtree "$_P"; rm -rf "$STAGE"' EXIT  # a signal also stops the supervised child tree
 trap 'exit 130' INT HUP TERM  # signals run the EXIT trap too
+if [ -n "$RC" ]; then _log "early check rc=$RC"; sed 's/^/early-check stderr| /' "$E" >> "$PREFIX/install.log"; rm -f "$E"; fi
 # No install-time budget: a supervised step is stopped (whole process group killed and reaped, the install FAILS) only when it
 # shows no progress for STALL_S seconds (hung child). Time the lifecycle reports as "waiting for the user" (the asked-for
 # sudo/firewall prompt, via the KEYLOOM_WAIT_FILE it creates while waiting) counts as progress.
@@ -123,13 +124,13 @@ echo "Unpacking bootstrap ..."
 PF="$STAGE/boot.tgz"
 sup bootstrap sh -c 'tail -c +"$1" "$2" | head -c "$3" > "$4/boot.tgz" && [ "$(sha256sum < "$4/boot.tgz" | cut -d" " -f1)" = "$5" ] \
   && tar -xzf "$4/boot.tgz" -C "$4" && rm -f "$4/boot.tgz"' sh "$((STUB_BYTES + BOOT_OFFSET + 1))" "$SELF" "$BOOT_LEN" "$STAGE" "$BOOT_SHA256" \
-  || { echo "ERROR: bootstrap could not be unpacked in time or its checksum differs (download damaged?)" >&2; exit 1; }
+  || { _BR=$?; [ -n "$EXTRACT" ] || _log "ERROR: bootstrap failed, exit $_BR (124 = no progress for ${STALL_S}s; otherwise unpack or checksum error)"; echo "ERROR: bootstrap could not be unpacked in time or its checksum differs (download damaged?)" >&2; exit 1; }
 PF=""
 PY="$STAGE/boot/python/bin/python3"; IP="$STAGE/boot/installer_payload.py"
 # seg LABEL OFFSET LEN SHA256 DEST REQUIRE [FORBID]: supervised hash + extract of ONE segment (live byte counters + heartbeat)
 seg() {
   "$PY" -I -B "$IP" extract --run "$SELF" --base "$STUB_BYTES" --label "$1" --offset "$2" --len "$3" --sha256 "$4" --dest "$5" \
-    --require "$6" ${7:+--forbid "$7"}
+    --require "$6" ${7:+--forbid "$7"} ${LOG:+--log "$LOG" --log-title "$TITLE"}
 }
 if [ -n "$EXTRACT" ]; then  # explicit user request: both segments, no installation; the same stall guard applies
   mkdir -p "$EXTRACT"
@@ -137,12 +138,12 @@ if [ -n "$EXTRACT" ]; then  # explicit user request: both segments, no installat
   seg runtime "$RUNTIME_OFFSET" "$RUNTIME_LEN" "$RUNTIME_SHA256" "$EXTRACT" payload/runtime
   echo "Extracted to $EXTRACT"; exit 0
 fi
+LOG="$PREFIX/install.log"  # --extract-only has no prefix, so it logs nothing (seg and PAY calls below use it)
 seg app "$APP_OFFSET" "$APP_LEN" "$APP_SHA256" "$STAGE" payload/ payload/runtime
 LC="$STAGE/payload/app/packaging/lifecycle.py"
 # Runtime bytes are read only when needed. A repair restores from them. Otherwise `runtime-available` decides:
 #   0 = the installed runtime (same runtime_id) is attached as a whole directory by the lifecycle: no runtime byte is read
 #   1 = no such runtime here (fresh install / the runtime really changed): extract just the new runtime, with visible progress
-#   3 = same runtime but not trusted: FAIL, a normal update never silently re-verifies/extracts it (use --repair)
 #   anything else (error, crash, missing CLI, 124 timeout) = FAIL, never a silent full-runtime fallback
 INPLACE=0
 if [ "$VERB" != repair ]; then
@@ -151,11 +152,11 @@ if [ "$VERB" != repair ]; then
   # core's `install --payload` handles leftover/replace under its lock), 4 = refused (shared runtime in use), other = error.
   # Neither 0 nor 4 reads any runtime byte; everything else falls through to the runtime decision below.
   TS=0
-  "$PY" -I -B "$IP" run --label target-state -- "$PY" -I -B "$LC" --prefix "$PREFIX" target-state \
-    --manifest "$STAGE/payload/install-manifest.json" ${ADOPT:+--from "$ADOPT"} || TS=$?
+  "$PY" -I -B "$IP" run --label target-state --log "$LOG" --log-title "$TITLE" -- "$PY" -I -B "$LC" --prefix "$PREFIX" target-state \
+    --manifest "$STAGE/payload/install-manifest.json" || TS=$?
   case "$TS" in
     0) CR=0
-       "$PY" -I -B "$IP" run --label check -- "$PY" -I -B "$LC" --prefix "$PREFIX" check --version "@VERSION_ID@" || CR=$?
+       "$PY" -I -B "$IP" run --label check --log "$LOG" --log-title "$TITLE" -- "$PY" -I -B "$LC" --prefix "$PREFIX" check --version "@VERSION_ID@" || CR=$?
        if [ "$CR" = 0 ]; then echo "Nothing to do: this exact build is already installed and verified. Use --repair to restore damaged files."; exit 0; fi
        [ "$CR" = 1 ] || { echo "ERROR: the installed-build check failed (code $CR); nothing was changed." >&2; exit 1; }
        INPLACE=1; echo "This build is already installed (inactive): activating it in place; no files or runtime are placed.";;
@@ -168,12 +169,11 @@ if [ "$VERB" = repair ]; then NEEDRT=1
 elif [ "$INPLACE" = 1 ]; then NEEDRT=0
 else
   RA=0
-  "$PY" -I -B "$IP" run --label runtime-available -- "$PY" -I -B "$LC" --prefix "$PREFIX" runtime-available \
-    --manifest "$STAGE/payload/install-manifest.json" ${ADOPT:+--from "$ADOPT"} || RA=$?
+  "$PY" -I -B "$IP" run --label runtime-available --log "$LOG" --log-title "$TITLE" -- "$PY" -I -B "$LC" --prefix "$PREFIX" runtime-available \
+    --manifest "$STAGE/payload/install-manifest.json" || RA=$?
   case "$RA" in
     0) NEEDRT=0; echo "Installed runtime $RUNTIME_ID will be attached; the runtime part of this installer is not read.";;
     1) NEEDRT=1;;
-    3) echo "ERROR: the installed runtime matches but is not trusted for a fast update. Run this installer with --repair (full verification)." >&2; exit 3;;
     *) echo "ERROR: runtime check failed (code $RA); not falling back to extracting the whole runtime. Run with --repair." >&2; exit 1;;
   esac
 fi
@@ -187,7 +187,8 @@ fi
 # extracted runtime itself, once. The non-runtime files are always hashed by the lifecycle.
 NONCE=""
 if [ "$NEEDRT" = 1 ] && [ "$VERB" != repair ]; then
-  if "$PY" -I -B "$IP" attest --label attest --lifecycle "$LC" --dest "$STAGE/payload" --producer segments --out "$STAGE/nonce"; then
+  if "$PY" -I -B "$IP" attest --label attest --lifecycle "$LC" --dest "$STAGE/payload" --producer segments --out "$STAGE/nonce" \
+    --log "$LOG" --log-title "$TITLE"; then
     NONCE=$(cat "$STAGE/nonce")
   fi
 fi
@@ -202,12 +203,12 @@ if [ "$VERB" = repair ]; then  # repair restores from the payload's runtime byte
   if [ "$MODELS_SET" = 1 ] && [ "$MODELS" = full ]; then set -- --models "$@"; fi
   set -- repair --payload "$STAGE/payload" --firewall "$FIREWALL" "$@"
 elif [ "$INPLACE" = 1 ]; then  # recorded identical inactive target: core journals and activates it where it stands
-  set -- install --version "@VERSION_ID@" --models "$MODELS" --firewall "$FIREWALL" ${ADOPT:+--adopt-from "$ADOPT"} "$@"
+  set -- install --version "@VERSION_ID@" --models "$MODELS" --firewall "$FIREWALL" "$@"
 else
-  [ "$NEEDRT" = 1 ] || set -- --attach-runtime ${ADOPT:+--runtime-src "$ADOPT"} "$@"  # whole-directory attach; fails if unavailable
-  set -- install --payload "$STAGE/payload" --models "$MODELS" --firewall "$FIREWALL" ${ADOPT:+--adopt-from "$ADOPT"} ${NONCE:+--payload-attested "$NONCE"} "$@"
+  [ "$NEEDRT" = 1 ] || set -- --attach-runtime "$@"  # whole-directory attach; fails if unavailable
+  set -- install --payload "$STAGE/payload" --models "$MODELS" --firewall "$FIREWALL" ${NONCE:+--payload-attested "$NONCE"} "$@"
 fi
-"$PY" -I -B "$IP" run --label "$VERB" --log "$PREFIX/install.log" --log-title "Keyloom @VERSION_ID@ linux-offline installer" --wait-file "$KEYLOOM_WAIT_FILE" -- "$PY" -I -B "$LC" --prefix "$PREFIX" "$@"
+"$PY" -I -B "$IP" run --label "$VERB" --log "$LOG" --log-title "$TITLE" --wait-file "$KEYLOOM_WAIT_FILE" -- "$PY" -I -B "$LC" --prefix "$PREFIX" "$@"
 RC=$?
 exit $RC
 __PAYLOAD_BELOW__

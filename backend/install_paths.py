@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DESCRIPTOR_NAME = "keyloom-install.json"
-LEGACY_DESCRIPTOR_NAME = "corridorkey-install.json"  # installs made before the Keyloom rename
 CK_INSTALL_ENV = "CK_INSTALL"
 MODELS_DIR_ENV = "CORRIDORKEY_V2_MODELS_DIR"
 SCHEMA = 1
@@ -25,17 +24,13 @@ _ALLOWED_ROOTS = frozenset({"python", "helper", "models", "cache", "scratch", "u
 
 
 def descriptor_in(directory: Path) -> Path:
-    """The descriptor in `directory`: the Keyloom name, else a pre-rename one, else the Keyloom path."""
-    legacy = directory / LEGACY_DESCRIPTOR_NAME
-    if not (directory / DESCRIPTOR_NAME).is_file() and legacy.is_file():
-        return legacy
+    """The descriptor in `directory`."""
     return directory / DESCRIPTOR_NAME
 
 
 def user_area(base: Path, sub: str = "") -> Path:
-    """`base/Keyloom[/sub]`, unless only the pre-rename `base/CorridorKey` exists (models/data stay where they are)."""
-    old = base / "CorridorKey"
-    return (old if old.is_dir() and not (base / "Keyloom").exists() else base / "Keyloom") / sub
+    """`base/Keyloom[/sub]`."""
+    return base / "Keyloom" / sub
 
 
 class InstallDescriptorError(RuntimeError):

@@ -120,10 +120,10 @@ as a whole directory (no companion file is opened, hashed or read); exit 1 (fres
 (`installer_payload.py runtime-extract`: verifies each shard's size and sha256 while streaming into a private holder inside the new version folder, accepting only
 the files the metadata assigns to that shard,
 renames it to `runtime` only after everything verified, no time limit (only the 300 s no-progress stall guard), any worker error cancels the rest, process tree killed
-and holder discarded on failure); exit 3 (identical but untrusted) and any other result stop visibly with no fallback; a missing companion stops visibly.
-Installation discovery (online Windows wrapper) is one read-only `installer_payload.py discover` run: HKCU/HKLM keys and the two candidate receipts are probed in parallel,
-then the registry-named folder is checked; precedence /PREFIX > HKCU > HKLM > default is fixed in code. The offline setup's folder choice stays in Inno Pascal because it
-runs before any bundled Python exists.
+and holder discarded on failure); any other result stops visibly with no fallback; a missing companion stops visibly.
+Installation discovery (online Windows wrapper) is one read-only `installer_payload.py discover` run that checks, in order: /PREFIX; the folder recorded under the
+Keyloom AppId, only if it holds `receipt.json`; else `Programs\Keyloom`. The checks run one after another, not in parallel. The offline setup's folder choice stays in
+Inno Pascal because it runs before any bundled Python exists.
 A fresh/changed-runtime Windows install takes as long as the extraction takes; it is stopped only if it shows no output for 300 s. The remaining
 native Inno copy is the app files and the small bootstrap and is not timed. The Linux `.run` keeps its runtime in-file (separate gzip segment). Online installers never use this companion.
 Add/Remove Programs
@@ -168,8 +168,8 @@ intact), 4 Keyloom running (quit it with File > Quit), 130 cancelled.
 Linux: `X.run [--prefix DIR] [--repair]` (default `~/.local/opt/Keyloom`; needs only sh/tar/gzip/awk/sha256sum). The payload is extracted
 into `PREFIX/.staging.*` (same filesystem, not a small `/tmp`).
 Windows: per-user Inno exe (1900 MiB slices like the full installer: keep the exe and every `-N.bin` together; `.sha256` lists all); unpacks to `{tmp}`
-with a visible console. `/PREFIX=DIR` and `/REPAIR=1` are accepted; otherwise an existing full-installer location is read from its Inno
-registry key (`Inno Setup: App Path`), else `%LOCALAPPDATA%\Programs\Keyloom`. It has its own AppId, `Uninstallable=no` and no Add/Remove Programs
+with a visible console. `/PREFIX=DIR` and `/REPAIR=1` are accepted; otherwise the folder in the Keyloom AppId's Inno
+registry key (`Inno Setup: App Path`), where the recorded folder is looked up under HKCU first, then HKLM, is used if it holds `receipt.json`, else `%LOCALAPPDATA%\Programs\Keyloom`. It has its own AppId, `Uninstallable=no` and no Add/Remove Programs
 entry, so it never touches the full installer's entry; remove an online-only install with `<prefix>\bin\keyloom-setup.cmd uninstall`.
 
 ## Background autostart contract (written by the app, removed by uninstall)
@@ -193,14 +193,9 @@ removed. Uninstall trusts only `receipt.json` and refuses a prefix without one.
 ## Acceptance evidence
 See [local workflow acceptance](../docs/design/rust-ui/local-workflow-acceptance.md) for the exact installer builds, installed-file checks, model verification and real GPU workflow results. Unit tests use tiny fixtures; they are not the evidence for native installation or GPU acceptance.
 
-## Rename migration (CorridorKey -> Keyloom)
+## Old CorridorKey installs
 
-New names: `keyloom-ui[.exe]`, `keyloom[-setup|-coordinator][.cmd]`, `keyloom-install.json`, `keyloom.desktop`, Run value
-`Keyloom`, unit `keyloom-network.service`, task `Keyloom Network Service`, default prefix `.../Keyloom`.
-Existing installs are upgraded in place (same prefix, receipt `app` value, Inno AppId and owner id). Readers accept the
-old descriptor, receipt app id, exe name, owner markers and settings/user-data folders; owned shims, desktop entry,
-autostart entry and network service are migrated by `lifecycle.activate` / `network_service.ensure_default`, and the old
-`corridorkey*` shims remain as forwarders only where they already existed. See `docs/branding-migration-validation.md`.
+Keyloom never reads or changes a CorridorKey install; remove old CorridorKey folders by hand.
 
 ## Monitored commands (`run_monitored.py`)
 `python packaging/run_monitored.py --deadline SECS [--label NAME] [--phase NAME] -- cmd arg...` supervises one foreground command: required

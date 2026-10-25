@@ -11,15 +11,8 @@ use std::path::{Component, Path, PathBuf};
 
 /// Descriptor file name, identical in both languages.
 pub const DESCRIPTOR_NAME: &str = "keyloom-install.json";
-/// Name written by installs made before the Keyloom rename; still read so those installs keep working.
-pub const LEGACY_DESCRIPTOR_NAME: &str = "corridorkey-install.json";
-
-/// The descriptor in `dir`: the Keyloom name, else a pre-rename one, else the Keyloom path (for messages).
+/// The descriptor in `dir`.
 pub fn descriptor_in(dir: &Path) -> PathBuf {
-    let legacy = dir.join(LEGACY_DESCRIPTOR_NAME);
-    if !dir.join(DESCRIPTOR_NAME).is_file() && legacy.is_file() {
-        return legacy;
-    }
     dir.join(DESCRIPTOR_NAME)
 }
 /// Explicit pointer at a descriptor file or its folder; also exported to child processes.
@@ -415,14 +408,9 @@ fn nonempty(v: Option<std::ffi::OsString>) -> Option<PathBuf> {
     v.filter(|s| !s.is_empty()).map(PathBuf::from)
 }
 
-/// `base/Keyloom`, unless only the pre-rename `base/CorridorKey` exists: existing models and data stay where they are.
+/// `base/Keyloom`.
 fn user_area(base: PathBuf) -> PathBuf {
-    let old = base.join("CorridorKey");
-    if old.is_dir() && !base.join("Keyloom").exists() {
-        old
-    } else {
-        base.join("Keyloom")
-    }
+    base.join("Keyloom")
 }
 
 /// Unix user area for app data (not settings): `$XDG_DATA_HOME` or `~/.local/share`, then `Keyloom`.

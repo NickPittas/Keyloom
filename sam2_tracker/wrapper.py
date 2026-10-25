@@ -290,7 +290,7 @@ class SAM2Tracker:
                 f"Import error: {exc}"
             ) from exc
 
-        temp_root = Path(tempfile.mkdtemp(prefix="corridorkey_sam2_"))
+        temp_root = Path(tempfile.mkdtemp(prefix="keyloom_sam2_"))
         frames_dir = temp_root / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
 

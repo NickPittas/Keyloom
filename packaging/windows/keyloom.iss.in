@@ -1,15 +1,16 @@
-; Keyloom (powered by CorridorKey) Windows installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
+; Keyloom Windows installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
 ; Per-user (no admin or automatic firewall rule); activation configures the network host. Each version lands in
 ; {app}\versions\<id>; lifecycle.py validates it, switches the active version, writes the Start Menu
 ; shortcut + receipt and (optionally) runs the shared model manager. User data lives outside {app}.
 #define VID "@VERSION_ID@"
 
 [Setup]
-; AppId is the installation identity and stays unchanged so a Keyloom setup upgrades in place.
-AppId={{7C1E6C52-3B0F-4D5A-9E57-2D6C7A0B7E21}
+; New AppId for Keyloom; the CorridorKey-era entry is never read.
+AppId={{3F9A2C71-8E4B-4D6F-B1A5-7C0E92D4A6B3}
 AppName=Keyloom
 AppVersion=@APP_VERSION@
-AppPublisher=Keyloom (powered by CorridorKey; private build)
+AppPublisher=Keyloom
+SetupIconFile=@ICON@
 DefaultDirName={code:DefaultDir}
 UsePreviousAppDir=no
 DisableProgramGroupPage=yes
@@ -52,7 +53,7 @@ Source: "@STAGE@\*"; DestDir: "{app}\versions\{#VID}"; Excludes: "\runtime\*"; F
 [UninstallRun]
 ; Removes shortcuts/shims/receipt and other versions; the running version's files go via UninstallDelete.
 ; Projects, outputs, models and settings are never touched.
-Filename: "{app}\bin\keyloom-setup.cmd"; Parameters: "uninstall --skip-running"; Flags: runhidden; RunOnceId: "CKUninstall"
+Filename: "{app}\bin\keyloom-setup.cmd"; Parameters: "uninstall --skip-running"; Flags: runhidden; RunOnceId: "KeyloomUninstall"
 
 [UninstallDelete]
 ; NO recursive deletion of any app directory here: versions\{#VID}\runtime may be an attached junction/symlink to a shared
@@ -67,6 +68,38 @@ Type: dirifempty; Name: "{app}\bin"
 Type: dirifempty; Name: "{app}"
 
 [Code]
+var
+  LogFile: String;  { <prefix>\install.log once the install folder is known (ssInstall) }
+  PreLog: String;   { %TEMP% log from the start of setup; AttachPreLog copies it into LogFile; kept afterwards }
+  LogWriteFailed: Boolean;
+
+procedure LogLine(Msg: String);
+var
+  Line: String;
+begin
+  Line := GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + ' ' + Msg;
+  if LogFile = '' then SaveStringToFile(PreLog, Line + #13#10, True)
+  else if not SaveStringToFile(LogFile, Line + #13#10, True) then
+  begin
+    LogWriteFailed := True;
+    SaveStringToFile(PreLog, Line + ' (install.log not writable: ' + LogFile + ')' + #13#10, True);
+  end;
+end;
+
+procedure AttachPreLog;
+var
+  Pre: AnsiString;
+begin
+  ForceDirectories(ExtractFilePath(LogFile));
+  if not LoadStringFromFile(PreLog, Pre) or not SaveStringToFile(LogFile, Pre, True) then LogWriteFailed := True;
+end;
+
+function LogHint: String;
+begin
+  Result := '';
+  if LogWriteFailed then Result := ' Log: ' + PreLog;
+end;
+
 { The path goes into a quoted command line: a trailing backslash would escape the closing quote
   and a drive root cannot hold the install, so roots are rejected and other paths get no trailing slash. }
 function IsDriveRoot(P: String): Boolean;
@@ -79,6 +112,7 @@ begin
   Result := True;
   if (CurPageID = wpSelectDir) and IsDriveRoot(WizardDirValue) then
   begin
+    LogLine('install folder is a drive root: ' + WizardDirValue);
     MsgBox('Choose a folder, not a drive root (for example D:\Apps\Keyloom).', mbError, MB_OK);
     Result := False;
   end;
@@ -90,16 +124,7 @@ var
 procedure ExitProcess(uExitCode: Cardinal); external 'ExitProcess@kernel32.dll stdcall';
 
 var
-  AdoptDir, SourceDir: String;   { AdoptDir: pre-rename install this one takes over; SourceDir: install whose runtime may be reused }
   RuntimeChecked: Boolean;
-
-var
-  LogFile: String;  { <prefix>\install.log once the install folder is known (ssInstall) }
-
-procedure LogLine(Msg: String);
-begin
-  if LogFile <> '' then SaveStringToFile(LogFile, GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + ' ' + Msg + #13#10, True);
-end;
 
 { One supervised Python step: a VISIBLE console runs installer_payload.py, which starts the real command as its own process tree,
   prints a heartbeat every second, kills and reaps the tree after 300 s without any output (exit 124) and never turns a stall
@@ -109,12 +134,16 @@ function RunPyV(Interp, Verb, StepName, Extra: String; var Rc: Integer): Boolean
 var
   IP, LogArg: String;
 begin
-  LogArg := '';
+  LogArg := ' --log "' + PreLog + '"';
   if LogFile <> '' then LogArg := ' --log "' + LogFile + '" --log-title "Keyloom {#VID} windows-offline installer"';
   IP := ExpandConstant('{tmp}\installer_payload.py');  { extracted early for the same-build check; later the bootstrap folder has it }
   if not FileExists(IP) then IP := ExpandConstant('{tmp}\kb\installer_payload.py');
   Result := Exec(Interp, '-I -B "' + IP + '" ' + Verb + ' --label ' + StepName + LogArg + Extra, '', SW_SHOW, ewWaitUntilTerminated, Rc);
-  if not Result then Rc := 2;
+  if not Result then
+  begin
+    LogLine('cannot start ' + Interp + ': ' + SysErrorMessage(Rc) + ' (' + IntToStr(Rc) + ')');
+    Rc := 2;
+  end;
 end;
 
 { Any command under the generic supervisor (heartbeat, process-tree kill on a stall, optional user-wait file). }
@@ -142,7 +171,7 @@ end;
 procedure FailSetup(Code: Integer; Msg: String);
 begin
   LogLine('FAILED (' + IntToStr(Code) + '): ' + Msg);
-  SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
+  SuppressibleMsgBox(Msg + LogHint, mbError, MB_OK, IDOK);
   FailCode := Code;
   Abort;  { Inno rolls back only what this setup created; the previous version and all user data stay }
 end;
@@ -152,38 +181,20 @@ var
   Key, S: String;
 begin
   Result := '';
-  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{7C1E6C52-3B0F-4D5A-9E57-2D6C7A0B7E21}_is1';
+  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{3F9A2C71-8E4B-4D6F-B1A5-7C0E92D4A6B3}_is1';
   if RegQueryStringValue(HKCU, Key, 'Inno Setup: App Path', S) or RegQueryStringValue(HKLM, Key, 'Inno Setup: App Path', S) then
     if DirExists(S) then Result := RemoveBackslashUnlessRoot(S);
 end;
 
-{ New installs go to ...\Programs\Keyloom. An earlier install in the default ...\Programs\CorridorKey is taken over (its models,
-  settings, shortcut, startup entry and network service move across; the old folder stays as the rollback holder). A folder the
-  user chose themselves is kept and updated in place.
-  This one small read-only lookup (HKCU then HKLM key, two receipts) deliberately stays in Pascal and is NOT moved to the bundled
-  parallel `discover` helper: Inno needs the default folder for the directory page BEFORE it extracts any [Files], and the bundled
-  Python (a whole directory tree, which cannot be extracted one file at a time) exists only after that extraction. The online
-  wrapper has no wizard page, so it runs `discover` once after its payload is unpacked. }
+{ The recorded Keyloom folder, else the default ...\Programs\Keyloom. Pascal reads it itself because the directory page needs it
+  before any [Files] entry is extracted. }
 function DefaultDir(Param: String): String;
 var
-  Prev, Old: String;
+  Prev: String;
 begin
   Result := ExpandConstant('{localappdata}\Programs\Keyloom');
   Prev := PrevAppPath;
-  Old := ExpandConstant('{localappdata}\Programs\CorridorKey');
-  if (Prev <> '') and (CompareText(Prev, Old) <> 0) then Result := Prev
-  else if (CompareText(Prev, Old) = 0) or ((Prev = '') and FileExists(Old + '\receipt.json')) then
-    if not FileExists(Result + '\receipt.json') then AdoptDir := Old;
-  { The runtime source is ONLY the pre-rename install being adopted (explicitly detected above) or, when empty, the chosen app folder itself
-    (PrepareRuntime). The default folder is never assumed to be the source: a user who picks a custom folder must not get a runtime
-    junction into some other install. }
-  SourceDir := AdoptDir;
-end;
-
-function ShimOf(Dir: String): String;
-begin
-  Result := Dir + '\bin\keyloom-setup.cmd';
-  if not FileExists(Result) then Result := Dir + '\bin\corridorkey-setup.cmd';
+  if (Prev <> '') and FileExists(Prev + '\receipt.json') then Result := Prev;
 end;
 
 { The same build, already installed and verified: say so and leave BEFORE anything is written (no files, no uninstall data, no
@@ -194,15 +205,51 @@ var
   Rc: Integer;
 begin
   Result := True;
+  PreLog := AddBackslash(GetEnv('TEMP')) + 'Keyloom-setup-{#VID}-' + GetDateTimeString('yyyymmdd-hhnnss', '', '') + '.log';
   Dir := DefaultDir('');
+  if (PrevAppPath <> '') and (Dir = PrevAppPath) then LogLine('install folder: ' + Dir + ' (recorded)')
+  else LogLine('install folder: ' + Dir + ' (default)');
   { Fast ordinary check with the installed Python, supervised and before any file is written. }
-  if DirExists(Dir + '\versions\{#VID}') and (AdoptDir = '') and CurrentPy(Dir, Py, Lc) then
+  if DirExists(Dir + '\versions\{#VID}') and CurrentPy(Dir, Py, Lc) then
   begin
     ExtractTemporaryFile('installer_payload.py');
-    if RunPy(Py, 'check', '"' + Py + '" -I -B "' + Lc + '" --prefix "' + Dir + '" check --version {#VID}', Rc) and (Rc = 0) then
+    RunPy(Py, 'check', '"' + Py + '" -I -B "' + Lc + '" --prefix "' + Dir + '" check --version {#VID}', Rc);
+    LogLine('fast check: ' + Dir + ' rc=' + IntToStr(Rc));
+    if Rc = 0 then
     begin
+      LogLine('already installed and verified; nothing was changed');
       SuppressibleMsgBox('Keyloom {#VID} is already installed and verified. Nothing was changed (settings, models and services are untouched). Use "keyloom-setup repair" to restore damaged files.', mbInformation, MB_OK, IDOK);
       ExitProcess(0);
+    end;
+  end;
+end;
+
+{ Running Keyloom holds instance.lock open with read/write access. Opening it with no sharing fails with error 32 (sharing violation),
+  which means Keyloom is running; setup then stops before anything is written. }
+function CreateFileW(FileName: String; Access, Share: Cardinal; Security: Longint; Disposition, Flags: Cardinal; Template: Longint): Longint;
+  external 'CreateFileW@kernel32.dll stdcall';
+function CloseHandle(Handle: Longint): Boolean; external 'CloseHandle@kernel32.dll stdcall';
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  L: String;
+  H, E: Longint;
+begin
+  Result := '';
+  L := ExpandConstant('{userappdata}\keyloom\instance.lock');
+  if FileExists(L) then
+  begin
+    H := CreateFileW(L, $80000000, 0, 0, 3, 0, 0);  { GENERIC_READ, no sharing, OPEN_EXISTING }
+    if H <> -1 then CloseHandle(H)
+    else
+    begin
+      E := DLLGetLastError;
+      if E = 32 then
+      begin
+        LogLine('Keyloom is running (instance.lock is held); setup stopped before any change');
+        Result := 'Keyloom is running. Quit it with File > Quit (a background network service does not need to be stopped), then run setup again. Nothing was changed.';
+      end
+      else LogLine('instance.lock check failed: ' + SysErrorMessage(E) + ' (' + IntToStr(E) + ')');
     end;
   end;
 end;
@@ -221,7 +268,7 @@ var
   installed Python may exist yet either). }
 procedure ClassifyTarget(AppDir: String);
 var
-  Py, Lc, Src, Man, Lcp: String;
+  Py, Lc, Man, Lcp: String;
   Rc, Rc2: Integer;
 begin
   InPlace := False;
@@ -235,15 +282,13 @@ begin
     FailSetup(6, 'A folder for this build already exists but no Python was available to classify it. Nothing was changed. Run "keyloom-setup repair" or remove that folder, then run setup again.');
   ExtractTemporaryFile('install-manifest.json');
   ExtractTemporaryFile('lifecycle.py');
-  Src := '';
-  if (SourceDir <> '') and (CompareText(SourceDir, AppDir) <> 0) then Src := ' --from "' + SourceDir + '"';
   WizardForm.StatusLabel.Caption := 'Checking the existing copy of this build (see the console window) ...';
   { core `prepare-target` (mutating, under core's mutation lock; it runs recover itself): exit 0 = place NOTHING (current or in-place),
     1 = destination prepared and journaled (unrecorded leftover removed link-safe / recorded damaged copy moved to a backup): place
     files, 4 = refused, 2 = invalid. No ordinary `recover` may run between this and `install --version`. }
   Man := ExpandConstant('{tmp}\install-manifest.json');
   Lcp := ExpandConstant('{tmp}\lifecycle.py');
-  RunPy(Py, 'prepare-target', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" prepare-target --manifest "' + Man + '"' + Src, Rc);
+  RunPy(Py, 'prepare-target', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" prepare-target --manifest "' + Man + '"', Rc);
   if Rc = 0 then
   begin
     { current vs in-place cannot be read from the output: ask the same lifecycle. current = nothing at all to do; in-place =
@@ -251,7 +296,8 @@ begin
     RunPy(Py, 'check', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" check --version {#VID}', Rc2);
     if Rc2 = 0 then
     begin
-      SuppressibleMsgBox('Keyloom {#VID} is already installed and verified. Nothing was changed.', mbInformation, MB_OK, IDOK);
+      LogLine('already installed and verified in place; nothing was changed');
+      SuppressibleMsgBox('Keyloom {#VID} is already installed and verified. Nothing was changed.' + LogHint, mbInformation, MB_OK, IDOK);
       ExitProcess(0);
     end
     else if Rc2 <> 1 then  { 1 = not the active build = in-place; a timeout (124) or any other result is a failure, never a guess }
@@ -277,28 +323,25 @@ end;
 
 procedure PrepareRuntime;
 var
-  Dest, Bpy, Lc, Man, Base, From, Meta: String;
+  Dest, Bpy, Lc, Man, Base, Meta: String;
   Rc: Integer;
 begin
   { ONE explicit decision per install (not a per-file Check). Nothing extracts unless runtime-available says 1. }
   if RuntimeChecked then exit;
   RuntimeChecked := True;
   Dest := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
-  if SourceDir = '' then SourceDir := Dest;
   Bpy := ExpandConstant('{tmp}\kb\python.exe');
   Lc := Dest + '\versions\{#VID}\app\packaging\lifecycle.py';
   Man := Dest + '\versions\{#VID}\install-manifest.json';
   if not (FileExists(Bpy) and FileExists(Lc) and FileExists(Man)) then
     FailSetup(7, 'Setup cannot check the runtime: the bootstrap or the new version''s lifecycle files are missing. Nothing was changed.');
   Base := '"' + Bpy + '" -I -B "' + Lc + '" --prefix "' + Dest + '" ';
-  From := '';
-  if CompareText(SourceDir, Dest) <> 0 then From := ' --from "' + SourceDir + '"';
   WizardForm.StatusLabel.Caption := 'Checking the installed runtime (see the console window) ...';
-  RunPy(Bpy, 'runtime-available', Base + 'runtime-available --manifest "' + Man + '"' + From, Rc);
+  RunPy(Bpy, 'runtime-available', Base + 'runtime-available --manifest "' + Man + '"', Rc);
   if Rc = 0 then
   begin
     { Reusable: attach the installed runtime as ONE whole directory (junction); no per-file hash, copy or link. Failure = failure. }
-    RunPy(Bpy, 'attach-runtime', Base + 'attach-runtime --version {#VID}' + From, Rc);
+    RunPy(Bpy, 'attach-runtime', Base + 'attach-runtime --version {#VID}', Rc);
     if Rc <> 0 then
       FailSetup(8, 'The installed runtime could not be attached (code ' + IntToStr(Rc) + '). Nothing was extracted. Run "keyloom-setup repair" for the installed version, then run this setup again.');
   end
@@ -317,8 +360,6 @@ begin
                 '). Keyloom was not activated; the previous version (if any) stays active. See the console output.');
     RuntimeExtracted := True;  { every shard was authenticated by the supervised extractor (size + sha256 + owned files) }
   end
-  else if Rc = 3 then
-    FailSetup(9, 'The installed runtime is identical but is not trusted for a fast update. Run "keyloom-setup repair" (full verification), then run this setup again. The runtime was not extracted again.')
   else if Rc = 124 then
     FailSetup(10, 'The runtime check showed no progress for 5 minutes and was stopped. Nothing was changed.')
   else
@@ -339,17 +380,22 @@ var
   Py, Lcp, AppDir, OldPy, OldLc: String;
   Rc: Integer;
 begin
+  LogLine('Setup finished with code ' + IntToStr(FailCode));
   if not RecoverPending then exit;
   RecoverPending := False;
   AppDir := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
   Py := ExpandConstant('{tmp}\kb\python.exe');
-  if not FileExists(Py) and not (CurrentPy(AppDir, OldPy, OldLc) and (OldPy <> '')) then exit;
+  if not FileExists(Py) and not (CurrentPy(AppDir, OldPy, OldLc) and (OldPy <> '')) then
+  begin
+    LogLine('WARNING: recover pending but no interpreter found; tried ' + Py + ' and ' + AppDir + '\current.txt (active runtime: ' + OldPy + ')');
+    exit;
+  end;
   if not FileExists(Py) then Py := OldPy;
   if not FileExists(ExpandConstant('{tmp}\lifecycle.py')) then ExtractTemporaryFile('lifecycle.py');
   Lcp := ExpandConstant('{tmp}\lifecycle.py');
   RunPy(Py, 'recover', '"' + Py + '" -I -B "' + Lcp + '" --prefix "' + AppDir + '" recover', Rc);
   if Rc <> 0 then
-    SuppressibleMsgBox('Cleanup of the unfinished install did not complete (code ' + IntToStr(Rc) + '). Run "keyloom-setup recover"; nothing else was changed.', mbError, MB_OK, IDOK);
+    SuppressibleMsgBox('Cleanup of the unfinished install did not complete (code ' + IntToStr(Rc) + '). Run "keyloom-setup recover"; nothing else was changed.' + LogHint, mbError, MB_OK, IDOK);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -364,11 +410,13 @@ begin
   begin
     if IsDriveRoot(ExpandConstant('{app}')) then
     begin
+      LogLine('install folder is a drive root: ' + ExpandConstant('{app}'));
       SuppressibleMsgBox('The install folder cannot be a drive root.', mbError, MB_OK, IDOK);
       FailCode := 5;
       Abort;
     end;
     LogFile := AppDir + '\install.log';
+    AttachPreLog;
     { the target is classified/prepared by PlaceFiles (first Check of the version-folder files), not here: the bundled bootstrap
       is only extracted once Inno starts copying }
   end;
@@ -382,7 +430,6 @@ begin
   Lc := AppDir + '\versions\{#VID}\app\packaging\lifecycle.py';
   if WizardIsTaskSelected('models') then Models := 'full' else Models := 'skip';
   Args := '"' + Bpy + '" -I -B "' + Lc + '" --prefix "' + AppDir + '" install --version {#VID} --models ' + Models;
-  if (AdoptDir <> '') and (CompareText(AdoptDir, AppDir) <> 0) then Args := Args + ' --adopt-from "' + AdoptDir + '"';
   if WizardIsTaskSelected('firewall') then Args := Args + ' --firewall yes' else Args := Args + ' --firewall skip';
   { Attestation only after the runtime shards were authenticated and extracted here. The lifecycle's one writer binds manifest sha,
     runtime id, resolved versions\<id> root and a fresh nonce; app files are still hashed by the lifecycle. An attached runtime
@@ -403,7 +450,10 @@ begin
   RunPy(Bpy, 'install', Args, Rc);
   if (Rc = 0) or (Rc = 3) then RecoverPending := False;
   if Rc = 3 then
-    SuppressibleMsgBox('Keyloom is installed but model setup is INCOMPLETE. Run "keyloom-setup models" (or repair) to finish; affected workflows stay unavailable until then.', mbInformation, MB_OK, IDOK)
+  begin
+    LogLine('Installation finished with model setup INCOMPLETE (code 3)');
+    SuppressibleMsgBox('Keyloom is installed but model setup is INCOMPLETE. Run "keyloom-setup models" (or repair) to finish; affected workflows stay unavailable until then.', mbInformation, MB_OK, IDOK);
+  end
   else if Rc <> 0 then
   begin
     FailCode := Rc;
@@ -412,8 +462,8 @@ begin
     { the failed transaction is settled by DeinitializeSetup (core `recover`, bounded, from the stable bootstrap) }
     LogLine('Installation failed with code ' + IntToStr(Rc));
     if Rc = 124 then
-      SuppressibleMsgBox('Installation STOPPED: a step showed no progress for 5 minutes and was ended. The previous version (if any) stays active; nothing was reported as installed.', mbError, MB_OK, IDOK)
+      SuppressibleMsgBox('Installation STOPPED: a step showed no progress for 5 minutes and was ended. The previous version (if any) stays active; nothing was reported as installed.' + LogHint, mbError, MB_OK, IDOK)
     else
-      SuppressibleMsgBox('Installation FAILED (code ' + IntToStr(Rc) + '): launch validation did not pass. The previous version (if any) stays active. See the console output.', mbError, MB_OK, IDOK);
+      SuppressibleMsgBox('Installation FAILED (code ' + IntToStr(Rc) + '): launch validation did not pass. The previous version (if any) stays active. See the console output.' + LogHint, mbError, MB_OK, IDOK);
   end;
 end;

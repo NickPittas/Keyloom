@@ -15,7 +15,8 @@ cosmetic now, the certificate pin is the identity, and the format is kept so an 
 (PC name), service-install.json, service-state.json (pid/state/endpoints/discovery/receiver, no secrets), coordinator.lock (held
 while running), coordinator.sqlite3, server-cert.pem/server-key.pem (never regenerated), local-join.token (rewritten at every
 start, loopback-only join), local-installation.json (which installation is THIS PC), host-removed.marker (user chose Remove:
-nothing re-installs the service until Start), stop.request (graceful-stop sentinel).
+nothing re-installs the service until Start), stop.request (graceful-stop sentinel). Operations and failures are logged to
+service.log beside the state folder (`<settings>/network/service.log`, see `_log`).
 The service listens dual-stack on one of ports 8443..8452 (existing port kept) on all interfaces, and answers UDP discovery on the
 fixed port 44554. Errors are ServiceError(code, message) with codes:
 bad_request, permission, port_in_use, service_unavailable, service_conflict, not_installed, not_configured, cert_mismatch,
@@ -32,6 +33,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -39,7 +41,6 @@ IS_WIN = os.name == "nt"
 UNIT = "keyloom-network.service"
 TASK = "Keyloom Network Service"
 RUN_VALUE = "KeyloomNetworkService"
-LEGACY_NAMES = ("corridorkey-network.service", "CorridorKey Network Service", "CorridorKeyNetworkService")  # before the rename
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 REGISTRY = "network-service.json"  # in the install prefix: tells lifecycle which state dir its service uses
 BOOT = "import sys;sys.path.insert(0,sys.argv[1]);from backend.network_service import main;sys.exit(main(sys.argv[2:]))"
@@ -59,19 +60,113 @@ class ServiceError(Exception):
         self.code, self.message = code, message
 
 
+# ---- logging -----------------------------------------------------------------------------------
+
+ECHO = False  # True mirrors every service.log line to stderr
+_T0 = time.monotonic()
+_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _write_line(sd, text):
+    """One line in <settings>/network/service.log (the file remote.rs writes). Best effort: a log failure never stops the service."""
+    if not sd:
+        return
+    line = f"{int(time.time())} [svc {time.monotonic() - _T0:7.1f}s pid={os.getpid()}] {_CTRL.sub('', text)}"
+    try:
+        p = Path(sd).parent / "service.log"
+        if p.is_file() and p.stat().st_size > 1 << 20:
+            try:
+                os.replace(p, p.with_name("service.log.old"))
+            except OSError:
+                pass
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    if ECHO:
+        print(line, file=sys.stderr)
+
+
+def _log(sd, msg):
+    _write_line(sd, msg[:4000])
+
+
+def _log_exc(sd, ctx, e):
+    _log(sd, f"{ctx}: {type(e).__name__}: {e}")
+    for ln in "".join(traceback.format_exception(e)).splitlines():  # traceback lines are kept whole
+        _write_line(sd, ln)
+
+
+def redact(argv):
+    """argv as one log line: the value after --token/--password/--secret and any K=V whose K names a secret are hidden."""
+    out, hide = [], False
+    for a in map(str, argv):
+        k, eq, _ = a.partition("=")
+        if hide:
+            out.append("***")
+        elif eq and re.search(r"TOKEN|SECRET|PASSWORD|KEY", k, re.I):
+            out.append(k + "=***")
+        else:
+            out.append(a)
+        hide = a in ("--token", "--password", "--secret")
+    return " ".join(out)
+
+
+@contextlib.contextmanager
+def _op(sd, name, quiet=False):
+    """An operation's start and result; a failure is logged as `code: message` (ServiceError) or with its traceback. quiet: failures only."""
+    if not quiet:
+        _log(sd, f"{name}: start")
+    try:
+        yield
+    except ServiceError as e:
+        _log(sd, f"{name}: failed: {e.code}: {e.message}")
+        raise
+    except Exception as e:
+        _log_exc(sd, name, e)
+        raise
+    if not quiet:
+        _log(sd, f"{name}: done")
+
+
 # ---- small helpers -----------------------------------------------------------------------------
 
-def _run(cmd, timeout=30):
+def _run(cmd, timeout=30, sd=None, quiet=False):
+    """quiet: a read-only query. When it succeeds (rc 0) nothing is logged; otherwise the whole run is logged as usual."""
+    run = f"run: {redact(cmd)}"
+    if not quiet:
+        _log(sd, run)
+    t0 = time.monotonic()
     try:
-        return subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except FileNotFoundError:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except FileNotFoundError as e:
+        if quiet:
+            _log(sd, run)
+        _log(sd, f"{cmd[0]}: FileNotFoundError: {e}")
         raise ServiceError("service_unavailable", f"{cmd[0]} is not available on this system") from None
     except subprocess.TimeoutExpired:
+        if quiet:
+            _log(sd, run)
+        _log(sd, f"{cmd[0]}: timed out after {timeout}s")
         raise ServiceError("service_unavailable", f"{cmd[0]} did not answer in {timeout}s") from None
+    if quiet and r.returncode == 0:
+        return r
+    if quiet:
+        _log(sd, run)
+    _log(sd, f"exit {r.returncode} after {time.monotonic() - t0:.1f}s")
+    for name, data in (("stdout", r.stdout), ("stderr", r.stderr)):
+        for ln in (data or b"").decode("oem" if IS_WIN else "utf-8", "replace").splitlines():
+            _log(sd, f"{name}| {ln}")
+    return r
+
+
+def _warn_if_failed(sd, r, what):
+    if r.returncode:  # the caller carries on: the lock check that follows decides
+        _log(sd, f"WARNING: {what} failed (exit {r.returncode}): {_out(r)}")
 
 
 def _out(r):
-    return (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip()[:300]
+    return (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip()
 
 
 def owner_id(root_or_prefix):
@@ -81,7 +176,7 @@ def owner_id(root_or_prefix):
 def install_context():
     """(app root, owner id) of the running code. Packaged trees are <prefix>/versions/<v>/app: owner = lifecycle.owner_id(prefix)."""
     root = Path(__file__).resolve().parents[1]
-    if root.name == "app" and ((root.parent / "keyloom-install.json").is_file() or (root.parent / "corridorkey-install.json").is_file()):
+    if root.name == "app" and (root.parent / "keyloom-install.json").is_file():
         return root, owner_id(root.parent.parent.parent), root.parent.parent.parent
     return root, owner_id(root), None
 
@@ -128,7 +223,7 @@ def ensure_dir(sd, create):
         try:
             sd.mkdir(mode=0o700, parents=True, exist_ok=True)
         except OSError as e:
-            raise ServiceError("permission", f"cannot create the service state directory ({type(e).__name__})") from None
+            raise ServiceError("permission", f"cannot create the service state directory {sd} ({type(e).__name__}: {e})") from None
     if not sd.is_dir():
         return False
     if not IS_WIN:
@@ -151,7 +246,7 @@ def _read_json(p):
         except (OSError, ValueError) as e:
             last = e
             time.sleep(0.05 * (attempt + 1))
-    raise ServiceError("internal", f"{Path(p).name} could not be read ({type(last).__name__}); it was left untouched") from None
+    raise ServiceError("internal", f"{Path(p).name} could not be read ({type(last).__name__}: {last}); it was left untouched") from None
 
 
 def _write_plain(p, data):  # non-secret status files: owner-only file, atomic replace
@@ -206,27 +301,15 @@ def _unit_text(cmd, sd, owner):
     def q(a):
         return '"' + a.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
     return (f"# X-Keyloom-Network-Owner={owner}\n# X-Keyloom-State-Dir={sd}\n"
-            "[Unit]\nDescription=Keyloom network service (powered by CorridorKey)\nStartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
+            "[Unit]\nDescription=Keyloom network service\nStartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
             f"[Service]\nType=simple\nExecStart={' '.join(q(a) for a in cmd)}\nWorkingDirectory={str(sd).replace(chr(37), chr(37) * 2)}\n"
             "Restart=on-failure\nRestartSec=10\nRestartPreventExitStatus=2\n\n[Install]\nWantedBy=default.target\n")
 
 
-@contextlib.contextmanager
-def _legacy_names():
-    """Run the OS-definition helpers against the pre-rename unit/task/value names."""
-    global UNIT, TASK, RUN_VALUE
-    saved = UNIT, TASK, RUN_VALUE
-    UNIT, TASK, RUN_VALUE = LEGACY_NAMES
-    try:
-        yield
-    finally:
-        UNIT, TASK, RUN_VALUE = saved
-
-
-def _systemctl(*a):
-    r = _run(["systemctl", "--user", *a])
+def _systemctl(*a, sd=None):
+    r = _run(["systemctl", "--user", *a], sd=sd)
     if r.returncode and a[0] in ("daemon-reload", "enable", "start", "stop", "disable"):
-        raise ServiceError("service_unavailable", f"systemctl --user {a[0]} failed: {_out(r) or r.returncode}")
+        raise ServiceError("service_unavailable", f"systemctl --user {a[0]} failed: {_out(r)[:2000] or r.returncode}")
     return r
 
 
@@ -246,22 +329,22 @@ def _task_xml(cmd, sd, owner, who):
             f"<WorkingDirectory>{e(str(sd))}</WorkingDirectory></Exec></Actions></Task>")
 
 
-def _win_user():
-    r = _run(["whoami"])
+def _win_user(sd):
+    r = _run(["whoami"], sd=sd)
     if r.returncode or not r.stdout.strip():
         raise ServiceError("service_unavailable", "cannot determine the current Windows user")
     return r.stdout.decode("utf-8", "replace").strip()
 
 
-def _definition():
+def _definition(sd=None):
     """-> {"mode", "state_dir"} of the per-user definition if one exists (owned or not), else None."""
     if not IS_WIN:
         p = _unit_path()
         if not p.is_file():
             return None
-        m = re.search(r"^# X-(?:Keyloom|CorridorKey)-State-Dir=(.*)$", p.read_text(encoding="utf-8", errors="replace"), re.M)
+        m = re.search(r"^# X-Keyloom-State-Dir=(.*)$", p.read_text(encoding="utf-8", errors="replace"), re.M)
         return {"mode": "systemd", "state_dir": m.group(1) if m else None}
-    r = _run(["schtasks", "/Query", "/TN", TASK, "/XML"])
+    r = _run(["schtasks", "/Query", "/TN", TASK, "/XML"], sd=sd, quiet=True)
     if r.returncode == 0:
         text = r.stdout.decode("utf-16", "replace") if r.stdout[:2] in (b"\xff\xfe", b"\xfe\xff") else r.stdout.decode("utf-8", "replace")
         m = re.search(r"<Description>(.*?)</Description>", text, re.S)
@@ -280,7 +363,7 @@ def _definition():
 
 
 def _same_dir(a, b):
-    """Same folder, also through the compatibility link the settings-folder rename leaves under the old name."""
+    """Same folder (by real path)."""
     try:
         return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
     except OSError:
@@ -289,7 +372,7 @@ def _same_dir(a, b):
 
 def _owned(sd):
     """The definition names `sd` AND `sd` carries our install record: only then may we change or remove it."""
-    d = _definition()
+    d = _definition(sd)
     inst = _read_json(sd / "service-install.json") if sd.is_dir() else None
     if d and d["state_dir"] and inst and _same_dir(d["state_dir"], sd):
         return d | {"install": inst}
@@ -304,76 +387,68 @@ def _write_definition(mode, cmd, sd, owner):
         tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex[:8]}")
         tmp.write_text(_unit_text(cmd, sd, owner), encoding="utf-8")
         os.replace(tmp, p)
-        _systemctl("daemon-reload")
-        _systemctl("enable", UNIT)
+        _systemctl("daemon-reload", sd=sd)
+        _systemctl("enable", UNIT, sd=sd)
         return mode
     if mode == "task":
         xml = sd / f".task.{uuid.uuid4().hex[:8]}.xml"
-        xml.write_text(_task_xml(cmd, sd, owner, _win_user()), encoding="utf-16")
+        xml.write_text(_task_xml(cmd, sd, owner, _win_user(sd)), encoding="utf-16")
         try:
-            r = _run(["schtasks", "/Create", "/TN", TASK, "/XML", str(xml), "/F"])
+            r = _run(["schtasks", "/Create", "/TN", TASK, "/XML", str(xml), "/F"], sd=sd)
         finally:
             xml.unlink(missing_ok=True)
         if r.returncode == 0:
-            _delete_run_value()
+            _delete_run_value(sd)
             return "task"
+        _log(sd, f"schtasks /Create refused the logon task (exit {r.returncode}): {_out(r)}; falling back to the HKCU Run value {RUN_VALUE}")
         mode = "run"  # standard users may be refused a logon task: equivalent per-user autostart, still no elevation
     import winreg
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         winreg.SetValueEx(k, RUN_VALUE, 0, winreg.REG_SZ, subprocess.list2cmdline(cmd))
+        _log(sd, "Run value written")
     return "run"
 
 
-def _delete_run_value():
+def _delete_run_value(sd):
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
             winreg.DeleteValue(k, RUN_VALUE)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as e:
+        _log(sd, f"could not remove the HKCU Run value {RUN_VALUE}: {type(e).__name__}: {e}")
 
 
-def _remove_definition(mode):
+def _remove_definition(mode, sd):
     if mode == "systemd":
-        _systemctl("disable", UNIT)
+        _systemctl("disable", UNIT, sd=sd)
         _unit_path().unlink(missing_ok=True)
-        _systemctl("daemon-reload")
+        _systemctl("daemon-reload", sd=sd)
     else:
         if mode == "task":
-            _run(["schtasks", "/Delete", "/TN", TASK, "/F"])
-        _delete_run_value()
+            r = _run(["schtasks", "/Delete", "/TN", TASK, "/F"], sd=sd)
+            if r.returncode:
+                raise ServiceError("service_unavailable", f"schtasks /Delete failed (exit {r.returncode}): {_out(r)[:2000]}")
+        _delete_run_value(sd)
 
 
 def _spawn(mode, cmd, sd):
     if mode == "systemd":
-        _run(["systemctl", "--user", "reset-failed", UNIT])
-        _systemctl("start", UNIT)
+        _warn_if_failed(sd, _run(["systemctl", "--user", "reset-failed", UNIT], sd=sd), "systemctl reset-failed")
+        _systemctl("start", UNIT, sd=sd)
     elif mode == "task":
-        r = _run(["schtasks", "/Run", "/TN", TASK])
+        r = _run(["schtasks", "/Run", "/TN", TASK], sd=sd)
         if r.returncode:
-            raise ServiceError("service_unavailable", f"the scheduled task could not be started: {_out(r)}")
+            raise ServiceError("service_unavailable", f"the scheduled task could not be started: {_out(r)[:2000]}")
     else:
         env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON") and k != "VIRTUAL_ENV"}
-        subprocess.Popen(cmd, cwd=str(sd), env=env, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, creationflags=0x00000008 | 0x00000200 | 0x08000000)
-
-
-def _retire_legacy(sd):
-    """Stop and unregister a pre-rename (CorridorKey) definition that serves THIS state folder. Only the definition goes;
-    the state folder, certificate, database and settings are never touched. True if one was found."""
-    with _legacy_names():
-        d = _definition()
-        if not d or not d["state_dir"] or not _same_dir(d["state_dir"], sd):
-            return False
         try:
-            _stop(d["mode"], sd, fallback=False)
-        except ServiceError:
-            pass  # the caller falls back to _kill_holder
-        try:
-            _remove_definition(d["mode"])
-        except ServiceError:
-            pass
-    return True
+            p = subprocess.Popen(cmd, cwd=str(sd), env=env, close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, creationflags=0x00000008 | 0x00000200 | 0x08000000)
+        except OSError as e:
+            raise ServiceError("start_failed", f"{type(e).__name__}: {e}") from None
+        _log(sd, f"started pid={p.pid}: {redact(cmd)}")
 
 
 def _kill_holder(sd):
@@ -383,7 +458,8 @@ def _kill_holder(sd):
     if not isinstance(pid, int) or pid <= 0:
         return
     if IS_WIN:
-        r = _run(["powershell", "-NoProfile", "-Command", f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"])
+        r = _run(["powershell", "-NoProfile", "-Command", f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"], sd=sd)
+        _warn_if_failed(sd, r, "PowerShell CommandLine query")
         cmdline = r.stdout.decode("utf-8", "replace")
     else:
         try:
@@ -393,7 +469,7 @@ def _kill_holder(sd):
     if str(sd) not in cmdline:
         return
     if IS_WIN:
-        _run(["taskkill", "/PID", str(pid), "/F"])
+        _warn_if_failed(sd, _run(["taskkill", "/PID", str(pid), "/F"], sd=sd), "taskkill")
     else:
         with contextlib.suppress(OSError):
             os.kill(pid, signal.SIGTERM)
@@ -402,7 +478,7 @@ def _kill_holder(sd):
         time.sleep(0.25)
 
 
-def _stop(mode, sd, wait=15, fallback=True):
+def _stop(mode, sd, wait=15):
     if not lock_busy(sd):
         return
     (sd / "stop.request").write_text("stop", encoding="utf-8")  # graceful on every platform; the service polls for it
@@ -410,14 +486,15 @@ def _stop(mode, sd, wait=15, fallback=True):
     while lock_busy(sd) and time.monotonic() < end:
         time.sleep(0.25)
     if lock_busy(sd):
-        _systemctl("stop", UNIT) if mode == "systemd" else _run(["schtasks", "/End", "/TN", TASK]) if mode == "task" else None
+        if mode == "systemd":
+            _systemctl("stop", UNIT, sd=sd)
+        elif mode == "task":
+            _warn_if_failed(sd, _run(["schtasks", "/End", "/TN", TASK], sd=sd), "schtasks /End")
         end = time.monotonic() + 10
         while lock_busy(sd) and time.monotonic() < end:
             time.sleep(0.25)
-    if fallback and lock_busy(sd):  # a pre-rename service may hold the lock under the old names
-        _retire_legacy(sd)
-        if lock_busy(sd):
-            _kill_holder(sd)
+    if lock_busy(sd):
+        _kill_holder(sd)
     (sd / "stop.request").unlink(missing_ok=True)
     if lock_busy(sd):
         raise ServiceError("busy", "the service did not stop; close it from Task Manager / systemctl and retry")
@@ -464,7 +541,7 @@ def _port_free(port):  # an explicitly requested port (old arguments) must be fr
     except OSError as e:
         if e.errno in (errno.EADDRINUSE, 10048):
             raise ServiceError("port_in_use", f"port {port} is already in use by another program; choose another port") from None
-        raise ServiceError("permission", f"port {port} cannot be opened ({type(e).__name__}); it may be reserved or blocked") from None
+        raise ServiceError("permission", f"port {port} cannot be opened ({type(e).__name__}: {e}); it may be reserved or blocked") from None
     finally:
         s.close()
 
@@ -570,6 +647,11 @@ def _live_endpoints(port):
 
 def status(state_dir):
     sd = state_path(state_dir)
+    with _op(sd, "status", quiet=True):
+        return _status(sd)
+
+
+def _status(sd):
     exists = ensure_dir(sd, False)
     cfg = read_config(sd) if exists else None
     d = _owned(sd) if exists else None
@@ -603,7 +685,7 @@ def status(state_dir):
         out["message"] = "installed, not running"
     else:
         out["message"] = "not installed"
-    if not d and _definition():
+    if not d and _definition(sd):
         out["message"] = "a service for a different state folder is registered for this user"
     diag = (st.get("message") if st.get("state") == "failed" else "") or (st.get("diagnostic") if live else "") or ""
     out["diagnostic"] = str(diag)[:300]  # last error only; the service never puts secrets in it
@@ -614,15 +696,16 @@ def install(state_dir, address=None, port=None, allow=None, name=None):
     """New callers pass only state_dir (+ allow_address_join, name): the host listens on every interface, the port is the existing
     one or the first free of 8443..8452, and `address` is a cosmetic value chosen here. Old callers may still pass address/port."""
     root, owner, prefix = install_context()
-    return _install(state_path(state_dir), service_python(sys.executable), root, owner, prefix, address, port, allow, name)
+    sd = state_path(state_dir)
+    with _op(sd, "install"):
+        return _install(sd, service_python(sys.executable), root, owner, prefix, address, port, allow, name)
 
 
 def _install(sd, py, root, owner, prefix, address=None, port=None, allow=None, name=None):
     if allow is not None and not isinstance(allow, bool):
         raise ServiceError("bad_request", "allow_address_join must be true or false")
     ensure_dir(sd, True)
-    _retire_legacy(sd)  # take over a pre-rename service of this state folder
-    existing = _definition()
+    existing = _definition(sd)
     if existing and (not existing["state_dir"] or os.path.normcase(existing["state_dir"]) != os.path.normcase(str(sd))):
         raise ServiceError("service_conflict", "a different network service is already registered for this user; remove it first")
     _cert_ok(sd)
@@ -632,6 +715,7 @@ def _install(sd, py, root, owner, prefix, address=None, port=None, allow=None, n
     if name is not None:
         _write_meta(sd, name)
     if lock_busy(sd):
+        _log(sd, "a service is running: stopping it before the change")
         _stop(mode, sd)
     allow = allow if allow is not None else (cfg["allow_address_join"] if cfg else True)
     address = address if address is not None else (cfg["address"] if cfg else _choose_address(sd))
@@ -641,10 +725,12 @@ def _install(sd, py, root, owner, prefix, address=None, port=None, allow=None, n
     else:
         port = _pick_port(cfg["port"] if cfg else None)
     validate(address, port, allow)
+    _log(sd, f"address={address} port={port} allow_address_join={allow} mode={mode}")
     (sd / REMOVED).unlink(missing_ok=True)
     _write_cfg(sd, address, port, allow)
     cmd = _command(py, root, sd)
     mode = _write_definition(mode, cmd, sd, owner)
+    _log(sd, f"definition written: mode={mode}")
     _write_plain(sd / "service-install.json", {"version": 1, "owner": owner, "mode": mode, "root": str(root), "python": str(py)})
     if prefix:
         _write_plain(Path(prefix) / REGISTRY, {"version": 1, "state_dir": str(sd)})
@@ -663,60 +749,64 @@ def _owned_or_raise(sd):
 def start(state_dir):
     """Start; installs first when nothing is installed (Remove then Start brings the same network back)."""
     sd = state_path(state_dir)
-    ensure_dir(sd, False)
-    d = _owned(sd) if sd.is_dir() else None
-    if not d or not (sd / "service.json").exists():
-        return install(state_dir)
-    (sd / REMOVED).unlink(missing_ok=True)
-    if not lock_busy(sd):
-        cfg = read_config(sd)
-        if not _port_ok(cfg["port"]):  # another program took our port: move to the next free one (PCs follow by discovery)
-            _write_cfg(sd, cfg["address"], _pick_port(), cfg["allow_address_join"])
-        i = d["install"]
-        _begin_start(d["mode"], _command(i["python"], i["root"], sd), sd)
-    return status(sd)
+    with _op(sd, "start"):
+        ensure_dir(sd, False)
+        d = _owned(sd) if sd.is_dir() else None
+        if not d or not (sd / "service.json").exists():
+            return install(state_dir)
+        (sd / REMOVED).unlink(missing_ok=True)
+        if not lock_busy(sd):
+            cfg = read_config(sd)
+            if not _port_ok(cfg["port"]):  # another program took our port: move to the next free one (PCs follow by discovery)
+                _write_cfg(sd, cfg["address"], _pick_port(), cfg["allow_address_join"])
+            i = d["install"]
+            _begin_start(d["mode"], _command(i["python"], i["root"], sd), sd)
+        return status(sd)
 
 
 def stop(state_dir):
     sd = state_path(state_dir)
-    d = _owned_or_raise(sd)
-    _stop(d["mode"], sd)
-    return status(sd)
+    with _op(sd, "stop"):
+        d = _owned_or_raise(sd)
+        _stop(d["mode"], sd)
+        return status(sd)
 
 
 def remove(state_dir):
     sd = state_path(state_dir)
-    ensure_dir(sd, False)
-    d = _owned(sd)
-    if d:
-        _stop(d["mode"], sd)
-        _remove_definition(d["mode"])
-        (sd / "service-install.json").unlink(missing_ok=True)
-        reg = Path(d["install"].get("root", "")).parents[2] / REGISTRY if d["install"].get("root") else None
-        if reg and reg.is_file() and (_read_json(reg) or {}).get("state_dir") == str(sd):
-            reg.unlink()
-    if sd.is_dir():
-        _write_plain(sd / REMOVED, {"version": 1, "time": time.time()})  # tombstone: installers/startup must not bring it back
-    return status(sd)  # state, certificate and database stay: removing the service never deletes the network
+    with _op(sd, "remove"):
+        ensure_dir(sd, False)
+        d = _owned(sd)
+        if d:
+            _stop(d["mode"], sd)
+            _remove_definition(d["mode"], sd)
+            (sd / "service-install.json").unlink(missing_ok=True)
+            reg = Path(d["install"].get("root", "")).parents[2] / REGISTRY if d["install"].get("root") else None
+            if reg and reg.is_file() and (_read_json(reg) or {}).get("state_dir") == str(sd):
+                reg.unlink()
+        if sd.is_dir():
+            _write_plain(sd / REMOVED, {"version": 1, "time": time.time()})  # tombstone: installers/startup must not bring it back
+        return status(sd)  # state, certificate and database stay: removing the service never deletes the network
 
 
 def configure(state_dir, allow, name=None):
     """Change policy / PC name of an existing configuration. The running service notices within ~1 s; nothing restarts."""
     sd = state_path(state_dir)
-    ensure_dir(sd, False)
-    cfg = read_config(sd) if sd.is_dir() else None
-    if not cfg:
-        raise ServiceError("not_configured", "the network service has no configuration yet; press Start")
-    if not isinstance(allow, bool):
-        raise ServiceError("bad_request", "allow_address_join must be true or false")
-    if name is not None:
-        _write_meta(sd, name)
-    if allow != cfg["allow_address_join"]:
-        _write_cfg(sd, cfg["address"], cfg["port"], allow)
-    return status(sd)
+    with _op(sd, "configure"):
+        ensure_dir(sd, False)
+        cfg = read_config(sd) if sd.is_dir() else None
+        if not cfg:
+            raise ServiceError("not_configured", "the network service has no configuration yet; press Start")
+        if not isinstance(allow, bool):
+            raise ServiceError("bad_request", "allow_address_join must be true or false")
+        if name is not None:
+            _write_meta(sd, name)
+        if allow != cfg["allow_address_join"]:
+            _write_cfg(sd, cfg["address"], cfg["port"], allow)
+        return status(sd)
 
 
-def _refresh_owned(sd, d, python, root, owner=None, restart=False):
+def _refresh_owned(sd, d, python, root, owner=None):
     py, was = service_python(python), lock_busy(sd)
     if was:
         _stop(d["mode"], sd)
@@ -724,8 +814,15 @@ def _refresh_owned(sd, d, python, root, owner=None, restart=False):
     cmd = _command(py, root, sd)
     mode = _write_definition(d["mode"], cmd, sd, owner)
     _write_plain(sd / "service-install.json", d["install"] | {"owner": owner, "mode": mode, "root": str(root), "python": str(py)})
-    if was or restart:
+    if was:
         _begin_start(mode, cmd, sd)
+
+
+def _refreshed_message(sd):
+    if lock_busy(sd):
+        return "network service now runs from the active version"
+    return ("network service registration updated to the active version; it is not running "
+            "(it starts at the next sign-in, or press Start in Clients)")
 
 
 def refresh(python, root, prefix):
@@ -734,240 +831,22 @@ def refresh(python, root, prefix):
     if not reg:
         return None
     sd = state_path(reg["state_dir"])
-    d = _owned(sd)
-    if not d or d["install"].get("owner") != owner_id(prefix):
-        return None
-    _refresh_owned(sd, d, python, root)
-    return "network service now runs from the active version"
+    with _op(sd, "refresh"):
+        d = _owned(sd)
+        if not d or d["install"].get("owner") != owner_id(prefix):
+            return None
+        _refresh_owned(sd, d, python, root)
+        return _refreshed_message(sd)
 
 
 def settings_dir(base):
-    """`<base>/keyloom`, unless only the pre-rename `<base>/corridorkey-native` exists: existing settings, certificates and
-    jobs stay where they are and the same folder (and instance lock) is shared by old and new builds. Mirrors rust-ui settings.rs."""
-    old = Path(base) / "corridorkey-native"
-    return old if old.is_dir() and not (Path(base) / "keyloom").exists() else Path(base) / "keyloom"
-
-
-def _migrate_legacy(python, root, owner):
-    """Replace a pre-rename definition this installation owns with one under the Keyloom names (stop old, write new, remove
-    old). The state directory, certificate, database and service identity are untouched. Foreign definitions are left alone."""
-    with _legacy_names():
-        d = _definition()
-    if not d or not d["state_dir"]:
-        return None
-    sd = Path(d["state_dir"])
-    inst = _read_json(sd / "service-install.json") if sd.is_dir() else None
-    if not inst:  # same user's per-user definition: the owner id of an older install location no longer blocks the takeover
-        return None
-    was = lock_busy(sd)
-    if was:
-        with _legacy_names():
-            _stop(d["mode"], sd)
-    cmd = _command(service_python(python), root, sd)
-    mode = _write_definition(d["mode"], cmd, sd, owner)
-    with _legacy_names():
-        try:
-            _remove_definition(d["mode"])
-        except ServiceError:
-            pass
-    _write_plain(sd / "service-install.json", inst | {"owner": owner, "mode": mode, "root": str(root), "python": str(service_python(python))})
-    if was:
-        _begin_start(mode, cmd, sd)
-    return "network service moved to the Keyloom name"
+    """`<base>/keyloom`: the settings and state folder of this user. Mirrors rust-ui settings.rs config_dir."""
+    return Path(base) / "keyloom"
 
 
 def _settings_base():
     return (os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")) if IS_WIN else \
         (os.environ.get("XDG_CONFIG_HOME") or (str(Path(os.environ["HOME"]) / ".config") if os.environ.get("HOME") else None))
-
-
-def _exclusive_lock(path):
-    """Linux: take the same advisory lock the app holds while it runs; None if it is busy. Windows: the rename itself fails
-    while the app has files open, so no separate lock is needed."""
-    if IS_WIN:
-        return True
-    import fcntl
-    f = open(path, "a")
-    try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        f.close()
-        return None
-    return f
-
-
-def _link_dir(link, target):
-    if IS_WIN:
-        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, timeout=30)
-        return r.returncode == 0
-    os.symlink(target, link)
-    return True
-
-
-def migrate_settings_dir(base, owners=()):
-    """The settings/state folder `corridorkey-native` is NOT renamed any more: no new rename is started on any platform.
-    Why: a rename leaves a gap (rename -> compatibility link) in which an older build, which only knows the old name, can start
-    and create a second, empty folder; holding the app's flock does not prevent that, and Windows has no lock shared with the
-    app at all. Every resolver (rust-ui settings.rs config_dir, this module's settings_dir, online) uses `corridorkey-native`
-    whenever it is a directory and `keyloom` does not exist, so settings, certificates, jobs and the instance lock simply stay
-    where they are. Only the cosmetic branding of that folder name is deferred.
-    What still runs: an INTERRUPTED rename left by an earlier version is completed or undone (see _finish_migration), under the
-    app's own flock, without ever replacing or deleting a folder.
-    Returns None (nothing to say), {"deferred": True, "message"} for the deferral notice, {"pending": True, "message"} when an
-    unfinished migration must wait (app running / Windows), or {"blocked": True, "message"} when two folders or an unreadable
-    journal make the state ambiguous (the caller must refuse to activate or change services until the user resolves it)."""
-    base = Path(base)
-    old, new, journal = base / "corridorkey-native", base / "keyloom", base / ".keyloom-migrate.json"
-    if os.path.lexists(journal):  # an interrupted run: complete it or undo it BEFORE anything else looks at the folders
-        blocked = _finish_migration(old, new, journal)
-        if blocked:
-            return blocked
-    if old.is_dir() and not old.is_symlink() and not os.path.lexists(new):
-        return {"moved": False, "deferred": True, "was_running": False,
-                "message": "settings folder name unchanged: Keyloom keeps using the existing corridorkey-native folder "
-                           "(renaming it to keyloom is deferred; nothing was moved)"}
-    return None
-def _rename_noreplace(src, dst):
-    """Rename a directory only if `dst` does not exist (Linux renameat2 + RENAME_NOREPLACE through stdlib ctypes). True: done.
-    False: `dst` exists (EEXIST/ENOTEMPTY), nothing changed. None: not available here (other OS, old kernel/filesystem): the
-    caller must NOT fall back to a plain rename, which would silently replace an empty directory."""
-    if not sys.platform.startswith("linux"):
-        return None
-    import ctypes
-    try:
-        fn = ctypes.CDLL(None, use_errno=True).renameat2
-    except (OSError, AttributeError):
-        return None
-    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    if fn(-100, os.fsencode(src), -100, os.fsencode(dst), 1) == 0:  # AT_FDCWD, RENAME_NOREPLACE
-        return True
-    e = ctypes.get_errno()
-    return False if e in (errno.EEXIST, errno.ENOTEMPTY) else None
-
-
-def _undo_rename(old, new):
-    """Put the renamed folder back under its original name, never replacing anything: True only on a completed no-replace rename."""
-    if os.path.lexists(old) or not new.is_dir() or new.is_symlink():
-        return False
-    return _rename_noreplace(new, old) is True
-
-
-def _finish_migration(old, new, journal):
-    """An interrupted rename (a timeout can stop the run between the rename and the link): reach a consistent state before
-    anything else, deterministically, deleting nothing.
-      original folder only            -> the rename never happened: drop the journal, migrate normally
-      keyloom only (rename done)      -> create the link; if that fails undo the rename; then rewrite paths, drop the journal
-      keyloom + link under old name   -> rewrite paths (idempotent), drop the journal
-      anything else (two real folders, foreign journal, unreadable journal, link impossible AND undo impossible)
-                                      -> journal and both folders untouched, returns {"blocked": True, "message"}; the caller
-                                         refuses to start or change services until the user resolves it.
-    Returns None when consistent."""
-    kind, msg = _migration_state(old, new, journal)
-    if kind == "blocked":
-        return _blocked(msg)
-    if kind == "drop":  # journal only: the rename never happened, no folder is touched
-        journal.unlink(missing_ok=True)
-        return None
-    if IS_WIN:  # no lock shared with the app's startup: completing (link, path rewrite) waits for a non-Windows run or the user
-        return {"moved": False, "pending": True, "was_running": False,
-                "message": "an earlier settings-folder rename is unfinished; it keeps working through the resolver and is "
-                           "completed when it can be done safely"}
-    lock = _exclusive_lock(new / "instance.lock")  # the app's own flock, BEFORE any link / undo / path rewrite
-    if lock is None:
-        return {"moved": False, "pending": True, "was_running": False,
-                "message": "an earlier settings-folder rename is unfinished; it is completed when Keyloom is not running"}
-    try:
-        kind, msg = _migration_state(old, new, journal)  # decided again under the lock
-        if kind == "blocked":
-            return _blocked(msg)
-        if kind == "drop":
-            journal.unlink(missing_ok=True)
-            return None
-        if kind == "link":
-            try:
-                linked = _link_dir(old, new)  # os.symlink never replaces an existing name
-            except OSError:
-                linked = False
-            if not linked:
-                if _undo_rename(old, new):  # no-replace rename back: the original, usable folder again
-                    _fix_paths(old, new, old)  # an earlier version rewrote paths before linking: point them back
-                    journal.unlink(missing_ok=True)
-                    return None
-                return _blocked("no link could be created under the old name and the rename could not be undone without "
-                                "risking another folder; nothing was deleted or replaced")
-        if _fix_paths(new, old, new):
-            journal.unlink(missing_ok=True)  # cleared only after the link and every path rewrite succeeded
-    finally:
-        if lock is not True:
-            lock.close()
-    return None
-
-
-def _blocked(msg):
-    return {"moved": False, "blocked": True, "was_running": False,
-            "message": "settings folder migration is unfinished and ambiguous: " + msg + ". Nothing was deleted or replaced. "
-                       "Keyloom setup will not activate or change services until it is resolved: keep the folder with your "
-                       "settings as 'corridorkey-native' (move the other aside) and run setup again"}
-
-
-def _migration_state(old, new, journal):
-    """Read-only classification of an interrupted rename -> (kind, message), kind one of:
-    drop (journal only: rename never happened) | link (keyloom exists, no old name) | fix (old name is the link; paths pending) |
-    blocked (two real folders, foreign/unreadable journal, old name not a link to keyloom, keyloom missing)."""
-    try:
-        j = _read_json(journal)
-    except ServiceError:
-        return "blocked", "its journal cannot be read"
-    if not j or Path(j.get("from", "")) != old or Path(j.get("to", "")) != new:
-        return "blocked", "its journal does not name these folders"
-    old_real = old.is_dir() and not old.is_symlink()
-    new_real = new.is_dir() and not new.is_symlink()
-    if old_real and not os.path.lexists(new):
-        return "drop", ""
-    if old_real and new_real:
-        return "blocked", "both a corridorkey-native and a keyloom folder exist"
-    if not new_real:
-        return "blocked", "the keyloom entry is missing or is not a plain folder"
-    if not os.path.lexists(old):
-        return "link", ""
-    if old.is_symlink() and _same_dir(old, new):
-        return "fix", ""
-    return "blocked", "the old name exists but is not a link to the keyloom folder"
-
-
-def settings_migration_state(base=None):
-    """Read-only (no lock, no write): {"blocked": bool, "message": str} for callers that must refuse to activate or change services
-    while an interrupted settings-folder rename is ambiguous. An unfinished but unambiguous one is not blocked (resolvers cope)."""
-    base = base or _settings_base()
-    if not base:
-        return {"blocked": False, "message": ""}
-    base = Path(base)
-    journal = base / ".keyloom-migrate.json"
-    if not os.path.lexists(journal):
-        return {"blocked": False, "message": ""}
-    kind, msg = _migration_state(base / "corridorkey-native", base / "keyloom", journal)
-    return {"blocked": kind == "blocked", "message": _blocked(msg)["message"] if kind == "blocked" else ""}
-
-
-def _fix_paths(new, old, new_path):
-    """Rewrite the old folder path inside settings.json textually (JSON-escaped form), keeping every other byte."""
-    f = Path(new_path) / "settings.json"
-    try:
-        text = f.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return True  # nothing to rewrite
-    except OSError:
-        return False  # retried on the next run (the journal stays)
-    a, b = json.dumps(str(old))[1:-1], json.dumps(str(new_path))[1:-1]
-    if a in text:
-        tmp = f.with_name(f".settings.{uuid.uuid4().hex[:8]}")
-        try:
-            tmp.write_text(text.replace(a, b), encoding="utf-8")
-            os.replace(tmp, f)
-        except OSError:
-            tmp.unlink(missing_ok=True)
-            return False
-    return True  # idempotent: the new path text never contains the old one
 
 
 def _user_settings():
@@ -987,44 +866,36 @@ def _user_settings():
     return net, sp.parent / "network" / "server"
 
 
-def ensure_default(python, root, prefix, adopt=None):
-    mig = {}
-    out = _ensure_default(python, root, prefix, adopt, mig)
-    if mig.get("message"):
-        out["message"] = (mig["message"] + "; " + out.get("message", "")).strip("; ")
-    return out
+def ensure_default(python, root, prefix):
+    sd = _user_settings()[1]
+    with _op(sd, "ensure_default"):
+        out = _ensure_default(python, root, prefix)
+        _log(sd, f"ensure_default branch: {out['action']}: {out['message']}")
+        return out
 
 
-def _ensure_default(python, root, prefix, adopt, mig_out):
+def _ensure_default(python, root, prefix):
     """Installer hook (run under the installed version's full Python, after activation): host this PC's network by default.
     Absent -> install + start; an existing service this prefix owns -> repointed at this version (restarted only if it ran);
     removed by the user (settings network.host_removed or our tombstone) or someone else's service -> left alone.
     Returns the JSON-serializable status plus `action`."""
     owner = owner_id(prefix)
-    owners = (owner, owner_id(adopt)) if adopt else (owner,)
-    mig = migrate_settings_dir(_settings_base(), owners) if _settings_base() else None
-    mig_out.update(mig or {})
-    if mig and mig.get("blocked"):  # unfinished folder migration: no service or settings change until it is resolved
-        return {"installed": False, "running": False, "action": "none", "message": mig["message"]}
     net, sd = _user_settings()
     if sd is None:
         return {"installed": False, "running": False, "action": "none", "message": "no settings location is available for this user; open Clients and press Start"}
     if net is None:
         return {"installed": False, "running": False, "action": "none", "message": "settings could not be read; open Clients and press Start"}
-    _migrate_legacy(python, root, owner)
     d = _owned(sd) if sd.is_dir() else None
     if d:
-        if d["install"].get("owner") not in owners:
+        if d["install"].get("owner") != owner:
             return status(sd) | {"action": "none", "message": "the network service belongs to another installation and was left untouched"}
-        marker = sd / ".restart-after-migrate"
-        _refresh_owned(sd, d, python, root, owner=owner, restart=marker.exists() and not lock_busy(sd))
-        marker.unlink(missing_ok=True)
+        _refresh_owned(sd, d, python, root, owner=owner)
         _write_plain(Path(prefix) / REGISTRY, {"version": 1, "state_dir": str(sd)})
-        return status(sd) | {"action": "refreshed", "message": "network service now runs from the active version"}
+        return status(sd) | {"action": "refreshed", "message": _refreshed_message(sd)}
     if net.get("host_removed") is True or (sd / REMOVED).exists():
         return (status(sd) if sd.is_dir() else {"installed": False, "running": False}) | {
             "action": "none", "message": "hosting was removed by you; open Clients and press Start to turn it on"}
-    if _definition():
+    if _definition(sd):
         return (status(sd) if sd.is_dir() else {"installed": False, "running": False}) | {
             "action": "none", "message": "another network service is registered for this user and was left untouched"}
     allow = (not net["use_invitation"]) if isinstance(net.get("use_invitation"), bool) else True
@@ -1039,19 +910,14 @@ def remove_owned(prefix):
     if not reg:
         return None
     sd = state_path(reg["state_dir"])
-    d = _owned(sd)
-    if d and d["install"].get("owner") == owner_id(prefix):
-        _stop(d["mode"], sd)
-        _remove_definition(d["mode"])
-        (sd / "service-install.json").unlink(missing_ok=True)
-    with _legacy_names():
-        old = _definition()
-        if old and old["state_dir"] and (_read_json(Path(old["state_dir"]) / "service-install.json") or {}).get("owner") == owner_id(prefix):
-            _stop(old["mode"], Path(old["state_dir"]))
-            _remove_definition(old["mode"])
-            (Path(old["state_dir"]) / "service-install.json").unlink(missing_ok=True)
-    (Path(prefix) / REGISTRY).unlink(missing_ok=True)
-    return "network service removed"
+    with _op(sd, "remove_owned"):
+        d = _owned(sd)
+        if d and d["install"].get("owner") == owner_id(prefix):
+            _stop(d["mode"], sd)
+            _remove_definition(d["mode"], sd)
+            (sd / "service-install.json").unlink(missing_ok=True)
+        (Path(prefix) / REGISTRY).unlink(missing_ok=True)
+        return "network service removed"
 
 
 # ---- the service process ---------------------------------------------------------------------------
@@ -1083,6 +949,7 @@ def _serve(sd):
             if time.monotonic() >= until:
                 raise
             time.sleep(0.05)
+    _log(sd, f"service starting: pid={os.getpid()} python={sys.executable} root={sys.path[0]} state={sd} port={cfg['port']}")
     store = server = resp = None
     stopping = threading.Event()
     watcher = None
@@ -1129,30 +996,35 @@ def _serve(sd):
         try:
             try:
                 server = CoordinatorServer(("::", port), ctx, store, **opts)  # IPv4 + IPv6 on one socket
+                _log(sd, f"listening on [::]:{port}")
             except OSError as e:
                 if e.errno in (errno.EADDRINUSE, 10048):
                     raise
                 server = CoordinatorServer(("0.0.0.0", port), ctx, store, **opts)  # no usable IPv6: IPv4 wildcard
+                _log(sd, f"listening on 0.0.0.0:{port} (no IPv6)")
         except OSError as e:
+            _log_exc(sd, f"cannot listen on port {port}", e)
             if e.errno in (errno.EADDRINUSE, 10048):
-                raise ServiceError("port_in_use", f"port {port} is already in use") from None
-            raise ServiceError("permission", f"cannot listen on port {port} ({type(e).__name__})") from None
+                raise ServiceError("port_in_use", f"port {port} is already in use ({e.strerror or e})") from None
+            raise ServiceError("permission", f"cannot listen on port {port} ({type(e).__name__}: {e.strerror or e})") from None
         derr = None
         try:
             resp = discovery.Responder(info, port)
             derr = resp.start()
         except Exception as e:  # discovery is optional: the coordinator must keep serving without it
-            derr = f"discovery could not start ({type(e).__name__})"
+            _log_exc(sd, "discovery", e)
+            derr = f"discovery could not start ({type(e).__name__}: {e})"
         stopper = threading.Thread(target=server.shutdown, daemon=True)
         once = threading.Lock()
 
-        def stop(*_):
+        def stop(reason):
             if once.acquire(blocking=False):
+                _log(sd, f"stop: {reason}")
                 stopper.start()
 
         for name in ("SIGTERM", "SIGINT", "SIGBREAK"):
             if hasattr(signal, name):
-                signal.signal(getattr(signal, name), stop)
+                signal.signal(getattr(signal, name), lambda *_, n=name: stop(n))
 
         def snapshot():
             i = info()
@@ -1161,10 +1033,10 @@ def _serve(sd):
                         receiver_online=i["receiver_online"], name=i["name"])
 
         def watch():
-            last, at = None, 0.0
+            last, at, last_err = None, 0.0, None
             while not stopping.is_set():
                 if (sd / "stop.request").exists():
-                    stop()
+                    stop("stop.request")
                     return
                 try:  # policy / name / identity changes apply live, without restarting anything
                     c = read_config(sd)
@@ -1177,29 +1049,52 @@ def _serve(sd):
                     if snap != last or time.monotonic() - at > 30:
                         _publish(sd, "running", **snap)
                         last, at = snap, time.monotonic()
-                except Exception:
-                    pass
+                except Exception as e:
+                    text = f"{type(e).__name__}: {e}"  # once per distinct error: the loop runs every second
+                    if text != last_err:
+                        _log_exc(sd, "watch", e)
+                        last_err = text
                 stopping.wait(1)
         _publish(sd, "running", **snapshot())
         watcher = threading.Thread(target=watch, name="keyloom-service-watch", daemon=True)
         watcher.start()
         server.serve_forever()
+        _log(sd, "service stopped")
         stopping.set()  # the watcher must not publish "running" after "stopped"
         watcher.join(3)
         _publish(sd, "stopped")
     finally:
         stopping.set()
-        if resp:
-            resp.stop()
-        if watcher:
-            watcher.join(3)
-        if server:
-            server.server_close()
-        if store:
-            store.close()
+        # each step has its own try: one failure must not skip the lock release below
+        try:
+            if resp:
+                resp.stop()
+        except Exception as e:
+            _log_exc(sd, "cleanup resp", e)
+        try:
+            if watcher:
+                watcher.join(3)
+        except Exception as e:
+            _log_exc(sd, "cleanup watcher", e)
+        try:
+            if server:
+                server.server_close()
+        except Exception as e:
+            _log_exc(sd, "cleanup server", e)
+        try:
+            if store:
+                store.close()
+        except Exception as e:
+            _log_exc(sd, "cleanup store", e)
         for n in ("local-join.token", "stop.request"):
-            (sd / n).unlink(missing_ok=True)
-        lock.close()
+            try:
+                (sd / n).unlink(missing_ok=True)
+            except Exception as e:
+                _log_exc(sd, f"cleanup unlink {n}", e)
+        try:
+            lock.close()
+        except Exception as e:
+            _log_exc(sd, "cleanup lock", e)
 
 
 def main(argv=None):
@@ -1216,9 +1111,10 @@ def main(argv=None):
         elif isinstance(e, pki.SecurityError):
             code, msg, rc = "cert_mismatch", str(e), 2
         else:
-            code, msg, rc = "start_failed", type(e).__name__, 1
+            code, msg, rc = "start_failed", f"{type(e).__name__}: {e}", 1
+        _log_exc(sd, "service failed", e)
         try:
             _publish(sd, "failed", code, msg)
-        except OSError:
-            pass
+        except OSError as pe:
+            _log_exc(sd, "could not publish the failure", pe)
         return rc

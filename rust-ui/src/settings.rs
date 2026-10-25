@@ -380,15 +380,9 @@ pub fn default_path() -> Option<PathBuf> {
     }
 }
 
-/// `<base>/keyloom`, unless only the pre-rename `<base>/corridorkey-native` exists: existing settings, pinned
-/// certificates, network state and the single-instance lock stay where they are (old and new builds share them).
+/// `<base>/keyloom`.
 pub fn config_dir(base: PathBuf) -> PathBuf {
-    let old = base.join("corridorkey-native");
-    if old.is_dir() && !base.join("keyloom").exists() {
-        old
-    } else {
-        base.join("keyloom")
-    }
+    base.join("keyloom")
 }
 
 /// `%APPDATA%\keyloom\settings.json`, else `%LOCALAPPDATA%\…`, else `None`.

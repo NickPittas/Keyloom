@@ -682,7 +682,7 @@ def render_iss(stage: Path, out: Path, meta: Path) -> Path:
     for k, v in {"@VERSION_ID@": m["version_id"], "@APP_VERSION@": m["app_version"],
                  "@STAGE@": str(stage), "@OUT@": str(out), "@BOOT@": str(boot),
                  "@RUNTIME_ID@": m["runtime_id"], "@RUNTIME_META@": meta.name,
-                 "@RUNTIME_META_SHA256@": sha256_file(meta)}.items():
+                 "@RUNTIME_META_SHA256@": sha256_file(meta), "@ICON@": str(REPO / "ui/theme/keyloom.ico")}.items():
         text = text.replace(k, v)
     iss = out / "keyloom.iss"
     iss.write_text(text, encoding="utf-8-sig")
@@ -1067,7 +1067,7 @@ def make_online_exe(stage: Path, out: Path, cache: Path, smoke: bool, iscc: str 
     text = (REPO / "packaging/windows/keyloom-online.iss.in").read_text()
     boot = make_boot_dir(stage, out / "bw")
     for k, v in {"@VERSION_ID@": m["version_id"], "@APP_VERSION@": m["app_version"], "@WRAP@": str(wrap), "@OUT@": str(out),
-                 "@BOOT@": str(boot)}.items():
+                 "@BOOT@": str(boot), "@ICON@": str(REPO / "ui/theme/keyloom.ico")}.items():
         text = text.replace(k, v)
     iss = out / "keyloom-online.iss"
     iss.write_text(text, encoding="utf-8-sig")

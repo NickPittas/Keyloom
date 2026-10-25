@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import contextlib
 import hashlib
+import io
 import json
 import ntpath
 import os
@@ -25,6 +27,7 @@ import sys
 import tarfile
 import threading
 import time
+import traceback
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 
 
@@ -254,7 +257,7 @@ def discard_holder(dest) -> None:
         shutil.rmtree(holder, ignore_errors=True)
 
 
-_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{7C1E6C52-3B0F-4D5A-9E57-2D6C7A0B7E21}_is1"
+_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{3F9A2C71-8E4B-4D6F-B1A5-7C0E92D4A6B3}_is1"
 
 
 def _reg_app_path(hive_name: str):
@@ -271,32 +274,15 @@ def _trim(p: str) -> str:
     return p if len(p.rstrip("\\/")) <= 2 else p.rstrip("\\/")  # keep a drive root's backslash like Inno's RemoveBackslashUnlessRoot
 
 
-def discover_install(prefix_param: str, localappdata: str, probe_reg=_reg_app_path, isfile=os.path.isfile, isdir=os.path.isdir,
-                     workers: int = WORKERS) -> tuple[str, str]:
-    """Which prefix does this online setup install into, and which pre-rename install does it adopt? ONE read-only operation.
-    Stage 1 runs the INDEPENDENT probes (HKCU key, HKLM key, new-folder receipt, old-folder receipt) in the bounded pool; stage 2
-    is the one probe that needs a stage-1 result (does the recorded folder exist). Precedence is fixed in code, never by completion
-    order: /PREFIX > HKCU > HKLM > default new folder, with adoption of the old default folder exactly as the Pascal logic had it.
-    Nothing is written, repaired or migrated here. Returns (prefix, adopt) - adopt is '' when there is none."""
-    new = ntpath.join(localappdata, "Programs", "Keyloom")
-    old = ntpath.join(localappdata, "Programs", "CorridorKey")
-    probes = {"hkcu": lambda: probe_reg("HKEY_CURRENT_USER"), "hklm": lambda: probe_reg("HKEY_LOCAL_MACHINE"),
-              "new": lambda: isfile(ntpath.join(new, "receipt.json")), "old": lambda: isfile(ntpath.join(old, "receipt.json"))}
-    with ThreadPoolExecutor(max_workers=min(clamp_workers(workers), len(probes))) as pool:
-        futs = {k: pool.submit(f) for k, f in probes.items()}
-        r = {k: f.result() for k, f in futs.items()}  # collected by name: completion order cannot matter
-    adopt, prefix = "", prefix_param
-    if not prefix:
-        recorded = r["hkcu"] if r["hkcu"] is not None else r["hklm"]
-        if recorded and isdir(recorded):  # stage 2: depends on the registry result
-            prefix = recorded
-        if prefix and ntpath.normcase(_trim(prefix)) == ntpath.normcase(old) and not r["new"]:
-            adopt, prefix = old, new
-        if not prefix:
-            prefix = new
-            if not r["new"] and r["old"]:
-                adopt = old
-    return _trim(prefix), adopt
+def discover_install(prefix_param, localappdata, probe_reg=_reg_app_path, isdir=os.path.isdir, isfile=os.path.isfile) -> tuple[str, str]:
+    """-> (prefix, source): /PREFIX, else the Keyloom folder the full installer recorded (only if it holds a receipt), else the default."""
+    if prefix_param:
+        return _trim(prefix_param), "param"
+    for hive in ("HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE"):
+        p = probe_reg(hive)
+        if p and isdir(p) and isfile(ntpath.join(p, "receipt.json")):
+            return _trim(p), hive
+    return ntpath.join(localappdata, "Programs", "Keyloom"), "default"
 
 
 def write_attestation(lifecycle, payload, producer: str) -> str:
@@ -313,15 +299,44 @@ def write_attestation(lifecycle, payload, producer: str) -> str:
 
 LOG = None  # open install.log (append, line-buffered) when --log is given; set by main()
 LOG_TITLE = ""
+_PART = ""  # the unterminated tail of the install log: stamped when its line ends (log_flush)
+_LOG_LOCK = threading.RLock()  # re-entrant: log_flush calls log_write, and a signal handler may log on the main thread
 WAIT_REPEAT = 20  # seconds between repeats of an unchanged wait reason
+HEARTBEAT_LOG_EVERY = 30  # every Nth heartbeat is also copied into the log; the console gets each one
 
 
 def log_write(text: str) -> None:
-    if LOG:
+    global LOG, _PART
+    with _LOG_LOCK:
+        if not LOG:
+            return
         try:
-            LOG.write(text)
-        except (OSError, ValueError):
-            pass
+            *lines, _PART = (_PART + text).split("\n")
+            for line in lines:
+                LOG.write(f"{time.strftime('%Y-%m-%d %H:%M:%S %z')} {line}\n")
+        except (OSError, ValueError) as e:  # a log that cannot be written never blocks the install, but it says so once
+            print(f"WARNING: writing install log {LOG.name} failed: {type(e).__name__}: {e}", file=sys.stderr)
+            LOG = None
+
+
+def log_flush() -> None:
+    with _LOG_LOCK:
+        if _PART:
+            log_write("\n")
+
+
+def log_exc(context: str, e: BaseException) -> None:
+    """The contract's exception record: `ERROR: <context>: <Type>: <message>`, then the whole traceback."""
+    log_write(f"ERROR: {context}: {type(e).__name__}: {e}\n{''.join(traceback.format_exception(e))}")
+
+
+def open_log(path: str, title: str) -> None:
+    global LOG, LOG_TITLE
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        LOG, LOG_TITLE = open(path, "a", encoding="utf-8", buffering=1), title
+    except OSError as e:  # a log that cannot be written never blocks the install
+        print(f"WARNING: install log {path} not writable ({type(e).__name__}: {e})", file=sys.stderr)
 
 
 def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: float = 1.0,
@@ -335,6 +350,7 @@ def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: floa
 
     def note(msg: str) -> None:
         print(msg, file=out, flush=True)
+        log_flush()  # a partial child line must end before this supervisor line starts
         log_write(msg + "\n")
     env = dict(popen.get("env") or os.environ)
     if wait_file:  # the child (lifecycle) creates this file only while it waits for the user / runs a visible transfer
@@ -342,36 +358,67 @@ def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: floa
     popen["env"] = env
     win = os.name == "nt"
     popen.update(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if win else popen.update(start_new_session=True)
-    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **popen)
+    log_write(f"[{label}] run: {' '.join(map(str, argv))}\n")
+    try:
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **popen)
+    except OSError as e:
+        note(f"FAILED: {label}: cannot start {argv[0]}: {type(e).__name__}: {e}")
+        log_exc(f"{label}: cannot start {argv[0]}", e)
+        return 127
     t0 = last = clock()
 
     def relay():
         nonlocal last
         fd, dec = p.stdout.fileno(), codecs.getincrementaldecoder("utf-8")("replace")  # keeps a split multibyte char whole
+        broken = False
+
+        def show(text):
+            nonlocal broken
+            try:
+                out.write(text)
+                out.flush()
+            except Exception as e:  # a dead relay would block the child on a full pipe: keep draining, say it once
+                if not broken:
+                    broken = True
+                    with contextlib.suppress(Exception):
+                        print(f"WARNING: [{label}] console output failed: {type(e).__name__}: {e}", file=sys.stderr)
+                    log_exc(f"{label}: console output", e)
+            log_write(text)
         while chunk := os.read(fd, 65536):  # raw chunks, not lines: a prompt without a newline must show at once
             last = clock()
-            text = dec.decode(chunk)
-            out.write(text)
-            out.flush()
-            log_write(text)
+            show(dec.decode(chunk))
+        show(dec.decode(b"", final=True))  # a multibyte char cut at EOF must not vanish
+        log_flush()
     rt = threading.Thread(target=relay, daemon=True)
     rt.start()
 
     def reap(term_wait=grace):
         if win:  # no process groups to signal: stop exactly this child's tree
-            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
+            r = subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, errors="replace")
+            log_write(f"[{label}] taskkill exit {r.returncode}\n")
+            for stream, text in (("stdout", r.stdout), ("stderr", r.stderr)):
+                for line in text.splitlines():
+                    log_write(f"[{label}] taskkill {stream}| {line}\n")
+            if r.returncode not in (0, 128):  # 128: the tree was already gone
+                note(f"WARNING: [{label}] taskkill exit {r.returncode}")
             p.wait()
             return
         try:
             if term_wait:
                 os.killpg(p.pid, signal.SIGTERM)
                 p.wait(timeout=term_wait)
-        except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
-            pass
+        except subprocess.TimeoutExpired:
+            pass  # still running after the grace period: SIGKILL below
+        except ProcessLookupError:
+            pass  # the group is already gone after a normal exit: expected
+        except PermissionError as e:
+            log_write(f"[{label}] killpg SIGTERM: {type(e).__name__}: {e}\n")
         try:
             os.killpg(p.pid, signal.SIGKILL)  # whatever of the group is left
-        except (ProcessLookupError, PermissionError):
-            pass
+        except ProcessLookupError:
+            pass  # the group is already gone after a normal exit: expected
+        except PermissionError as e:
+            log_write(f"[{label}] killpg SIGKILL: {type(e).__name__}: {e}\n")
         p.wait()
 
     def on_signal(signum, _frame):
@@ -383,14 +430,14 @@ def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: floa
             old[s] = signal.signal(s, on_signal)
         except ValueError:  # not the main thread
             pass
-    shown_why, shown_at = None, 0.0
+    shown_why, shown_at, beats = None, 0.0, 0
     try:
         while True:
             try:
                 rc = p.wait(timeout=poll)
                 reap()  # stray grandchildren of a finished child die with its group
                 rt.join(5)  # the rest of its output
-                log_write(f"[{label}] exit code {rc} after {clock() - t0:.0f}s\n")
+                note(f"[{label}] exit {rc} after {clock() - t0:.0f}s")
                 return rc
             except subprocess.TimeoutExpired:
                 pass
@@ -415,8 +462,12 @@ def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: floa
                 if shown_why is not None:
                     note(f"[{label}] wait finished ({shown_why})")
                     shown_why = None
-                print(f"[{label}] supervisor heartbeat: running {now - t0:.0f}s, last output {now - last:.0f}s ago (liveness only)",
-                      file=out, flush=True)
+                beat = f"[{label}] supervisor heartbeat: running {now - t0:.0f}s, last output {now - last:.0f}s ago (liveness only)"
+                print(beat, file=out, flush=True)
+                beats += 1
+                if beats % HEARTBEAT_LOG_EVERY == 0:
+                    log_flush()  # never merge into a partial child line
+                    log_write(beat + "\n")
     except BaseException:
         reap()
         raise
@@ -448,18 +499,25 @@ def main(argv=None) -> int:
     ap.add_argument("--log")
     ap.add_argument("--log-title", default="")
     ap.add_argument("rest", nargs="*")
-    a, extra = ap.parse_known_args(argv)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):  # argparse writes its usage errors to stderr: the log keeps them too
+            a, extra = ap.parse_known_args(argv)
+    except SystemExit as e:
+        if e.code:  # a usage error, not --help
+            sys.stderr.write(err.getvalue())
+            args = sys.argv[1:] if argv is None else argv
+            if "--log" in args[:-1]:
+                open_log(args[args.index("--log") + 1], "")
+            log_write(f"ERROR: usage: {err.getvalue().strip()}\n")
+        raise
     if a.log:
-        global LOG, LOG_TITLE
-        try:
-            os.makedirs(os.path.dirname(os.path.abspath(a.log)), exist_ok=True)
-            LOG, LOG_TITLE = open(a.log, "a", encoding="utf-8", buffering=1), a.log_title
-        except OSError as e:  # a log that cannot be written never blocks the install
-            print(f"WARNING: install log {a.log} not writable ({type(e).__name__})", file=sys.stderr)
+        open_log(a.log, a.log_title)
     if a.cmd == "run":  # run -- CMD ...: stall-guarded, heartbeat-supervised foreign command (exit code passed through)
         cmd = a.rest + extra  # everything after `--` lands in the positional list (argparse version dependent)
         cmd = cmd[1:] if cmd[:1] == ["--"] else cmd
         if not cmd:
+            log_write("ERROR: usage: run needs -- COMMAND\n")
             ap.error("run needs -- COMMAND")
         return supervise(cmd, a.label, wait_file=a.wait_file)
     if a.cmd == "attest":  # writes the lifecycle's attestation marker; the caller invokes it ONLY after every runtime byte was authenticated
@@ -469,15 +527,21 @@ def main(argv=None) -> int:
                 f.write(nonce + "\n")
         except Exception as e:  # noqa: BLE001 - any failure means "no attestation": the lifecycle then verifies the runtime itself
             print(f"FAILED: attest: {type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc()
+            log_exc("attest", e)
             return 1
+        log_write(f"attest: nonce written to {a.out}\n")
         return 0
-    if a.cmd == "discover":  # read-only; writes "prefix\nadopt\n" for the Inno wrapper (no JSON parsing in Pascal)
+    if a.cmd == "discover":  # read-only; writes "prefix\nsource\n" for the Inno wrapper (no JSON parsing in Pascal)
         try:
-            prefix, adopt = discover_install(a.prefix_param, os.environ["LOCALAPPDATA"], workers=a.workers)
+            prefix, source = discover_install(a.prefix_param, os.environ["LOCALAPPDATA"])
             with open(a.out, "w", encoding="utf-8") as f:
-                f.write(prefix + "\n" + adopt + "\n")
-        except (OSError, KeyError) as e:
+                f.write(prefix + "\n" + source + "\n")
+            log_write(f"discover: prefix={prefix} source={source}\n")
+        except Exception as e:  # noqa: BLE001 - the Inno wrapper stops on any failure; the log keeps the cause
             print(f"FAILED: discover: {type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc()
+            log_exc("discover", e)
             return 1
         return 0
     if a.cmd == "runtime-extract":  # supervisor of the worker; discards the private holder if the worker failed or was killed
@@ -493,6 +557,7 @@ def main(argv=None) -> int:
             extract_runtime(a.meta, a.meta_sha256, a.runtime_id, a.dest, a.label, workers=a.workers)
         except (OSError, EOFError, ValueError, tarfile.TarError) as e:
             print(f"FAILED: {a.label}: {type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc()
             return 1
         return 0
     seg = (a.run, a.base, a.offset, a.len, a.sha256, a.dest, a.label)
@@ -507,9 +572,22 @@ def main(argv=None) -> int:
         extract_segment(*seg, require=a.require, forbid=a.forbid)
     except (OSError, EOFError, ValueError, tarfile.TarError) as e:
         print(f"FAILED: {a.label}: {type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc()
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    except SystemExit as e:  # usage errors and signal exits bypass the next clause: the log keeps the code
+        if e.code:
+            log_write(f"exit {e.code}\n")
+        log_flush()
+        raise
+    except Exception as e:  # noqa: BLE001 - the parent relays stderr; the log keeps the same record
+        traceback.print_exc()
+        log_exc("payload", e)
+        rc = 1
+    log_flush()
+    sys.exit(rc)

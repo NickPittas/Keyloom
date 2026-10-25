@@ -202,7 +202,7 @@ class ProvisionManager:
             os.close(fd)
 
     def _journal_path(self, target: Path) -> Path:
-        return target.with_name(f".{target.name}.corridorkey-publish.json")
+        return target.with_name(f".{target.name}.keyloom-publish.json")
 
     def _write_journal(self, journal: dict, root: Path, *, allow_leaf_link: bool) -> None:
         target = Path(journal["target"])

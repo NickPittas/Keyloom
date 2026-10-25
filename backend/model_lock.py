@@ -34,7 +34,7 @@ def _lock_path(destination: Path) -> Path:
     owner = str(os.getuid()) if hasattr(os, "getuid") else hashlib.sha256(
         os.environ.get("USERNAME", os.environ.get("USER", "user")).encode()
     ).hexdigest()[:16]
-    shared_root = Path(tempfile.gettempdir()) / "corridorkey-model-locks"
+    shared_root = Path(tempfile.gettempdir()) / "keyloom-model-locks"
     for ancestor in reversed((shared_root, *shared_root.parents)):
         if _is_link(ancestor):
             raise OSError(errno.ELOOP, "model lock path contains a link or reparse point", str(ancestor))

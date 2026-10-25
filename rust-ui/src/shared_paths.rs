@@ -209,7 +209,7 @@ pub fn test_access(root: &Path) -> Access {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let (path, mut f) = (0..8u32)
             .find_map(|n| {
-                let p = root.join(format!(".corridorkey-access-{}-{nanos}-{n}.tmp", std::process::id()));
+                let p = root.join(format!(".keyloom-access-{}-{nanos}-{n}.tmp", std::process::id()));
                 match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
                     Ok(f) => Some(Ok((p, f))),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
