@@ -396,21 +396,33 @@ def runtime_in_use(prefix: Path, d: Path, refs: set | None = None) -> bool:
     return False
 
 
-def runtime_trusted(prefix: Path, vdir: Path) -> bool:
+def runtime_untrusted_reason(prefix: Path, vdir: Path) -> str:
     """Is vdir/runtime a runtime this install may skip re-hashing? Reads a handful of JSON/links, never a runtime file.
     A real runtime/ counts when its interpreter exists (its activation verified it; explicit repair re-hashes). An attached link
     counts only when its target is inside this prefix and its owner's manifest carries the same runtime identity."""
     rt = vdir / "runtime"
     try:
         if not is_link(rt):
-            return rt.is_dir() and (rt / RUNTIME_PY).exists()
+            return "" if rt.is_dir() and (rt / RUNTIME_PY).exists() else f"runtime/ is not a link and has no {RUNTIME_PY}"
         t = rt.resolve()
-        if not t.is_dir() or not (t / RUNTIME_PY).exists() or not t.is_relative_to(prefix.resolve()):
-            return False
+        if not t.is_dir():
+            return f"link target {t} is missing"
+        if not (t / RUNTIME_PY).exists():
+            return f"link target {t} has no interpreter"
+        if not t.is_relative_to(prefix.resolve()):
+            return f"link target {t} is outside {prefix.resolve()}"
         want = runtime_id(read_manifest(vdir)["files"])
-        return t.name == want if t.parent.name == STORE else runtime_id(read_manifest(t.parent)["files"]) == want
-    except (InstallError, OSError, KeyError, TypeError):
-        return False
+        if t.parent.name == STORE:
+            return "" if t.name == want else f"store entry {t.name} != runtime id {want}"
+        got = runtime_id(read_manifest(t.parent)["files"])
+        return "" if got == want else f"owner {t.parent} runtime id {got} != {want}"
+    except (InstallError, OSError, KeyError, TypeError) as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def runtime_trusted(prefix: Path, vdir: Path) -> bool:
+    """True when runtime_untrusted_reason() finds nothing wrong."""
+    return not runtime_untrusted_reason(prefix, vdir)
 
 
 def verify_bundle(version_dir: Path, skip_runtime: bool = False, only: set | None = None) -> list[tuple[str, str]]:
@@ -1035,8 +1047,9 @@ def activate(prefix: Path, version: str, *, shortcuts: bool = True, selfcheck: b
     vdir = vpath(prefix, version)
     receipt = read_receipt(prefix)
     linked = is_link(vdir / "runtime")
-    if (reused or linked) and not runtime_trusted(prefix, vdir):
-        raise InstallError("the attached runtime is not a validated owned runtime; run the full installer or --repair")
+    why = runtime_untrusted_reason(prefix, vdir) if reused or linked else ""
+    if why:
+        raise InstallError(f"the attached runtime is not a validated owned runtime ({why}); run the full installer or --repair")
     shared = (vdir / "runtime").resolve() if linked else None
     problems = verify_bundle(vdir, skip_runtime=reused)
     if problems:
