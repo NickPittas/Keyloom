@@ -1763,10 +1763,14 @@ def cmd_uninstall(a) -> int:
             failed.append(str(d))
     for e in prefix.glob(".staging.*"):
         if e.is_dir() and not e.is_symlink():
-            try_rmtree(e)
+            if not try_rmtree(e):
+                failed.append(str(e))
     if not _unlink_owned(prefix / RECEIPT):
         failed.append(str(prefix / RECEIPT))
     for d in (prefix / "bin", vroot, prefix):
+        if d.is_dir() and not d.is_symlink() and any(d.iterdir()):
+            say(f"Kept {d}: it still holds files Keyloom did not install ({', '.join(sorted(x.name for x in d.iterdir())[:10])})")
+            continue  # still holds the user's own files (kept on purpose) or a removal failure already listed above
         if not _unlink_owned(d) and not deferred:  # with deferred versions the Windows cleanup removes these after this window closes
             failed.append(str(d))
     if deferred:

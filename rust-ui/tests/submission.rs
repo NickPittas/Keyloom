@@ -220,9 +220,11 @@ fn external_or_movie_sources_and_mismatched_frames_are_refused_before_start() {
     let clip = p.b.join("projects/Show/clips/shot_01");
     // No mapping for the share on this PC.
     assert!(has(&s.preflight(&[root("projects", &p.b.join("projects"))], "j").unwrap_err(), "no path mapping for shared location \"out\""));
-    // clip.json names an external source: the worker would follow it, even though Frames exist here.
+    // clip.json names an external source, but local Frames win (ClipEntry.find_assets order): the worker never opens it.
     fs::write(clip.join("clip.json"), r#"{"source":{"type":"sequence","original_path":"/sender/only/frames"}}"#).unwrap();
-    assert!(has(&problems(&p, &s), "external source metadata"), "{:?}", problems(&p, &s));
+    let pre = s.preflight(&roots(&p.b), "j").expect("local Frames are the source");
+    assert_eq!(pre.first_frame, clip.join("Frames/f_1101.png"));
+    assert!(pre.job.source_map.is_empty(), "no external path to remap");
     // No local Frames at all, only an external sequence that exists on this PC.
     fs::remove_dir_all(clip.join("Frames")).unwrap();
     let ext = p.base.join("elsewhere");
@@ -231,12 +233,12 @@ fn external_or_movie_sources_and_mismatched_frames_are_refused_before_start() {
         fs::write(ext.join(format!("f_{}.png", 1101 + i)), b"x").unwrap();
     }
     fs::write(clip.join("clip.json"), json!({"source": {"type": "sequence", "original_path": ext}}).to_string()).unwrap();
-    assert!(has(&problems(&p, &s), "external image sequence"), "{:?}", problems(&p, &s));
+    assert!(has(&problems(&p, &s), "reads an external folder"), "{:?}", problems(&p, &s));
     // A movie clip.
     fs::write(clip.join("clip.json"), "{}").unwrap();
     fs::create_dir_all(clip.join("Source")).unwrap();
     fs::write(clip.join("Source/a.mp4"), b"x").unwrap();
-    assert!(has(&problems(&p, &s), "self-contained image sequence"), "{:?}", problems(&p, &s));
+    assert!(has(&problems(&p, &s), "extract its frames first"), "{:?}", problems(&p, &s));
     let _ = fs::remove_dir_all(p.base);
 }
 

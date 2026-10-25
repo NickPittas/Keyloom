@@ -1,8 +1,8 @@
 //! Always-visible CPU/RAM/GPU/VRAM: the footer is on every main page with a fixed rectangle, shows real numbers
-//! or honest dashes, and the Clients cards show the same values or say why there are none. Private fixtures,
+//! or honest dashes, and remote cells never invent numbers. Private fixtures,
 //! a fake helper process, headless egui; no counters, GPU, display or network.
 mod common;
-use ck::metrics::{ClientTelemetry, Sample, Source};
+use ck::metrics::{client_cells_at, ClientTelemetry, Sample, Source};
 use ck::ui::{App, AppOptions};
 use eframe::egui::{self, epaint::Shape, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
 use serde_json::json;
@@ -146,22 +146,20 @@ fn client_cards_show_local_numbers_and_never_invent_remote_ones() {
     let at = a.clients_rect().unwrap().center();
     let t = click(&ctx, &mut a, at);
     assert!(a.clients_open());
-    let cards = t.matches("CPU 37% · RAM 12.0 / 32.0 GiB").count();
-    assert_eq!(cards, 1, "only this computer has telemetry: {t}");
-    assert!(t.contains("no telemetry: SSH workers do not report it"), "{t}");
-    // The network API will fill remote telemetry through this hook: same cells, server-computed age.
+    // The Clients page is an availability table: this computer's GPU is not reported by a worker, so no number is painted.
+    assert!(t.contains("This computer") && t.contains("Not reported") && t.contains("not started"), "{t}");
+    // Remote telemetry is painted by the Batch queue for a remote client with a run: these are the cells it paints.
+    // The network API fills it through this model: same cells, server-computed age.
     let (s, age) = Sample::from_api(&json!({"seq": 2, "cpu_percent": 91.0, "ram_used_bytes": 3u64<<30, "ram_total_bytes": 8u64<<30, "measured_age_s": 2.0,
         "gpus": [{"uuid": "GPU-r", "index": 0, "name": "Remote GPU", "utilization_percent": 12.0, "vram_used_bytes": 1u64<<30, "vram_total_bytes": 4u64<<30}]})).unwrap().unwrap();
     let t0 = std::time::Instant::now();
-    a.set_client_telemetry("far", Some(ClientTelemetry::reported_at(s.clone(), age, Some(0.3), t0)));
-    let t = painted(&ctx, &mut a, vec![]);
-    assert!(t.contains("CPU 91% · RAM 3.0 / 8.0 GiB") && t.contains("Remote GPU"), "{t}");
-    a.set_client_telemetry("far", Some(ClientTelemetry::reported(s, Some(120.0), None)));
-    let t = painted(&ctx, &mut a, vec![]);
-    assert!(t.contains("stale 120 s"), "{t}");
-    a.set_client_telemetry("far", Some(ClientTelemetry::NotConnected));
-    let t = painted(&ctx, &mut a, vec![]);
-    assert!(t.contains("not connected"), "{t}");
+    let c = client_cells_at(&ClientTelemetry::reported_at(s.clone(), age, Some(0.3), t0), &[], t0);
+    assert_eq!((c.cpu.as_str(), c.ram.as_str(), c.status.as_deref()), ("91%", "3.0 / 8.0 GiB", None));
+    assert!(c.gpu.contains("Remote GPU"), "{}", c.gpu);
+    let c = client_cells_at(&ClientTelemetry::reported(s, Some(120.0), None), &[], t0);
+    assert_eq!(c.status.as_deref(), Some("stale 120 s"));
+    let c = client_cells_at(&ClientTelemetry::NotConnected, &[], t0);
+    assert_eq!((c.cpu.as_str(), c.status.as_deref()), ("—", Some("not connected")));
     let _ = fs::remove_dir_all(&e.base);
 }
 

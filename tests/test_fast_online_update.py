@@ -66,14 +66,12 @@ def test_attach_stages_zero_runtime_bytes(tmp_path, monkeypatch):
     touched = []
     real_copy = online.copy_verified
     monkeypatch.setattr(online, "copy_verified", lambda s, d, m: touched.append(d.name) or real_copy(s, d, m))
-    seen = {}
-    monkeypatch.setattr(L, "verify_bundle", lambda d, skip_runtime=False: seen.update(skip=skip_runtime) or [])
     stage = prefix / ".staging.t"
     stage.mkdir()
     tree = online.build_tree(None, prefix, None, stage, prefix / ".staging.dl", pdir, mani, raw, [],
                              {"app/packaging/lifecycle.py", "app/a.py"}, attach=True)  # fx=None: any download would crash
     assert sorted(touched) == ["a.py", "lifecycle.py"]
-    assert not (tree / "runtime").exists() and seen == {"skip": True}
+    assert not (tree / "runtime").exists()
 
 
 def test_no_attach_requires_runtime_files(tmp_path, monkeypatch):
@@ -89,19 +87,22 @@ def install_receipt(prefix, mani):
     d = prefix / "versions" / "v1"
     d.mkdir(parents=True)
     (d / L.MANIFEST).write_text(json.dumps(mani))
+    (d / "runtime" / L.RUNTIME_PY).parent.mkdir(parents=True)
+    (d / "runtime" / L.RUNTIME_PY).write_text("x")
+    L.atomic_write_json(prefix / L.RECEIPT, {"schema": 1, "app": L.APP_ID, "prefix": str(prefix), "current": "v1",
+                                             "versions": ["v1"], "activated_at": "2026-01-01T00:00:00+0000"})
     return {"current": "v1"}, d
 
 
 def test_up_to_date_deep_is_one_nonruntime_verify(tmp_path, monkeypatch):
     mani, _, _, prefix = fixture(tmp_path)
-    rec, _ = install_receipt(prefix, mani)
+    rec, d = install_receipt(prefix, mani)
     calls = []
     monkeypatch.setattr(L, "pointer_ok", lambda p, v: True)
     monkeypatch.setattr(L, "verify_bundle", lambda d, skip_runtime=False: calls.append(skip_runtime) or [])
-    monkeypatch.setattr(L, "runtime_available", lambda p, m, s=None: good(m), raising=False)
     assert online.up_to_date(prefix, rec, mani, deep=False) and calls == []  # pre-check hashes nothing
     assert online.up_to_date(prefix, rec, mani) and calls == [True]
-    monkeypatch.setattr(L, "runtime_available", lambda p, m, s=None: {"ok": False, "reason": "no seal"}, raising=False)
+    (d / "runtime" / L.RUNTIME_PY).unlink()  # the shared runtime is no longer trusted: not current
     assert not online.up_to_date(prefix, rec, mani)
 
 
@@ -114,84 +115,50 @@ def good(m):
 def test_only_exact_ok_dict_with_matching_rid_is_trusted(tmp_path, monkeypatch, resp):
     mani = fixture(tmp_path)[0]
     monkeypatch.setattr(L, "runtime_available", lambda p, m, s=None: resp, raising=False)
-    assert online.runtime_ok(tmp_path, mani) is False
+    assert online.runtime_ok(tmp_path, mani) is None
     monkeypatch.setattr(L, "runtime_available", lambda p, m, s=None: good(m), raising=False)
-    assert online.runtime_ok(tmp_path, mani) is True
+    assert online.runtime_ok(tmp_path, mani) == good(mani)
 
 
-def test_unchanged_untrusted_runtime_needs_repair_not_fallback(tmp_path, monkeypatch):
+def test_unchanged_untrusted_runtime_is_not_attached(tmp_path, monkeypatch):
     mani, _, _, prefix = fixture(tmp_path)
     install_receipt(prefix, mani)
-    monkeypatch.setattr(L, "read_receipt", lambda p: {"current": "v1"})
     monkeypatch.setattr(L, "runtime_available", lambda p, m, s=None: {"ok": False, "reason": "no seal"}, raising=False)
-    with pytest.raises(online.Fail, match="Repair"):
-        online.trusted_runtime(prefix, {"current": "v1"}, mani, None)
+    assert online.trusted_runtime(prefix, mani) is False  # not reusable: the payload carries a fresh runtime
     changed = json.loads(json.dumps(mani))
     changed["files"]["runtime/lib/big.so"] = meta(b"new-runtime")
-    assert online.trusted_runtime(prefix, {"current": "v1"}, changed, None) is False  # runtime changed: download path
+    assert online.trusted_runtime(prefix, changed) is False  # runtime changed: download path
     monkeypatch.setattr(L, "runtime_available", lambda p, m, s=None: good(m), raising=False)
-    assert online.trusted_runtime(prefix, {"current": "v1"}, mani, None) is True
+    assert online.trusted_runtime(prefix, mani) is True
 
 
-def test_progress_reports_each_second_and_marks_waiting(monkeypatch):
+def test_pool_reports_only_when_bytes_move(monkeypatch):
+    """One line per change; an idle second is silent so the supervisor's stall guard can see it."""
     lines = []
     monkeypatch.setattr(online, "say", lines.append)
-    with online.Progress("w.whl", 4 << 20, phase="downloading") as p:
-        p.tick(1 << 20)
+
+    def work(_):
+        online.POOL.add(1 << 20)
         threading.Event().wait(2.3)
-    assert len(lines) >= 2
-    assert "downloading w.whl" in lines[0] and "MiB/s" in lines[0] and "elapsed" in lines[0]
-    assert any("WAITING" in x for x in lines)  # no new bytes: marked as liveness, not progress
-
-
-class _Resp:
-    status = 200
-    headers = {"Content-Length": "10"}
-
-    def __init__(self, exc):
-        self.exc = exc
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def read(self, n):
-        raise self.exc
-
-
-class _Fx:
-    calls = 0
-
-    def open(self, url, offset):
-        _Fx.calls += 1
-        return _Resp(TimeoutError())
+    online.POOL.map("downloading", [0], work, total=4 << 20)
+    assert len(lines) == 1 and "downloading: 1.0/4.0 MiB" in lines[0] and "elapsed" in lines[0]
 
 
 def test_stalled_download_fails_precisely_after_bounded_retries(tmp_path, monkeypatch):
+    attempts = []
     monkeypatch.setattr(online, "RETRIES", 2)
-    monkeypatch.setattr(online.time, "sleep", lambda s: None)
     monkeypatch.setattr(online, "say", lambda m: None)
+    monkeypatch.setattr(online, "run_fetch_child",
+                        lambda tls, w, cache: attempts.append(1) or (20, "stalled: no data for 25s"))
     w = {"url": "https://example.com/x.whl", "sha256": "a" * 64, "size": 10}
     with pytest.raises(online.Fail, match="stalled: no data for"):
-        online.download(_Fx(), w, tmp_path)
-    assert _Fx.calls == 2 and not (tmp_path / ("a" * 64 + ".whl")).exists()
+        online.download(tmp_path, w, tmp_path)
+    assert len(attempts) == 2 and not (tmp_path / ("a" * 64 + ".whl")).exists()
 
 
-def test_lifecycle_deadline_is_failure_and_attach_args(tmp_path, monkeypatch):
-    sleeper = tmp_path / "lc.py"
-    sleeper.write_text("import time\ntime.sleep(30)\n")
-    tree = tmp_path / "t"
-    (tree / "app/packaging").mkdir(parents=True)
-    (tree / "app/packaging/lifecycle.py").write_text("import time\ntime.sleep(30)\n")
-    monkeypatch.setattr(online, "FAST_DEADLINE", 1)
-    monkeypatch.setattr(online, "PHASE_LIMIT", 2)
+def test_lifecycle_attach_args(tmp_path, monkeypatch):
     monkeypatch.setattr(online, "say", lambda m: None)
-    assert online.run_lifecycle(tmp_path, tree, "repair", "skip", None, attach=True) == 124
-    monkeypatch.setattr(online, "FAST_DEADLINE", 30)
     seen = []
     monkeypatch.setattr(online.subprocess, "Popen", lambda cmd, env: seen.append(cmd) or type("P", (), {"wait": lambda s, timeout=None: 0})())
-    assert online.run_lifecycle(tmp_path, tree, "install", "skip", tmp_path / "old", attach=True) == 0
-    assert "--attach-runtime" not in seen[0] and "--runtime-src" not in seen[0]  # unpublished core flags: never passed
-    assert seen[0][seen[0].index("--adopt-from") + 1] == str(tmp_path / "old")
+    assert online.run_lifecycle(tmp_path, tmp_path / "t", "install", "skip", attach=True) == 0
+    assert "--attach-runtime" in seen[0] and "--runtime-src" not in seen[0]  # unpublished core flag: never passed

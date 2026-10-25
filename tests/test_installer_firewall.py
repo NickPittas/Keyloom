@@ -101,8 +101,8 @@ def test_firewalld_is_reported_unsupported(monkeypatch):
     assert rec["status"] == "unsupported" and "firewalld" in rec["detail"]
 
 
-def test_declined_skip_and_no_terminal_stay_pending_with_commands(monkeypatch):
-    for kw, mode in (({"answer": False}, "ask"), ({}, "skip"), ({"tty": False}, "ask")):
+def test_skip_and_no_terminal_stay_pending_with_commands(monkeypatch):
+    for kw, mode in (({}, "skip"), ({"tty": False}, "ask")):
         env = Env(monkeypatch, **kw)
         rec = fw.run(mode, None)
         assert rec["status"] == "pending" and env.calls == []
@@ -122,7 +122,7 @@ def test_accept_adds_only_missing_rules_and_records_ownership(monkeypatch):
     assert rec["status"] == "ok" and rec["owned"] == ["10.147.0.0/24"]
     assert [c[2] for c in env.adds] == ["10.147.0.0/24"] * 2 and {c[-3] for c in env.adds} == {"tcp", "udp"}
     assert all(c[-1].startswith("Keyloom installer") for c in env.adds)  # ownership comment
-    assert env.calls[0] == ["status"] and len(env.asked) == 1
+    assert env.calls[0] == ["status"] and env.asked == []  # the firewall choice is made up front: no question
 
 
 def test_fully_covered_by_user_rules_adds_nothing_and_owns_nothing(monkeypatch):
@@ -139,7 +139,8 @@ def test_settled_networks_do_not_ask_or_sudo_again_but_new_ones_do(monkeypatch):
     assert again["status"] == "ok" and again["owned"] == first["owned"] and env.calls == [] and env.asked == []
     env2 = Env(monkeypatch, links=[link("eth0", "10.0.0.5/24"), link("wlan0", "172.20.1.5/24")])
     third = fw.run("ask", first)
-    assert env2.asked and third["owned"] == ["10.0.0.0/24", "172.20.1.0/24"]
+    assert env2.asked == []  # the install path no longer prompts
+    assert third["owned"] == ["10.0.0.0/24", "172.20.1.0/24"]
     env3 = Env(monkeypatch, status=STATUS_USER_RULES + "8443:8452/tcp  ALLOW  10.0.0.0/24\n44554/udp  ALLOW  10.0.0.0/24\n")
     assert fw.run("ask", {"status": "pending", "owned": ["10.0.0.0/24"], "networks": []})["owned"] == ["10.0.0.0/24"]
     assert env3.adds == []  # reinstall after a covered state adds no duplicate
@@ -257,11 +258,11 @@ def test_helper_failure_names_the_error_and_is_pending(monkeypatch, tmp_path, ca
 
 
 def test_lifecycle_records_pending_truth_in_receipt(monkeypatch, tmp_path, capsys):
-    Env(monkeypatch, answer=False)
+    Env(monkeypatch)
     monkeypatch.setattr(lifecycle, "_firewall_run", lambda v, m, p: fw.run(m, p))
     installed_tree(tmp_path)
     monkeypatch.setattr(lifecycle, "IS_WIN", False)
-    assert lifecycle.firewall_step(tmp_path, "ask") == "pending"
+    assert lifecycle.firewall_step(tmp_path, "skip") == "pending"
     saved = json.loads((tmp_path / lifecycle.RECEIPT).read_text())
     assert saved["firewall"]["status"] == "pending" and saved["firewall"]["commands"] and saved["network"]["firewall_rules"] is False
     out = capsys.readouterr().out
@@ -312,10 +313,10 @@ def test_windows_already_allowed_changes_nothing(monkeypatch):
     assert rec["status"] == "ok" and rec["owned"] == [] and env.elevated == [] and "nothing was added" in rec["detail"]
 
 
-def test_windows_skip_or_no_terminal_adds_nothing_and_gives_the_exact_command(monkeypatch):
+def test_windows_skip_adds_nothing_and_gives_the_exact_command(monkeypatch):
     for kw in ({"tty": True}, {"tty": False}):
         env = WinEnv(monkeypatch, **kw)
-        rec = fw.run_windows("skip" if kw["tty"] else "ask", None)
+        rec = fw.run_windows("skip", None)  # the UAC step needs no terminal: only skip stops it
         assert rec["status"] == "pending" and env.elevated == [] and env.prog in rec["commands"][0] and rec["owned"] == []
 
 
@@ -332,9 +333,7 @@ def test_windows_adds_only_the_scoped_rules_once_and_records_them(monkeypatch):
     assert again["owned"] == rec["owned"] and len(env.elevated) == 1
 
 
-def test_windows_declined_or_failed_elevation_stays_pending_without_ownership(monkeypatch):
-    env = WinEnv(monkeypatch, answer=False)
-    assert fw.run_windows("ask", None)["status"] == "pending" and env.elevated == []
+def test_windows_failed_elevation_stays_pending_without_ownership(monkeypatch):
     env = WinEnv(monkeypatch, elevated_ok=False)
     rec = fw.run_windows("ask", None)
     assert rec["status"] == "pending" and rec["owned"] == [] and len(env.elevated) == 1
@@ -358,14 +357,14 @@ def test_online_forwards_firewall_choice_to_the_same_lifecycle(monkeypatch, tmp_
         online.run_lifecycle(tmp_path, tmp_path / "tree", verb, "skip")
     assert [c[c.index("--firewall") + 1] for c in seen] == ["skip", "skip"]
     assert seen[0][-2:] == ["--models", "skip"] and "--models" not in seen[1]
-    assert online.build_parser().parse_args(["--payload-dir", "p", "--sources", "s"]).firewall == "ask"
+    assert online.build_parser().parse_args(["--payload-dir", "p", "--sources", "s"]).firewall == "yes"
 
 
 def test_offline_and_online_stubs_pass_the_choice_and_stay_nonblocking():
     off = (REPO / "packaging/linux/installer-stub.sh").read_text()
     on = (REPO / "packaging/linux/online-stub.sh").read_text()
-    assert off.count('--firewall "$FIREWALL"') == 3 and 'FIREWALL=ask' in off
-    assert on.count('--firewall "$FIREWALL"') == 1 and 'FIREWALL=ask' in on
+    assert off.count('--firewall "$FIREWALL"') == 3 and 'FIREWALL=yes' in off
+    assert on.count('--firewall "$FIREWALL"') == 1 and 'FIREWALL=yes' in on
     assert '--models "$MODELS" --firewall' in off  # models handling untouched
     parser = lifecycle.build_parser()
     for verb in ("install", "repair", "uninstall"):

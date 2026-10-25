@@ -37,6 +37,7 @@ def env(tmp_path, monkeypatch):
     for t in ("ffmpeg", "ffprobe"):
         (ff / t).write_text("x")
     ui = tmp_path / "ui-bin"
+    (tmp_path / "rt").mkdir()  # an existing runtime cache (validated by the stub below), so no uv/runtime phase
     cfg = tmp_path / "cfg.json"
     cfg.write_text(json.dumps({"ffmpeg_dir": str(ff), "wheel_cache": str(tmp_path / "wc"), "runtime_dir": str(tmp_path / "rt")}))
     calls = []
@@ -228,12 +229,10 @@ def test_unterminated_output_and_quiet_child_do_not_block_heartbeat(tmp_path, ca
     assert "heartbeat" in (tmp_path / "build.log").read_text()
 
 
-def test_phase_budget_is_capped_by_the_ordinary_command_gate(tmp_path, monkeypatch):
-    assert br.ORDINARY_GATE == 10  # the user's current gate; the next test shrinks it only to keep the test fast
-    monkeypatch.setattr(br, "ORDINARY_GATE", 1)
-    b = br.Build(tmp_path, 100)
-    with pytest.raises(br.BuildError, match="timed out after 1s"):
-        b.run("long", [sys.executable, "-c", "import time; time.sleep(60)"], 7200)  # configured budget 2 h
+def test_phase_budget_is_capped_by_the_overall_build_deadline(tmp_path):
+    b = br.Build(tmp_path, 1)  # overall build deadline: 1 s left
+    with pytest.raises(br.BuildError, match="timed out"):
+        b.run("long", [sys.executable, "-c", "import time; time.sleep(60)"], 7200)  # configured phase budget 2 h
     assert b.phases[-1]["exit"] == "timeout"
 
 

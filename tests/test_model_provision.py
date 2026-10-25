@@ -594,11 +594,13 @@ class TestDiskPreflight:
         final = roots.data_dir / "gvm" / "weights" / "weights.bin"
         final.parent.mkdir(parents=True)
         final.write_bytes(data)
+        fake_snapshot_repo(monkeypatch, {"t/gvm": {"weights.bin": data}})
         col = Collector()
         mgr = manager(Catalog(1, "t", {}, {"gvm": art}), roots, col)
         monkeypatch.setattr(mgr.checker.hash_cache, "save", lambda: False)
 
-        result = mgr.op_download(["gvm"])
+        # Download skips installed files without hashing; repair re-fetches and records digests.
+        result = mgr.op_repair(["gvm"])
         assert result["ok"] is False
         assert col.of("artifact-error")[-1]["error"] == "verification-cache"
         assert col.of("op-done")[-1]["ok"] is False
@@ -755,7 +757,7 @@ class TestEventStream:
         assert crashed.returncode == 77
         assert not final.exists()
         assert list(final.parent.parent.glob(".weights.*.previous"))
-        assert (final.parent.parent / ".weights.corridorkey-publish.json").exists()
+        assert (final.parent.parent / ".weights.keyloom-publish.json").exists()
 
         recovered = subprocess.run(
             [sys.executable, fixture, "--download", "--profile", "required",
@@ -765,7 +767,7 @@ class TestEventStream:
         assert recovered.returncode == 0, recovered.stderr + recovered.stdout
         assert final.read_bytes() == good
         assert not list(final.parent.parent.glob(".weights.*.previous"))
-        assert not (final.parent.parent / ".weights.corridorkey-publish.json").exists()
+        assert not (final.parent.parent / ".weights.keyloom-publish.json").exists()
         assert not (roots.cache_dir / "model-operations" / "crash-operation.active").exists()
         assert [event["event"] for event in events][-1] == "op-done"
         assert events[-1]["ok"] is True
@@ -817,7 +819,7 @@ class TestEventStream:
         assert terminal["event"] == "op-done"
         assert terminal["error"] == "install-descriptor"
 
-    def test_same_size_corruption_is_verified_then_repaired_before_skip(self, roots, monkeypatch):
+    def test_same_size_corruption_is_skipped_by_download_and_repaired_by_repair(self, roots, monkeypatch):
         correct = b"right-bytes"
         art = snapshot_artifact("gvm", "gvm/weights", [make_filespec("weights.bin", correct)])
         cat = Catalog(1, "t", {}, {"gvm": art})
@@ -830,6 +832,8 @@ class TestEventStream:
         mgr = manager(cat, roots)
 
         assert mgr.op_download(["gvm"])["ok"] is True
+        assert calls == []
+        assert mgr.op_repair(["gvm"])["ok"] is True
         assert calls == ["t/gvm"]
         assert final.read_bytes() == correct
         assert mgr.checker.check_artifact(art)["ready"] is True

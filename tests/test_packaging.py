@@ -17,6 +17,9 @@ FAKE_SETUP = '''
 import json, os, sys
 ok = not os.path.exists(os.environ["CK_FAIL_FLAG"]) if "CK_FAIL_FLAG" in os.environ else True
 op = "verify" if "--verify" in sys.argv else "download"
+if "--check" in sys.argv:  # nothing is present yet: the download below fetches the artifact
+    print(json.dumps({"event": "status", "artifact": "x", "kind": "weights", "present": False}))
+    op, ok = "check", True
 print(json.dumps({"event": "artifact-start", "artifact": "x"}))
 print(json.dumps({"event": "op-done", "op": op, "ok": ok}))
 sys.exit(0 if ok else 1)
@@ -70,9 +73,9 @@ def test_install_update_rollback_unicode_spaces(env):
     prefix = env / "dest dir ü"
     p1 = make_payload(env, "p1", "a")
     v1 = json.loads((p1 / "install-manifest.json").read_text())["version_id"]
-    assert install(env, p1, prefix) == 3  # models skipped => explicitly incomplete
+    assert install(env, p1, prefix) == 0  # models skipped is a success; only a requested install that fails is 3
     r = lifecycle.read_receipt(prefix)
-    assert r["current"] == v1  # fake payload has no network service module: nothing configured
+    assert r["current"] == v1  # a failed network step never blocks activation (it is recorded in the receipt)
     assert r["models"]["ready"] is False
     assert os.readlink(prefix / "current") == f"versions/{v1}"
     desk = Path(os.environ["XDG_DATA_HOME"]) / "applications/keyloom.desktop"
@@ -97,7 +100,7 @@ def test_failed_activation_keeps_previous_and_discards_new(env):
     install(env, p1, prefix)
     cur = lifecycle.read_receipt(prefix)["current"]
     p2 = make_payload(env, "p2", "b")
-    (p2 / "BAD").write_text("")  # selfcheck exits 1 ...
+    (p2 / "bin/keyloom-ui").write_text("#!/bin/sh\nexit 1\n")  # the UI self-check fails ...
     bundle.write_manifest(p2, "9.9", "lock", "cat")  # ... and the bundle itself is consistent
     vid2 = json.loads((p2 / "install-manifest.json").read_text())["version_id"]
     assert install(env, p2, prefix) == 2
@@ -150,6 +153,15 @@ def test_uninstall_removes_only_owned_and_keeps_user_data(env):
     assert not (Path(os.environ["XDG_DATA_HOME"]) / "applications/keyloom.desktop").exists()
 
 
+def test_uninstall_reports_incomplete_when_a_staging_tree_cannot_be_removed(env, monkeypatch):
+    prefix = env / "p"
+    install(env, make_payload(env), prefix)
+    real = lifecycle.try_rmtree
+    monkeypatch.setattr(lifecycle, "try_rmtree", lambda p: False if p.name.startswith(".staging.") else real(p))
+    (prefix / ".staging.x").mkdir()
+    assert run("--prefix", str(prefix), "uninstall") == 1
+
+
 def test_uninstall_refuses_without_receipt(env):
     d = env / "other"
     d.mkdir()
@@ -175,7 +187,7 @@ def test_linux_run_installer_checksum_and_extract(env):
     data[-5] ^= 0xFF
     run_file.write_bytes(bytes(data))
     bad = subprocess.run(["sh", str(run_file), "--extract-only", str(env / "y")], capture_output=True, text=True, timeout=10)
-    assert bad.returncode != 0 and "checksum" in bad.stderr
+    assert bad.returncode != 0 and "checksum" in bad.stdout + bad.stderr  # failures are logged to stdout
 
 
 def test_end_to_end_stub_install(env):
@@ -184,19 +196,21 @@ def test_end_to_end_stub_install(env):
     prefix = env / "stub prefix"
     r = subprocess.run(["sh", str(run_file), "--prefix", str(prefix), "--models", "skip"], capture_output=True,
                        text=True, timeout=12, env=dict(os.environ))
-    assert r.returncode == 3, r.stderr  # app installed, models explicitly incomplete
+    assert r.returncode == 0, r.stderr  # app installed; models skipped is a success
     assert lifecycle.read_receipt(prefix)["current"]
     assert not list(prefix.glob(".staging.*"))
 
 
 def test_iss_rendering(env):
     stage = make_payload(env, "stage")
-    iss = bundle.render_iss(stage, env).read_text(encoding="utf-8-sig")
+    meta = env / "runtime-meta.json"
+    meta.write_text("{}")
+    iss = bundle.render_iss(stage, env, meta).read_text(encoding="utf-8-sig")
     assert "@" not in re.sub(r"\{.*?\}|[\w.]+@[\w.]+", "", iss.replace("@VERSION_ID@", ""))
     assert "PrivilegesRequired=lowest" in iss and "--models" in iss
     low = iss.lower().replace("no admin or automatic firewall rule", "").replace("(no admin or automatic firewall rule)", "")
-    assert low.count("firewall") == 1 and "--firewall skip" in low  # only the silent-install switch: rules are the lifecycle's (UAC) step
-    assert "exitprocess(0)" in low and "check: needruntime" in low and "runtimechecked" in low  # Check runs per file: the answer must be cached and "excludes: \"runtime" in low  # exit-0 no-op; runtime reuse
+    assert "name: firewall;" in low and "--firewall yes" in low and "--firewall skip" in low  # the task picks yes or skip; rules are the lifecycle's (UAC) step
+    assert "exitprocess(0)" in low and "prepareruntime;" in low and "runtimechecked" in low  # exit-0 no-op; runtime decided once per install
 
 
 @pytest.mark.parametrize("name", ["linux-x86_64", "windows-x86_64"])
@@ -245,7 +259,7 @@ def test_interrupt_leaves_no_orphans_and_keeps_old(env, monkeypatch, same_versio
     p2 = make_payload(env, "b2", "a" if same_version else "b")
     if same_version:  # an intact identical build is a no-op now; a damaged one takes the replace-with-backup path
         (prefix / "versions" / v1 / "share/keyloom.png").write_text("damaged")
-    monkeypatch.setattr(lifecycle, "run_selfcheck", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(lifecycle, "run_light_check", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
     assert install(env, p2, prefix) == 130
     assert lifecycle.read_receipt(prefix)["current"] == v1
     assert sorted(d.name for d in (prefix / "versions").iterdir()) == [v1]
@@ -275,7 +289,7 @@ def test_locked_failed_version_is_deferred_not_lost(env, monkeypatch):
     prefix = env / "d"
     install(env, make_payload(env, "d1", "a"), prefix)
     p2 = make_payload(env, "d2", "b")
-    (p2 / "BAD").write_text("")
+    (p2 / "bin/keyloom-ui").write_text("#!/bin/sh\nexit 1\n")
     bundle.write_manifest(p2, "9.9", "lock", "cat")
     v2 = json.loads((p2 / "install-manifest.json").read_text())["version_id"]
     monkeypatch.setattr(lifecycle, "try_rmtree", lambda p: False)  # Windows: our own exe is locked
@@ -335,6 +349,7 @@ def test_model_args_preserve_spaces_and_globs(env):
     stage = make_payload(env, "stage")
     (stage / "app/scripts/setup_models.py").write_text(
         'import json,sys,os\nopen(os.environ["ARGLOG"],"a").write(json.dumps(sys.argv[1:])+"\\n")\n'
+        'print(json.dumps({"event":"status","artifact":"x","kind":"weights","present":False}))\n'
         'print(json.dumps({"event":"op-done","ok":True}))\n')
     bundle.write_manifest(stage, "9.9", "lock", "cat")
     run_file = bundle.make_linux_run(stage, env)
@@ -437,7 +452,7 @@ def test_first_install_failure_removes_shortcuts_shims_and_retry_works(env, monk
     assert not (prefix / "bin").exists() and not (prefix / "receipt.json").exists()
     assert not (prefix / "current").exists() and not list((prefix / "versions").iterdir())
     monkeypatch.undo()
-    assert install(env, make_payload(env, "again"), prefix) == 3  # retry into the same folder is accepted
+    assert install(env, make_payload(env, "again"), prefix) == 0  # retry into the same folder is accepted
 
 
 def test_no_payload_failure_is_journaled_and_live_version_is_never_deleted(env, monkeypatch):
@@ -445,7 +460,7 @@ def test_no_payload_failure_is_journaled_and_live_version_is_never_deleted(env, 
     install(env, make_payload(env, "w1", "a"), prefix)
     v1 = lifecycle.read_receipt(prefix)["current"]
     p2 = make_payload(env, "w2", "b")
-    (p2 / "BAD").write_text("")
+    (p2 / "bin/keyloom-ui").write_text("#!/bin/sh\nexit 1\n")
     bundle.write_manifest(p2, "9.9", "lock", "cat")
     v2 = json.loads((p2 / "install-manifest.json").read_text())["version_id"]
     os.rename(p2, prefix / "versions" / v2)  # what the Windows installer does: files placed in place
@@ -456,7 +471,7 @@ def test_no_payload_failure_is_journaled_and_live_version_is_never_deleted(env, 
     lifecycle.recover(prefix)
     assert not (prefix / "versions" / v2).exists() and lifecycle.read_receipt(prefix)["current"] == v1
     # re-activating the live version in place and failing must not delete it
-    monkeypatch.setattr(lifecycle, "run_selfcheck", lambda *a, **k: (_ for _ in ()).throw(lifecycle.InstallError("x")))
+    monkeypatch.setattr(lifecycle, "run_light_check", lambda *a, **k: (_ for _ in ()).throw(lifecycle.InstallError("x")))
     assert run("--prefix", str(prefix), "install", "--version", v1, "--models", "skip") == 2
     assert (prefix / "versions" / v1).is_dir() and lifecycle.verify_bundle(prefix / "versions" / v1) == []
 

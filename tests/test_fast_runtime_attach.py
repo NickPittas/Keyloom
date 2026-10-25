@@ -73,8 +73,9 @@ def test_cli_exit_codes(tmp_path, capsys):
     assert lifecycle.main(["--prefix", p, "runtime-available", "--manifest", str(mp)]) == 0
     mp.write_text(json.dumps(manifest("b")))
     assert lifecycle.main(["--prefix", p, "runtime-available", "--manifest", str(mp)]) == 1
-    assert lifecycle.main(["--prefix", p, "runtime-available", "--manifest", str(tmp_path / "none.json")]) == 1
-    assert lifecycle.main(["--prefix", p, "link-runtime", "--version", "2-y"]) == 0  # alias
+    assert lifecycle.main(["--prefix", p, "runtime-available", "--manifest", str(tmp_path / "none.json")]) == 2  # unreadable manifest
+    with pytest.raises(SystemExit):  # the old link-runtime alias is gone
+        lifecycle.main(["--prefix", p, "link-runtime", "--version", "2-y"])
     assert lifecycle.main(["--prefix", p, "attach-runtime", "--version", "2-y"]) == 0
 
 
@@ -83,38 +84,15 @@ def _env(tmp_path, monkeypatch):
         monkeypatch.setenv(k, str(tmp_path / d))
 
 
-def test_adopted_prefix_second_update_holder_uninstall_then_release(tmp_path, monkeypatch):
-    """CorridorKey prefix -> attach Keyloom prefix -> adopt receipts -> 2nd update w/o --from -> holder uninstall -> reuse -> release."""
+def test_corridorkey_install_is_never_a_runtime_source(tmp_path, monkeypatch):
+    """CorridorKey adoption is gone: a CorridorKey prefix is not consulted, so a Keyloom prefix cannot attach its runtime."""
     _env(tmp_path, monkeypatch)
     m = manifest()
     old, new = tmp_path / "old", tmp_path / "new"
-    owner = legacy(old, m)
+    legacy(old, m)
     lifecycle.atomic_write_json(old / lifecycle.RECEIPT, dict(lifecycle.read_receipt(old), app="CorridorKey"))
     new_version(new, m, "2-y")
-    assert lifecycle.attach_runtime(new, "2-y", old)["ok"]  # real cross-prefix attach, explicit src
-    lifecycle.atomic_write_json(new / lifecycle.RECEIPT, {
-        "schema": 1, "app": "Keyloom", "prefix": str(new), "current": "2-y", "versions": ["2-y"],
-        "activated_at": "2026-02-01T00:00:00+0000"})
-    lifecycle.finish_adopt(new, old)  # adopted_from / holder_of
-    m3 = manifest()
-    m3["files"]["app/x.py"]["sha256"] = "9" * 64  # next build: same runtime identity, changed app
-    assert lifecycle.runtime_available(new, m3)["ok"]  # no explicit src
-    new_version(new, m3, "3-z")
-    assert lifecycle.attach_runtime(new, "3-z")["ok"]
-    assert (new / "versions/3-z/runtime").resolve() == (owner / "runtime").resolve()
-    rc = lifecycle.read_receipt(new)
-    lifecycle.atomic_write_json(new / lifecycle.RECEIPT, dict(rc, current="3-z", versions=["2-y", "3-z"]))
-    # holder uninstall keeps the referenced runtime + a minimal owned receipt
-    assert lifecycle.main(["--prefix", str(old), "uninstall", "--firewall", "skip"]) == 0
-    assert (owner / PY).is_file() and json.loads((old / lifecycle.RECEIPT).read_text())["runtime_holder"]
-    m4 = manifest()
-    m4["files"]["app/x.py"]["sha256"] = "8" * 64
-    assert lifecycle.runtime_available(new, m4)["ok"]  # reuse still works afterwards
-    new_version(new, m4, "4-w")
-    assert lifecycle.attach_runtime(new, "4-w")["ok"]
-    # the adopter goes: the retained runtime is released, never earlier
-    assert lifecycle.main(["--prefix", str(new), "uninstall", "--firewall", "skip"]) == 0
-    assert not old.exists() or not (old / "versions").exists() and not (old / lifecycle.RECEIPT).exists()
+    assert not lifecycle.attach_runtime(new, "2-y")["ok"] and not os.path.islink(new / "versions/2-y/runtime")
 
 
 def test_unvalidated_outside_link_is_not_trusted(tmp_path):

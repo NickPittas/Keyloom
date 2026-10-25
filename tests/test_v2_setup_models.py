@@ -2,7 +2,6 @@
 import importlib.util
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -15,79 +14,70 @@ sm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sm)
 
 
-def _fake_downloader(calls, skip=()):
-    def _w(root, repo, rev):
-        calls.append("ck")
-        for n in ("corridorkey_v2", "foundation_stats"):
-            f = root / "weights" / f"{n}.safetensors"
-            f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_bytes(b"x")
-
-    def _c(root):
-        calls.append("cradio")
-        if "cradio" in skip:
-            return
-        d = root / "vfms/cradio/C-RADIOv4-SO400M"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "config.json").write_text("{}")
-        (d / "hf_model.py").write_text("#")
-        (d / "model.safetensors").write_bytes(b"x")
-
-    def _m(root):
-        calls.append("moge")
-        f = root / "vfms/moge/model.pt"
+def _write_bundle(root):
+    """Lay out the files a successful CK2 bundle download leaves behind."""
+    for n in ("corridorkey_v2", "foundation_stats"):
+        f = root / "weights" / f"{n}.safetensors"
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_bytes(b"x")
+    d = root / "vfms/cradio/C-RADIOv4-SO400M"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text("{}")
+    (d / "hf_model.py").write_text("#")
+    (d / "model.safetensors").write_bytes(b"x")
+    f = root / "vfms/moge/model.pt"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(b"x")
+    f = root / "vfms/rvm/pretrain_rvm_small16_256_204031069.npz"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(b"x")
 
-    def _r(root):
-        calls.append("rvm")
-        f = root / "vfms/rvm/pretrain_rvm_small16_256_204031069.npz"
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_bytes(b"x")
 
-    return SimpleNamespace(CORRIDORKEY_REPO="r", download_corridorkey=_w,
-                           download_cradio=_c, download_moge=_m, download_rvm=_r)
+class FakeManager:
+    """Stands in for ProvisionManager.op_download: writes the bundle only on success."""
+    ok = True
+
+    def __init__(self, root):
+        self.root = root
+
+    def op_download(self, targets):
+        assert targets == ["corridorkey"]
+        if self.ok:
+            _write_bundle(self.root)
+        return {"ok": self.ok, "failed": [], "cancelled": False}
 
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("CORRIDORKEY_V2_MODELS_DIR", str(tmp_path))
-    # Package files are vendored in the repo; assets dir is the tmp dir.
-    calls = []
-    monkeypatch.setattr(sm, "_load_v2_downloader", lambda: _fake_downloader(calls))
-    return tmp_path, calls
+    monkeypatch.setattr(sm, "create_provision_manager", lambda **kwargs: FakeManager(tmp_path))
+    return tmp_path
 
 
 def test_not_installed_initially(env):
     assert sm.is_installed("corridorkey") is False
 
 
-def test_download_then_idempotent(env):
-    _, calls = env
+def test_download_goes_through_manager(env):
     assert sm.download_corridorkey() is True
-    assert calls == ["ck", "cradio", "moge", "rvm"]
     assert sm.is_installed("corridorkey") is True
-    calls.clear()
-    assert sm.download_corridorkey() is True
-    assert calls == []
 
 
-def test_incomplete_download_fails(env, monkeypatch):
-    _, calls = env
-    monkeypatch.setattr(sm, "_load_v2_downloader", lambda: _fake_downloader(calls, skip=("cradio",)))
+def test_failed_manager_result_returns_false(env, monkeypatch):
+    monkeypatch.setattr(FakeManager, "ok", False)
     assert sm.download_corridorkey() is False
     assert not sm.is_installed("corridorkey")
 
 
 def test_download_exception_returns_false(env, monkeypatch):
-    def boom():
+    def boom(**kwargs):
         raise RuntimeError("offline")
-    monkeypatch.setattr(sm, "_load_v2_downloader", boom)
+    monkeypatch.setattr(sm, "create_provision_manager", boom)
     assert sm.download_corridorkey() is False
 
 
 def test_check_lists_problems(env, monkeypatch, capsys):
-    tmp, _ = env
+    tmp = env
     monkeypatch.setattr(sys, "argv", ["setup_models.py", "--check"])
     sm.main()
     out = capsys.readouterr().out

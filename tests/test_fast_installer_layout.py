@@ -141,22 +141,13 @@ def test_wrong_member_and_traversal_rejected(tmp_path):
         extract(run, c, "RUNTIME", tmp_path / "d", require="payload/app")
 
 
-def test_deadline_fails_without_extending(tmp_path):
-    _, run, raw, c = build(tmp_path)
-    t = iter(range(0, 100000, 20))  # every clock() call advances 20 s
-    with pytest.raises(TimeoutError):
-        extract(run, c, "APP", tmp_path / "d", deadline=10, clock=lambda: next(t))
-
-
 def test_extractor_cli_exit_codes(tmp_path):
     _, run, raw, c = build(tmp_path)
     args = [sys.executable, "-I", str(Path(ip.__file__)), "extract", "--run", str(run), "--base", c["STUB_BYTES"],
-            "--offset", c["APP_OFFSET"], "--len", c["APP_LEN"], "--label", "app", "--dest", str(tmp_path / "d"), "--deadline", "5"]
+            "--offset", c["APP_OFFSET"], "--len", c["APP_LEN"], "--label", "app", "--dest", str(tmp_path / "d")]
     assert subprocess.run(args + ["--sha256", c["APP_SHA256"]], capture_output=True).returncode == 0
     r = subprocess.run(args + ["--sha256", "0" * 64], capture_output=True, text=True)
-    assert r.returncode == 1 and "checksum mismatch" in r.stderr
-    no_deadline = [a for a in args if a not in ("--deadline", "5")]  # an unlimited phase is refused
-    assert subprocess.run(no_deadline + ["--sha256", c["APP_SHA256"]], capture_output=True).returncode == 2
+    assert r.returncode == 1 and "checksum mismatch" in r.stdout  # the supervised worker's output is relayed to stdout
 
 
 def alive(pid):
@@ -172,27 +163,15 @@ def test_supervisor_kills_and_reaps_blocked_worker_group(tmp_path):
     out = io.StringIO()
     t0 = time.monotonic()
     # the worker blocks (like stuck I/O) and leaves a grandchild in its process group
-    rc = ip.supervise(["/bin/sh", "-c", f"sleep 60 & echo $! > {pidfile}; wait"], "blocked", 1, out=out, poll=0.2)
+    rc = ip.supervise(["/bin/sh", "-c", f"sleep 60 & echo $! > {pidfile}; wait"], "blocked", out=out, poll=0.2, stall=1)
     assert rc == 124 and time.monotonic() - t0 < 5
-    assert "exceeded its 1s limit" in out.getvalue() and "heartbeat" in out.getvalue()
+    assert "no progress for 1s" in out.getvalue() and "heartbeat" in out.getvalue()
     assert not alive(int(pidfile.read_text()))
 
 
-def test_supervisor_passes_exit_code_and_requires_deadline():
-    assert ip.supervise(["/bin/sh", "-c", "exit 3"], "x", 5, out=io.StringIO(), poll=0.2) == 3
-    with pytest.raises(ValueError):
-        ip.supervise(["/bin/true"], "x", 0)
-    assert ip.main(["run", "--label", "x", "--deadline", "5", "--", "/bin/sh", "-c", "exit 7"]) == 7
-
-
-def test_shared_total_budget_across_phases():
-    assert ip.phase_limit(100, 30, 10, now=100) == 10      # first phase: its cap
-    assert ip.phase_limit(100, 30, 10, now=115) == 10
-    assert ip.phase_limit(100, 30, 10, now=125) == 5       # only 5 s of the 30 s left
-    for now in (130, 140):                                  # spent: no phase may start
-        with pytest.raises(TimeoutError):
-            ip.phase_limit(100, 30, 10, now=now)
-    assert ip.main(["limit", "--start", "0", "--total", "30", "--phase", "10"]) == 124  # epoch long ago
+def test_supervisor_passes_exit_code():
+    assert ip.supervise(["/bin/sh", "-c", "exit 3"], "x", out=io.StringIO(), poll=0.2) == 3
+    assert ip.main(["run", "--label", "x", "--", "/bin/sh", "-c", "exit 7"]) == 7
 
 
 def test_rendered_stub_shell_syntax_and_flow(tmp_path):
@@ -206,15 +185,15 @@ def test_rendered_stub_shell_syntax_and_flow(tmp_path):
     assert "payload/runtime/python/bin/python3" not in text
     # no phase is unlimited and nothing runs unsupervised
     assert not re.search(r'seg \w+ .*" 0 payload', text) and "--deadline 0" not in text
-    assert 'sup bootstrap "$PHASE_S"' in text and "--label runtime-available --deadline" in text
-    # runtime-available: 0 attach, 1 extract, 3 and every other code FAIL (no silent full-runtime fallback)
+    assert "sup bootstrap sh -c" in text and "--label runtime-available --log" in text
+    # runtime-available: 0 attach, 1 extract, every other code FAILs (no silent full-runtime fallback, no code-3 branch)
     case = text[text.index('case "$RA" in'):text.index('esac', text.index('case "$RA" in'))]
     assert re.search(r"0\) NEEDRT=0", case) and re.search(r"1\) NEEDRT=1", case)
-    assert re.search(r"3\).*exit 3", case) and re.search(r"\*\).*exit 1", case)
+    assert not re.search(r"\b3\)", case) and re.search(r"\*\).*exit 1", case)
     assert "KEYLOOM_RUNTIME_PHASE" not in text and "RUNTIME_PHASE_S" not in text  # no unapproved deadline escape hatch
     # install/repair are supervised; the attach flags exist only on the reuse branch of install, never on repair
-    assert '--label "$VERB" --deadline "$_IL" --wait-file' in text
-    assert '--attach-runtime ${ADOPT:+--runtime-src "$ADOPT"}' in text
+    assert '--label "$VERB" --log "$LOG" --log-title "$TITLE" --wait-file' in text
+    assert 'set -- --attach-runtime "$@"' in text
     assert text.index('[ "$NEEDRT" = 1 ] || set -- --attach-runtime') > text.index("never --attach-runtime")  # else branch only
     assert "sudo -S" not in text and "read -s" not in text
 
@@ -237,7 +216,7 @@ def alive_pid(pid):
 
 
 def test_shell_supervisor_success_and_exit_code(tmp_path):
-    s = sup_script(tmp_path, "sup ok 5 sh -c 'exit 0'\nR=0; sup bad 5 sh -c 'exit 3' || R=$?\necho got $R\n")
+    s = sup_script(tmp_path, "sup ok sh -c 'exit 0'\nR=0; sup bad sh -c 'exit 3' || R=$?\necho got $R\n")
     r = subprocess.run(["/bin/sh", str(s)], capture_output=True, text=True, timeout=8)
     assert r.returncode == 0 and "got 3" in r.stdout, (r.stdout, r.stderr)
 
@@ -245,11 +224,11 @@ def test_shell_supervisor_success_and_exit_code(tmp_path):
 def test_shell_supervisor_timeout_kills_only_its_tree(tmp_path):
     unrelated = subprocess.Popen(["/bin/sleep", "30"])
     pidfile = tmp_path / "gc.pid"
-    s = sup_script(tmp_path, f"R=0; sup blocked 2 sh -c 'sleep 30 & echo $! > {pidfile}; wait' || R=$?\necho got $R\n")
+    s = sup_script(tmp_path, f"STALL_S=2; R=0; sup blocked sh -c 'sleep 30 & echo $! > {pidfile}; wait' || R=$?\necho got $R\n")
     try:
         t0 = time.monotonic()
         r = subprocess.run(["/bin/sh", str(s)], capture_output=True, text=True, timeout=8)
-        assert "got 124" in r.stdout and "exceeded its 2s limit" in r.stderr and "heartbeat" in r.stdout, (r.stdout, r.stderr)
+        assert "got 124" in r.stdout and "made no progress for 2s" in r.stderr and "heartbeat" in r.stdout, (r.stdout, r.stderr)
         assert time.monotonic() - t0 < 6
         assert not alive_pid(int(pidfile.read_text()))  # the blocked child's own descendant is gone
         assert alive_pid(unrelated.pid)                  # a process that is not its descendant is untouched
@@ -262,10 +241,10 @@ def test_wait_file_pauses_clock_only_when_declared(tmp_path):
     wf = tmp_path / "waiting"
     wf.write_text("waiting for sudo consent")
     out = io.StringIO()
-    assert ip.supervise(["/bin/sh", "-c", "sleep 1.5"], "install", 1, out=out, poll=0.2, wait_file=str(wf)) == 0
+    assert ip.supervise(["/bin/sh", "-c", "sleep 1.5"], "install", out=out, poll=0.2, wait_file=str(wf)) == 0
     assert "WAITING FOR USER" in out.getvalue() and "sudo consent" in out.getvalue()
     wf.unlink()  # no declared wait: the same worker is cut off at the deadline
-    assert ip.supervise(["/bin/sh", "-c", "sleep 30"], "install", 1, out=io.StringIO(), poll=0.2, wait_file=str(wf), grace=1) == 124
+    assert ip.supervise(["/bin/sh", "-c", "sleep 30"], "install", out=io.StringIO(), poll=0.2, wait_file=str(wf), stall=1, grace=1) == 124
 
 
 def test_unavailable_cli_never_reads_runtime(tmp_path):
@@ -277,8 +256,9 @@ def test_unavailable_cli_never_reads_runtime(tmp_path):
     fake.write_text(f'''#!/bin/sh
 echo "$*" >> {log}
 case "$*" in
-  *" limit "*) echo 10;;
-  *" run "*) exit ${{RA_CODE:-2}};;
+  *runtime-available*) exit ${{RA_CODE:-2}};;
+  *" run "*) exit 1;;
+  *attest*) echo x > {tmp_path}/st/nonce;;
 esac
 exit 0
 ''')
@@ -286,11 +266,11 @@ exit 0
     stub = raw[:int(c["STUB_BYTES"])].decode()
     # swap the bootstrap unpack for a prepared fake interpreter; everything after it is the real flow
     head, tail = stub.split('PY="$STAGE/boot/python/bin/python3"', 1)
-    flow = f'STAGE={tmp_path}/st; mkdir -p $STAGE/payload; PREFIX={tmp_path}/p; VERB=install; ADOPT=""; EXTRACT=""; SELF=x\n' \
-           f'TOTAL_S=30; PHASE_S=10; T0=$(date +%s)\nPY={fake}' + tail
+    flow = f'STAGE={tmp_path}/st; mkdir -p $STAGE/payload; PREFIX={tmp_path}/p; VERB=install; EXTRACT=""; SELF=x\n' \
+           f'PY={fake}' + tail
     script = tmp_path / "flow.sh"
     script.write_text("set -eu\n" + "\n".join(l for l in c_consts(stub)) + "\n" + flow.split("\nset +e")[0])
-    for code, wants_runtime, rc in ((2, False, 1), (3, False, 3), (1, True, 0)):
+    for code, wants_runtime, rc in ((2, False, 1), (3, False, 1), (1, True, 0)):
         log.write_text("")
         r = subprocess.run(["/bin/sh", str(script)], capture_output=True, text=True, env={"RA_CODE": str(code), "PATH": "/usr/bin:/bin"})
         assert ("--label runtime --offset" in log.read_text()) is wants_runtime, r.stderr
@@ -298,4 +278,4 @@ exit 0
 
 
 def c_consts(stub):
-    return [l for l in stub.splitlines() if re.match(r"(STUB_BYTES|BOOT_|APP_|RUNTIME_)", l)]
+    return [l for l in stub.splitlines() if re.match(r"(STUB_BYTES|BOOT_|APP_|RUNTIME_|TITLE=)", l)]

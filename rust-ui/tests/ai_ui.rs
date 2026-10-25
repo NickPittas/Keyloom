@@ -1047,7 +1047,7 @@ fn missing_worker_setup_is_reported_with_the_fix_and_keying_is_refused() {
     settle(&ctx, &mut app);
     let t = app.ai().setup_text().join(" ");
     assert!(
-        t.contains("not a CorridorKey checkout") && t.contains("Settings"),
+        t.contains("not a Keyloom checkout") && t.contains("Settings"),
         "{t}"
     );
     let r = app.ai().key_rect.unwrap();

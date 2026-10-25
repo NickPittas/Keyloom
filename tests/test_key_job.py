@@ -48,7 +48,8 @@ class FakeEngine:
 
     def run_clip(self, input_path, output_dir, params, *, outputs, temp_dir, frame_dir_fps,
                  hint_video_path, ffmpeg_bin, on_progress, check_cancel, on_status,
-                 initial_hint_path=None, initial_hint_index=0, hint_frame_indices=None):
+                 initial_hint_path=None, initial_hint_index=0, hint_frame_indices=None,
+                 enforce_fixed_window=False):
         listing = sorted(os.listdir(input_path))
         self.calls.append(dict(
             listing=listing, hint=hint_video_path, initial_hint_path=initial_hint_path,

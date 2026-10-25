@@ -985,8 +985,8 @@ def runtime_ok(prefix: Path, mani: dict) -> dict | None:
 
 def trusted_runtime(prefix: Path, mani: dict) -> bool:
     """True: attach the existing runtime by reference (payload omits runtime/). False: the runtime is new/different, so the
-    payload carries it (downloaded if needed). The identical runtime that cannot be used safely never falls back to a
-    copy/extraction on a normal update: it needs Repair."""
+    payload carries it (downloaded if needed). An identical runtime that is not trusted (missing, outside the prefix,
+    unsealed) is not attached: the payload carries a fresh one. Only an invalid manifest fails."""
     if runtime_ok(prefix, mani):
         return True
     try:

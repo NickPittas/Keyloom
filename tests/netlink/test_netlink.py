@@ -7,6 +7,7 @@ import sys
 
 import pytest
 
+from backend.coordinator import client as cl
 from backend.coordinator import pki
 from backend.netlink import Bridge
 
@@ -88,7 +89,7 @@ def test_pair_never_echoes_token_and_files_are_private(env):
     creds = str(env["dir"] / "c.json")
     r = call(b, "pair", {"invitation_path": invite(env), "credentials_path": creds, "name": "pc"})
     token = pki.read_credentials(creds)["token"]
-    assert r["ok"] and list(r["result"]) == ["installation_id"] and token not in json.dumps(r)
+    assert r["ok"] and r["result"]["installation_id"] and "token" not in r["result"] and token not in json.dumps(r)
     c = call(b, "connect", {"credentials_path": creds})
     assert token not in json.dumps(c)
     if os.name != "nt":
@@ -255,9 +256,8 @@ def test_pair_save_failure_after_redeem_is_distinct(env, monkeypatch):
 
 
 def test_pair_transport_failure_says_maybe_used_and_cert_failure_says_unsent(env, monkeypatch):
-    from backend.coordinator import client as cl
     inv, dest = invite(env), env["dir"] / "d.json"
-    monkeypatch.setattr(cl.Client, "pair", classmethod(lambda c, i, n: (_ for _ in ()).throw(TimeoutError())))
+    monkeypatch.setattr(cl.Client, "pair", classmethod(lambda c, i, n, e=None: (_ for _ in ()).throw(TimeoutError())))
     r = call(Bridge(), "pair", {"invitation_path": inv, "credentials_path": str(dest), "name": "x"})
     assert r["error"]["code"] == "pair_uncertain" and "MAY" in r["error"]["message"] and not dest.exists()
     monkeypatch.undo()
@@ -342,40 +342,22 @@ def test_lock_released_when_process_exits(env):
         proc.kill()
 
 
-class _Reply:
-    """Fake HTTPS connection returning a canned status/body."""
-    def __init__(self, status, body):
-        self.status, self._b = status, body
-
-    def read(self, n=None):
-        return self._b
+def _canned(monkeypatch, status, body):
+    """Replace only the wire exchange with one canned HTTP reply; the client's own parsing and checks still run."""
+    monkeypatch.setattr(cl, "exchange", lambda urls, *a, **k: (urls[0], status, body))
 
 
 @pytest.mark.parametrize("status,body", [(200, b"\xff\xfe not utf8"), (200, b"[1,2]"), (200, b"null"), (200, b"not json"),
                                          (500, b"{}"), (500, b'{"error":"str"}'), (500, b'{"error":{"code":5}}'), (500, b"\xff")])
 def test_malformed_replies_are_transport(env, monkeypatch, status, body):
     b, _ = connected(env, "m")
-    import http.client as hc
-
-    class Conn:
-        def __init__(self, *a, **k): pass
-        def request(self, *a, **k): pass
-        def getresponse(self): return _Reply(status, body)
-        def close(self): pass
-    monkeypatch.setattr(hc, "HTTPSConnection", Conn)
+    _canned(monkeypatch, status, body)
     r = call(b, "installations")
     assert r["error"]["code"] == "transport", r
 
 
 def test_malformed_pairing_reply_is_uncertain(env, monkeypatch):
-    import http.client as hc
-
-    class Conn:
-        def __init__(self, *a, **k): pass
-        def request(self, *a, **k): pass
-        def getresponse(self): return _Reply(200, b'{"installation_id":5}')
-        def close(self): pass
-    monkeypatch.setattr(hc, "HTTPSConnection", Conn)
+    _canned(monkeypatch, 200, b'{"installation_id":5}')
     dest = env["dir"] / "d.json"
     r = call(Bridge(), "pair", {"invitation_path": invite(env), "credentials_path": str(dest), "name": "x"})
     assert r["error"]["code"] == "pair_uncertain" and not dest.exists()

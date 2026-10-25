@@ -23,13 +23,13 @@ def test_env_override_wins(linux, monkeypatch, tmp_path):
 
 def test_xdg_used(linux, monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    assert vp.get_v2_models_dir() == tmp_path / "EZ-CorridorKey2" / "CorridorKeyV2"
+    assert vp.get_v2_models_dir() == tmp_path / "Keyloom" / "EngineV2"
 
 
 def test_home_fallback_and_no_mkdir(linux, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     d = vp.get_v2_models_dir()
-    assert d == tmp_path / ".local/share/EZ-CorridorKey2/CorridorKeyV2"
+    assert d == tmp_path / ".local/share/Keyloom/EngineV2"
     assert not d.exists()
 
 
