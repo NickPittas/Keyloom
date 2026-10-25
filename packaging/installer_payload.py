@@ -395,11 +395,11 @@ def supervise(argv, label: str, out=sys.stdout, clock=time.monotonic, poll: floa
     def reap(term_wait=grace):
         if win:  # no process groups to signal: stop exactly this child's tree
             r = subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, errors="replace")
-            log_write(f"[{label}] taskkill exit {r.returncode}\n")
-            for stream, text in (("stdout", r.stdout), ("stderr", r.stderr)):
-                for line in text.splitlines():
-                    log_write(f"[{label}] taskkill {stream}| {line}\n")
             if r.returncode not in (0, 128):  # 128: the tree was already gone
+                log_write(f"[{label}] taskkill exit {r.returncode}\n")
+                for stream, text in (("stdout", r.stdout), ("stderr", r.stderr)):
+                    for line in text.splitlines():
+                        log_write(f"[{label}] taskkill {stream}| {line}\n")
                 note(f"WARNING: [{label}] taskkill exit {r.returncode}")
             p.wait()
             return

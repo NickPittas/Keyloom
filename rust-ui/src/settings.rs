@@ -569,11 +569,9 @@ mod tests {
     }
 
     #[test]
-    fn existing_prerelease_settings_dir_is_kept() {
+    fn settings_dir_is_keyloom_even_with_legacy_dir() {
         let d = dir("legacy-config");
         std::fs::create_dir_all(d.join("corridorkey-native")).unwrap();
-        assert_eq!(config_dir(d.clone()), d.join("corridorkey-native"));
-        std::fs::create_dir_all(d.join("keyloom")).unwrap();
         assert_eq!(config_dir(d.clone()), d.join("keyloom"));
         let fresh = dir("fresh-config");
         assert_eq!(config_dir(fresh.clone()), fresh.join("keyloom"));

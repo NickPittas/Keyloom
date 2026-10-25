@@ -463,16 +463,13 @@ mod tests {
     }
 
     #[test]
-    fn pre_rename_descriptor_and_user_area_are_still_found() {
-        let d = tmp("legacy-names");
-        std::fs::write(d.join(LEGACY_DESCRIPTOR_NAME), "{}").unwrap();
-        assert_eq!(descriptor_in(&d), d.join(LEGACY_DESCRIPTOR_NAME));
+    fn descriptor_and_user_area_use_keyloom_names() {
+        let d = tmp("keyloom-names");
         std::fs::write(d.join(DESCRIPTOR_NAME), "{}").unwrap();
         assert_eq!(descriptor_in(&d), d.join(DESCRIPTOR_NAME));
-        let base = tmp("legacy-area");
+        let base = tmp("keyloom-area");
+        assert_eq!(user_area(base.clone()), base.join("Keyloom"));
         std::fs::create_dir_all(base.join("CorridorKey")).unwrap();
-        assert_eq!(user_area(base.clone()), base.join("CorridorKey"));
-        std::fs::create_dir_all(base.join("Keyloom")).unwrap();
         assert_eq!(user_area(base.clone()), base.join("Keyloom"));
     }
 
