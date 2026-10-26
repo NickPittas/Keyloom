@@ -1,8 +1,7 @@
 //! Per-installation Path Mapping: a shared location *name* maps to this PC's own mount/drive/UNC root.
 //! Jobs and the future API carry `SharedRef` (name + validated relative components), never a host path;
 //! each receiving installation resolves it under its own root. Local roots are checked with this
-//! platform's path rules; a foreign path is never parsed here. Separate from the legacy SSH
-//! `Target::path_map`, which is left untouched.
+//! platform's path rules; a foreign path is never parsed here.
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::{Component, Path, PathBuf};

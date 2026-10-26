@@ -1,5 +1,5 @@
 //! Worker protocol v1 over stdio (`ai-implementation-brief.md` §3, §7): versioned events, a persistent
-//! worker process per target (local spawn, or the same command through the system `ssh` client) and the
+//! local worker process per target and the
 //! identity gate. Bounded line reader: a malformed or oversized line is a fatal `Msg::Protocol`.
 use crate::jobs::{KeyJob, Require};
 use serde::{Deserialize, Serialize};
@@ -320,23 +320,6 @@ impl Hello {
 
 // ---- targets -------------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Storage {
-    #[default]
-    Shared,
-    /// Reserved (brief §7.3 phase A5); rejected by `Target::validate`.
-    Transfer,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RemoteOs {
-    #[default]
-    Linux,
-    Windows,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TargetKind {
@@ -344,19 +327,6 @@ pub enum TargetKind {
     Local {
         repo: PathBuf,
         python: Option<PathBuf>,
-    },
-    /// `repo`/`python` are absolute paths on the remote host, in the syntax of `os`. Linux: POSIX `sh`
-    /// quoting. Windows: one encoded PowerShell command, so neither cmd.exe nor PowerShell re-parses them.
-    Ssh {
-        #[serde(default)]
-        os: RemoteOs,
-        host: String,
-        user: Option<String>,
-        port: Option<u16>,
-        python: String,
-        repo: String,
-        /// ssh client executable; `None` → `ssh` from PATH.
-        ssh: Option<PathBuf>,
     },
 }
 
@@ -368,199 +338,21 @@ pub struct Target {
     pub gpu: u32,
     #[serde(default = "yes")]
     pub enabled: bool,
-    #[serde(default)]
-    pub storage: Storage,
-    #[serde(default)]
-    pub path_map: Vec<(String, String)>,
 }
 fn yes() -> bool {
     true
 }
 
-/// POSIX single-quote: safe for any byte but NUL inside `sh -c`.
-pub fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-fn win_abs(s: &str) -> bool {
-    let b = s.as_bytes();
-    s.starts_with("\\\\") && s.len() > 2
-        || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
-}
-/// PowerShell treats these typographic quotes like `'` inside single-quoted strings.
-fn is_ps_quote_like(c: char) -> bool {
-    matches!(c, '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
-}
-
-/// PowerShell single-quoted literal: no variable or subexpression expansion; only `'` needs doubling.
-pub fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-/// Base64 of the UTF-16LE bytes, the form `powershell -EncodedCommand` takes. Output uses only `A-Za-z0-9+/=`,
-/// so neither cmd.exe nor PowerShell as ssh's remote shell can treat any of it specially.
-pub fn ps_encode(script: &str) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut out = String::new();
-    for c in bytes.chunks(3) {
-        let n = (u32::from(c[0]) << 16)
-            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*c.get(2).unwrap_or(&0));
-        for k in 0..4 {
-            out.push(if k <= c.len() {
-                T[(n >> (18 - 6 * k) & 63) as usize] as char
-            } else {
-                '='
-            });
-        }
-    }
-    out
-}
-
-/// The command string handed to ssh. Linux: `cd` + `exec` with POSIX single-quoting. Windows: a PowerShell
-/// script whose only dynamic parts are single-quoted literals, shipped as `-EncodedCommand` (`-Command`-style
-/// text would be re-parsed by the remote shell). stdin/stdout are the worker's own: the protocol is ASCII-only
-/// JSON (see `Cmd::line`) so PowerShell/console code pages cannot alter it.
-pub fn remote_command(os: RemoteOs, repo: &str, python: &str, gpu: u32) -> String {
-    match os {
-        RemoteOs::Linux => format!(
-            "cd -- {} && exec {} -m backend.worker --gpu {}",
-            sh_quote(repo),
-            sh_quote(python),
-            gpu
-        ),
-        RemoteOs::Windows => {
-            let script = format!(
-                "Set-Location -LiteralPath {} -ErrorAction Stop; & {} -m backend.worker --gpu {}; exit $LASTEXITCODE",
-                ps_quote(repo),
-                ps_quote(python),
-                gpu
-            );
-            format!(
-                "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
-                ps_encode(&script)
-            )
-        }
-    }
-}
-
-fn plain(field: &str, v: &str, extra: &str) -> Result<(), String> {
-    if v.is_empty()
-        || v.starts_with('-')
-        || !v
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c) || extra.contains(c))
-    {
-        return Err(format!("invalid {field}: {v:?}"));
-    }
-    Ok(())
-}
-
 impl Target {
     pub fn is_local(&self) -> bool {
-        matches!(self.kind, TargetKind::Local { .. })
+        true
     }
 
     pub fn validate(&self) -> Result<(), String> {
         if self.id.is_empty() || self.id.chars().any(char::is_control) {
             return Err("target id must be non-empty text".into());
         }
-        if self.storage != Storage::Shared {
-            return Err(format!(
-                "{}: transfer storage is not supported yet",
-                self.id
-            ));
-        }
-        if let TargetKind::Ssh {
-            os,
-            host,
-            user,
-            python,
-            repo,
-            ..
-        } = &self.kind
-        {
-            plain("host", host, ":[]%")?;
-            if let Some(u) = user {
-                plain("user", u, "")?;
-            }
-            for (f, v) in [("python", python), ("repo", repo)] {
-                if v.is_empty() || v.chars().any(char::is_control) {
-                    return Err(format!("invalid remote {f}"));
-                }
-            }
-            match os {
-                RemoteOs::Linux => {
-                    if python.starts_with('-') {
-                        return Err("invalid remote python".into());
-                    }
-                }
-                RemoteOs::Windows => {
-                    for (f, v) in [("python", python), ("repo", repo)] {
-                        if !win_abs(v) || v.contains('/') || v.chars().any(is_ps_quote_like) {
-                            return Err(format!("remote {f} must be an absolute Windows path with backslashes and no smart quotes: {v:?}"));
-                        }
-                    }
-                }
-            }
-            // Shared-root maps: local side absolute, remote side absolute in the target OS's syntax.
-            for (l, r) in &self.path_map {
-                let remote_ok = match os {
-                    RemoteOs::Linux => r.starts_with('/') && !r.contains('\\'),
-                    RemoteOs::Windows => win_abs(r) && !r.contains('/'),
-                };
-                if !crate::jobs::is_abs(l) || !remote_ok || r.chars().any(char::is_control) {
-                    return Err(format!(
-                        "bad path_map entry [{l:?}, {r:?}] for a {os:?} target"
-                    ));
-                }
-            }
-        }
         Ok(())
-    }
-
-    /// Arguments after the program name: fixed hardening options, `-p`, one `[user@]host` token, `--`, then
-    /// ONE remote command string built by `remote_command` (ssh hands it to the remote default shell).
-    pub fn ssh_args(&self) -> Result<Vec<String>, String> {
-        self.validate()?;
-        let TargetKind::Ssh {
-            os,
-            host,
-            user,
-            port,
-            python,
-            repo,
-            ..
-        } = &self.kind
-        else {
-            return Err("not an ssh target".into());
-        };
-        let mut a: Vec<String> = [
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ClearAllForwardings=yes",
-            "-o",
-            "ServerAliveInterval=10",
-            "-o",
-            "ServerAliveCountMax=3",
-        ]
-        .map(String::from)
-        .into();
-        if let Some(p) = port {
-            a.extend(["-p".into(), p.to_string()]);
-        }
-        a.push(match user {
-            Some(u) => format!("{u}@{host}"),
-            None => host.clone(),
-        });
-        a.push("--".into());
-        a.push(remote_command(*os, repo, python, self.gpu));
-        Ok(a)
     }
 
     fn command(&self) -> Result<Command, String> {
@@ -581,16 +373,6 @@ impl Target {
                     &mut c,
                     crate::runtime::launch(None).install.as_ref(),
                 );
-                c
-            }
-            TargetKind::Ssh { ssh, .. } => {
-                let mut c = Command::new(ssh.clone().unwrap_or_else(|| "ssh".into()));
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    c.creation_flags(0x0800_0000);
-                }
-                c.args(self.ssh_args()?);
                 c
             }
         })

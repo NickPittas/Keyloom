@@ -9,7 +9,7 @@
 //! - A running inference is never killed automatically: silence is reported (`stalled`), the user decides
 //!   (`cancel`, then `force_stop`).
 //! - Model identity: the first local worker's hello digest is the trusted reference. Jobs that pin no digest
-//!   run on local workers and, on remote workers, only if their digest equals the reference. Unknown digests
+//!   run on local workers and, on any other worker, only if its digest equals the reference. Unknown digests
 //!   need the explicit `allow_unverified` opt-in and are flagged on the job.
 use crate::jobs::{JobError, KeyJob, Recovery, MANIFEST_NAME, PROTOCOL};
 use crate::tasks::{TaskJob, TaskKind};
@@ -203,9 +203,9 @@ struct Slot {
 
 /// A lost job's writer counts as stopped only with proof: a local worker whose process has exited. On Windows
 /// the venv `python.exe` is a launcher that starts the real interpreter, so the launcher exiting proves nothing
-/// about the process tree: local Windows workers stay fenced until the user confirms. Remote: never proof.
-pub fn writer_proven(target_is_local: bool, windows_host: bool) -> bool {
-    target_is_local && !windows_host
+/// about the process tree: local Windows workers stay fenced until the user confirms.
+pub fn writer_proven(windows_host: bool) -> bool {
+    !windows_host
 }
 
 #[derive(Clone, Debug)]
@@ -384,8 +384,7 @@ impl Scheduler {
                 return Err(format!("duplicate target id {}", t.id));
             }
         }
-        let mut order: Vec<usize> = (0..targets.len()).collect();
-        order.sort_by_key(|i| !targets[*i].is_local());
+        let order: Vec<usize> = (0..targets.len()).collect();
         let slots = targets
             .into_iter()
             .map(|target| Slot {
@@ -500,7 +499,7 @@ impl Scheduler {
         if !self
             .slots
             .iter()
-            .any(|s| s.target.is_local() && s.target.enabled)
+            .any(|s| s.target.enabled)
         {
             return Err("no enabled local worker".into());
         }
@@ -527,7 +526,7 @@ impl Scheduler {
             let Some(&c) = self
                 .order
                 .iter()
-                .find(|c| self.slots[**c].target.is_local() && self.slots[**c].target.enabled)
+                .find(|c| self.slots[**c].target.enabled)
             else {
                 continue;
             };
@@ -775,7 +774,7 @@ impl Scheduler {
             .iter()
             .map(|s| TargetView {
                 id: s.target.id.clone(),
-                local: s.target.is_local(),
+                local: true,
                 enabled: s.target.enabled,
                 status: s.status.clone(),
                 busy_with: s.job.clone(),
@@ -1207,7 +1206,7 @@ impl Scheduler {
         if s.stopping {
             s.status = TargetStatus::Stopped;
         }
-        let proven = writer_proven(s.target.is_local(), cfg!(windows));
+        let proven = writer_proven(cfg!(windows));
         if let (Some(id), true) = (s.lost_job.clone(), proven) {
             if let Some(t) = self.tasks.iter().position(|t| t.job.job_id == id) {
                 s.lost_job = None;
@@ -1407,7 +1406,7 @@ impl Scheduler {
             s.status = TargetStatus::Refused(why);
             return;
         }
-        if s.target.is_local() && self.reference.is_none() {
+        if self.reference.is_none() {
             self.reference = Some(digests(&h));
             self.reference_from = Some(s.target.id.clone());
         }
@@ -1465,25 +1464,16 @@ impl Scheduler {
             ));
         }
         // Identity. A pinned digest must match. An unpinned one means "the trusted local reference": local
-        // workers are trusted even when the reference carries no digest; remote workers must match it.
+        // workers are trusted even when the reference carries no digest.
         let mut sent = e.job.require.clone();
         let mut check = e.job.require.clone();
         for (name, want) in sent.models.iter_mut() {
             if want.is_none() {
                 match &self.reference {
                     Some(r) => *want = r.get(name).cloned().flatten(),
-                    None if !s.target.is_local()
-                        && self.slots.iter().any(|l| {
-                            l.target.is_local()
-                                && l.target.enabled
-                                && matches!(l.status, TargetStatus::Fresh | TargetStatus::Starting)
-                        }) =>
-                    {
-                        return Cand::Wait("waiting for the local worker's model digest".into());
-                    }
                     None => {}
                 }
-                if want.is_none() && s.target.is_local() && h.models.contains_key(name) {
+                if want.is_none() && h.models.contains_key(name) {
                     check.models.remove(name); // trusted local, no digest anywhere
                     continue;
                 }
@@ -1497,31 +1487,18 @@ impl Scheduler {
         // Pure in-memory from here on: the local filesystem preflight happens at dispatch, off the UI thread.
         let wire = if !deep {
             None
-        } else if s.target.is_local() {
+        } else {
             let mut w = (*e.job).clone();
             w.require = sent;
             Some(Box::new(w))
-        } else {
-            match e.job.mapped(&s.target.path_map) {
-                Ok(mut w) => {
-                    w.require = sent;
-                    Some(Box::new(w))
-                }
-                Err(r) => return Cand::No(r),
-            }
         };
         Cand::Go { wire, unverified }
     }
 
     fn dispatch(&mut self, ev: &mut Vec<SchedEvent>) {
         if self.reference.is_none() && self.jobs.iter().any(|e| e.state == JobState::Queued) {
-            // Remote jobs need the local digest as reference: bring up the first local worker.
-            if let Some(c) = self
-                .order
-                .iter()
-                .copied()
-                .find(|c| self.slots[*c].target.is_local())
-            {
+            // Jobs need the local digest as reference: bring up the first worker.
+            if let Some(&c) = self.order.first() {
                 self.spawn_if_fresh(c);
             }
         }
@@ -1611,24 +1588,20 @@ impl Scheduler {
         self.jobs[j].dispatched_at = Some(Instant::now());
         self.jobs[j].last_activity = Some(Instant::now());
         self.set(j, JobState::Dispatching { target }, ev);
-        if self.slots[c].target.is_local() {
-            // Symlink/containment checks touch the filesystem (slow on a NAS): helper thread, result in `tick`.
-            let (tx, rx) = channel();
-            let local = self.jobs[j].job.clone();
-            let hold = self.preflight_hold.clone();
-            std::thread::spawn(move || {
-                while hold
-                    .as_ref()
-                    .is_some_and(|h| h.load(std::sync::atomic::Ordering::SeqCst))
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                let _ = tx.send(local.check_disk());
-            });
-            self.slots[c].preflight = Some((rx, job));
-        } else {
-            self.send_job(c, &job, ev);
-        }
+        // Symlink/containment checks touch the filesystem (slow on a NAS): helper thread, result in `tick`.
+        let (tx, rx) = channel();
+        let local = self.jobs[j].job.clone();
+        let hold = self.preflight_hold.clone();
+        std::thread::spawn(move || {
+            while hold
+                .as_ref()
+                .is_some_and(|h| h.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = tx.send(local.check_disk());
+        });
+        self.slots[c].preflight = Some((rx, job));
     }
 
     fn send_job(&mut self, c: usize, job: &KeyJob, ev: &mut Vec<SchedEvent>) {
@@ -1648,7 +1621,7 @@ impl Scheduler {
         let mut reasons = vec![];
         for &c in &self.order {
             let s = &self.slots[c];
-            if !s.target.is_local() || !s.target.enabled {
+            if !s.target.enabled {
                 continue;
             }
             match &s.status {
@@ -1733,8 +1706,7 @@ impl Scheduler {
                 }
                 Ok(None) => {
                     if let Some(c) = self.order.iter().copied().find(|c| {
-                        self.slots[*c].target.is_local()
-                            && self.slots[*c].status == TargetStatus::Fresh
+                        self.slots[*c].status == TargetStatus::Fresh
                     }) {
                         self.spawn_if_fresh(c);
                     }

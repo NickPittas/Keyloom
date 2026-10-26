@@ -379,7 +379,7 @@ pub enum BatchPreset {
 }
 
 /// Why this row's export cannot run on the client it is placed on: it runs on this computer and must read the
-/// Key result from the local path, so a remote client needs a path mapping that covers the result folder.
+/// Key result from the local path, so a remote client cannot run it (`export_block` reports the stored reason).
 fn network_target(p: &Placement) -> Option<&str> {
     match p { Placement::Target(id) => id.strip_prefix("network:"), Placement::Auto => None }
 }
@@ -393,7 +393,7 @@ fn net_label(targets: &[(String, String)], id: &str) -> Option<String> {
     match (legacy.next(), legacy.next()) { (Some(t), None) => Some(t.1.clone()), _ => None }
 }
 
-fn export_block(targets: &[Target], r: &BatchRow) -> Option<String> {
+fn export_block(r: &BatchRow) -> Option<String> {
     let x = r.export.as_ref()?;
     if let Some(w) = &x.why {
         return Some(w.clone());
@@ -401,13 +401,7 @@ fn export_block(targets: &[Target], r: &BatchRow) -> Option<String> {
     if x.dests.is_empty() {
         return None;
     }
-    let dir = &r.plan()?.job.manifest_dir;
-    let covered = |t: &Target| t.is_local() || t.path_map.iter().any(|(l, _)| dir.starts_with(l));
-    let bad = match &r.placement {
-        Placement::Target(id) => targets.iter().find(|t| &t.id == id).filter(|t| !covered(t)),
-        Placement::Auto => targets.iter().filter(|t| t.enabled).find(|t| !covered(t)),
-    };
-    bad.map(|t| format!("client {} has no path mapping for the result folder: the local export could not read it", t.id))
+    None
 }
 
 impl BatchRow {
@@ -569,8 +563,6 @@ pub fn effective_targets(st: &Settings, repo: Option<&Path>) -> Vec<Target> {
         },
         gpu: 0,
         enabled: true,
-        storage: Default::default(),
-        path_map: vec![],
     }]
 }
 
@@ -596,24 +588,23 @@ fn setup_problems(
         ));
     }
     for t in targets.iter().filter(|t| t.enabled) {
-        if let TargetKind::Local { repo, python } = &t.kind {
-            let py = python
-                .clone()
-                .unwrap_or_else(|| crate::import::python(repo));
-            let why = if !repo.join("backend/worker/__main__.py").is_file() {
-                Some(format!("{}: {} is not a Keyloom checkout (no backend/worker). Fix the repo folder in Settings > AI worker targets.", t.id, repo.display()))
-            } else if !py.is_file() {
-                Some(if python.is_some() {
-                    format!("{}: the configured Python does not exist at {}. Fix Python in Settings > AI worker targets, or repair the installation.", t.id, py.display())
-                } else {
-                    format!("{}: no Python at {}. Create the repo's .venv or set Python in Settings > AI worker targets.", t.id, py.display())
-                })
+        let TargetKind::Local { repo, python } = &t.kind;
+        let py = python
+            .clone()
+            .unwrap_or_else(|| crate::import::python(repo));
+        let why = if !repo.join("backend/worker/__main__.py").is_file() {
+            Some(format!("{}: {} is not a Keyloom checkout (no backend/worker). Fix the repo folder in Settings > AI worker targets.", t.id, repo.display()))
+        } else if !py.is_file() {
+            Some(if python.is_some() {
+                format!("{}: the configured Python does not exist at {}. Fix Python in Settings > AI worker targets, or repair the installation.", t.id, py.display())
             } else {
-                None
-            };
-            if let Some(w) = why {
-                v.push((Some(t.id.clone()), w));
-            }
+                format!("{}: no Python at {}. Create the repo's .venv or set Python in Settings > AI worker targets.", t.id, py.display())
+            })
+        } else {
+            None
+        };
+        if let Some(w) = why {
+            v.push((Some(t.id.clone()), w));
         }
     }
     v
@@ -792,9 +783,8 @@ impl AiUi {
                 }
             }
         }
-        let targets = self.targets.clone();
         let why = b.rows.iter().find_map(|r| match &r.state {
-            _ if r.plan().is_some() => export_block(&targets, r),
+            _ if r.plan().is_some() => export_block(r),
             RowState::Blocked(w) => Some(w.clone()),
             RowState::Existing { reason, .. } => Some(format!("{}: a result already exists ({reason})", r.clip.display_name)),
             RowState::Ready(_) => None,
@@ -2150,9 +2140,6 @@ impl AiUi {
                     }
                 });
             }
-            if self.sched.targets().iter().any(|t| !t.local && t.enabled) && self.sched.reference().is_none() {
-                ui.colored_label(WARN, "Remote workers need a verified local model digest first: run Check workers and get the local worker Ready. If the local worker is Down, remote jobs stay blocked.");
-            }
     }
 
     /// The Key panel body: summary, blockers with their fix actions, target, button, job status.
@@ -2734,7 +2721,6 @@ impl AiUi {
                 });
             }
             let tv = self.sched.targets();
-            let targets = self.targets.clone();
             let session = self.placement.clone();
             let owns = self.clients.clone();
             let Some(b) = self.batch.as_mut() else { return };
@@ -2822,7 +2808,7 @@ impl AiUi {
                     });
                 }
                 if let Some(x) = &r.export {
-                    let why = export_block(&targets, r);
+                    let why = export_block(r);
                     match &why {
                         Some(w) => {
                             ui.label(RichText::new(format!("export not queued: {}", trunc(w))).color(BAD));
@@ -2897,7 +2883,7 @@ impl AiUi {
                 let n = self
                     .batch
                     .as_ref()
-                    .map_or(0, |b| b.rows.iter().filter(|r| r.plan().is_some() && export_block(&targets, r).is_none()).count());
+                    .map_or(0, |b| b.rows.iter().filter(|r| r.plan().is_some() && export_block(r).is_none()).count());
                 let n_replace = self.batch.as_ref().map_or(0, |b| {
                     b.rows.iter().filter(|r| r.choice == Choice::Replace && r.plan().is_some()).count()
                 });
@@ -2972,8 +2958,7 @@ impl AiUi {
             return self.confirm_batch_network();
         }
         let Some(b) = &self.batch else { return };
-        let targets = self.targets.clone();
-        let live = |r: &&BatchRow| r.plan().is_some() && export_block(&targets, r).is_none();
+        let live = |r: &&BatchRow| r.plan().is_some() && export_block(r).is_none();
         let hits = crate::pipeline::collisions(
             b.rows.iter().filter(live).map(|r| (r.clip.display_name.as_str(), &r.plan().unwrap().job)),
         );
@@ -3000,7 +2985,7 @@ impl AiUi {
         let mut per_client: BTreeMap<String, usize> = BTreeMap::new();
         for r in rows {
             let Some(p) = r.plan().cloned() else { continue };
-            if let Some(w) = export_block(&targets, &r) {
+            if let Some(w) = export_block(&r) {
                 errs.push(format!("{}: export: {w}", r.clip.display_name));
                 continue;
             }
@@ -3517,7 +3502,7 @@ fn client_picker(
                 let label = format!(
                     "{} — {} · {live}",
                     t.id,
-                    if t.local { "this computer" } else { "remote" }
+                    "this computer"
                 );
                 if ui.selectable_label(on, label).clicked() {
                     pick(ui, Some(t.id.clone()));
@@ -3561,11 +3546,7 @@ fn target_line(t: &TargetView) -> String {
         Trust::Mismatch => "model identity: DIFFERS from local",
         Trust::Unverified => "model identity: unverifiable",
     };
-    format!(
-        "{} ({}): {st}{hw} · {trust}",
-        t.id,
-        if t.local { "local" } else { "remote" }
-    )
+    format!("{} (local): {st}{hw} · {trust}", t.id)
 }
 
 fn notes(ui: &mut Ui, n: &[String]) {

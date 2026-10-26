@@ -5,7 +5,7 @@
 use super::theme;
 use crate::settings::{self as cfg, Settings, Store};
 use crate::shared_paths::{self as sp, Access, SharedRoot};
-use crate::worker::{RemoteOs, Target, TargetKind};
+use crate::worker::{Target, TargetKind};
 use eframe::egui::{self, Color32, RichText, Ui};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
@@ -43,7 +43,7 @@ static CATS: [(Cat, &str, &str); 7] = [
         (Cat::Interface, "Interface", "ui scale zoom"),
         (Cat::AiDefaults, "AI defaults", "vram hint temporal despill linear carry key"),
         (Cat::PathMapping, "Path mapping", "shared storage nas mount drive unc root location network client folder"),
-        (Cat::Targets, "AI worker targets", "ssh remote gpu path map host python windows"),
+        (Cat::Targets, "AI worker targets", "gpu python windows"),
         (Cat::Masks, "Masks and hints", "sam2 tracker model"),
         (Cat::Paths, "Paths and info", "preferences runtime repo python folder"),
 ];
@@ -403,7 +403,7 @@ impl Page {
             Some(Err(TryRecvError::Disconnected)) => self.probe = None,
             _ => {}
         }
-        dim(ui, "Each PC names the shared storage it sees. Jobs refer to a shared location by name and a relative path; every PC resolves that under its own folder, drive or UNC share. Applies to network jobs only; AI worker target path maps are separate and unchanged.");
+        dim(ui, "Each PC names the shared storage it sees. Jobs refer to a shared location by name and a relative path; every PC resolves that under its own folder, drive or UNC share. Applies to network jobs.");
         self.map_rects.clear();
         let (mut remove, mut test) = (None, None);
         let busy = self.browse_row.is_some();
@@ -411,13 +411,13 @@ impl Page {
         for (i, r) in self.draft.shared_roots.iter_mut().enumerate() {
             card(ui, |ui| {
                 row(ui, "Shared location name", |ui| {
-                    let n = ui.add(egui::TextEdit::singleline(&mut r.name).id(egui::Id::new(("shared_root_name", i))).desired_width(ui.available_width().clamp(90.0, 200.0)).hint_text("e.g. NAS"));
+                    let n = ui.add(egui::TextEdit::singleline(&mut r.name).id(ui.make_persistent_id(("shared_root_name", i))).desired_width(ui.available_width().clamp(90.0, 200.0)).hint_text("e.g. NAS"));
                     self.map_rects.push(("name", i, n.rect));
                 });
                 row(ui, "Folder on this PC", |ui| {
                     // Leave room for Browse so the pair never overflows a narrow card.
                     let w = (ui.available_width() - 100.0).clamp(90.0, 260.0);
-                    let l = ui.add(egui::TextEdit::singleline(&mut r.local).id(egui::Id::new(("shared_root_local", i))).desired_width(w).hint_text(if cfg!(windows) { r"Z:\Shared or \\nas\share" } else { "/mnt/nas" }));
+                    let l = ui.add(egui::TextEdit::singleline(&mut r.local).id(ui.make_persistent_id(("shared_root_local", i))).desired_width(w).hint_text(if cfg!(windows) { r"Z:\Shared or \\nas\share" } else { "/mnt/nas" }));
                     self.map_rects.push(("local", i, l.rect));
                     let b = ui.add_enabled(!busy, egui::Button::new("Browse…"));
                     self.map_rects.push(("browse", i, b.rect));
@@ -552,9 +552,6 @@ fn trim_targets(targets: &mut [Target]) {
             TargetKind::Local { python, .. } => {
                 *python = python.take().and_then(|p| opt_value(p.display().to_string()).map(|s| s.trim().to_owned().into()));
             }
-            TargetKind::Ssh { user, .. } => {
-                *user = user.take().and_then(|u| opt_value(u).map(|s| s.trim().to_owned()));
-            }
         }
     }
 }
@@ -572,34 +569,18 @@ mod opt_text_tests {
     }
 }
 
-/// AI worker machines. Empty list = one implicit local worker (GPU 0). All machines are assumed to see the
-/// same shared storage; `path_map` translates this machine's paths to the worker's (POSIX path, drive letter
-/// or UNC). Results are always read back from the local path.
+/// AI worker machines. Empty list = one implicit local worker (GPU 0).
 fn targets_ui(ui: &mut Ui, targets: &mut Vec<Target>) {
     dim(ui, "No targets = one local worker on GPU 0. One worker runs one job at a time; jobs are placed by Auto (local first) or on a chosen target. Applied after running jobs finish.");
-    dim(ui, "Synthetic local-GPU, Linux SSH, and Windows local-disk SSH smoke checks passed. Windows NAS/service deployment, packaged UI, and full workflows remain unverified.");
-    dim(ui, "Windows SSH workers may not see desktop mapped drives. Legacy: this installation's own shared-storage names live under Path mapping.");
+    dim(ui, "Legacy: this installation's own shared-storage names live under Path mapping.");
     ui.add_space(4.0);
     let mut remove = None;
     for (i, t) in targets.iter_mut().enumerate() {
         card(ui, |ui| {
-        egui::CollapsingHeader::new(format!("{} ({})", t.id, if t.is_local() { "local" } else { "SSH" })).id_salt(("target", i)).show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} (local)", t.id)).id_salt(("target", i)).show(ui, |ui| {
             text(ui, "Name", &mut t.id);
             theme::checkbox(ui, &mut t.enabled, "Enabled");
             ui.add(egui::DragValue::new(&mut t.gpu).range(0..=15).prefix("GPU index "));
-            let local = t.is_local();
-            let mut want_local = local;
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut want_local, true, "This machine");
-                ui.selectable_value(&mut want_local, false, "Remote (SSH)");
-            });
-            if want_local != local {
-                t.kind = if want_local {
-                    TargetKind::Local { repo: PathBuf::new(), python: None }
-                } else {
-                    TargetKind::Ssh { os: RemoteOs::Linux, host: String::new(), user: None, port: None, python: String::new(), repo: String::new(), ssh: None }
-                };
-            }
             match &mut t.kind {
                 TargetKind::Local { repo, python } => {
                     let mut r = repo.display().to_string();
@@ -609,40 +590,6 @@ fn targets_ui(ui: &mut Ui, targets: &mut Vec<Target>) {
                     opt_text(ui, "Python (empty = <repo>/.venv)", &mut p);
                     *python = p.map(Into::into);
                 }
-                TargetKind::Ssh { os, host, user, port, python, repo, .. } => {
-                    ui.horizontal(|ui| {
-                        ui.label("Remote OS");
-                        ui.selectable_value(os, RemoteOs::Linux, "Linux");
-                        ui.selectable_value(os, RemoteOs::Windows, "Windows (local-disk smoke tested)");
-                    });
-                    text(ui, "Host (ssh name or address)", host);
-                    opt_text(ui, "User (empty = ssh config)", user);
-                    let mut pt = port.unwrap_or(0);
-                    ui.add(egui::DragValue::new(&mut pt).range(0..=65535).prefix("Port (0 = default) "));
-                    *port = (pt != 0).then_some(pt);
-                    let hint = if *os == RemoteOs::Windows { r"absolute path, e.g. C:\Keyloom" } else { "absolute path, e.g. /opt/Keyloom" };
-                    text(ui, &format!("Repo folder on the worker ({hint})"), repo);
-                    text(ui, "Python on the worker (absolute path)", python);
-                }
-            }
-            ui.label("Path map: this machine's NAS path -> the worker's path");
-            dim(ui, if matches!(t.kind, TargetKind::Ssh { os: RemoteOs::Windows, .. }) { r"e.g. /mnt/NAS  ->  \\nas\share  (preferred; a drive letter only if the SSH session has it)" } else { "e.g. /mnt/NAS  ->  /mnt/NAS" });
-            let mut rm = None;
-            for (j, (l, r)) in t.path_map.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(l).id_salt(("pm_l", i, j)).desired_width(120.0));
-                    ui.label("->");
-                    ui.add(egui::TextEdit::singleline(r).id_salt(("pm_r", i, j)).desired_width(120.0));
-                    if ui.small_button("Remove").clicked() {
-                        rm = Some(j);
-                    }
-                });
-            }
-            if let Some(j) = rm {
-                t.path_map.remove(j);
-            }
-            if ui.button("Add path mapping").clicked() {
-                t.path_map.push((String::new(), String::new()));
             }
             if ui.button("Remove this target").clicked() {
                 remove = Some(i);
@@ -663,8 +610,6 @@ fn targets_ui(ui: &mut Ui, targets: &mut Vec<Target>) {
             },
             gpu: 0,
             enabled: true,
-            storage: Default::default(),
-            path_map: vec![],
         });
     }
 }

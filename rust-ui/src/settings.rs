@@ -458,7 +458,8 @@ impl Store {
     }
 
     fn parse(bytes: &[u8]) -> Result<Settings, String> {
-        let raw: Value = serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
+        let mut raw: Value =
+            serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
         match raw.get("version").and_then(Value::as_u64) {
             Some(v) if v == VERSION as u64 => {}
             Some(v) => {
@@ -467,6 +468,10 @@ impl Store {
                 ))
             }
             None => return Err("missing settings version".into()),
+        }
+        // SSH machines were removed; drop them so an old file still loads with the rest of its settings.
+        if let Some(a) = raw.get_mut("ai_targets").and_then(Value::as_array_mut) {
+            a.retain(|t| t.get("kind").and_then(Value::as_str) == Some("local"));
         }
         let s: Settings = serde_json::from_value(raw).map_err(|e| e.to_string())?;
         s.validate_core()?;

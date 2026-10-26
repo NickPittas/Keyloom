@@ -113,20 +113,6 @@ pub fn ui(
             acts.extend(net.rows(ui, s, sp, own_net, own_iid));
         });
     });
-    if targets.iter().any(|t| !t.local) {
-        ui.add_space(8.0);
-        egui::CollapsingHeader::new("Legacy SSH workers (advanced)").show(ui, |ui| {
-            for t in targets.iter().filter(|t| !t.local) {
-                let (state, colour) = state_text(t);
-                ui.horizontal(|ui| {
-                    ui.label(&t.id);
-                    ui.colored_label(colour, state);
-                    if let TargetStatus::Refused(reason) | TargetStatus::Down(reason) = &t.status { ui.colored_label(BAD, reason); }
-                    if t.busy_with.is_none() && ui.small_button("Recheck").clicked() { ai.scheduler_mut().reset_target(&t.id); }
-                });
-            }
-        });
-    }
     ui.add_space(12.0);
     egui::CollapsingHeader::new("Default assignment").show(ui, |ui| {
         let mut cur = default.clone();

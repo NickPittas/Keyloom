@@ -305,48 +305,6 @@ impl KeyJob {
         a[..n] == b[..n]
     }
 
-    /// Copy with every absolute path rewritten through `map` (longest prefix wins, whole components only).
-    /// Err = the first path no entry covers. The copy is re-validated so a mapping cannot break containment.
-    pub fn mapped(&self, map: &[(String, String)]) -> Result<KeyJob, String> {
-        let m = |p: &Path| -> Result<PathBuf, String> {
-            let s = p.to_str().unwrap_or("");
-            let c = comps(s);
-            let best = map
-                .iter()
-                .filter(|(l, _)| {
-                    let lc = comps(l);
-                    c.len() >= lc.len() && c[..lc.len()] == lc[..]
-                })
-                .max_by_key(|(l, _)| comps(l).len())
-                .ok_or_else(|| format!("no path_map entry covers {s}"))?;
-            let rest = &c[comps(&best.0).len()..];
-            let sep = if best.1.contains('\\') && !best.1.contains('/') {
-                "\\"
-            } else {
-                "/"
-            };
-            let mut out = best.1.trim_end_matches(['/', '\\']).to_owned();
-            if out.is_empty() && !is_abs(&best.1) {
-                return Err(format!("bad path_map target {}", best.1));
-            }
-            for r in rest {
-                out.push_str(sep);
-                out.push_str(r);
-            }
-            Ok(out.into())
-        };
-        let mut j = self.clone();
-        j.clip_root = m(&self.clip_root)?;
-        j.manifest_dir = m(&self.manifest_dir)?;
-        for (k, v) in &self.outputs {
-            j.outputs
-                .insert(k.clone(), v.iter().map(|p| m(p)).collect::<Result<_, _>>()?);
-        }
-        j.path_map = vec![]; // already applied; the worker rejects a non-empty map
-        j.validate().map_err(|e| format!("after path_map: {e}"))?;
-        Ok(j)
-    }
-
     /// Local filesystem check (symlinks): every output, resolved through existing ancestors, stays under the
     /// resolved manifest folder, and that folder never contains the source clip. Only for local targets.
     pub fn check_disk(&self) -> Result<(), JobError> {

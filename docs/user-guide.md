@@ -204,7 +204,7 @@ In the **Queue** panel each clip has its own section with ordered rows: **Pre-ma
 - **Path mapping:** how shared storage is named on this computer, for network rendering ([details](network-rendering.md#4-map-shared-storage-on-each-pc)).
 
   ![Path mapping](screenshots/native/10-path-mapping.png)
-- **AI worker targets:** extra workers launched over SSH, or a local checkout. Normal installs need nothing here.
+- **AI worker targets:** a local checkout. Normal installs need nothing here; other PCs are used through **Clients** (top bar).
 - **Masks and hints:** default SAM2 tracker model.
 - **Paths and info:** read-only locations of preferences, runtime and Python.
 - **Models & runtime…** button: see below.

@@ -115,10 +115,9 @@ Loader tests build temporary projects at run time and prove the loader changes n
 The **Settings** button (Board, and the bottom bar of a clip workspace) opens a page for the decoded-frame RAM budget (0 = Auto, half the
 available RAM, 1–8 GB), decode workers (0 = Auto), default looping and UI scale, plus the **AI worker targets** and the AI defaults that seed a new clip's Key options;
 mask defaults are saved but not used yet.
-A target is a local checkout (repo folder, optional Python, GPU index) or a remote worker launched over the system
-`ssh` (Linux; Windows selectable but flagged untested in-app), with per-target path-mapping rows; an empty list =
-one implicit local worker on GPU 0 found via `$CK_REPO` or near the program/working folder. All targets are assumed
-to see the same shared storage (no transfer copies); a remote job needs the local worker's verified model digest first.
+A target is a local checkout (repo folder, optional Python, GPU index); an empty list =
+one implicit local worker on GPU 0 found via `$CK_REPO` or near the program/working folder. All local targets are assumed
+to see the same shared storage (no transfer copies); other PCs are used through **Clients** (top bar, network connections), and a remote job needs the local worker's verified model digest first.
 Preferences live in `$XDG_CONFIG_HOME/keyloom/settings.json` (never in project data). UI scale applies on Apply; RAM, workers
 and looping apply to the next clip you open, and `--cache-mb` overrides the saved RAM budget. Back/Esc/Cancel discard unsaved edits.
 
