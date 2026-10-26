@@ -46,6 +46,26 @@ impl RemoteSet {
     pub fn online(&self) -> bool {
         self.remotes.iter().any(Remote::online)
     }
+    /// Online opted-in PCs, using the Board's assignment IDs. One row per PC: the first wins when two client rows reach the same network.
+    pub fn automatic_candidates(&self, s: &Settings, sp: Option<&Path>) -> Vec<(String, String)> {
+        let own: Vec<String> = self.remotes.iter().filter_map(Remote::me).map(str::to_owned).collect();
+        let mut seen = std::collections::HashSet::new();
+        conn_of(s, sp).iter().flat_map(|(c, _)| {
+            self.remotes.iter().find(|r| r.key == key_of(c) && r.accepts_work(c)).into_iter().flat_map(|r| {
+                let ns = r.ns();
+                r.other_installations(&own).into_iter().filter(|i| i.gpu.is_some()).filter_map(move |i| {
+                    ns.as_ref().map(|ns| (format!("network:{ns}/{}", i.id), i.name))
+                })
+            })
+        }).filter(|c| seen.insert(c.0.clone())).collect()
+    }
+    /// The Automatic candidates that are free right now (see `Remote::is_free`).
+    pub fn free_candidates(&self, s: &Settings, sp: Option<&Path>) -> Vec<String> {
+        self.automatic_candidates(s, sp).into_iter().map(|c| c.0).filter(|id| {
+            let Some((ns, iid)) = id.strip_prefix("network:").and_then(|x| x.split_once('/')) else { return false };
+            self.remotes.iter().any(|r| r.ns().as_deref() == Some(ns) && r.is_free(iid))
+        }).collect()
+    }
     fn get(&mut self, creds: &str) -> Option<&mut Remote> {
         self.remotes.iter_mut().find(|r| r.key == creds)
     }
@@ -78,6 +98,8 @@ impl RemoteSet {
             }
         }
         self.remotes.sort_by_key(|r| conns.iter().position(|(c, _)| key_of(c) == r.key));
+        let free = self.free_candidates(env.settings, env.settings_path);
+        env.ai.dispatch_auto(&free, env.metrics);
         let default = env.settings.network.default_submit.trim().to_owned();
         for mut n in env.ai.take_net_outbox() {
             match self.route(&n.target, &default) {

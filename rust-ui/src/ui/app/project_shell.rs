@@ -330,13 +330,12 @@ impl App {
         }
     }
 
-    /// The global bar: File, Open, Save, Quit, the Saved/Unsaved indicator, and the project output folder.
+    /// The global bar: File, the Saved/Unsaved indicator, and the project output folder.
     pub(super) fn chrome(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.refresh_draft_dirty();
         let has = self.project.is_some();
         let busy = self.imp.busy() || self.dialog_active();
-        let pages = self.settings_open || self.models_open || self.clients_open;
         let (mut open, mut save, mut quit) = (false, false, false);
         let mut new = false;
         let mut rects: [Option<egui::Rect>; 2] = [None; 2];
@@ -365,9 +364,6 @@ impl App {
                 }
             });
             rects[0] = Some(file.response.rect);
-            open |= ui.add_enabled(!pages, egui::Button::new("Open")).clicked();
-            save |= ui.add_enabled(has, egui::Button::new("Save")).on_hover_text("Ctrl+S").clicked();
-            quit |= ui.button("Quit").clicked();
             if has {
                 let unsaved = self.unsaved();
                 let (t, c) = if unsaved {

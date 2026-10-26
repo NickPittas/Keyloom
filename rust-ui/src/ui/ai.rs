@@ -306,10 +306,17 @@ enum RowState {
         newver: Option<Plan>,
         resume: Option<Plan>,
         replace: Option<Plan>,
-        /// Why Replace is unavailable (shown as the disabled reason).
-        replace_why: Option<String>,
     },
     Blocked(String),
+}
+
+/// A confirmed Automatic shot with everything its submit needs once a PC is free.
+struct AutoShot {
+    row: BatchRow,
+    plan: Plan,
+    project: Project,
+    st: Settings,
+    preset_name: Option<String>,
 }
 
 struct BatchRow {
@@ -400,6 +407,33 @@ fn export_block(r: &BatchRow) -> Option<String> {
     None
 }
 
+/// What keeps a clip from queueing without a decision, and whether the user may accept it (`OK`).
+/// `None` = clean.
+fn row_problem(r: &BatchRow, net: &[(String, String)]) -> Option<(String, bool)> {
+    match &r.state {
+        RowState::Blocked(why) => return Some((format!("not queued: {why}"), false)),
+        RowState::Existing { newver: Some(p), .. } => {
+            let v = p.values["version"].as_u64().unwrap_or(0);
+            return Some((format!("a result exists: OK writes v{v:03}"), true));
+        }
+        RowState::Existing { reason, newver: None, .. } => return Some((format!("a result exists, no free version: {reason}"), false)),
+        RowState::Ready(_) => {}
+    }
+    if let Some(w) = export_block(r) {
+        return Some((format!("export not queued: {w}"), false));
+    }
+    if let Some(n) = &r.note {
+        return Some((n.clone(), true));
+    }
+    if network_target(&r.placement).is_some_and(|t| net_label(net, t).is_none()) {
+        return Some(("assigned PC is not known on any joined network".into(), false));
+    }
+    if !r.overrides.is_empty() {
+        return Some((format!("keeps this clip's own values: {}", r.overrides.join(", ")), true));
+    }
+    None
+}
+
 impl BatchRow {
     /// Hints are regenerated ahead of Key: frames of an interrupted run were keyed with the OLD hint, so
     /// continuing it would mix old and new hints in one result.
@@ -419,8 +453,6 @@ impl BatchRow {
 
 /// The batch review: computed in the background, then confirmed by the user. The plans are the frozen jobs.
 struct Batch {
-    /// The user confirmed that rows set to Replace overwrite their owned result files.
-    confirm_replace: bool,
     rows: Vec<BatchRow>,
     pending: Option<Receiver<Vec<BatchRow>>>,
     /// Everything needed to recompute the rows when another preset is chosen.
@@ -432,21 +464,14 @@ struct Batch {
     preset_name: Option<String>,
     /// `queue_pipeline`: queue as soon as the plan is ready instead of waiting for a review click.
     auto: bool,
+    /// The Board button started this: queue straight away when no clip needs a decision.
+    quick: bool,
 }
 
 mod queue_view;
 mod tasks;
 pub use queue_view::{Cell, Phase, QueueRow, QueueRun, QueueSection, Stage};
 pub use tasks::{sig_of, PreviewResult, TaskDone};
-
-/// Where a reviewed Batch runs: this computer's own clients (each row's client), or a network client.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub enum NetChoice {
-    #[default]
-    Local,
-    Auto,
-    Install(String),
-}
 
 /// One shot handed to the network controller (`remote::Remote`): the frozen spec plus what to show for it.
 pub struct NetSubmit {
@@ -509,10 +534,12 @@ pub struct AiUi {
     touched: std::collections::BTreeSet<String>,
     /// Network Batch: the chosen destination, the paired clients to choose from `(installation id, label)`, whether
     /// the coordinator link is online, and the shots waiting to be sent.
-    pub net_choice: NetChoice,
     pub net_targets: Vec<(String, String)>,
     pub net_online: bool,
     net_outbox: Vec<NetSubmit>,
+    /// Confirmed Automatic shots waiting for a free PC, in order.
+    // ponytail: dropped on quit, not saved; the user confirms them again.
+    auto_pending: std::collections::VecDeque<AutoShot>,
     /// Shots whose clip.json was rewritten here: the App re-reads them (route/markers/bases) on its next tick.
     refresh_clips: Vec<String>,
     /// Re-reads the driver found necessary (published/ended jobs), drained by the UI.
@@ -647,10 +674,10 @@ impl AiUi {
             temporal_rect: None,
             batch_reset_rects: vec![],
             touched: Default::default(),
-            net_choice: NetChoice::Local,
             net_targets: vec![],
             net_online: false,
             net_outbox: vec![],
+            auto_pending: Default::default(),
             refresh_clips: vec![],
             refreshes: vec![],
             temporal_items: vec![],
@@ -936,7 +963,6 @@ impl AiUi {
     pub fn set_clip_client(&mut self, clip: &Clip, id: Option<&str>) -> Result<(), String> {
         crate::persist::save_client(clip, id)?;
         self.clients.insert(clip.root.clone(), id.map(str::to_owned));
-        self.net_choice = NetChoice::Local;
         self.disk_gen += 1;
         Ok(())
     }
@@ -1252,7 +1278,6 @@ impl AiUi {
                                         newver: g.newver,
                                         resume: g.resume,
                                         replace: g.replace,
-                                        replace_why: e.replace_why,
                                     },
                                     c,
                                 )
@@ -1307,7 +1332,6 @@ impl AiUi {
             ctx.request_repaint();
         });
         self.batch = Some(Batch {
-            confirm_replace: false,
             rows: vec![],
             pending: Some(rx),
             project: project.clone(),
@@ -1316,6 +1340,7 @@ impl AiUi {
             presets,
             preset_name,
             auto: false,
+            quick: false,
         });
     }
 
@@ -1464,7 +1489,7 @@ impl AiUi {
             }
             None => {
                 let live = match &self.placement {
-                    Placement::Auto => "Automatic: the scheduler picks an eligible client (this computer first).".to_string(),
+                    Placement::Auto => "Automatic: the next free PC (nothing rendering, GPU and VRAM under 50%)".to_string(),
                     Placement::Target(id) => {
                         let st = tv.iter().find(|t| t.id == *id).map_or_else(
                             || "not configured any more".to_string(),
@@ -1569,12 +1594,14 @@ impl AiUi {
         }
     }
 
-    /// Board "Assign selected to": one client for every chosen clip, saved per clip.
-    pub fn assign_selected_ui(&mut self, ui: &mut Ui, clips: &[&Clip]) {
+    /// Board "Assign to": one client for every chosen clip, saved per clip. `all` = every clip in the project is chosen.
+    pub fn assign_selected_ui(&mut self, ui: &mut Ui, clips: &[&Clip], all: bool) {
         let tv = self.sched.targets();
         let cur = self.assignment.clone();
         let mut want: Option<Option<String>> = None;
-        ui.label(RichText::new("Assign selected to").color(DIM).size(12.0));
+        let n = clips.len();
+        let label = if all { format!("Assign all {n} clips to") } else { format!("Assign {n} selected to") };
+        ui.label(RichText::new(label).color(DIM).size(12.0));
         let session = self.placement.clone();
         client_picker(ui, "assign_selected", &session, &cur, &tv, &self.net_targets, |_, w| want = Some(w));
         if let Some(w) = want {
@@ -1583,7 +1610,6 @@ impl AiUi {
                 Some(id) => Placement::Target(id.clone()),
             };
         }
-        let n = clips.len();
         if ui
             .add_enabled(n > 0, egui::Button::new(format!("Apply to {n}")))
             .on_disabled_hover_text("Select clips first")
@@ -2368,7 +2394,6 @@ impl AiUi {
                 if matches!(i, Intent::Resume | Intent::Replace) {
                     self.notice = Some("Resume/Replace stay local. Choose a new result for the network client.".into());
                 } else if let Some(pick) = project.clips.iter().position(|c| c.root == clip.root) {
-                    self.net_choice = NetChoice::Local;
                     self.begin_batch(&ui.ctx().clone(), project, st, &[pick]);
                 }
             } else {
@@ -2584,9 +2609,8 @@ impl AiUi {
             .collect()
     }
 
-    /// Board batch controls: "Key selected N clips" starts the review (nothing is queued yet).
-    pub fn batch_ui(&mut self, ui: &mut Ui, project: &Project, st: &Settings, picks: &[usize]) {
-        // Visible preset choice before Review: the same saved file the review dropdown lists.
+    /// Board preset dropdown: the choice "Key" starts the review from (the same saved file the review lists).
+    pub fn board_preset_ui(&mut self, ui: &mut Ui) {
         let saved = self.batch_presets();
         if self.board_preset.as_ref().is_some_and(|n| !saved.iter().any(|p| &p.name == n)) {
             self.board_preset = None;
@@ -2624,19 +2648,24 @@ impl AiUi {
                 }
             });
         }
-        let r = ui.add_enabled(
-            !picks.is_empty() && self.batch.is_none() && !self.model_mutation_active,
-            egui::Button::new(format!(
-                "Key selected {} clip{}…",
-                picks.len(),
-                if picks.len() == 1 { "" } else { "s" }
-            )),
-        );
+    }
+
+    /// Board batch controls: "Key selected N clips" starts the review (nothing is queued yet).
+    pub fn batch_ui(&mut self, ui: &mut Ui, project: &Project, st: &Settings, picks: &[usize]) {
+        let label = format!("Key selected {} clip{}…", picks.len(), if picks.len() == 1 { "" } else { "s" });
+        let enabled = !picks.is_empty() && self.batch.is_none() && !self.model_mutation_active;
+        let r = ui.add_enabled_ui(enabled, |ui| theme::primary_button(ui, label)).inner;
         self.board_key_rect = Some(r.rect);
         if r.clicked() {
+            let saved = self.batch_presets();
             let name = self.board_preset.clone();
             match resolve_preset(&saved, &name) {
-                Ok(preset) => self.begin_with(&ui.ctx().clone(), project, st, picks, preset, name),
+                Ok(preset) => {
+                    self.begin_with(&ui.ctx().clone(), project, st, picks, preset, name);
+                    if let Some(b) = &mut self.batch {
+                        b.quick = true;
+                    }
+                }
                 Err(e) => self.notice = Some(e),
             }
         }
@@ -2645,6 +2674,7 @@ impl AiUi {
     /// The review: per clip the frozen range, the resolved example path and what will happen; existing results
     /// offer the next free version (never a replace). Confirm queues exactly these jobs on the chosen target.
     pub fn batch_review(&mut self, ui: &mut Ui) {
+        self.batch_confirm_rect = None; // a stale rect must never be clicked
         if let Some(b) = &mut self.batch {
             if let Some(rx) = &b.pending {
                 match rx.try_recv() {
@@ -2669,229 +2699,55 @@ impl AiUi {
                 }
             }
         }
-        if self.batch.is_none() {
+        let Some(b) = &self.batch else { return };
+        if b.quick && !b.rows.is_empty() && b.rows.iter().all(|r| row_problem(r, &self.net_targets).is_none()) {
+            self.confirm_batch();
             return;
         }
         let mut confirm = false;
         let mut cancel = false;
-        let mut reload: Option<Option<String>> = None;
         let mut reset_shot: Option<Clip> = None;
         let mut reset_rects: Vec<(String, egui::Rect)> = vec![];
-        let mut items: Vec<(String, egui::Rect)> = vec![];
-        let mut combo_rect = None;
-        // Client picks made in the review are saved to their clip (the row and the clip stay one value).
-        let mut writes: Vec<(Clip, Option<String>)> = vec![];
         ui.group(|ui| {
             ui.label(RichText::new("Review batch").strong());
-            self.batch_preset_items.clear();
-            if let Some(b) = &self.batch {
-                let cur = b
-                    .preset_name
-                    .as_ref()
-                    .and_then(|n| b.presets.iter().find(|p| &p.name == n))
-                    .map_or("Current settings (no preset)".to_string(), presets::label);
-                ui.horizontal(|ui| {
-                    ui.label("Preset");
-                    let cb = egui::ComboBox::from_id_salt("batch_preset")
-                        .selected_text(cur)
-                        .width(320.0)
-                        .show_ui(ui, |ui| {
-                            let r = ui.selectable_label(b.preset_name.is_none(), "Current settings (no preset)");
-                            if r.clicked() {
-                                reload = Some(None);
-                            }
-                            items.push((String::new(), r.rect));
-                            for p in &b.presets {
-                                let on = b.preset_name.as_deref() == Some(&p.name);
-                                let r = ui.selectable_label(on, presets::label(p));
-                                if r.clicked() {
-                                    reload = Some(Some(p.name.clone()));
-                                }
-                                items.push((p.name.clone(), r.rect));
-                            }
-                        });
-                    combo_rect = Some(cb.response.rect);
-                });
-            }
-            let tv = self.sched.targets();
-            let session = self.placement.clone();
-            let owns = self.clients.clone();
+            let net = self.net_targets.clone();
             let Some(b) = self.batch.as_mut() else { return };
+            let total = b.rows.len();
+            let need = b.rows.iter().filter(|r| row_problem(r, &net).is_some()).count();
+            ui.label(RichText::new(format!("{} clip(s) ready; {need} need a decision.", total - need)).color(DIM));
             // The rows scroll; the verdict and the Queue/Cancel buttons stay reachable below them.
             let max_h = (ui.available_height() * 0.5).max(140.0);
             egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
             for r in &mut b.rows {
-                let regen = r.regenerates();
+                let Some((text, ok_allowed)) = row_problem(r, &net) else { continue };
+                if !ok_allowed && r.choice != Choice::Skip {
+                    r.choice = Choice::Skip; // a problem the user cannot accept never queues
+                }
+                let ok = if matches!(r.state, RowState::Existing { .. }) { Choice::NewVersion } else { Choice::Queue };
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(&r.clip.display_name).strong());
-                    ui.label(
-                        RichText::new(format!("frames {}–{}", r.range.0, r.range.1)).color(DIM),
-                    );
-                    match &r.state {
-                        RowState::Ready(_) => {
-                            ui.label("new result");
-                            let mut on = r.choice == Choice::Queue;
-                            if theme::checkbox(ui, &mut on, "queue").changed() {
-                                r.choice = if on { Choice::Queue } else { Choice::Skip };
-                            }
-                        }
-                        RowState::Existing {
-                            reason,
-                            newver,
-                            resume,
-                            replace,
-                            replace_why,
-                        } => {
-                            ui.colored_label(WARN, trunc(reason));
-                            ui.selectable_value(&mut r.choice, Choice::Skip, "skip");
-                            if let Some(p) = newver {
-                                let v = p.values["version"].as_u64().unwrap_or(0);
-                                ui.selectable_value(
-                                    &mut r.choice,
-                                    Choice::NewVersion,
-                                    format!("write as v{v:03}"),
-                                );
-                            }
-                            if resume.is_some() && !regen {
-                                ui.selectable_value(&mut r.choice, Choice::Resume, "resume");
-                            } else if resume.is_some() {
-                                ui.label(RichText::new("resume unavailable: the hint is regenerated").color(DIM).size(11.0));
-                            }
-                            match replace {
-                                Some(p) => {
-                                    ui.selectable_value(
-                                        &mut r.choice,
-                                        Choice::Replace,
-                                        format!("replace {} owned files", p.job.outputs.values().map(Vec::len).sum::<usize>()),
-                                    );
-                                }
-                                None => {
-                                    ui.add_enabled(false, egui::Button::new("replace"))
-                                        .on_disabled_hover_text(replace_why.clone().unwrap_or_else(|| "Replace is not available for this result".into()));
-                                    if let Some(w) = replace_why {
-                                        ui.label(RichText::new(format!("replace unavailable: {}", trunc(w))).color(DIM).size(11.0));
-                                    }
-                                }
-                            }
-                        }
-                        RowState::Blocked(why) => {
-                            ui.colored_label(BAD, format!("not queued: {}", trunc(why)));
-                        }
+                    ui.colored_label(if ok_allowed { WARN } else { BAD }, trunc(&text));
+                    if ok_allowed {
+                        ui.selectable_value(&mut r.choice, ok, "OK");
                     }
-                });
-                if !r.steps.is_empty() && r.plan().is_some() {
-                    let chain: Vec<&str> = r.steps.iter().map(|s| s.kind.label()).collect();
-                    ui.label(
-                        RichText::new(format!("first: {} > Key", chain.join(" > ")))
-                            .color(DIM)
-                            .size(12.0),
-                    );
-                }
-                if let Some(n) = &r.note {
-                    ui.label(RichText::new(n).color(WARN).size(12.0));
-                }
-                if !r.overrides.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(format!("keeps this shot's own: {}", r.overrides.join(", "))).color(DIM).size(12.0));
+                    ui.selectable_value(&mut r.choice, Choice::Skip, "Skip");
+                    if !r.overrides.is_empty() {
                         let b = ui.small_button("Use preset values");
                         reset_rects.push((r.clip.folder.clone(), b.rect));
                         if b.clicked() {
                             reset_shot = Some(r.clip.clone());
                         }
-                    });
-                }
-                if let Some(x) = &r.export {
-                    let why = export_block(r);
-                    match &why {
-                        Some(w) => {
-                            ui.label(RichText::new(format!("export not queued: {}", trunc(w))).color(BAD));
-                        }
-                        None => {
-                            for (product, d) in &x.dests {
-                                ui.label(RichText::new(format!("then export {product} -> {}", d.display())).monospace().size(11.0).color(DIM));
-                            }
-                        }
-                    }
-                }
-                if let Some(p) = r.plan() {
-                    let first = p.job.outputs.values().next().and_then(|v| v.first());
-                    ui.label(
-                        RichText::new(format!(
-                            "to {}",
-                            first.map_or(String::new(), |f| f.display().to_string())
-                        ))
-                        .monospace()
-                        .size(11.0)
-                        .color(DIM),
-                    );
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Render client").color(DIM).size(12.0));
-                    let inherits = owns
-                        .get(&r.clip.root)
-                        .cloned()
-                        .unwrap_or_else(|| crate::persist::clip_client(&r.clip))
-                        .is_none();
-                    let cur = if inherits { Placement::Auto } else { r.placement.clone() };
-                    let folder = r.clip.folder.clone();
-                    client_picker(ui, ("batch_client", &folder), &session, &cur, &tv, &self.net_targets, |_, w| {
-                        r.placement = match &w {
-                            None => session.clone(),
-                            Some(id) => Placement::Target(id.clone()),
-                        };
-                        writes.push((r.clip.clone(), w));
-                    });
-                    let n = r.steps.len();
-                    if n > 0 {
-                        ui.label(
-                            RichText::new(format!("pre-matte / hint steps queued ahead of Key ({n} step{})", if n == 1 { "" } else { "s" }))
-                                .color(DIM)
-                                .size(11.0),
-                        );
                     }
                 });
             }
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Run on");
-                let cur = match &self.net_choice {
-                    NetChoice::Local => "Each shot’s assigned client".to_string(),
-                    NetChoice::Auto => "Network: any available client".into(),
-                    NetChoice::Install(id) => format!("Network: {}", self.net_targets.iter().find(|t| &t.0 == id).map_or(id.as_str(), |t| t.1.as_str())),
-                };
-                egui::ComboBox::from_id_salt("batch_where").selected_text(cur).width(300.0).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.net_choice, NetChoice::Local, "Each shot’s assigned client");
-                    if self.net_online {
-                        ui.selectable_value(&mut self.net_choice, NetChoice::Auto, "Network: any available client");
-                        for (id, label) in self.net_targets.clone() {
-                            ui.selectable_value(&mut self.net_choice, NetChoice::Install(id.clone()), format!("Network: {label}"));
-                        }
-                    }
-                });
-                if self.net_choice != NetChoice::Local {
-                    ui.label(RichText::new("Each shot is sent whole (Hint → Key → Deliver as reviewed), new results only. Resume/Replace stay on this computer.").color(DIM).size(11.5));
-                }
             });
             ui.horizontal_wrapped(|ui| {
                 let n = self
                     .batch
                     .as_ref()
                     .map_or(0, |b| b.rows.iter().filter(|r| r.plan().is_some() && export_block(r).is_none()).count());
-                let n_replace = self.batch.as_ref().map_or(0, |b| {
-                    b.rows.iter().filter(|r| r.choice == Choice::Replace && r.plan().is_some()).count()
-                });
-                let confirmed = n_replace == 0 || self.batch.as_ref().is_some_and(|b| b.confirm_replace);
-                if n_replace > 0 {
-                    if let Some(b) = self.batch.as_mut() {
-                        theme::checkbox(
-                            ui,
-                            &mut b.confirm_replace,
-                            format!("I confirm: replace the owned result files of {n_replace} clip(s). The worker keeps the old files until the new ones are verified; other files in those folders are untouched."),
-                        );
-                    }
-                }
                 let b = ui.add_enabled(
-                    n > 0 && confirmed && !self.model_mutation_active,
+                    n > 0 && !self.model_mutation_active,
                     egui::Button::new(format!(
                         "Queue {n} clip{}",
                         if n == 1 { "" } else { "s" },
@@ -2901,19 +2757,8 @@ impl AiUi {
                 confirm = b.clicked();
                 cancel = ui.button("Cancel").clicked();
             });
-            ui.label(
-                RichText::new("Each row queues on its own client. Automatic lets the scheduler choose an eligible client; it never starts a second local worker. Only whole clips are distributed.")
-                    .color(DIM)
-                    .size(12.0),
-            );
+            ui.label(RichText::new("Clips queue on their assigned client.").color(DIM).size(12.0));
         });
-        for (clip, want) in writes {
-            if let Err(e) = self.set_clip_client(&clip, want.as_deref()) {
-                self.notice = Some(format!("Client not saved for {}: {e}", clip.display_name));
-            }
-        }
-        self.batch_preset_items = items;
-        self.batch_preset_rect = combo_rect;
         self.batch_reset_rects = reset_rects;
         if let Some(c) = reset_shot {
             // Explicit user action: the shot's hand edits are dropped, then the rows are rebuilt from the preset.
@@ -2921,11 +2766,9 @@ impl AiUi {
                 self.reset_to_row_base(&c.folder);
                 self.reload_batch(ui.ctx(), name);
             }
-        } else if let Some(name) = reload {
-            self.reload_batch(ui.ctx(), name);
         } else if confirm {
             self.confirm_batch();
-                } else if cancel {
+        } else if cancel {
             self.batch = None;
         }
     }
@@ -2942,14 +2785,14 @@ impl AiUi {
             }
         };
         self.begin_with(ctx, &b.project, &b.st, &b.picks, preset, name);
+        if let Some(nb) = &mut self.batch {
+            nb.quick = b.quick;
+        }
     }
 
     /// Queue the confirmed review: per clip its hint steps, Key and the optional export, each depending on the
     /// one before. Cross-clip conflicts and unreadable exports are refused before anything is queued.
     pub fn confirm_batch(&mut self) {
-        if self.net_choice != NetChoice::Local && self.batch.is_some() {
-            return self.confirm_batch_network();
-        }
         let Some(b) = &self.batch else { return };
         let live = |r: &&BatchRow| r.plan().is_some() && export_block(r).is_none();
         let hits = crate::pipeline::collisions(
@@ -2960,6 +2803,9 @@ impl AiUi {
                 "Nothing queued: {}",
                 hits.into_iter().map(|h| h.1).collect::<Vec<_>>().join("; ")
             ));
+            if let Some(b) = &mut self.batch {
+                b.quick = false; // the review shows its Queue and Cancel buttons instead of refusing again
+            }
             return;
         }
         // A PC this computer cannot route to keeps the whole Batch for the user to fix; nothing is consumed.
@@ -2969,12 +2815,14 @@ impl AiUi {
         }).collect();
         if !unroutable.is_empty() {
             self.notice = Some(format!("Nothing queued, the review is kept: pick another client for {}.", unroutable.join("; ")));
+            if let Some(b) = &mut self.batch {
+                b.quick = false;
+            }
             return;
         }
-        let used_preset = b.preset_name.is_some();
         let Some(b) = self.batch.take() else { return };
         let rows = b.rows;
-        let (mut queued, mut errs) = (0, vec![]);
+        let (mut queued, mut waiting, mut errs) = (0, 0, vec![]);
         let mut per_client: BTreeMap<String, usize> = BTreeMap::new();
         for r in rows {
             let Some(p) = r.plan().cloned() else { continue };
@@ -2982,35 +2830,14 @@ impl AiUi {
                 errs.push(format!("{}: export: {w}", r.clip.display_name));
                 continue;
             }
-            let res = if let Some(target) = network_target(&r.placement) {
-                self.network_row(&b.project, &b.st, b.preset_name.as_deref(), &r, &p, Some(target.to_owned())).map(|n| {
-                    let id = n.submission_id.clone();
-                    self.net_outbox.push(n);
-                    id
-                })
-            } else if r.hint.is_some() {
-                self.submit_pipeline_row(&r, p)
-            } else if r.steps.is_empty() {
-                self.submit_plan(&r.clip, p, &r.params, &r.out)
-            } else {
-                self.submit_chain(&r.clip, r.steps.clone(), Some((p, r.params.clone(), r.out.clone())))
-            };
-            match res {
-                Ok(_) => {
+            if matches!(r.placement, Placement::Auto) {
+                self.auto_pending.push_back(AutoShot { row: r, plan: p, project: b.project.clone(), st: b.st.clone(), preset_name: b.preset_name.clone() });
+                waiting += 1;
+                continue;
+            }
+            match self.submit_row(&b.project, &b.st, b.preset_name.as_deref(), &r, p) {
+                Ok(()) => {
                     queued += 1;
-                    if used_preset || r.hint.is_some() {
-                        // The baked values equal the shot's overrides where it has any: keep their markers.
-                        let old = self.drafts.get(&r.clip.folder);
-                        let (explicit, from_preset) = old.map(|d| (d.explicit.clone(), d.from_preset.clone())).unwrap_or_default();
-                        let mut nd = Draft { params: r.params.clone(), out: r.out.clone(), notes: vec![], explicit, from_preset };
-                        if let Some(b) = &r.base {
-                            nd.confirmed(b);
-                        }
-                        if !nd.explicit.is_empty() {
-                            self.touched.insert(r.clip.folder.clone());
-                        }
-                        self.drafts.insert(r.clip.folder.clone(), nd);
-                    }
                     *per_client.entry(self.placement_text(&r.placement)).or_default() += 1;
                 }
                 Err(e) => errs.push(format!("{}: {e}", r.clip.display_name)),
@@ -3022,10 +2849,78 @@ impl AiUi {
             if on.is_empty() { "" } else { ": " },
             on.join(", ")
         );
+        if waiting > 0 {
+            m += &format!(" {waiting} waiting for a free PC.");
+        }
         if !errs.is_empty() {
             m += &format!(" Not queued: {}", errs.join(" "));
         }
         self.notice = Some(m);
+    }
+
+    /// Route one planned shot by its placement (network PC, hint pipeline, single plan or chain) and remember its edits.
+    fn submit_row(&mut self, project: &Project, st: &Settings, preset_name: Option<&str>, r: &BatchRow, p: Plan) -> Result<(), String> {
+        let res = if let Some(target) = network_target(&r.placement) {
+            self.network_row(project, st, preset_name, r, &p, Some(target.to_owned())).map(|n| {
+                let id = n.submission_id.clone();
+                self.net_outbox.push(n);
+                id
+            })
+        } else if r.hint.is_some() {
+            self.submit_pipeline_row(r, p)
+        } else if r.steps.is_empty() {
+            self.submit_plan(&r.clip, p, &r.params, &r.out)
+        } else {
+            self.submit_chain(&r.clip, r.steps.clone(), Some((p, r.params.clone(), r.out.clone())))
+        };
+        res?;
+        if preset_name.is_some() || r.hint.is_some() {
+            // The baked values equal the shot's overrides where it has any: keep their markers.
+            let old = self.drafts.get(&r.clip.folder);
+            let (explicit, from_preset) = old.map(|d| (d.explicit.clone(), d.from_preset.clone())).unwrap_or_default();
+            let mut nd = Draft { params: r.params.clone(), out: r.out.clone(), notes: vec![], explicit, from_preset };
+            if let Some(b) = &r.base {
+                nd.confirmed(b);
+            }
+            if !nd.explicit.is_empty() {
+                self.touched.insert(r.clip.folder.clone());
+            }
+            self.drafts.insert(r.clip.folder.clone(), nd);
+        }
+        Ok(())
+    }
+
+    /// Hand ONE waiting Automatic shot to each free PC: remote ones in `free_remote` (`network:` ids), then this computer.
+    /// A PC given a shot is busy at once (a remote job counts from "sending", a local job from its submit), and the
+    /// list is never split up front: a finished PC just takes the next shot.
+    pub fn dispatch_auto(&mut self, free_remote: &[String], local: &crate::metrics::View) {
+        if self.auto_pending.is_empty() || self.model_mutation_active {
+            return;
+        }
+        // Unknown load (no live sample, GPU unreadable) is NOT free.
+        let local_free = !self.sched.running() && matches!(local, crate::metrics::View::Live(s) if crate::remote::lightly_loaded(s));
+        let pcs = local_free.then_some(None).into_iter().chain(free_remote.iter().map(|id| Some(id.clone())));
+        for pc in pcs {
+            let Some(mut a) = self.auto_pending.pop_front() else { break };
+            let automatic = a.row.placement.clone();
+            if let Some(id) = &pc {
+                a.row.placement = Placement::Target(id.clone());
+            }
+            if let Err(e) = self.submit_row(&a.project, &a.st, a.preset_name.as_deref(), &a.row, a.plan.clone()) {
+                if pc.is_some() {
+                    // A refused network PC is not the shot's fault: it waits, and the next PC in this tick gets it.
+                    a.row.placement = automatic;
+                    self.auto_pending.push_front(a);
+                } else {
+                    self.notice = Some(format!("{}: not queued, {e}", a.row.clip.display_name));
+                }
+            }
+        }
+    }
+
+    /// Drop the Automatic shots still waiting for a free PC.
+    pub fn cancel_auto(&mut self) {
+        self.auto_pending.clear();
     }
 
     fn network_row(&mut self, project: &Project, st: &Settings, preset_name: Option<&str>, r: &BatchRow, plan: &Plan, target: Option<String>) -> Result<NetSubmit, String> {
@@ -3069,55 +2964,6 @@ impl AiUi {
         commit(&r.clip, &plan, &r.params, &r.out)?; // clip id / output values, as a local queue does
         self.persist_row_settings(&r);
         Ok(NetSubmit { submission_id: format!("sub_{}", new_id()), spec, target: target.clone(), folder: r.clip.folder.clone(), name: r.clip.display_name.clone() })
-    }
-
-    /// The reviewed Batch sent to the network instead of this computer's clients: each shot is one frozen
-    /// Hint → Key → Deliver workflow (new results only; Resume/Replace stay local and are named, not dropped).
-    fn confirm_batch_network(&mut self) {
-        if !self.net_online {
-            self.notice = Some("The network client is not connected (Clients page): nothing was sent. Pick \"This computer\" or connect first.".into());
-            return;
-        }
-        let target = match &self.net_choice {
-            NetChoice::Install(id) => Some(id.clone()),
-            _ => None,
-        };
-        if target.as_deref().is_some_and(|t| net_label(&self.net_targets, t).is_none()) {
-            self.notice = Some("That network PC is not known on any joined network: nothing was sent and the review is kept. Pick the PC again.".into());
-            return;
-        }
-        let Some(b) = self.batch.take() else { return };
-        let (mut sent, mut errs) = (0, vec![]);
-        for r in b.rows {
-            let Some(plan) = r.plan().cloned() else { continue };
-            let name = r.clip.display_name.clone();
-            let why = if plan.job.mode != JobMode::New {
-                Some("Resume/Replace are local only".to_string())
-            } else {
-                None
-            };
-            if let Some(w) = why {
-                errs.push(format!("{name}: not sent, {w}."));
-                continue;
-            }
-            let res = self.network_row(&b.project, &b.st, b.preset_name.as_deref(), &r, &plan, target.clone());
-            match res {
-                Ok(n) => {
-                    self.net_outbox.push(n);
-                    sent += 1;
-                }
-                Err(e) => errs.push(format!("{name}: not sent, {e}")),
-            }
-        }
-        let dest = match &self.net_choice {
-            NetChoice::Install(id) => self.net_targets.iter().find(|t| &t.0 == id).map_or(id.clone(), |t| t.1.clone()),
-            _ => "any available client".into(),
-        };
-        let mut m = format!("Sent {sent} shot(s) to the network ({dest}).");
-        if !errs.is_empty() {
-            m += &format!(" {}", errs.join(" "));
-        }
-        self.notice = Some(m);
     }
 
     /// Shots confirmed for the network, for the controller to send.
@@ -3432,7 +3278,7 @@ fn client_picker(
 ) {
     let auto_text = inherit_text(session);
     let note = match session {
-        Placement::Auto => "the scheduler picks an eligible client".to_string(),
+        Placement::Auto => "the next free PC (nothing rendering, GPU and VRAM under 50%)".to_string(),
         Placement::Target(id) => format!("this clip renders on {id} until it has its own"),
     };
     let text = match cur {

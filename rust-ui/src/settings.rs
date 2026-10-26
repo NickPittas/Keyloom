@@ -160,6 +160,7 @@ impl Default for Network {
 pub struct Connection {
     pub credentials: String,
     pub enabled: bool,
+    /// On the local service, accept jobs from other PCs; on a client, allow Automatic to send it shots.
     pub receive: bool,
     /// Last known https addresses of the host (tried in order on connect; refreshed by Rescan).
     pub endpoints: Vec<String>,

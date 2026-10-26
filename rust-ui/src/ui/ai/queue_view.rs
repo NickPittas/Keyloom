@@ -324,10 +324,18 @@ impl AiUi {
 
     /// Board queue: one block per clip. Active, queued and unresolved clips are always shown; only finished
     /// whole clips are limited (newest 12).
-    pub fn queue_ui(&mut self, ui: &mut Ui, local: &crate::metrics::View, active: &[u32], telemetry: &std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>) {
+    pub fn queue_ui(&mut self, ui: &mut Ui, local: &crate::metrics::View, active: &[u32]) {
         // Never let the content ask the panel for more than it has been given.
         let w = ui.available_width();
         ui.set_max_width(w);
+        if !self.auto_pending.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(format!("Waiting for a free PC ({})", self.auto_pending.len()));
+                if ui.small_button("Cancel").clicked() {
+                    self.cancel_auto();
+                }
+            });
+        }
         let all = self.queue_view();
         let mut clients = vec![];
         for run in all.iter().flat_map(|s| &s.runs) {
@@ -340,9 +348,7 @@ impl AiUi {
         for client in clients {
             let target = self.sched.targets().into_iter().find(|t| t.id == client);
             let is_local = target.as_ref().is_some_and(|t| t.local);
-            let t = if is_local { crate::metrics::ClientTelemetry::Local(local.clone()) } else {
-                telemetry.get(&client).cloned().unwrap_or_else(|| crate::metrics::ClientTelemetry::Unreported("No statistics reported".into()))
-            };
+            let t = crate::metrics::ClientTelemetry::Local(local.clone());
             // Finished runs the user cleared are gone; active ones are never hidden.
             let all: Vec<_> = all.iter().cloned().filter_map(|mut s| {
                 s.runs.retain(|r| r.client == client && (r.active || !r.rows.iter().flat_map(|x| &x.ids).all(|id| self.cleared.contains(id))));

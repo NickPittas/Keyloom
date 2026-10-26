@@ -60,6 +60,13 @@ enum Pend {
     Endpoints(Vec<String>, String),
 }
 
+/// GPU load and VRAM use both under 50% on every GPU. A value that is missing or unknown counts as NOT free, never as free.
+pub(crate) fn lightly_loaded(s: &Sample) -> bool {
+    s.gpus.as_ref().is_some_and(|g| !g.is_empty() && g.iter().all(|g| {
+        g.util.is_some_and(|u| u < 50.0) && matches!((g.vram_used, g.vram_total), (Some(u), Some(t)) if t > 0 && u * 2 < t)
+    }))
+}
+
 #[derive(Clone, Debug)]
 pub struct Install {
     pub id: String,
@@ -285,6 +292,22 @@ fn attempt_file(attempt: &str, job_id: &str, seq: u64, stages: &[(String, &'stat
     json!({"attempt_id": attempt, "job_id": job_id, "seq": seq, "stages": stages.iter().map(|s| &s.0).collect::<Vec<_>>(), "meta": meta})
 }
 
+/// A sent job's saved record as a history entry, keyed by connection and submission.
+fn sent_entry(owner: &str, rec: Value) -> crate::queue::Entry {
+    let text = |k: &str| rec[k].as_str().unwrap_or("").to_owned();
+    crate::queue::Entry {
+        id: format!("sent:{owner}:{}", text("submission_id")),
+        folder: text("folder"),
+        label: "Sent".into(),
+        state: rec["state"].as_str().unwrap_or("queued").into(),
+        detail: text("reason"),
+        at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        kind: "sent".into(),
+        owner: owner.into(),
+        job: Some(rec),
+    }
+}
+
 fn side_file(creds: &Path, ext: &str) -> PathBuf {
     let mut n = creds.as_os_str().to_owned();
     n.push(ext);
@@ -506,6 +529,9 @@ impl Remote {
     pub fn online(&self) -> bool {
         self.phase == Phase::Online
     }
+    pub fn accepts_work(&self, cfg: &Conn) -> bool {
+        !cfg.local_host && cfg.enabled && cfg.receive && self.online()
+    }
     pub fn registered(&self) -> bool {
         self.registered
     }
@@ -526,15 +552,27 @@ impl Remote {
                 return Some("an unresolved network attempt is recorded on this computer".into());
             }
             if self.jobs.is_empty() {
+                let pending = |jobs: &[Value]| jobs.iter().any(|j| !matches!(j["state"].as_str(), Some("succeeded" | "failed" | "cancelled" | "not sent")) || j.get("submission").is_some_and(|v| !v.is_null()));
+                let unreadable = || Some("the saved network job list cannot be read".to_string());
+                let (saved, err) = crate::queue::history_path().map(|p| crate::queue::read(&p)).unwrap_or_default();
+                if err.is_some() {
+                    return unreadable();
+                }
+                let owner = c.to_string_lossy();
+                let mine: Vec<Value> = saved.into_iter().filter(|e| e.kind == "sent" && e.owner == owner).filter_map(|e| e.job).collect();
+                if pending(&mine) {
+                    return Some("saved jobs on the current network need to be reconnected and finished first".into());
+                }
+                // Not yet imported from the old per-connection file.
                 match std::fs::read(side_file(c, ".jobs.json")) {
                     Ok(bytes) => match serde_json::from_slice::<Vec<Value>>(&bytes) {
-                        Ok(jobs) if jobs.iter().any(|j| !matches!(j["state"].as_str(), Some("succeeded" | "failed" | "cancelled" | "not sent")) || j.get("submission").is_some_and(|v| !v.is_null())) => {
+                        Ok(jobs) if pending(&jobs) => {
                             return Some("saved jobs on the current network need to be reconnected and finished first".into());
                         }
-                        Err(_) => return Some("the saved network job list cannot be read".into()),
+                        Err(_) => return unreadable(),
                         _ => {}
                     },
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Some("the saved network job list cannot be read".into()),
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return unreadable(),
                     _ => {}
                 }
             }
@@ -565,7 +603,7 @@ impl Remote {
         self.claim_inflight || !matches!(self.rx, Rx::Idle) || !self.held.is_empty()
     }
     pub(crate) fn claim_ready(&self, now: Instant, cfg: &Conn) -> bool {
-        cfg.receive && self.registered && self.online() && !self.closing && !self.claim_busy() && self.last_claim.is_none_or(|t| now.saturating_duration_since(t) >= CLAIM_EVERY)
+        cfg.local_host && cfg.receive && self.registered && self.online() && !self.closing && !self.claim_busy() && self.last_claim.is_none_or(|t| now.saturating_duration_since(t) >= CLAIM_EVERY)
     }
     pub(crate) fn claiming(&self) -> bool {
         self.claim_inflight
@@ -991,7 +1029,7 @@ impl Remote {
         let local = env.ai.scheduler().targets().into_iter().find(|t| t.local && t.enabled);
         let hello_gpu = local.as_ref().and_then(|t| t.hello.as_ref()).and_then(|h| h.gpu.clone());
         let sample = if let View::Live(s) = env.metrics { Some(s.clone()) } else { None };
-        if hello_gpu.is_none() && due(self.last_probe, Duration::from_secs(60)) {
+        if env.cfg.local_host && hello_gpu.is_none() && due(self.last_probe, Duration::from_secs(60)) {
             self.last_probe = Some(now);
             env.ai.probe_workers(); // start the local client so its GPU identity is known
         }
@@ -999,7 +1037,7 @@ impl Remote {
         if self.registered && !self.reg_inflight && !self.name_unsupported && self.reg_name != truncate(env.cfg.name.trim(), 64) {
             self.registered = false;
         }
-        if !self.registered && !self.reg_inflight {
+        if env.cfg.local_host && !self.registered && !self.reg_inflight {
             match (&hello_gpu, &sample) {
                 (Some(g), Some(s)) => match g.verified_uuid() {
                     Ok(u) => {
@@ -1173,7 +1211,7 @@ impl Remote {
         }
         // Claim only when opted in, registered, nothing is in progress, the verified local GPU is idle and the app is not closing.
         let idle = local.as_ref().is_some_and(|(st, busy)| *st == crate::scheduler::TargetStatus::Ready && !busy) && !env.ai.scheduler().running() && !env.ai.targets_pending();
-        let ok = env.cfg.receive && env.cfg.may_claim && !self.closing && self.registered && matches!(self.rx, Rx::Idle) && self.held.is_empty() && uuid.is_some() && idle;
+        let ok = env.cfg.local_host && env.cfg.receive && env.cfg.may_claim && !self.closing && self.registered && matches!(self.rx, Rx::Idle) && self.held.is_empty() && uuid.is_some() && idle;
         if ok && !self.claim_inflight && self.last_claim.is_none_or(|t| now.saturating_duration_since(t) >= CLAIM_EVERY) {
             self.last_claim = Some(now);
             let maps: Vec<String> = env.settings.shared_roots.iter().map(|r| r.name.clone()).collect();
@@ -1541,9 +1579,26 @@ impl Remote {
         if let Some(n) = std::fs::read(side_file(c, ".network.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v["network_id"].as_str().map(str::to_owned)) {
             self.cached_ns.get_or_insert(n);
         }
+        let owner = c.to_string_lossy().into_owned();
+        let hp = crate::queue::history_path();
+        if let Some(hp) = &hp {
+            // One-time import of the old per-connection file; renamed, never deleted.
+            let old = side_file(c, ".jobs.json");
+            if let Some(a) = std::fs::read(&old).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+                let es: Vec<_> = a.as_array().into_iter().flatten().cloned().map(|j| sent_entry(&owner, j)).collect();
+                if let Err(e) = crate::queue::merge_old(hp, es).and_then(|()| crate::queue::rename_free(&old, &side_file(c, ".jobs.json.imported")).map_err(|e| e.to_string())) {
+                    self.status = Some(format!("Could not import the old list of sent jobs ({e})."));
+                }
+            }
+        }
+        let (saved, err) = hp.map(|p| crate::queue::read(&p)).unwrap_or_default();
+        if err.is_some() {
+            self.status = err;
+        }
+        let saved: Vec<Value> = saved.into_iter().filter(|e| e.kind == "sent" && e.owner == owner).filter_map(|e| e.job).collect();
         {
-            if let Some(a) = std::fs::read(side_file(c, ".jobs.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
-                for j in a.as_array().into_iter().flatten() {
+            {
+                for j in &saved {
                     self.jobs.push(NetJob {
                         submission_id: j["submission_id"].as_str().unwrap_or("").into(),
                         submission: j.get("submission").filter(|v| v.is_object()).cloned(),
@@ -1587,15 +1642,14 @@ impl Remote {
     }
 
     fn write_jobs(&mut self, c: &Path) {
-        {
-            let mut finished = 0;
-            let mut live: Vec<Value> = self.jobs.iter().rev().filter(|j| {
-                if j.terminal() { finished += 1; finished <= 12 } else { true }
-            }).map(|j| json!({"submission_id": j.submission_id, "submission": j.submission, "installation": j.installation, "stages": j.stages, "cursor": j.cursor, "active_stage": j.active_stage, "cancel_requested": j.cancel_requested, "on": j.on, "done": j.done, "total": j.total, "reason": j.reason, "job_id": j.job_id, "folder": j.folder, "name": j.name, "state": j.state})).collect();
-            live.reverse();
-            if let Err(e) = write_private(&side_file(&c, ".jobs.json"), &Value::Array(live)) {
-                self.status = Some(format!("Could not save the list of sent jobs ({e}); they cannot be followed after a restart."));
-            }
+        let Some(hp) = crate::queue::history_path() else {
+            self.status = Some("Could not save the list of sent jobs (no settings folder); they cannot be followed after a restart.".into());
+            return;
+        };
+        let owner = c.to_string_lossy().into_owned();
+        let add = self.jobs.iter().map(|j| sent_entry(&owner, json!({"submission_id": j.submission_id, "submission": j.submission, "installation": j.installation, "stages": j.stages, "cursor": j.cursor, "active_stage": j.active_stage, "cancel_requested": j.cancel_requested, "on": j.on, "done": j.done, "total": j.total, "reason": j.reason, "job_id": j.job_id, "folder": j.folder, "name": j.name, "state": j.state}))).collect();
+        if let Err(e) = crate::queue::replace(&hp, |e| e.kind == "sent" && e.owner == owner, add) {
+            self.status = Some(format!("Could not save the list of sent jobs ({e}); they cannot be followed after a restart."));
         }
     }
 
@@ -1603,6 +1657,7 @@ impl Remote {
 
     pub fn status_line(&self, cfg: &Conn) -> (String, bool) {
         match &self.phase {
+            Phase::Online if !cfg.local_host => ("Connected".into(), true),
             Phase::Online if self.registered => (format!("Connected{}", if cfg.receive { ", taking network work when the GPU is idle" } else { "" }), true),
             Phase::Online => (format!("Connected; {}", self.register_note.clone().unwrap_or_else(|| "registering this computer…".into())), true),
             Phase::Off if cfg.enabled => ("Not connected".into(), false),
@@ -1621,6 +1676,15 @@ impl Remote {
     }
 
     pub fn has_queue(&self) -> bool { !self.jobs.is_empty() }
+
+    /// Free for Automatic: none of our jobs queued or running on it, and its last reported load is under 50%.
+    /// The sample must be fresh: an unknown or stale age is not free.
+    pub(crate) fn is_free(&self, iid: &str) -> bool {
+        !self.jobs.iter().any(|j| j.installation.as_deref() == Some(iid) && !j.terminal())
+            && self.installs.iter().find(|i| i.id == iid).is_some_and(|i| {
+                i.connected && matches!(Sample::from_api(&i.stats), Ok(Some((s, Some(age)))) if age <= crate::metrics::REMOTE_STALE_S && lightly_loaded(&s))
+            })
+    }
 
     fn telemetry(&self, id: &str) -> ClientTelemetry {
         let Some(i) = self.installs.iter().find(|i| i.id == id) else { return ClientTelemetry::Unreported("Waiting for PC statistics".into()) };
@@ -1729,7 +1793,7 @@ impl Remote {
             acts.push(Action::Enable { creds: creds.clone(), on: en });
         }
         let mut rc = cfg.receive;
-        let accept = crate::ui::theme::checkbox(ui, &mut rc, "").on_hover_text("Receiving: a network job runs on this computer's own local client, only when it is idle and its shared locations resolve here. Only one network's job runs at a time.");
+        let accept = crate::ui::theme::checkbox(ui, &mut rc, "").on_hover_text(if cfg.local_host { "This PC takes jobs that other PCs send to it" } else { "Automatic may send shots to this PC" });
         if accept.changed() {
             acts.push(Action::Receive { creds: creds.clone(), on: rc });
         }

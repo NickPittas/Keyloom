@@ -799,15 +799,33 @@ impl AiUi {
         }
         self.tk.history_root = root.map(Path::to_path_buf);
         self.tk.last_saved.clear();
-        self.tk.history = match root {
-            Some(r) => {
-                let (h, err) = crate::queue::load(r);
+        self.tk.history = match (root, crate::queue::history_path()) {
+            (Some(r), Some(p)) => {
+                // One-time import of the old per-project file; renamed, never deleted.
+                let old = r.join(crate::queue::OLD_FILE);
+                if old.exists() {
+                    let (entries, err) = crate::queue::load(&old);
+                    let owner = r.to_string_lossy().into_owned();
+                    let entries: Vec<_> = entries.into_iter().map(|mut e| {
+                        e.owner = owner.clone();
+                        e
+                    }).collect();
+                    if err.is_some() {
+                        self.notice = err; // unreadable: already kept aside as .unreadable
+                    } else if let Err(e) = crate::queue::merge_old(&p, entries)
+                        .and_then(|()| crate::queue::rename_free(&old, &r.join(format!("{}.imported", crate::queue::OLD_FILE))).map_err(|e| e.to_string()))
+                    {
+                        self.notice = Some(format!("Old queue history not imported: {e}"));
+                    }
+                }
+                let (h, err) = crate::queue::load(&p);
                 if err.is_some() {
                     self.notice = err;
                 }
-                h
+                let owner = r.to_string_lossy();
+                h.into_iter().filter(|e| e.kind == "local" && e.owner == owner).collect()
             }
-            None => vec![],
+            _ => vec![],
         };
     }
 
@@ -857,6 +875,8 @@ impl AiUi {
                 detail,
                 at,
                 job,
+                kind: "local".into(),
+                owner: root.to_string_lossy().into_owned(),
             });
         }
         out
@@ -864,9 +884,10 @@ impl AiUi {
 
     /// Write the queue snapshot when anything changed. A failed write is reported, never ignored.
     pub fn queue_sync(&mut self) {
-        let Some(root) = self.tk.history_root.clone() else {
+        let (Some(root), Some(path)) = (self.tk.history_root.clone(), crate::queue::history_path()) else {
             return;
         };
+        let owner = root.to_string_lossy().into_owned();
         let mine = self.queue_entries(&root);
         let mut all: Vec<crate::queue::Entry> = self
             .tk
@@ -885,7 +906,7 @@ impl AiUi {
         if sig == self.tk.last_saved {
             return;
         }
-        match crate::queue::save(&root, &all) {
+        match crate::queue::replace(&path, |e| e.kind == "local" && e.owner == owner, all) {
             Ok(()) => self.tk.last_saved = sig,
             Err(e) => {
                 self.tk.last_saved = sig;

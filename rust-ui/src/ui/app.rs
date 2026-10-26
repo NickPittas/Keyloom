@@ -204,7 +204,7 @@ pub struct App {
     new_project_draft: Option<(PathBuf, String)>,
     new_project_error: Option<String>,
     new_project_create_rect: Option<egui::Rect>,
-    /// "Open clip settings" button rectangles from the last Board frame: top bar, then per-card (layout tests).
+    /// "Open clip settings" button rectangles from the last Board frame: per-card (layout tests).
     open_rects: Vec<(Option<usize>, egui::Rect)>,
     /// Settings and Models pages replace the Board/workspace while open, which stay untouched underneath.
     settings: SettingsPage,
@@ -224,8 +224,6 @@ pub struct App {
     net_repo: Option<PathBuf>,
     net_python: Option<PathBuf>,
     clients_rect: Option<egui::Rect>,
-    /// Remote clients' reported telemetry by target id; filled by the network API once it exists, empty until then.
-    client_telemetry: std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>,
     clients_back_rect: Option<egui::Rect>,
     settings_rect: Option<egui::Rect>,
     /// The Settings button was clicked this frame; handled once the screen has finished drawing.
@@ -297,9 +295,9 @@ impl App {
     /// Same, with the file-dialog backend replaced (tests never open a real dialog).
     pub fn with_picker(ctx: &egui::Context, opts: AppOptions, dialogs: Backend) -> Self {
         super::theme::apply(ctx);
-        let settings = SettingsPage::new(Store::load(
-            opts.settings_path.clone().or_else(default_path),
-        ));
+        let settings_path = opts.settings_path.clone().or_else(default_path);
+        crate::queue::set_settings_path(settings_path.clone());
+        let settings = SettingsPage::new(Store::load(settings_path));
         ctx.set_zoom_factor(settings.saved().interface.ui_scale);
         let settings_saved = settings.saved().clone();
         let models = super::models::Page::new(opts.repo.as_deref());
@@ -380,7 +378,6 @@ impl App {
             net_repo: opts.repo.clone().or(launch.repo.clone()),
             net_python: launch.python.clone(),
             clients_rect: None,
-            client_telemetry: Default::default(),
             clients_back_rect: None,
             settings_rect: None,
             settings_requested: false,
@@ -743,13 +740,6 @@ impl App {
                 {
                     want = Some(PickKind::Folder);
                 }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Open another project…"))
-                    .on_disabled_hover_text(why)
-                    .clicked()
-                {
-                    want = Some(PickKind::Project);
-                }
             });
         }
         if let Some(k) = want {
@@ -778,8 +768,12 @@ impl App {
         for n in &p.notes {
             ui.colored_label(WARN, n);
         }
+        let picks: Vec<usize> = sel.iter().copied().collect();
+        let chosen: Vec<&Clip> = picks.iter().filter_map(|i| p.clips.get(*i)).collect();
+        let every = !p.clips.is_empty() && sel.len() == p.clips.len();
+        self.ai.batch_ui(ui, p, self.settings.saved(), &picks);
         ui.horizontal_wrapped(|ui| {
-            let mut all = !p.clips.is_empty() && sel.len() == p.clips.len();
+            let mut all = every;
             if super::theme::checkbox(ui, &mut all, "All").changed() {
                 sel = if all {
                     (0..p.clips.len()).collect()
@@ -787,30 +781,9 @@ impl App {
                     BTreeSet::new()
                 };
             }
-            ui.label(format!("{} selected", sel.len()));
-            let one = sel.len() == 1;
-            let ready = one
-                && sel
-                    .iter()
-                    .next()
-                    .and_then(|i| p.clips.get(*i))
-                    .is_some_and(|c| matches!(self.imp.card_state(c), CardState::Idle));
-            let r = ui
-                .add_enabled(ready, egui::Button::new("Open clip"))
-                .on_disabled_hover_text(if one {
-                    "This clip has no frames yet"
-                } else {
-                    "Select exactly one clip"
-                });
-            self.open_rects.push((None, r.rect));
-            if r.clicked() {
-                open_idx = sel.iter().next().copied();
-            }
-            let picks: Vec<usize> = sel.iter().copied().collect();
-            self.ai.batch_ui(ui, p, self.settings.saved(), &picks);
+            self.ai.board_preset_ui(ui);
             ui.separator();
-            let chosen: Vec<&Clip> = picks.iter().filter_map(|i| p.clips.get(*i)).collect();
-            self.ai.assign_selected_ui(ui, &chosen);
+            self.ai.assign_selected_ui(ui, &chosen, every);
         });
         if let Some(n) = self.ai.notice.clone() {
             ui.colored_label(WARN, n);
@@ -841,10 +814,10 @@ impl App {
                 .max_size(900.0)
                 .show_separator_line(true)
                 .show(ui, |ui| {
-                    queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active, &self.client_telemetry);
+                    queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active);
                 });
         } else {
-            Panel::bottom("board_queue_bottom").resizable(true).default_size(280.0).min_size(150.0).show(ui, |ui| { queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active, &self.client_telemetry); });
+            Panel::bottom("board_queue_bottom").resizable(true).default_size(280.0).min_size(150.0).show(ui, |ui| { queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active); });
         }
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
@@ -909,7 +882,7 @@ impl App {
         for action in queue_actions { self.net_action(action); }
     }
 
-    fn batch_queue(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote_set::RemoteSet, local: &crate::metrics::View, active: &[u32], telemetry: &std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>) -> Vec<crate::remote::Action> {
+    fn batch_queue(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote_set::RemoteSet, local: &crate::metrics::View, active: &[u32]) -> Vec<crate::remote::Action> {
         ui.horizontal(|ui| {
             ui.heading("Queue");
             if ui.small_button("Clear finished").on_hover_text("Removes finished, failed and cancelled jobs from the queue and its logs. Running jobs stay.").clicked() {
@@ -919,7 +892,7 @@ impl App {
         });
         let mut actions = vec![];
         egui::ScrollArea::vertical().id_salt("batch_work_queue").auto_shrink([false; 2]).show(ui, |ui| {
-            ai.queue_ui(ui, local, active, telemetry);
+            ai.queue_ui(ui, local, active);
             actions = remote.queue_ui(ui);
         });
         actions
@@ -2589,6 +2562,8 @@ impl App {
             }
         }
         if !self.remote.available() {
+            let view = self.metrics.view(now);
+            self.ai.dispatch_auto(&[], &view); // no network: Automatic means this computer
             return;
         }
         if self.driver.is_none() {
@@ -2767,14 +2742,6 @@ impl App {
         self.metrics_rect
     }
 
-    /// Remote client telemetry as the network API reports it (`None` = forget it again).
-    pub fn set_client_telemetry(&mut self, target_id: &str, t: Option<crate::metrics::ClientTelemetry>) {
-        match t {
-            Some(t) => self.client_telemetry.insert(target_id.to_owned(), t),
-            None => self.client_telemetry.remove(target_id),
-        };
-    }
-
     pub fn settings_page(&mut self) -> &mut SettingsPage {
         &mut self.settings
     }
@@ -2857,7 +2824,7 @@ impl App {
         }
     }
 
-    /// "Open clip settings" button rectangles from the last Board frame: `None` = the top bar, `Some(i)` = card `i`.
+    /// "Open clip settings" button rectangles from the last Board frame: `Some(i)` = card `i`.
     pub fn open_settings_rects(&self) -> &[(Option<usize>, egui::Rect)] {
         &self.open_rects
     }
@@ -3090,7 +3057,7 @@ impl App {
                                 ui.add_space(14.0);
                             }
                             let (own_net, own_iid) = self.setup.svc().map(|v| (v.network_id.clone(), v.host_installation_id.clone())).unwrap_or_default();
-                            let (placement, table_acts) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.client_telemetry, &self.remote, self.settings.saved(), self.settings.store_path(), own_net.as_deref(), own_iid.as_deref());
+                            let (placement, table_acts) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.remote, self.settings.saved(), self.settings.store_path(), own_net.as_deref(), own_iid.as_deref());
                             if let Some(p) = placement {
                                 self.ai.placement = p;
                             }

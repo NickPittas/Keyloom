@@ -55,7 +55,6 @@ pub fn ui(
     default: &Placement,
     _local: &crate::metrics::View,
     _active: &[u32],
-    _remote: &std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>,
     net: &crate::remote_set::RemoteSet,
     s: &Settings,
     sp: Option<&Path>,
@@ -75,7 +74,7 @@ pub fn ui(
             // Header widths set each column's width (cells wrap inside it); drag a header's right edge to resize.
             let wid = ui.scope_id().with("client_col_widths");
             let mut widths: Vec<f32> = ui.data(|d| d.get_temp(wid)).unwrap_or_else(|| vec![140.0, 70.0, 190.0, 280.0, 220.0, 130.0, 60.0, 60.0, 60.0, 70.0, 90.0]);
-            for (heading, w) in ["Client", "Kind", "Address", "Status", "GPU", "ID", "Connect", "Accept work when GPU is idle", "Default for Batch job", "", ""].iter().zip(widths.iter_mut()) {
+            for (heading, w) in ["Client", "Kind", "Address", "Status", "GPU", "ID", "Connect", "Accept work", "Default for Batch job", "", ""].iter().zip(widths.iter_mut()) {
                 col_header(ui, heading, w);
             }
             ui.data_mut(|d| d.insert_temp(wid, widths));
