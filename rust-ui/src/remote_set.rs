@@ -194,11 +194,13 @@ impl RemoteSet {
         let mut acts = vec![];
         for (c, default) in conn_of(s, sp) {
             let Some(r) = self.remotes.iter().find(|r| r.key == key_of(&c)) else { continue };
-            // `own_net` unknown (None) must not match a connection whose network is unknown too.
-            if c.local_host || own_net.is_some_and(|n| r.ns().as_deref() == Some(n)) {
+            let blocker = r.remove_blocker(c.creds.as_deref());
+            // `own_net` unknown (None) must not match a connection whose network is unknown too. A leftover
+            // self-connection is skipped only when idle and removable; otherwise its controls must stay reachable.
+            let own_net_conn = own_net.is_some_and(|n| r.ns().as_deref() == Some(n));
+            if c.local_host || (own_net_conn && !c.enabled && r.receiving().is_none() && blocker.is_none()) {
                 continue;
             }
-            let blocker = r.remove_blocker(c.creds.as_deref());
             acts.extend(r.row(ui, &c, default, blocker, &own));
             ui.end_row();
         }
@@ -217,6 +219,15 @@ impl RemoteSet {
             ui.label("");
         }
         vec![]
+    }
+
+    /// This computer's own connection status and attempt message, drawn in the Local row's Status cell.
+    pub fn local_status(&self, ui: &mut Ui, s: &Settings, sp: Option<&Path>) -> Vec<Action> {
+        let conns = conn_of(s, sp);
+        match conns.iter().find(|(c, _)| c.local_host).and_then(|(c, _)| self.remotes.iter().find(|r| r.key == key_of(c)).map(|r| (r, c))) {
+            Some((r, c)) => r.status_cell(ui, c),
+            None => vec![],
+        }
     }
 }
 

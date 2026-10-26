@@ -196,6 +196,11 @@ fn classify(j: &crate::tasks::TaskJob) -> (Stage, String) {
     }
 }
 
+/// Index of the run holding the most recently queued job. `queued` is every tracked job id in queue order (append-only).
+fn newest_run(queued: &[&str], runs: &[Vec<&str>]) -> Option<usize> {
+    runs.iter().enumerate().max_by_key(|(_, ids)| ids.iter().filter_map(|id| queued.iter().position(|q| q == id)).max()).map(|(i, _)| i)
+}
+
 fn client_of(state: &JobState, fallback: String) -> String {
     match state {
         JobState::Dispatching { target } | JobState::Running { target, .. } | JobState::Done { target, .. } | JobState::Rejected { target, .. } | JobState::Lost { target, .. } => target.clone(),
@@ -348,7 +353,12 @@ impl AiUi {
             }).collect();
             // Current = newest active run per clip; with nothing active, the last run of the newest clip.
             let mut current: Vec<(&QueueSection, &QueueRun)> = all.iter().filter_map(|s| s.runs.iter().rev().find(|r| r.active).map(|r| (s, r))).collect();
-            if current.is_empty() { if let Some(s) = all.last() { if let Some(r) = s.runs.last() { current.push((s, r)); } } }
+            if current.is_empty() {
+                let flat: Vec<(&QueueSection, &QueueRun)> = all.iter().flat_map(|s| s.runs.iter().map(move |r| (s, r))).collect();
+                let queued: Vec<&str> = self.tracked.iter().map(|t| t.job_id.as_str()).collect();
+                let ids: Vec<Vec<&str>> = flat.iter().map(|(_, r)| r.rows.iter().flat_map(|row| row.ids.iter().map(String::as_str)).collect()).collect();
+                current.extend(newest_run(&queued, &ids).map(|i| flat[i]));
+            }
             let log: Vec<String> = all.iter().flat_map(|s| s.runs.iter()
                 .filter(|r| !current.iter().any(|(_, c)| std::ptr::eq(*c, *r)))
                 .map(move |r| format!("{} · {}", s.title, r.reason))).collect();
@@ -481,6 +491,14 @@ mod tests {
 
     fn row(text: &str, frac: f32, bad: bool, precomputed: bool) -> QueueRow {
         QueueRow { stage: Stage::Key, heading: String::new(), cell: Cell { text: text.into(), frac, bad }, products: vec![], ids: vec![], precomputed, attention: false, active: false }
+    }
+
+    #[test]
+    fn newest_run_is_the_one_queued_last() {
+        let queued = ["a", "b", "c", "d"];
+        assert_eq!(newest_run(&queued, &[vec!["a", "d"], vec!["c"], vec!["b"]]), Some(0));
+        assert_eq!(newest_run(&queued, &[vec!["a"], vec!["c"], vec!["b"]]), Some(1));
+        assert_eq!(newest_run(&queued, &[]), None);
     }
 
     #[test]

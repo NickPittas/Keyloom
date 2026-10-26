@@ -81,7 +81,12 @@ pub fn ui(
                 ui.label("This computer");
                 ui.label("Local");
                 ui.label("—");
-                ui.colored_label(colour, state.to_string());
+                ui.vertical(|ui| {
+                    ui.colored_label(colour, state.to_string());
+                    if i == 0 {
+                        acts.extend(net.local_status(ui, s, sp));
+                    }
+                });
                 let gpu = t.hello.as_ref().and_then(|h| h.gpu.as_ref()).map(|g| format!("{} · {:.0} GB", g.name, g.vram_gb)).unwrap_or_else(|| "Not reported".into());
                 ui.label(gpu);
                 if i == 0 {

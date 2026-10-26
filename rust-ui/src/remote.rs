@@ -61,7 +61,7 @@ enum Pend {
     /// Writes a reusable invitation file (the bridge never returns its secret).
     Invite,
     /// Replaces the connected client's endpoint list (token and session are kept).
-    Endpoints(Vec<String>),
+    Endpoints(Vec<String>, String),
 }
 
 #[derive(Clone, Debug)]
@@ -270,6 +270,7 @@ pub struct Remote {
     closing: bool,
     wake_hint: Option<Arc<dyn Fn() + Send + Sync>>,
     sent_endpoints: Vec<String>,
+    sent_prefer: String,
     endpoints_inflight: bool,
     target_host: String,
     local_host: bool,
@@ -514,6 +515,7 @@ impl Remote {
             closing: false,
             wake_hint: None,
             sent_endpoints: vec![],
+            sent_prefer: String::new(),
             endpoints_inflight: false,
             target_host: String::new(),
             local_host: false,
@@ -790,18 +792,19 @@ impl Remote {
                     }
                     if self.req(Op::Connect, args, Pend::Connect) {
                         self.sent_endpoints = eps;
+                        self.sent_prefer = env.cfg.preferred.clone();
                         self.phase = Phase::Connecting;
                     }
                 }
             }
             Phase::Online => {
                 let want: Vec<String> = env.cfg.endpoints.iter().take(16).cloned().collect();
-                if !self.endpoints_inflight && want != self.sent_endpoints {
+                if !self.endpoints_inflight && (want != self.sent_endpoints || env.cfg.preferred != self.sent_prefer) {
                     let mut a = json!({"urls": want});
                     if !env.cfg.preferred.is_empty() {
                         a["prefer"] = json!(env.cfg.preferred);
                     }
-                    self.endpoints_inflight = self.req(Op::Endpoints, a, Pend::Endpoints(want));
+                    self.endpoints_inflight = self.req(Op::Endpoints, a, Pend::Endpoints(want, env.cfg.preferred.clone()));
                 }
                 self.drive(now, env, creds.as_deref())
             }
@@ -830,9 +833,10 @@ impl Remote {
                     Err(e) => format!("Invitation not created ({})", err_text(&e)),
                 });
             }
-            (Pend::Endpoints(sent), r) => {
+            (Pend::Endpoints(sent, prefer), r) => {
                 self.endpoints_inflight = false;
-                self.sent_endpoints = sent; // retry only when addresses change or the link reconnects
+                self.sent_endpoints = sent; // retry only when addresses or the preferred one change, or the link reconnects
+                self.sent_prefer = prefer;
                 if let Err(e) = r {
                     self.status = Some(format!("Could not update host addresses: {}", err_text(&e)));
                 }
@@ -1009,7 +1013,7 @@ impl Remote {
         match p {
             Pend::Pair => "pair",
             Pend::Invite => "invite",
-            Pend::Endpoints(_) => "endpoints",
+            Pend::Endpoints(..) => "endpoints",
             Pend::Connect => "connect",
             Pend::Register => "register",
             Pend::Stats => "stats",
@@ -1796,6 +1800,24 @@ impl Remote {
         acts
     }
 
+    /// The Status cell's text: the connection's status line (hover: its notes) and, when an attempt is owned here, its reason and Forget.
+    pub fn status_cell(&self, ui: &mut Ui, cfg: &Conn) -> Vec<Action> {
+        let mut acts = vec![];
+        let (line, up) = self.status_line(cfg);
+        let hover: Vec<&str> = [self.status.as_deref(), self.name_note.as_deref()].into_iter().flatten().collect();
+        let status = ui.colored_label(if up { egui::Color32::from_rgb(150, 190, 150) } else { egui::Color32::from_rgb(224, 176, 80) }, line);
+        if !hover.is_empty() {
+            status.on_hover_text(hover.join("\n"));
+        }
+        if let Rx::Owned(m) = &self.rx {
+            ui.colored_label(egui::Color32::from_rgb(225, 110, 110), m);
+            if ui.small_button("Forget attempt").on_hover_text("I checked this computer: forget this attempt locally").clicked() {
+                acts.push(Action::ForgetAttempt(self.key.clone()));
+            }
+        }
+        acts
+    }
+
     /// One connection as a table row: Client, Kind, Address, Status, GPU, then `controls`. The caller ends the row.
     pub fn row(&self, ui: &mut Ui, cfg: &Conn, is_default: bool, blocker: Option<String>, own: &[String]) -> Vec<Action> {
         let mut acts = vec![];
@@ -1822,20 +1844,7 @@ impl Remote {
         if cur != cfg.preferred {
             acts.push(Action::Prefer { creds: creds.clone(), url: cur });
         }
-        ui.vertical(|ui| {
-            let (line, up) = self.status_line(cfg);
-            let hover: Vec<&str> = [self.status.as_deref(), self.name_note.as_deref()].into_iter().flatten().collect();
-            let status = ui.colored_label(if up { egui::Color32::from_rgb(150, 190, 150) } else { egui::Color32::from_rgb(224, 176, 80) }, line);
-            if !hover.is_empty() {
-                status.on_hover_text(hover.join("\n"));
-            }
-            if let Rx::Owned(m) = &self.rx {
-                ui.colored_label(egui::Color32::from_rgb(225, 110, 110), m);
-                if ui.small_button("Forget attempt").on_hover_text("I checked this computer: forget this attempt locally").clicked() {
-                    acts.push(Action::ForgetAttempt(creds.clone()));
-                }
-            }
-        });
+        ui.vertical(|ui| acts.extend(self.status_cell(ui, cfg)));
         let gpus: Vec<String> = installs.iter().filter_map(|i| i.gpu.clone()).collect();
         ui.label(if gpus.is_empty() { "Not reported".to_owned() } else { gpus.join(", ") });
         acts.extend(self.controls(ui, cfg, is_default, blocker));
