@@ -157,7 +157,7 @@ impl Page {
     pub fn take_browse(&mut self) -> Option<(usize, Option<PathBuf>)> {
         let i = self.browse_req.take()?;
         self.browse_row = Some(i);
-        let dir = self.draft.shared_roots.get(i).map(|r| PathBuf::from(&r.local)).filter(|p| p.is_dir());
+        let dir = self.draft.shared_roots.get(i).map(|r| PathBuf::from(&r.local));
         Some((i, dir))
     }
     /// The picker answered (`None` = cancelled or could not open). Ignored if the page was reopened meanwhile.
@@ -172,6 +172,7 @@ impl Page {
     }
 
     pub fn apply(&mut self) -> bool {
+        trim_targets(&mut self.draft.ai_targets);
         match self.store.save(self.draft.clone()) {
             Ok(()) => {
                 self.error = None;
@@ -531,11 +532,42 @@ fn text(ui: &mut Ui, label: &str, v: &mut String) {
     ui.add(egui::TextEdit::singleline(v).desired_width(f32::INFINITY));
 }
 
-/// Optional text: empty = `None`.
+/// Optional text: empty (or only spaces) = `None`. The text is kept as typed; `apply` trims the saved value.
 fn opt_text(ui: &mut Ui, label: &str, v: &mut Option<String>) {
     let mut t = v.clone().unwrap_or_default();
     text(ui, label, &mut t);
-    *v = (!t.trim().is_empty()).then_some(t.trim().to_owned());
+    *v = opt_value(t);
+}
+
+fn opt_value(t: String) -> Option<String> {
+    (!t.trim().is_empty()).then_some(t)
+}
+
+/// Trim the optional fields that `opt_text` stores untrimmed, so the saved file has no stray spaces.
+fn trim_targets(targets: &mut [Target]) {
+    for t in targets {
+        match &mut t.kind {
+            TargetKind::Local { python, .. } => {
+                *python = python.take().and_then(|p| opt_value(p.display().to_string()).map(|s| s.trim().to_owned().into()));
+            }
+            TargetKind::Ssh { user, .. } => {
+                *user = user.take().and_then(|u| opt_value(u).map(|s| s.trim().to_owned()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod opt_text_tests {
+    use super::opt_value;
+
+    #[test]
+    fn keeps_spaces_and_blank_means_none() {
+        assert_eq!(opt_value(String::new()), None);
+        assert_eq!(opt_value("   ".into()), None);
+        assert_eq!(opt_value(r"C:\Program Files".into()), Some(r"C:\Program Files".into()));
+        assert_eq!(opt_value(" a ".into()), Some(" a ".into()));
+    }
 }
 
 /// AI worker machines. Empty list = one implicit local worker (GPU 0). All machines are assumed to see the
@@ -596,9 +628,9 @@ fn targets_ui(ui: &mut Ui, targets: &mut Vec<Target>) {
             let mut rm = None;
             for (j, (l, r)) in t.path_map.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(l).desired_width(120.0));
+                    ui.add(egui::TextEdit::singleline(l).id_salt(("pm_l", i, j)).desired_width(120.0));
                     ui.label("->");
-                    ui.add(egui::TextEdit::singleline(r).desired_width(120.0));
+                    ui.add(egui::TextEdit::singleline(r).id_salt(("pm_r", i, j)).desired_width(120.0));
                     if ui.small_button("Remove").clicked() {
                         rm = Some(j);
                     }
