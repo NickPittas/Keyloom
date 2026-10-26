@@ -918,7 +918,8 @@ impl AiUi {
         }
         ui.separator();
         let mut dismiss = None;
-        egui::CollapsingHeader::new(format!("Earlier sessions · {} jobs", older.len())).default_open(false).show(ui, |ui| {
+        let mut dismiss_all = false;
+        egui::CollapsingHeader::new(format!("Earlier sessions · {} jobs", older.len())).id_salt("earlier_sessions").default_open(false).show(ui, |ui| {
         for h in &older {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(&h.folder).strong());
@@ -941,9 +942,17 @@ impl AiUi {
                 }
             });
         }
+        if ui.small_button("Dismiss all").clicked() {
+            dismiss_all = true;
+        }
         });
         if let Some(id) = dismiss {
             self.tk.history.retain(|h| h.id != id);
+            self.tk.last_saved.clear();
+        }
+        // Same set the single Dismiss can reach: the `older` list, whatever its state.
+        if dismiss_all {
+            self.tk.history.retain(|h| !older.iter().any(|o| o.id == h.id));
             self.tk.last_saved.clear();
         }
     }

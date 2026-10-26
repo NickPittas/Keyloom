@@ -812,7 +812,7 @@ impl Setup {
         ui.heading("This PC");
         ui.horizontal_wrapped(|ui| {
             ui.label("Name");
-            ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(180.0).char_limit(64));
+            ui.add(egui::TextEdit::singleline(&mut self.name).id_salt("net_pc_name").desired_width(180.0).char_limit(64));
             if ui.add_enabled(name_ok && self.name.trim() != c.settings.network.name, egui::Button::new("Save")).clicked() {
                 cmds.push(Cmd::SaveName(self.name.trim().to_owned()));
                 self.pend_name = Some(self.name.trim().to_owned());
@@ -881,7 +881,7 @@ impl Setup {
             let online = c.connections.iter().find(|k| k.online && conns.iter().any(|x| x.local_host && x.credentials == k.credentials));
             ui.horizontal_wrapped(|ui| {
                 ui.label("Save invitation to");
-                ui.add(egui::TextEdit::singleline(&mut self.invite_path).desired_width(240.0));
+                ui.add(egui::TextEdit::singleline(&mut self.invite_path).id_salt("net_invite_path").desired_width(240.0));
                 if ui.button("Browse…").clicked() { cmds.push(Cmd::Browse(PickKind::NetInvitationSave)); }
                 if ui.add_enabled(online.is_some() && !self.invite_path.trim().is_empty(), egui::Button::new("Create invitation")).clicked() {
                     if let Some(k) = online {
@@ -897,7 +897,7 @@ impl Setup {
             }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Import invitation");
-                ui.add(egui::TextEdit::singleline(&mut self.invitation).desired_width(240.0));
+                ui.add(egui::TextEdit::singleline(&mut self.invitation).id_salt("net_invitation_path").desired_width(240.0));
                 if ui.button("Browse…").clicked() { cmds.push(Cmd::Browse(PickKind::NetInvitationOpen)); }
                 if ui.add_enabled(!self.joining() && !self.invitation.trim().is_empty(), egui::Button::new("Join with invitation")).clicked() {
                     let meta = JoinMeta { name: self.reg_name.clone(), ..Default::default() };

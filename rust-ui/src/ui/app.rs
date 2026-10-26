@@ -3037,6 +3037,7 @@ impl App {
                 if let Some((_, dir)) = self.settings.take_browse() {
                     let c = ctx.clone();
                     if !self.picker.start(PickKind::MappingRoot, dir, move || c.request_repaint()) {
+                        self.settings.set_error("Another file dialog is already open; close it first".into());
                         self.settings.browse_done(None);
                     }
                 }
