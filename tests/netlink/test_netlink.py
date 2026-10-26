@@ -30,6 +30,9 @@ class Fake:
     def __init__(self, creds, timeout):
         self.calls = []
 
+    def prefer(self, url):
+        self.calls.append(("prefer", url))
+
     def installations(self):
         self.calls.append("installations")
         return {"installations": []}

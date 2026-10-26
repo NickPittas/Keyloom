@@ -1,6 +1,8 @@
 """Request boundaries: addresses may change, authenticated mutations must never be replayed."""
 import hashlib
 
+import threading
+
 import pytest
 
 from backend.coordinator import client, pki
@@ -57,3 +59,14 @@ def test_wrong_leaf_is_rejected():
 
     with pytest.raises(pki.SecurityError):
         pki.check_pin(Socket(), hashlib.sha256(b"pinned leaf").hexdigest())
+
+
+def test_preferred_address_is_tried_first_and_unknown_is_ignored():
+    url, ts = "https://192.168.1.2:8443", "https://100.64.1.2:8443"
+    c = object.__new__(client.Client)
+    c._lock, c.url, c._known, c.last = threading.Lock(), url, [url, ts], None
+    c.prefer(ts)
+    assert c._order()[0] == ts
+    c.last = None
+    c.prefer("https://10.9.9.9:8443")  # not a known address: nothing changes
+    assert c.last is None and c._order() == [url, ts]

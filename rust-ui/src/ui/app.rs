@@ -2756,6 +2756,12 @@ impl App {
             }
             Action::CancelJob { creds, job_id } => self.remote.cancel_job(&creds, &job_id),
             Action::ForgetAttempt(creds) => self.remote.forget_attempt(&creds),
+            Action::Prefer { creds, url } => {
+                if let Some(c) = self.net_draft().connections.iter_mut().find(|c| c.credentials == creds) {
+                    c.preferred = url;
+                }
+                self.net_save("Updated");
+            }
         }
     }
 
@@ -3076,7 +3082,6 @@ impl App {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            let paired = self.remote.other_installations();
                             if self.remote.available() {
                                 let infos = self.remote.infos();
                                 let cx = crate::network_setup::Ctx {
@@ -3089,12 +3094,12 @@ impl App {
                                 setup_cmds = self.setup.ui(ui, &cx);
                                 ui.add_space(14.0);
                             }
-                            if let Some(p) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.client_telemetry, &paired) {
+                            let (own_net, own_iid) = self.setup.svc().map(|v| (v.network_id.clone(), v.host_installation_id.clone())).unwrap_or_default();
+                            let (placement, table_acts) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.client_telemetry, &self.remote, self.settings.saved(), self.settings.store_path(), own_net.as_deref(), own_iid.as_deref());
+                            if let Some(p) = placement {
                                 self.ai.placement = p;
                             }
-                            egui::CollapsingHeader::new("Connection details (advanced)").default_open(false).show(ui, |ui| {
-                                net_actions = self.remote.ui(ui, self.settings.saved(), self.settings.store_path());
-                            });
+                            net_actions.extend(table_acts);
                         });
                 });
                 for a in net_actions {

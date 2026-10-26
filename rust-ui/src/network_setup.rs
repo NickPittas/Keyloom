@@ -241,13 +241,25 @@ fn state_dir(sp: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// `host` or `[v6]` of an https URL (no port).
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     let r = url.strip_prefix("https://").unwrap_or(url);
     let r = r.split('/').next().unwrap_or(r);
     if r.starts_with('[') {
         return r.find(']').map_or(r, |i| &r[..=i]).to_owned();
     }
     r.rsplit_once(':').map_or(r, |x| x.0).to_owned()
+}
+
+/// How an address is reached, from its literal (no lookup): this computer, Tailscale, the LAN, or a name.
+pub(crate) fn ep_kind(url: &str) -> &'static str {
+    use std::net::IpAddr;
+    match host_of(url).trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(a) if a.is_loopback() => "Local",
+        Ok(IpAddr::V4(a)) if a.octets()[0] == 100 && a.octets()[1] & 0xC0 == 64 => "Tailscale",
+        Ok(IpAddr::V6(a)) if a.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0] => "Tailscale",
+        Ok(_) => "LAN",
+        Err(_) => "Network",
+    }
 }
 
 fn short(url: &str) -> String {
@@ -374,6 +386,10 @@ impl Setup {
             out: vec![],
             updates: vec![],
         }
+    }
+
+    pub fn svc(&self) -> Option<&Svc> {
+        self.svc.as_ref()
     }
 
     pub fn take_joined(&mut self) -> Option<Joined> {
@@ -949,13 +965,12 @@ impl Setup {
                 ui.label(RichText::new(h).strong());
             }
             ui.end_row();
-            let mut shown: Vec<&str> = vec![];
             for pc in &pcs {
-                rows += 1;
                 let k = find_conn(&conns, c.connections, &pc.network_id, pc.host_iid.as_deref());
-                if let Some(k) = k {
-                    shown.push(&k.credentials);
+                if k.is_some() {
+                    continue; // already joined: its row is in the Clients table
                 }
+                rows += 1;
                 let mut on = k.is_some_and(|k| k.enabled);
                 let can = k.is_some() || (pc.join && !self.joining());
                 let label = if pc.name.is_empty() { "Unnamed PC".to_owned() } else { pc.name.clone() };
@@ -998,23 +1013,6 @@ impl Setup {
                 });
                 ui.end_row();
             }
-            // Saved PCs the scan did not find stay visible (and can still be switched off).
-            for k in conns.iter().filter(|k| !k.local_host && !shown.contains(&k.credentials.as_str())) {
-                let info = c.connections.iter().find(|i| i.credentials == k.credentials);
-                rows += 1;
-                let nid = conn_nid(k, c.connections);
-                let name = if !k.host_name.is_empty() { k.host_name.clone() } else { info.map_or_else(|| "Saved PC".to_owned(), |i| i.label.clone()) };
-                let mut on = k.enabled;
-                if ui.add_enabled_ui(true, |ui| crate::ui::theme::checkbox(ui, &mut on, &name).changed()).inner {
-                    cmds.push(Cmd::UsePc { credentials: k.credentials.clone(), network_id: nid, host_iid: None, name: String::new(), endpoints: vec![], on });
-                }
-                let addr: Vec<String> = k.endpoints.iter().map(|u| host_of(u)).collect();
-                ui.add(egui::Label::new(RichText::new(if addr.is_empty() { info.and_then(|i| i.url.as_deref()).map(host_of).unwrap_or_default() } else { addr.join(", ") }).size(11.5)).wrap());
-                ui.label("");
-                ui.colored_label(WARN, "not found");
-                ui.colored_label(if info.is_some_and(|i| i.online) { GOOD } else { DIM }, if info.is_some_and(|i| i.online) { "Connected" } else if k.enabled { "Saved, not connected" } else { "Saved" });
-                ui.end_row();
-            }
         });
         if rows == 0 {
             ui.label(RichText::new(if self.scan.is_some() { "No other Keyloom PCs were found. Check that the other PC is running Keyloom, then ReScan." } else { "Press ReScan to look for other PCs." }).color(DIM));
@@ -1044,5 +1042,14 @@ mod discovery_contract_tests {
             assert_eq!(args["endpoints"][0], "https://100.64.1.2:8443");
         }
         assert!(parse_scan(&json!({"pcs": [{"network_id": &fp[..16], "fingerprint_sha256": &fp[..16]}]})).pcs.is_empty());
+    }
+
+    #[test]
+    fn ep_kind_classifies() {
+        assert_eq!(ep_kind("https://192.168.1.5:8443"), "LAN");
+        assert_eq!(ep_kind("https://100.101.2.3:8443"), "Tailscale");
+        assert_eq!(ep_kind("https://[fd7a:115c:a1e0::1]:8443"), "Tailscale");
+        assert_eq!(ep_kind("https://127.0.0.1:8443"), "Local");
+        assert_eq!(ep_kind("https://pc.example.net:8443"), "Network");
     }
 }

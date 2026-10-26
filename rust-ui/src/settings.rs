@@ -148,6 +148,8 @@ pub struct Connection {
     pub receive: bool,
     /// Last known https addresses of the host (tried in order on connect; refreshed by Rescan).
     pub endpoints: Vec<String>,
+    /// User-picked address tried first (empty = automatic).
+    pub preferred: String,
     /// Certificate fingerprint of the network (empty = learn it from the connection).
     pub network_id: String,
     /// Exact host installation this connection targets (empty = legacy: every member).

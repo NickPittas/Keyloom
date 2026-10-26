@@ -4,9 +4,9 @@
 //! the legacy `network:{PC id}` form is honoured only while exactly one network knows that PC.
 use crate::netlink::Source;
 use crate::network_setup::ConnectionInfo;
-use crate::remote::{Action, Conn, Env, Install, Remote};
+use crate::remote::{Action, Conn, Env, Remote};
 use crate::settings::Settings;
-use eframe::egui::{RichText, Ui};
+use eframe::egui::Ui;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -24,7 +24,13 @@ fn conn_of(s: &Settings, sp: Option<&Path>) -> Vec<(Conn, bool)> {
     s.network.effective_connections(sp).into_iter().filter(|c| !c.credentials.trim().is_empty() && seen.insert(c.credentials.trim().to_owned())).map(|c| {
         let key = c.credentials.trim().to_owned();
         let default = s.network.default_submit.trim() == key;
-        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), may_claim: false, endpoints: c.endpoints.clone(), target_host: c.host_installation_id.trim().to_owned(), local_host: c.local_host }, default)
+        let mut endpoints = c.endpoints.clone();
+        let p = c.preferred.trim();
+        if !p.is_empty() {
+            endpoints.retain(|u| u.as_str() != p);
+            endpoints.insert(0, p.to_owned());
+        }
+        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), may_claim: false, endpoints, preferred: p.to_owned(), target_host: c.host_installation_id.trim().to_owned(), local_host: c.local_host }, default)
     }).collect()
 }
 
@@ -106,7 +112,9 @@ impl RemoteSet {
             self.rr = i + 1;
         }
         let many = self.remotes.len() > 1;
-        env.ai.net_targets = self.remotes.iter().flat_map(|r| r.targets(many.then(|| r.label()).as_deref())).collect();
+        // A connection to this computer's own network offers the same PCs as the local one: count those once.
+        let own: Vec<String> = self.remotes.iter().zip(&conns).filter(|(_, (c, _))| c.local_host).filter_map(|(r, _)| r.ns()).collect();
+        env.ai.net_targets = self.remotes.iter().filter(|r| !r.ns().is_some_and(|n| own.contains(&n))).flat_map(|r| r.targets(many.then(|| r.label()).as_deref())).collect();
         env.ai.net_online = self.online();
     }
 
@@ -121,10 +129,6 @@ impl RemoteSet {
     }
     pub fn has_queue(&self) -> bool {
         self.remotes.iter().any(Remote::has_queue)
-    }
-    pub fn other_installations(&self) -> Vec<Install> {
-        let many = self.remotes.len() > 1;
-        self.remotes.iter().flat_map(|r| r.other_installations(many.then(|| r.label()).as_deref())).collect()
     }
 
     /// What Setup needs to name and offer each connection (invitations pick one explicitly).
@@ -180,27 +184,56 @@ impl RemoteSet {
         acts
     }
 
-    /// The Clients page's network section: one card per joined network.
-    pub fn ui(&mut self, ui: &mut Ui, s: &Settings, sp: Option<&Path>) -> Vec<Action> {
+    /// The Clients table's rows for the other networks' PCs. This computer's own rows are `local_controls` and the
+    /// Local row, never these. Nothing when networking is off.
+    pub fn rows(&self, ui: &mut Ui, s: &Settings, sp: Option<&Path>, own_net: Option<&str>, own_iid: Option<&str>) -> Vec<Action> {
         if !self.available() {
-            ui.label(RichText::new("Network rendering is not available in this build.").color(egui_dim()));
             return vec![];
         }
-        let conns = conn_of(s, sp);
-        if conns.is_empty() {
-            ui.label(RichText::new("No networks joined yet. Join one below.").color(egui_dim()));
-        }
+        let own: Vec<String> = self.remotes.iter().filter_map(Remote::me).map(str::to_owned).chain(own_iid.map(str::to_owned)).collect();
         let mut acts = vec![];
-        for (c, default) in conns {
-            if let Some(r) = self.remotes.iter().find(|r| r.key == key_of(&c)) {
-                let blocker = r.remove_blocker(c.creds.as_deref());
-                acts.extend(r.card(ui, &c, default, blocker));
+        for (c, default) in conn_of(s, sp) {
+            let Some(r) = self.remotes.iter().find(|r| r.key == key_of(&c)) else { continue };
+            // `own_net` unknown (None) must not match a connection whose network is unknown too.
+            if c.local_host || own_net.is_some_and(|n| r.ns().as_deref() == Some(n)) {
+                continue;
             }
+            let blocker = r.remove_blocker(c.creds.as_deref());
+            acts.extend(r.row(ui, &c, default, blocker, &own));
+            ui.end_row();
         }
         acts
     }
+
+    /// This computer's own connection controls (its local-host connection), or five empty cells when there is none.
+    pub fn local_controls(&self, ui: &mut Ui, s: &Settings, sp: Option<&Path>) -> Vec<Action> {
+        let conns = conn_of(s, sp);
+        if let Some((c, default)) = conns.iter().find(|(c, _)| c.local_host) {
+            if let Some(r) = self.remotes.iter().find(|r| r.key == key_of(c)) {
+                return r.controls(ui, c, *default, r.remove_blocker(c.creds.as_deref()));
+            }
+        }
+        for _ in 0..5 {
+            ui.label("");
+        }
+        vec![]
+    }
 }
 
-fn egui_dim() -> eframe::egui::Color32 {
-    eframe::egui::Color32::from_rgb(169, 187, 175)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Connection;
+
+    #[test]
+    fn preferred_goes_first() {
+        let (u1, u2, u3) = ("https://192.168.1.2:8443", "https://100.64.1.2:8443", "https://10.0.0.9:8443");
+        let mut s = Settings::default();
+        let mut c = Connection { credentials: "/c.json".into(), endpoints: vec![u1.into(), u2.into()], preferred: u2.into(), ..Default::default() };
+        s.network.connections = vec![c.clone()];
+        assert_eq!(conn_of(&s, None)[0].0.endpoints, [u2, u1]);
+        c.preferred = u3.into();
+        s.network.connections = vec![c];
+        assert_eq!(conn_of(&s, None)[0].0.endpoints, [u3, u1, u2]);
+    }
 }

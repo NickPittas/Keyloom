@@ -13,9 +13,10 @@ stdout carries nothing else; stderr gets at most a few bounded diagnostics. Requ
 Ops (args are exact; unknown keys are refused; bodies are validated by the coordinator):
   pair          invitation_path, credentials_path, name, [existing_credentials_path, existing_credentials_paths[], endpoints[]]   -> installation_id   (credentials written 0600, never echoed;
                 the destination is reserved before the one-use code is redeemed; `endpoints` are extra routes to the SAME pinned certificate)
-  connect       credentials_path, [endpoints[]]            -> installation_id   (session id kept beside it, 0600; takes an exclusive
+  connect       credentials_path, [endpoints[], prefer]    -> installation_id   (session id kept beside it, 0600; takes an exclusive
                 lock on <credentials>.lock until close/EOF/exit, so a second bridge on the same credentials gets `busy`)
-  endpoints     urls[<=16 https]   replaces the connected client's extra addresses atomically (token, ids and the connection are untouched)
+  endpoints     urls[<=16 https], [prefer]   replaces the connected client's extra addresses atomically (token, ids and the connection are untouched);
+                prefer = the user's pick, tried first (a failure still falls back)
   discover      [timeout_s (3-20, default 20)], [known[<=64 https URLs]]   -> {elapsed_ms, sources{broadcast_ifaces, tailscale, neighbors},
                 partial, pcs[{network_id, fingerprint_sha256, name, host_installation_id, join, receiver_online, self,
                 endpoints[{url, kind, reachable, rtt_ms, error}]}]}   (synchronous, returns by its deadline; run it on its own bridge process)
@@ -62,7 +63,6 @@ import re
 import secrets
 import ssl
 import sys
-import time
 
 from . import coordinator as _c
 from . import network_service as _svc
@@ -352,9 +352,10 @@ class Bridge:
             self.lock = None
 
     def op_connect(self, a):
-        _need(a, ("credentials_path",), ("endpoints",))
+        _need(a, ("credentials_path",), ("endpoints", "prefer"))
         path = _path(a["credentials_path"], "credentials_path")
         eps = _urls(a.get("endpoints", []), "endpoints")
+        prefer = _urls([a["prefer"]], "prefer")[0] if "prefer" in a else None
         creds = pki.read_credentials(path)
         self._secret(creds["token"])
         # One bridge per credentials: the persisted session id would otherwise let two processes act as one installation.
@@ -367,6 +368,8 @@ class Bridge:
             raise pki.OwnerBusy("these credentials are already in use by a running link") from None
         try:
             client = self.client_cls(creds, self.timeout, endpoints=eps) if eps else self.client_cls(creds, self.timeout)
+            if prefer:
+                client.prefer(prefer)
             session_id = self._session(path)
         except BaseException:
             if not keep:
@@ -381,13 +384,15 @@ class Bridge:
 
     def op_endpoints(self, a):
         """Replace the connected client's extra addresses (same pinned certificate) without reconnecting or touching any id/token."""
-        _need(a, ("urls",))
+        _need(a, ("urls",), ("prefer",))
         urls = _urls(a["urls"], "urls")
-        c = self._live()  # not_connected if there is no link
+        self._live()  # not_connected if there is no link
         kept = pki.clean_endpoints(urls, explicit=[self.creds["url"]])
         if urls and not kept:
             raise BridgeError("bad_request", "none of those addresses is a LAN, Tailscale or ZeroTier address")
         self.client.set_endpoints(kept)
+        if "prefer" in a:
+            self.client.prefer(_urls([a["prefer"]], "prefer")[0])
         return {"endpoints": list(self.client.endpoints)}
 
     def op_discover(self, a):
