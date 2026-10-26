@@ -62,9 +62,10 @@ fn invalid_mappings_are_refused_and_nothing_is_written() {
     assert!(st.save(st.saved().clone()).is_err());
 }
 
+static W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1440);
 fn run(ctx: &egui::Context, app: &mut App, events: Vec<Event>) {
     let raw = RawInput {
-        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 900.0))),
+        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(W.load(std::sync::atomic::Ordering::SeqCst) as f32, 900.0))),
         events,
         ..Default::default()
     };
@@ -168,4 +169,50 @@ fn unusable_mapping_keeps_other_settings_and_unknown_row_keys_and_refuses_save_u
     assert_eq!(again.saved().playback.cache_mib, 4096);
     assert_eq!(again.saved().shared_roots[0].local, "/mnt/nas");
     assert_eq!(again.saved().shared_roots[0].extra["note"]["k"], 1);
+}
+
+fn type_into(ctx: &egui::Context, app: &mut App, what: &str, row: usize, text: &str) {
+    let at = app.settings_page().map_rect(what, row).unwrap_or_else(|| panic!("{what} {row} drawn")).center();
+    click(ctx, app, at);
+    // What winit sends when a field takes focus: IME enabled and an empty preedit; then the key text.
+    let pre = Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None });
+    run(ctx, app, vec![pre.clone(), pre]);
+    run(ctx, app, vec![Event::Text(text.into())]);
+    run(ctx, app, vec![]);
+}
+
+#[test]
+fn name_and_folder_accept_typing_across_add_and_apply() {
+  for (w, with_project) in [(1440, true), (1440, false), (800, false), (500, false), (360, false)] {
+    W.store(w, std::sync::atomic::Ordering::SeqCst);
+    let base = tmp(&format!("typing{w}{with_project}"));
+    let project = base.join("proj");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("project.json"), r#"{"version":2}"#).unwrap();
+    let ctx = egui::Context::default();
+    let opts = AppOptions { project: with_project.then_some(project), settings_path: Some(base.join("cfg/settings.json")), ..Default::default() };
+    let mut app = App::with_picker(&ctx, opts, Arc::new(|_, _| vec![]));
+    for _ in 0..3 {
+        run(&ctx, &mut app, vec![]);
+    }
+    let at = app.settings_rect().expect("Settings button").center();
+    click(&ctx, &mut app, at);
+    app.settings_page().select_path_mapping();
+    run(&ctx, &mut app, vec![]);
+    for round in 0..3 {
+        let at = app.settings_page().map_rect("add", 0).expect("Add drawn").center();
+        click(&ctx, &mut app, at);
+        run(&ctx, &mut app, vec![]);
+        type_into(&ctx, &mut app, "name", 0, "NAS");
+        assert_eq!(app.settings_page().draft().shared_roots[0].name, "NAS", "w{w} p{with_project} round {round}: name");
+        type_into(&ctx, &mut app, "local", 0, "/mnt/nas");
+        assert_eq!(app.settings_page().draft().shared_roots[0].local, "/mnt/nas", "w{w} p{with_project} round {round}: folder");
+        let at = app.settings_page().apply_rect().expect("Apply drawn").center();
+        click(&ctx, &mut app, at);
+        // Remove the applied row so the next round starts from row 0 again.
+        app.settings_page().draft_mut().shared_roots.clear();
+        assert!(app.settings_page().apply());
+        run(&ctx, &mut app, vec![]);
+    }
+}
 }
