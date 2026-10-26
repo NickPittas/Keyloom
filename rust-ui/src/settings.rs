@@ -115,17 +115,17 @@ pub struct Masks {
 }
 
 /// Connection to a coordinator (no secret here: `credentials` is only the PATH of the private credentials file).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Network {
-    /// Connect to the paired coordinator when the app starts.
+    /// Connect to the joined network when the app starts.
     pub enabled: bool,
     /// Take work from the network when this computer's GPU is idle (opt-in).
     pub receive: bool,
     /// Empty = `<settings folder>/network/credentials.json`.
     pub credentials: String,
-    /// Every network this PC has joined, each connected independently. Empty (and never migrated) = the legacy
-    /// single connection above.
+    /// Every network this PC has joined, each connected independently. An old single connection (the fields above)
+    /// becomes the first entry when the file is loaded.
     pub connections: Vec<Connection>,
     /// Credentials path of the connection Auto Batch jobs go to (empty = first online one).
     pub default_submit: String,
@@ -133,10 +133,26 @@ pub struct Network {
     pub name: String,
     /// The user removed this PC's own host service: it is not installed again at startup (Start clears it).
     pub host_removed: bool,
-    /// Hosting requires an invitation (inverse of the local service's `allow_address_join`).
-    pub use_invitation: bool,
+    /// Allow other PCs to join this PC's service.
+    pub allow_join: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            receive: false,
+            credentials: String::new(),
+            connections: vec![],
+            default_submit: String::new(),
+            name: String::new(),
+            host_removed: false,
+            allow_join: true,
+            extra: Map::new(),
+        }
+    }
 }
 
 /// One joined network (no secret here: `credentials` is only the PATH of its private credentials file).
@@ -162,22 +178,8 @@ pub struct Connection {
 }
 
 impl Network {
-    /// The connections to run: the saved list, or (until the list is first written) the legacy single one when its
-    /// credentials file exists. Writing the list sets `connections_migrated`, so removing the last one sticks.
-    pub fn effective_connections(&self, settings_path: Option<&std::path::Path>) -> Vec<Connection> {
-        if !self.connections.is_empty() || self.extra.get("connections_migrated").and_then(Value::as_bool) == Some(true) {
-            return self.connections.clone();
-        }
-        let path = match self.credentials.trim() {
-            "" => settings_path.and_then(std::path::Path::parent).map(|d| d.join("network").join("credentials.json")),
-            c => Some(std::path::PathBuf::from(c)),
-        };
-        path.filter(|p| p.exists()).map(|p| Connection { credentials: p.display().to_string(), enabled: self.enabled, receive: self.receive, ..Default::default() }).into_iter().collect()
-    }
-    /// Make the list the source of truth (keeps the legacy fields as they were).
-    pub fn materialize(&mut self, settings_path: Option<&std::path::Path>) {
-        self.connections = self.effective_connections(settings_path);
-        self.extra.insert("connections_migrated".into(), Value::Bool(true));
+    pub fn connections(&self) -> &[Connection] {
+        &self.connections
     }
 }
 
@@ -435,7 +437,7 @@ impl Store {
             return s;
         };
         match std::fs::read(&p) {
-            Ok(bytes) => match Self::parse(&bytes) {
+            Ok(bytes) => match Self::parse(&bytes, p.parent()) {
                 Ok(v) => s.saved = v,
                 Err(e) => {
                     s.problem = Some(format!(
@@ -457,7 +459,7 @@ impl Store {
         s
     }
 
-    fn parse(bytes: &[u8]) -> Result<Settings, String> {
+    fn parse(bytes: &[u8], dir: Option<&Path>) -> Result<Settings, String> {
         let mut raw: Value =
             serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
         match raw.get("version").and_then(Value::as_u64) {
@@ -472,6 +474,27 @@ impl Store {
         // SSH machines were removed; drop them so an old file still loads with the rest of its settings.
         if let Some(a) = raw.get_mut("ai_targets").and_then(Value::as_array_mut) {
             a.retain(|t| t.get("kind").and_then(Value::as_str) == Some("local"));
+        }
+        if let Some(n) = raw.get_mut("network").and_then(Value::as_object_mut) {
+            // The old `use_invitation` is `allow_join` turned around.
+            if let Some(old) = n.remove("use_invitation").and_then(|v| v.as_bool()) {
+                n.entry("allow_join").or_insert(Value::Bool(!old));
+            }
+            // An old file with one connection in the fields above and no list: that connection becomes the list.
+            // An empty list marked migrated means the user removed everything and stays empty.
+            let empty = n.get("connections").and_then(Value::as_array).is_none_or(Vec::is_empty);
+            if empty && n.get("connections_migrated").and_then(Value::as_bool) != Some(true) {
+                let field = |k| n.get(k).and_then(Value::as_bool).unwrap_or(false);
+                let path = match n.get("credentials").and_then(Value::as_str).unwrap_or("").trim() {
+                    "" => dir.map(|d| d.join("network").join("credentials.json")),
+                    c => Some(PathBuf::from(c)),
+                };
+                let conns: Vec<Value> = path.filter(|p| p.exists()).map(|p| serde_json::json!({"credentials": p.display().to_string(), "enabled": field("enabled"), "receive": field("receive")})).into_iter().collect();
+                if !conns.is_empty() {
+                    n.insert("connections".into(), Value::Array(conns));
+                    n.insert("connections_migrated".into(), Value::Bool(true));
+                }
+            }
         }
         let s: Settings = serde_json::from_value(raw).map_err(|e| e.to_string())?;
         s.validate_core()?;

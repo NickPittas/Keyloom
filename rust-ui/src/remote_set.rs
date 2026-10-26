@@ -1,7 +1,6 @@
 //! Every joined network, each driven by its own `Remote` (own bridge, sidefiles, retry and attempt state). The set
 //! only routes: Batch submissions go to the owning network, offers/claims are serialized across networks (round
-//! robin), and the pickers see one merged list of PCs. Assignments are namespaced `network id/PC id` (never an index);
-//! the legacy `network:{PC id}` form is honoured only while exactly one network knows that PC.
+//! robin), and the pickers see one merged list of PCs. Assignments are namespaced `network id/PC id` (never an index).
 use crate::netlink::Source;
 use crate::network_setup::ConnectionInfo;
 use crate::remote::{Action, Conn, Env, Remote};
@@ -15,13 +14,12 @@ pub struct RemoteSet {
     remotes: Vec<Remote>,
     /// Round robin start for the next claim.
     rr: usize,
-    invite_owner: Option<String>,
 }
 
-fn conn_of(s: &Settings, sp: Option<&Path>) -> Vec<(Conn, bool)> {
+fn conn_of(s: &Settings, _sp: Option<&Path>) -> Vec<(Conn, bool)> {
     let name = s.network.name.trim().to_owned(); // empty = do not rename (an existing host name is never overwritten)
     let mut seen = std::collections::HashSet::new();
-    s.network.effective_connections(sp).into_iter().filter(|c| !c.credentials.trim().is_empty() && seen.insert(c.credentials.trim().to_owned())).map(|c| {
+    s.network.connections().iter().filter(|c| !c.credentials.trim().is_empty() && seen.insert(c.credentials.trim().to_owned())).map(|c| {
         let key = c.credentials.trim().to_owned();
         let default = s.network.default_submit.trim() == key;
         let mut endpoints = c.endpoints.clone();
@@ -40,7 +38,7 @@ fn key_of(c: &Conn) -> String {
 
 impl RemoteSet {
     pub fn new(source: Source) -> Self {
-        Self { source, remotes: vec![], rr: 0, invite_owner: None }
+        Self { source, remotes: vec![], rr: 0 }
     }
     pub fn available(&self) -> bool {
         self.source != Source::Off
@@ -60,12 +58,7 @@ impl RemoteSet {
                     let i = self.remotes.iter().position(|r| r.ns().as_deref() == Some(ns)).ok_or("that PC's network is not set up on this computer")?;
                     return Ok((i, Some(iid.to_owned())));
                 }
-                let mut owners = self.remotes.iter().enumerate().filter(|(_, r)| r.has_install(t));
-                match (owners.next(), owners.next()) {
-                    (Some((i, _)), None) => Ok((i, Some(t.clone()))),
-                    (None, _) => Err("this older assignment names a PC no connected network knows: pick the PC again".into()),
-                    _ => Err("this older assignment matches PCs on several networks: pick the PC again".into()),
-                }
+                Err("that PC is not known on any joined network; pick it again".into())
             }
             None => self.remotes.iter().position(|r| !default.is_empty() && r.key == default && r.online())
                 .or_else(|| self.remotes.iter().position(Remote::online))
@@ -128,27 +121,9 @@ impl RemoteSet {
         self.remotes.iter().all(Remote::quiescent)
     }
 
-    /// What Setup needs to name and offer each connection (invitations pick one explicitly).
+    /// What Setup needs to name and offer each connection.
     pub fn infos(&self) -> Vec<ConnectionInfo> {
         self.remotes.iter().map(|r| ConnectionInfo { credentials: r.key.clone(), label: r.label(), network_id: r.ns(), online: r.online(), url: r.url() }).collect()
-    }
-    /// `false` = that connection is no longer set up, so nothing was written.
-    pub fn invite(&mut self, creds: &str, path: String) -> bool {
-        self.invite_owner = Some(creds.to_owned());
-        match self.get(creds) {
-            Some(r) => {
-                r.invite(path);
-                true
-            }
-            None => {
-                self.invite_owner = None;
-                false
-            }
-        }
-    }
-    pub fn invite_note(&self) -> Option<&str> {
-        let key = self.invite_owner.as_deref()?;
-        self.remotes.iter().find(|r| r.key == key)?.invite_note.as_deref()
     }
 
     pub fn cancel_job(&mut self, creds: &str, job_id: &str) {

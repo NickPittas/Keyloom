@@ -1,6 +1,5 @@
-"""TLS identity, invitations and private credential files.
-Trust model: the invitation (delivered through a channel the user verifies) carries the server certificate
-PEM *and* its SHA-256 fingerprint. The client checks the fingerprint offline, then uses that certificate as
+"""TLS identity and private credential files.
+Trust model: the client checks the server certificate's SHA-256 fingerprint against the one the user selected, then uses that certificate as
 the only trust anchor (CERT_REQUIRED). The identity is the pinned certificate, NOT an address: host-name checking is off and
 the leaf's SHA-256 is compared right after every handshake, before any request byte, so the same identity works over every
 address of the PC (LAN, Tailscale, ZeroTier, loopback) and across address changes. Certificate SANs are cosmetic."""
@@ -32,11 +31,11 @@ class OwnerBusy(SecurityError):
 
 
 class PairedNotSaved(SecurityError):
-    """The server accepted the pairing but the credentials could not be stored: the invitation is spent."""
+    """The server accepted the join but the credentials could not be stored: join again from the Clients page."""
 
     def __init__(self, installation_id, why):
-        super().__init__(f"paired as {installation_id} but the credentials could not be saved ({why}); the invitation is USED and "
-                         f"the token is lost. Ask the server owner to revoke {installation_id} and issue a new invitation.")
+        super().__init__(f"paired as {installation_id} but the credentials could not be saved ({why}); the join code is USED and "
+                         f"the token is lost. Join again from the Clients page.")
         self.installation_id = installation_id
 
 
@@ -44,8 +43,8 @@ class PairingUncertain(SecurityError):
     """The request may or may not have reached the server before the connection failed."""
 
     def __init__(self, why):
-        super().__init__(f"pairing failed in transit ({why}); the invitation MAY have been used. Nothing was retried. "
-                         "If a new attempt is refused, ask the server owner to revoke the installation and issue a new invitation.")
+        super().__init__(f"pairing failed in transit ({why}); the join code MAY have been used. Nothing was retried. "
+                         "If a new attempt is refused, join again from the Clients page.")
 
 
 _IS_WINDOWS = os.name == "nt"
@@ -216,10 +215,10 @@ def server_context(cert_path, key_path):
 
 
 def client_context(cert_pem, expected_fingerprint):
-    """The supplied certificate is the sole trust anchor, after its fingerprint matched the invitation.
+    """The supplied certificate is the sole trust anchor, after its fingerprint matched the selected one.
     No host-name check: callers MUST run `check_pin` on the handshaken socket before sending anything."""
     if not hmac.compare_digest(fingerprint(cert_pem), expected_fingerprint.lower()):
-        raise SecurityError("certificate does not match the invitation fingerprint")
+        raise SecurityError("certificate does not match the selected fingerprint")
     ctx = ssl.create_default_context(cadata=cert_pem)  # explicit cadata: system roots are not loaded
     ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_REQUIRED
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -234,7 +233,7 @@ def endpoint(url):
 
 
 def verified_trust(url, cert_pem, expected_fingerprint):
-    """Offline checks shared by pairing and every later connection (the address is not part of the identity)."""
+    """Offline checks shared by joining and every later connection (the address is not part of the identity)."""
     host, port = endpoint(url)
     return host, port, client_context(cert_pem, expected_fingerprint)
 
@@ -283,7 +282,7 @@ def address_kind(host, iface=""):
 
 def clean_endpoints(urls, explicit=(), limit=16):
     """Distinct canonical https URLs. Untrusted advertisements keep only trusted literals; hosts of `explicit` URLs
-    (a deliberate invitation / address the user typed) are kept whatever they are."""
+    (a deliberate join / address the user typed) are kept whatever they are."""
     allow = set()
     for u in explicit:
         try:
@@ -305,13 +304,7 @@ def clean_endpoints(urls, explicit=(), limit=16):
     return out[:limit]
 
 
-# ---- invitation / credentials --------------------------------------------------------------------
-
-def write_invitation(path, url, cert_pem, code, expires_at):
-    endpoint(url)
-    write_private_new(path, json.dumps({"version": 1, "url": url, "certificate_pem": cert_pem,
-                                        "fingerprint_sha256": fingerprint(cert_pem), "code": code, "expires_at": expires_at}))
-
+# ---- credentials ---------------------------------------------------------------------------------
 
 _ID_OK = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 _TOKEN_OK = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
@@ -338,16 +331,6 @@ def _load(path, kind):
         d = json.loads(read_private(path))
     except ValueError:
         raise SecurityError(f"{kind} file is not valid JSON; it was left untouched") from None
-    return d
-
-
-def read_invitation(path):
-    d = _load(path, "invitation")
-    need = {"version", "url", "certificate_pem", "fingerprint_sha256", "code", "expires_at"}
-    if not isinstance(d, dict) or set(d) != need or d["version"] != 1 or isinstance(d["expires_at"], bool) \
-            or not isinstance(d["expires_at"], (int, float)):
-        raise SecurityError("not a valid pairing invitation")
-    _strings(d, "invitation", "url", "certificate_pem", "fingerprint_sha256", "code")
     return d
 
 

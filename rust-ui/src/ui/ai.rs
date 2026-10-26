@@ -384,13 +384,9 @@ fn network_target(p: &Placement) -> Option<&str> {
     match p { Placement::Target(id) => id.strip_prefix("network:"), Placement::Auto => None }
 }
 
-/// A network PC's picker label: ids are `network id/PC id`; a legacy bare PC id matches only when exactly one network has it.
+/// A network PC's picker label: ids are `network id/PC id`.
 fn net_label(targets: &[(String, String)], id: &str) -> Option<String> {
-    if let Some(t) = targets.iter().find(|t| t.0 == id) {
-        return Some(t.1.clone());
-    }
-    let mut legacy = targets.iter().filter(|t| t.0.split_once('/').is_some_and(|(_, i)| i == id));
-    match (legacy.next(), legacy.next()) { (Some(t), None) => Some(t.1.clone()), _ => None }
+    targets.iter().find(|t| t.0 == id).map(|t| t.1.clone())
 }
 
 fn export_block(r: &BatchRow) -> Option<String> {

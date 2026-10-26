@@ -898,7 +898,7 @@ def _ensure_default(python, root, prefix):
     if _definition(sd):
         return (status(sd) if sd.is_dir() else {"installed": False, "running": False}) | {
             "action": "none", "message": "another network service is registered for this user and was left untouched"}
-    allow = (not net["use_invitation"]) if isinstance(net.get("use_invitation"), bool) else True
+    allow = net["allow_join"] if isinstance(net.get("allow_join"), bool) else (not net["use_invitation"] if isinstance(net.get("use_invitation"), bool) else True)
     name = net["name"].strip()[:64] if isinstance(net.get("name"), str) and net["name"].strip() else None
     out = _install(sd, service_python(python), Path(root), owner, Path(prefix), None, None, allow, name)
     return out | {"action": "installed", "message": "this PC now hosts the network"}

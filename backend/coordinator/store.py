@@ -16,12 +16,9 @@ from .schema import (ApiError, MAX_BATCH, canonical, digest, validate_claim, val
                      validate_spec, validate_stats, validate_target, ident, obj, text, choice, bad, REJECT_CODES)
 
 SCHEMA_VERSION = 2
-MAX_INSTALLATIONS = 64  # joins by address / reusable invitation stop here; one-use pairings are unaffected
-MAX_SHARED_INVITATIONS = 16
-SHARED_TTL = 7 * 86400
+MAX_INSTALLATIONS = 64  # joins stop here
 SESSION_TTL = 120  # s without any call before another session id may take over the installation
 MAX_ACTIVE_JOBS = 2000
-_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 _DDL = """
 CREATE TABLE installations(id TEXT PRIMARY KEY, name TEXT NOT NULL, is_admin INTEGER NOT NULL,
@@ -49,7 +46,7 @@ CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT, attempt_id TEXT NOT NU
 CREATE INDEX events_job ON events(job_id, id);
 CREATE TABLE job_rejections(job_id TEXT NOT NULL, installation_id TEXT NOT NULL, PRIMARY KEY(job_id, installation_id));
 """
-# Schema 2 only adds reusable (non-admin, multi-use, expiring) invitations; the one-use `pairings` table is untouched.
+# Schema 2 added reusable invitations. Both `pairings` and `shared_invitations` stay in place for old databases; nothing writes them now.
 _DDL_V2 = """
 CREATE TABLE shared_invitations(code_hash TEXT PRIMARY KEY, created_by TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL);
 """
@@ -57,10 +54,6 @@ CREATE TABLE shared_invitations(code_hash TEXT PRIMARY KEY, created_by TEXT NOT 
 
 def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
-
-
-def _code_hash(code):
-    return hashlib.sha256("".join(c for c in code.upper() if c.isalnum()).encode()).hexdigest()
 
 
 def new_id(prefix):
@@ -129,24 +122,7 @@ class Store:
                               (now, SESSION_TTL)).fetchall():
             self._requeue_offer(db, att, "offer expired: owner session lapsed before start", now)
 
-    # ---- pairing / identity -----------------------------------------------------------------------
-
-    def create_pairing(self, is_admin=False, ttl=600):
-        code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(10))
-        with self._tx() as db:
-            db.execute("INSERT INTO pairings VALUES(?,?,?,NULL,NULL)", (_code_hash(code), int(is_admin), self.clock() + ttl))
-        return f"{code[:5]}-{code[5:]}"
-
-    def create_shared_invitation(self, creator, ttl=SHARED_TTL):
-        """Reusable code for any number of NON-ADMIN installations until it expires (7 days). Returns (code, expires_at)."""
-        code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(20))
-        with self._tx() as db:
-            now = self.clock()
-            db.execute("DELETE FROM shared_invitations WHERE expires_at<?", (now,))
-            if db.execute("SELECT count(*) FROM shared_invitations").fetchone()[0] >= MAX_SHARED_INVITATIONS:
-                raise ApiError(409, "too_many_invitations", "too many active invitations; wait for one to expire")
-            db.execute("INSERT INTO shared_invitations VALUES(?,?,?,?)", (_code_hash(code), creator["id"], now, now + ttl))
-        return "-".join(code[i:i + 5] for i in range(0, 20, 5)), now + ttl
+    # ---- identity -----------------------------------------------------------------------------------
 
     def _issue(self, db, name, is_admin, now):
         token, iid = secrets.token_urlsafe(32), new_id("inst")
@@ -163,24 +139,6 @@ class Store:
         with self._tx() as db:
             self._room(db)
             return self._issue(db, name, False, self.clock())
-
-    def pair(self, code, name):
-        """One-use code (or a reusable invitation): the same transaction creates the installation. Token is returned once."""
-        text(name, "name", 64)
-        if not isinstance(code, str) or len(code) > 32:
-            bad("code must be the pairing code")
-        now = self.clock()
-        with self._tx() as db:
-            h = _code_hash(code)
-            row = db.execute("SELECT * FROM pairings WHERE code_hash=?", (h,)).fetchone()
-            if row and row["used_at"] is None and row["expires_at"] >= now:
-                iid, token = self._issue(db, name, row["is_admin"], now)
-                db.execute("UPDATE pairings SET used_at=?, installation_id=? WHERE code_hash=? AND used_at IS NULL", (now, iid, h))
-                return iid, token
-            if not row and db.execute("SELECT 1 FROM shared_invitations WHERE code_hash=? AND expires_at>=?", (h, now)).fetchone():
-                self._room(db)
-                return self._issue(db, name, False, now)
-            raise ApiError(403, "pairing_rejected", "pairing code is unknown, used or expired")
 
     def authenticate(self, bearer):
         """`<installation_id>.<token>` -> installation row, constant-time hash compare, revoked refused."""

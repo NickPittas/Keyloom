@@ -208,26 +208,6 @@ class Client:
             raise BadReply("hello does not carry the pinned fingerprint")
         return out
 
-    @classmethod
-    def pair(cls, invitation, name, endpoints=None):
-        """Redeem an invitation dict; returns the new credentials dict (caller stores it privately). The invitation URL is what
-        is written; `endpoints` are only extra routes to try, certificate-covered addresses first (older invitations)."""
-        c = cls({"url": invitation["url"], "certificate_pem": invitation["certificate_pem"],
-                 "fingerprint_sha256": invitation["fingerprint_sha256"], "installation_id": "-", "token": "-"}, endpoints=endpoints)
-        covered = []
-        for u in c.endpoints:
-            try:
-                covered.append(pki.cert_covers_host(invitation["certificate_pem"], pki.endpoint(u)[0]))
-            except Exception:
-                covered.append(False)
-        c._known = [u for _, u in sorted(zip((not x for x in covered), c.endpoints), key=lambda t: t[0])]
-        out = c._call("POST", "/v1/pair", {"protocol": PROTOCOL, "code": invitation["code"], "name": name}, auth=False)
-        if not pki.valid_installation_id(out.get("installation_id")) or not pki.valid_token(out.get("token")):
-            raise BadReply("pairing reply carries unusable credentials")  # never reported as a success
-        return {"version": 1, "url": invitation["url"], "certificate_pem": invitation["certificate_pem"],
-                "fingerprint_sha256": invitation["fingerprint_sha256"],
-                "installation_id": out["installation_id"], "token": out["token"]}
-
     def register(self, body): return self._call("POST", "/v1/session", body)
     def submit(self, submission_id, spec, target=None): return self._call("POST", "/v1/jobs", {"submission_id": submission_id, "spec": spec, "target": target})
     def claim(self, body): return self._call("POST", "/v1/claim", body)
@@ -238,12 +218,11 @@ class Client:
     def job(self, job_id): return self._call("GET", f"/v1/jobs/{job_id}")
     def job_events(self, job_id, after=0, limit=100): return self._call("GET", f"/v1/jobs/{job_id}/events?after={after}&limit={limit}")
     def stats(self, body): return self._call("POST", "/v1/stats", body)
-    def invite(self): return self._call("POST", "/v1/invitations", {})
     def installations(self): return self._call("GET", "/v1/installations")
 
 
 def _store_new(credentials_path, issue):
-    """Reserve a private destination, run `issue()` -> credentials dict, then store. Order matters (see redeem_to_file)."""
+    """Reserve a private destination, run `issue()` -> credentials dict, then store. Order matters: the destination is reserved first."""
     pki.reserve_private(credentials_path)
     try:
         creds = issue()
@@ -266,15 +245,6 @@ def _store_new(credentials_path, issue):
             pass
         raise pki.PairedNotSaved(creds["installation_id"], type(e).__name__) from None
     return creds["installation_id"]
-
-
-def redeem_to_file(inv, credentials_path, name, endpoints=None):
-    """The one pairing routine (CLI and bridge). Order matters: reserve a private destination first (exclusive, protected,
-    verified), redeem the one-use code, then store. Returns installation_id. Raises SecurityError subclasses:
-    PairedNotSaved (code spent, token lost) and PairingUncertain (transport failure; code MAY be spent). Never retries."""
-    if inv["expires_at"] < time.time():
-        raise pki.SecurityError("invitation has expired; ask the server owner for a new one")
-    return _store_new(credentials_path, lambda: Client.pair(inv, name, endpoints))
 
 
 def join_to_file(url, credentials_path, name, path="/v1/join", extra=None, pem=None, timeout=15, existing=None, loopback=False,

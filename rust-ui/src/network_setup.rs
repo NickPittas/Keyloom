@@ -1,18 +1,17 @@
 //! Network setup: this PC hosts its own per-user network service automatically (installed once at startup unless
 //! the user removed it) and the Clients page lists the other Keyloom PCs found on every LAN / Tailscale / ZeroTier
 //! interface. It owns its own lazy bridge link (separate from `remote::Remote`, which only runs while a connection
-//! is enabled), so setup works unpaired/offline and never touches a client's credentials lock. Nothing scans in the
+//! is enabled), so setup works not joined/offline and never touches a client's credentials lock. Nothing scans in the
 //! background: a scan runs only when Clients is first opened or when ReScan is pressed. A join writes a NEW
 //! credentials file under `<settings>/network/` (or reuses the saved one of the same network); the App adds it to
 //! the retained connections and never switches or resets an existing session. Secrets never pass through here: the
-//! bridge writes credentials and invitations itself.
+//! bridge writes credentials itself.
 //!
 //! Every bridge request has a deadline (service operations 45 s, scans 35 s). When it passes, the bridge process is
 //! dropped (killed and reaped) and the UI says the state is unknown until Refresh; a request is never retried.
 use crate::netlink::{Link, Op, Source, State};
 use crate::remote::{err_text, nlog};
 use crate::settings::{Connection, Settings};
-use crate::ui::picker::PickKind;
 use eframe::egui::{self, Color32, RichText, Ui};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -76,10 +75,6 @@ pub struct Pc {
 impl Pc {
     fn join_args(&self, url: &str, name: &str) -> Value {
         json!({"url": url, "name": name, "fingerprint_sha256": self.fingerprint_sha256, "endpoints": self.urls()})
-    }
-
-    fn invitation_route(&self) -> Value {
-        json!({"fingerprint_sha256": self.fingerprint_sha256, "endpoints": self.urls()})
     }
 
     /// Reachable addresses first, then the rest (<= 16, https only).
@@ -175,22 +170,17 @@ pub struct Ctx<'a> {
     pub settings_path: Option<&'a Path>,
     pub connected: bool,
     pub connections: &'a [ConnectionInfo],
-    pub invite_note: Option<&'a str>,
 }
 
 /// Work for the App (it owns the picker, the settings and the connected clients).
 pub enum Cmd {
     /// Save the global PC name (the App pushes it to every joined host).
     SaveName(String),
-    /// Write an invitation for the network of the connection with these credentials.
-    Invite { connection: String, path: String },
-    Browse(PickKind),
     /// The row's checkbox changed on a saved connection (`endpoints` empty = keep the saved ones).
     UsePc { credentials: String, network_id: String, host_iid: Option<String>, name: String, endpoints: Vec<String>, on: bool },
     /// Persist `network.host_removed`.
     HostRemoved(bool),
-    /// Persist `network.use_invitation`.
-    UseInvitation(bool),
+    AllowJoin(bool),
 }
 
 pub struct Setup {
@@ -206,8 +196,6 @@ pub struct Setup {
     joined: Option<Joined>,
     name: String,
     name_loaded: bool,
-    invitation: String,
-    invite_path: String,
     remove_armed: bool,
     dir: String,
     net_dir: Option<PathBuf>,
@@ -215,7 +203,7 @@ pub struct Setup {
     installed_once: bool,
     // Mirrors of the settings, refreshed every frame by `ensure`.
     host_removed: bool,
-    use_inv: bool,
+    allow_join: bool,
     reg_name: String,
     existing: Vec<String>,
     known_local: Vec<String>,
@@ -227,11 +215,9 @@ pub struct Setup {
     scan_link: Option<Link>,
     scan_item: Option<Value>,
     scan_id: Option<String>,
-    /// Name / join policy the user changed but the service has not been told yet (coalesced, flushed when idle).
+    /// Name the user changed but the service has not been told yet (coalesced, flushed when idle).
     pend_name: Option<String>,
     pend_allow: Option<bool>,
-    inv_dirty: bool,
-    policy_synced: bool,
     out: Vec<Cmd>,
     updates: Vec<ScanUpdate>,
 }
@@ -360,15 +346,13 @@ impl Setup {
             joined: None,
             name: crate::remote::default_name(),
             name_loaded: false,
-            invitation: String::new(),
-            invite_path: String::new(),
             remove_armed: false,
             dir: String::new(),
             net_dir: None,
             ensure: Ensure::Idle,
             installed_once: false,
             host_removed: false,
-            use_inv: false,
+            allow_join: true,
             reg_name: crate::remote::default_name(),
             existing: vec![],
             known_local: vec![],
@@ -381,8 +365,6 @@ impl Setup {
             scan_id: None,
             pend_name: None,
             pend_allow: None,
-            inv_dirty: false,
-            policy_synced: false,
             out: vec![],
             updates: vec![],
         }
@@ -402,16 +384,6 @@ impl Setup {
     pub fn set_note(&mut self, s: String) {
         self.note = Some(s);
     }
-    /// The App's picker answered (`None` = cancelled).
-    pub fn browse_done(&mut self, kind: PickKind, path: Option<PathBuf>) {
-        if let Some(p) = path.map(|p| p.display().to_string()) {
-            match kind {
-                PickKind::NetInvitationOpen => self.invitation = p,
-                _ => self.invite_path = p,
-            }
-        }
-    }
-
     fn busy(&self) -> bool {
         !self.pend.is_empty() || !self.queue.is_empty()
     }
@@ -443,11 +415,11 @@ impl Setup {
     /// here; the service comes back only through Start or the OS sign-in.
     pub fn ensure(&mut self, s: &Settings, sp: Option<&Path>) {
         self.set_dir(sp);
-        let conns = s.network.effective_connections(sp);
+        let conns = s.network.connections();
         self.existing = conns.iter().map(|c| c.credentials.clone()).collect();
         self.known_local = conns.iter().filter(|c| c.local_host).map(|c| c.network_id.clone()).collect();
         self.host_removed = s.network.host_removed;
-        self.use_inv = s.network.use_invitation;
+        self.allow_join = s.network.allow_join;
         let n: String = s.network.name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
         self.reg_name = if n.is_empty() { crate::remote::default_name().chars().filter(|c| !c.is_control()).take(64).collect() } else { n };
         self.known_urls = conns.iter().flat_map(|c| c.endpoints.iter().cloned()).collect();
@@ -488,7 +460,7 @@ impl Setup {
     }
 
     fn install(&mut self, what: &'static str) {
-        self.push(Op::ServiceInstall, json!({"allow_address_join": self.svc.as_ref().and_then(|s| s.policy).unwrap_or(!self.use_inv), "name": self.reg_name}), Pend::Service(what));
+        self.push(Op::ServiceInstall, json!({"allow_address_join": self.svc.as_ref().and_then(|s| s.policy).unwrap_or(self.allow_join), "name": self.reg_name}), Pend::Service(what));
     }
 
     /// Per frame: start the link when something is queued, send, collect replies, enforce deadlines, drop the link when idle.
@@ -609,8 +581,8 @@ impl Setup {
         }
     }
 
-    /// Tell the running service about a changed name / join policy once its link is free. Several edits collapse into
-    /// one request; nothing is lost when a status poll or another operation was in flight at the click.
+    /// Tell the running service about a changed name once its link is free. Several edits collapse into one request;
+    /// nothing is lost when a status poll or another operation was in flight at the click.
     fn flush_cfg(&mut self) {
         if self.pend_name.is_none() && self.pend_allow.is_none() {
             return;
@@ -619,14 +591,12 @@ impl Setup {
         if !svc.installed {
             self.pend_name = None; // the settings are saved and a later install reads them
             self.pend_allow = None;
-            self.inv_dirty = false;
             return;
         }
         if self.busy() {
             return;
         }
-        let allow = self.pend_allow.take().unwrap_or(svc.allow_join);
-        let mut args = json!({"allow_address_join": allow});
+        let mut args = json!({"allow_address_join": self.pend_allow.take().unwrap_or(svc.allow_join)});
         if let Some(n) = self.pend_name.take() {
             args["name"] = json!(n);
         }
@@ -665,12 +635,9 @@ impl Setup {
         match (p, out) {
             (Pend::Status { ensure }, Ok(v)) => {
                 let svc = parse_svc(&v);
-                // The service is the truth for the join policy: adopt it once, unless the user just changed it.
-                if !self.policy_synced && !self.inv_dirty {
-                    self.policy_synced = true;
-                    if let Some(a) = svc.policy.filter(|a| *a == self.use_inv) {
-                        self.out.push(Cmd::UseInvitation(!a));
-                    }
+                // Startup only (no retry loop): a service that disagrees with the saved setting gets the saved value once.
+                if ensure && self.pend_allow.is_none() && svc.policy.is_some_and(|p| p != self.allow_join) {
+                    self.pend_allow = Some(self.allow_join);
                 }
                 self.svc = Some(svc);
                 self.svc_unknown = false;
@@ -687,9 +654,6 @@ impl Setup {
             }
             (Pend::Service(what), Ok(_)) => {
                 nlog(&format!("setup {what} ok"));
-                if what == "Settings" {
-                    self.inv_dirty = self.pend_allow.is_some();
-                }
                 self.note = Some(format!("{what}: done."));
                 match what {
                     "Install" => self.push(Op::ServiceStatus, json!({}), Pend::Status { ensure: true }),
@@ -705,9 +669,6 @@ impl Setup {
             (Pend::Service(what), Err(e)) => {
                 nlog(&format!("{what} failed: {} ({})", e.code, err_text(&e)));
                 self.note = Some(format!("{what} failed ({})", err_text(&e)));
-                if what == "Settings" {
-                    self.inv_dirty = self.pend_allow.is_some();
-                }
                 if what == "Install" {
                     self.ensure = Ensure::Done;
                 }
@@ -819,13 +780,18 @@ impl Setup {
             self.known_urls.extend(c.connections.iter().filter_map(|k| k.url.clone()));
             self.rescan();
         }
-        let conns = c.settings.network.effective_connections(sp);
+        let conns = c.settings.network.connections();
         let idle = !self.busy();
         let svc = self.svc.clone().unwrap_or_default();
         let name_ok = !self.name.trim().is_empty() && self.name.trim().chars().count() <= 64 && !self.name.chars().any(char::is_control);
 
         ui.add_space(8.0);
         ui.heading("This PC");
+        let mut allow_join = c.settings.network.allow_join;
+        if crate::ui::theme::checkbox(ui, &mut allow_join, "Let other PCs join this PC").changed() {
+            cmds.push(Cmd::AllowJoin(allow_join));
+            self.pend_allow = Some(allow_join);
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label("Name");
             ui.add(egui::TextEdit::singleline(&mut self.name).id_salt("net_pc_name").desired_width(180.0).char_limit(64));
@@ -883,52 +849,6 @@ impl Setup {
                 self.push(Op::ServiceStatus, json!({}), Pend::Status { ensure: false });
             }
         });
-        // Invitation: off = any PC on your networks may join by address; on = joins need an invitation file.
-        let mut inv = if svc.installed && self.svc.is_some() { !svc.allow_join } else { c.settings.network.use_invitation };
-        if crate::ui::theme::checkbox(ui, &mut inv, "Use invitation").changed() {
-            cmds.push(Cmd::UseInvitation(inv));
-            self.pend_allow = Some(!inv);
-            self.inv_dirty = true;
-        }
-        if !inv {
-            ui.label(RichText::new("Any PC that can reach this one on your LAN, Tailscale or ZeroTier can join without an invitation.").color(DIM).size(11.0));
-        } else {
-            ui.label(RichText::new("Other PCs need an invitation file to join this PC.").color(DIM).size(11.0));
-            let online = c.connections.iter().find(|k| k.online && conns.iter().any(|x| x.local_host && x.credentials == k.credentials));
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Save invitation to");
-                ui.add(egui::TextEdit::singleline(&mut self.invite_path).id_salt("net_invite_path").desired_width(240.0));
-                if ui.button("Browse…").clicked() { cmds.push(Cmd::Browse(PickKind::NetInvitationSave)); }
-                if ui.add_enabled(online.is_some() && !self.invite_path.trim().is_empty(), egui::Button::new("Create invitation")).clicked() {
-                    if let Some(k) = online {
-                        cmds.push(Cmd::Invite { connection: k.credentials.clone(), path: self.invite_path.trim().to_owned() });
-                    }
-                }
-            });
-            if online.is_none() {
-                ui.label(RichText::new("Start this PC's service first to create an invitation.").color(DIM).size(11.5));
-            }
-            if let Some(n) = c.invite_note {
-                ui.label(RichText::new(n).color(DIM).size(11.5));
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Import invitation");
-                ui.add(egui::TextEdit::singleline(&mut self.invitation).id_salt("net_invitation_path").desired_width(240.0));
-                if ui.button("Browse…").clicked() { cmds.push(Cmd::Browse(PickKind::NetInvitationOpen)); }
-                if ui.add_enabled(!self.joining() && !self.invitation.trim().is_empty(), egui::Button::new("Join with invitation")).clicked() {
-                    let meta = JoinMeta { name: self.reg_name.clone(), ..Default::default() };
-                    // The invitation file stays with the bridge; only the routes this scan found are offered for its network.
-                    let routes: Vec<Value> = self.scan.iter().flat_map(|s| s.pcs.iter()).filter(|p| !p.is_self).map(|p| (p, p.urls())).filter(|(_, u)| !u.is_empty())
-                        .take(MAX_KNOWN).map(|(p, _)| p.invitation_route()).collect();
-                    let mut args = json!({"invitation_path": self.invitation.trim(), "name": self.reg_name});
-                    if !routes.is_empty() {
-                        args["discovery_endpoints"] = json!(routes);
-                    }
-                    self.begin_join(Op::Pair, args, meta);
-                }
-            });
-        }
-
         ui.add_space(14.0);
         ui.horizontal(|ui| {
             ui.heading("Other PCs");
@@ -1003,7 +923,7 @@ impl Setup {
                     Some(k) if k.enabled => ("Enabled, not connected".into(), WARN),
                     Some(_) => ("Not used".into(), DIM),
                     None if pc.join => ("Available".into(), DIM),
-                    None => ("Needs invitation".into(), WARN),
+                    None => ("Join not allowed".into(), WARN),
                 };
                 ui.horizontal(|ui| {
                     ui.colored_label(status.1, status.0);

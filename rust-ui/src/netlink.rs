@@ -38,7 +38,6 @@ pub const BRIDGE_TIMEOUT_S: u32 = 15;
 /// The bridge's operations; `name()` is the wire name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
-    Pair,
     Connect,
     Register,
     Submit,
@@ -58,7 +57,6 @@ pub enum Op {
     ServiceStop,
     ServiceRemove,
     JoinAddress,
-    NetworkInvite,
     ServiceLocalJoin,
     Discover,
     Endpoints,
@@ -68,7 +66,6 @@ pub enum Op {
 impl Op {
     pub fn name(self) -> &'static str {
         match self {
-            Op::Pair => "pair",
             Op::Connect => "connect",
             Op::Register => "register",
             Op::Submit => "submit",
@@ -88,7 +85,6 @@ impl Op {
             Op::ServiceStop => "service_stop",
             Op::ServiceRemove => "service_remove",
             Op::JoinAddress => "join_address",
-            Op::NetworkInvite => "network_invite",
             Op::ServiceLocalJoin => "service_local_join",
             Op::Discover => "discover",
             Op::Endpoints => "endpoints",

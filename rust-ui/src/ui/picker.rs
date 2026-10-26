@@ -27,10 +27,6 @@ pub enum PickKind {
     ExportFolder,
     /// Local folder for a Path Mapping row in Settings.
     MappingRoot,
-    /// A network invitation file to join with.
-    NetInvitationOpen,
-    /// Where to save a new network invitation.
-    NetInvitationSave,
 }
 
 /// Blocks until the user chooses; an empty list = cancelled. Tests inject a mock.
@@ -98,17 +94,6 @@ pub fn rfd_backend() -> Backend {
             PickKind::MappingRoot => d
                 .set_title("Choose the folder where this PC sees the shared location")
                 .pick_folder()
-                .into_iter()
-                .collect(),
-            PickKind::NetInvitationOpen => d
-                .set_title("Choose the network invitation file")
-                .pick_file()
-                .into_iter()
-                .collect(),
-            PickKind::NetInvitationSave => d
-                .set_title("Save the network invitation")
-                .set_file_name(format!("Keyloom-invitation-{}.json", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())))
-                .save_file()
                 .into_iter()
                 .collect(),
             PickKind::AddTo => d

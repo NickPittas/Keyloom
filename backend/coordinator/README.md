@@ -1,21 +1,18 @@
 # Network coordinator (protocol v1) — control-plane foundation
 
-**User setup is in Keyloom → Clients:** every installation hosts automatically; press Rescan to list PCs (name + addresses) and tick the ones to connect, Start/Stop/Remove/Refresh the service, or tick *Use invitation* for the optional save/browse/create/import flows. See [the network guide](../../docs/network-rendering.md). The sections below document the developer CLI and protocol.
+**User setup is in Keyloom → Clients:** every installation hosts automatically; press Rescan to list PCs (name + addresses) and tick the ones to connect, Start/Stop/Remove/Refresh the service. Joining a network is done from that page. See [the network guide](../../docs/network-rendering.md). The sections below document the developer CLI and protocol.
 
 Python stdlib `ssl`/`http.server`/`sqlite3` plus `cryptography`; no new dependency.
 The coordinator records who owns which attempt. It never runs a worker, never resolves a client path and never
 reuses `Storage::Transfer`. The Rust `Scheduler` stays the only executor (integration later).
 
 Run (opt-in, loopback by default, explicit paths only — see `python -m backend.coordinator --help`):
-`serve --state-dir D [--host --port --advertise-host H --invite-out F --invite-admin]`,
-`pair --invitation F --credentials F --name N` (the destination is reserved — new, private, verified — *before* the one-use code is redeemed),
-and the operator commands below. One process owns a state dir (lock file). State dir must be
-**local disk** (SQLite WAL), not a NAS. The UI creates reusable 7-day invitations without restarting the host; CLI one-use invitations retain their original behavior.
+the operator commands below. Joining is `/v1/join`, called from the Clients page. One process owns a state dir (lock file).
+State dir must be **local disk** (SQLite WAL), not a NAS.
 
 ## Trust and credentials
-Trust note: the certificate and fingerprint inside an invitation only prove each other are consistent; they do not authenticate the server. Trust comes from delivering the invitation file over a channel you trust, optionally comparing the fingerprint `serve` prints (and `pair` prints) with the one you expect. The certificate is valid 365 days; there is no renewal/rotation yet (regenerate by hand and re-pair).
-Invitation (private file, 0600): URL, certificate PEM, SHA-256 fingerprint, one-time code (10 min, ~50 bit,
-hash stored, 10 failures/min/IP and 30/5 min global throttle). The client verifies the fingerprint offline, then uses that
+Trust note: the certificate and fingerprint a joining PC receives only prove each other are consistent; they do not authenticate the server. Trust comes from comparing the fingerprint the server shows with the one you expect. The certificate is valid 365 days; there is no renewal/rotation yet (regenerate by hand and re-join).
+Join credentials (private file, 0600): URL, certificate PEM, SHA-256 fingerprint. The client verifies the fingerprint offline, then uses that
 certificate as the sole anchor (CERT_REQUIRED, no host-name check) and compares the leaf SHA-256 right after every handshake,
 before any request byte. The identity is the pinned certificate, not an address, so the same identity works over LAN, Tailscale,
 ZeroTier and loopback and survives address changes with no re-keying; SANs are cosmetic (current interfaces + loopback at creation)
@@ -27,7 +24,7 @@ Tokens/codes never appear in argv, stdout or logs. 10 bad-auth attempts/min/IP �
 its own peers; accepted on a LAN).
 
 ## API (all JSON, ≤1 MiB, `Authorization: Bearer <installation_id>.<token>`, one request per connection)
-`POST /v1/pair` · `/v1/session` · `/v1/jobs` (submit) · `/v1/claim` · `/v1/attempts/{id}/(reject|start|events)` ·
+`POST /v1/join` · `/v1/session` · `/v1/jobs` (submit) · `/v1/claim` · `/v1/attempts/{id}/(reject|start|events)` ·
 `/v1/jobs/{id}/cancel` · `/v1/stats` · `GET /v1/jobs/{id}` · `/v1/jobs/{id}/events?after=&limit=` · `/v1/installations`.
 No long-poll: clients poll. Claim/start/reject/events/stats need the installation's current `session_id`.
 `/v1/session` accepts an optional `name` (1-64 characters, no control characters) that renames the same installation row; it never creates an identity or token, and callers that omit it keep their stored name. A PC joined to several networks sends its one name to each host.
@@ -60,8 +57,8 @@ The service status (`netlink service_status`) lists `certificate_addresses`; an 
   Cancel of a started job only sets `cancel_requested` (returned on start/events responses).
 - **Events**: `seq` contiguous from 1 per attempt; replay with identical content is a no-op, different content 409,
   gap 409; batch ≤256, event ≤16 KiB, atomic; `terminal` must be last. Submitter reads with a persisted cursor.
-- **Policy**: submitter or admin installation (invited with `--invite-admin`) may read/cancel a job; others get 404.
-  Any paired installation may list `/v1/installations`.
+- **Policy**: submitter or admin installation may read/cancel a job; others get 404.
+  Any joined installation may list `/v1/installations`.
 - **GPU slot**: `installation_id:gpu_uuid`; one GPU per installation; a GPU UUID registered by another live installation
   → 409. The client must supply the verified device UUID (respect `CUDA_VISIBLE_DEVICES`; not an NVML index).
 - **Stats** (`POST /v1/stats`, in-memory latest only, no history, works while idle, counts as heartbeat): `seq`,
@@ -94,7 +91,7 @@ Every transaction first revokes (compare-and-set on `offered` only) offers whose
   self-contained Frames/Input/AlphaHint under the mapped clip root). `KeyJob.path_map` stays empty.
 - Heartbeat (stats or any call) at least every ~60 s while holding an offer.
 - Credential/invitation/key files are re-checked on EVERY read: POSIX mode 0600; Windows owner-only ACL via `icacls` (fails closed if it cannot be read). The Windows path is exercised only with a mocked `icacls` — **not verified on real Windows, so Windows pilot readiness is unproven**. No credential rotation yet.
-- Pairing failures are distinct: `paired_not_saved` (code spent, token lost: revoke + new invitation) and `pair_uncertain` (transport failure; the code MAY be spent; never auto-retried).
+- Join failures are distinct: `paired_not_saved` (login issued but not saved: Join again from the Clients page) and `pair_uncertain` (transport failure; a login MAY have been issued; never auto-retried).
 
 Limits: ≤32 concurrent handlers (extra connections dropped), 15 s per-read I/O timeout, and a hard 30 s deadline per connection (TLS handshake + headers + body + reply; the socket is shut down by a timer), ≤2000 active jobs.
 Receiver-reported `effective_plan` (≤8 KiB) is stored but **not validated** by the server.

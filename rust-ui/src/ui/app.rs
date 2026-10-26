@@ -2334,9 +2334,7 @@ impl App {
             self.pending_reload = Some(p);
         }
         if let Some(r) = self.picker.poll() {
-            if matches!(r.0, PickKind::NetInvitationOpen | PickKind::NetInvitationSave) {
-                self.setup.browse_done(r.0, r.1.into_iter().next());
-            } else if r.0 == PickKind::MappingRoot {
+            if r.0 == PickKind::MappingRoot {
                 self.settings.browse_done(r.1.into_iter().next());
             } else {
                 self.held_pick = Some(r);
@@ -2626,16 +2624,10 @@ impl App {
         }
     }
 
-    /// Open the settings draft with the connection list as the source of truth (a legacy single connection becomes
-    /// its first entry), so edits never touch the other networks.
+    /// Open the settings draft; edits touch only the connection list entries they name.
     fn net_draft(&mut self) -> &mut crate::settings::Network {
-        let sp = self.settings.store_path().map(std::path::PathBuf::from);
         self.settings.open();
-        let n = &mut self.settings.draft_mut().network;
-        if n.extra.get("connections_migrated").and_then(serde_json::Value::as_bool) != Some(true) {
-            n.materialize(sp.as_deref());
-        }
-        n
+        &mut self.settings.draft_mut().network
     }
 
     /// A join finished: keep every existing connection and session; only an explicit Save changes the global name.
@@ -2681,7 +2673,7 @@ impl App {
     /// keeps targeting every member; one that already names a host is corrected to the host the scan shows.
     fn net_scan_updates(&mut self, ups: Vec<crate::network_setup::ScanUpdate>) {
         let infos = self.remote.infos();
-        let conns = self.settings.saved().network.effective_connections(self.settings.store_path());
+        let conns = self.settings.saved().network.connections();
         let nid = |c: &crate::settings::Connection| if c.network_id.is_empty() { infos.iter().find(|i| i.credentials == c.credentials).and_then(|i| i.network_id.clone()).unwrap_or_default() } else { c.network_id.clone() };
         let edits: Vec<_> = conns.iter().filter(|c| !c.local_host).filter_map(|c| {
             let id = nid(c);
@@ -2731,7 +2723,6 @@ impl App {
     fn net_action(&mut self, a: crate::remote::Action) {
         use crate::remote::Action;
         match a {
-            Action::Pair { .. } => {}
             Action::Enable { creds, on } => {
                 if let Some(c) = self.net_draft().connections.iter_mut().find(|c| c.credentials == creds) {
                     c.enabled = on;
@@ -2863,7 +2854,6 @@ impl App {
             PickKind::Relink => self.relink_picked(ctx, paths[0].clone()),
             PickKind::RelinkMovie => self.movie_picked(paths[0].clone()),
             PickKind::HintSequence => self.sequence_picked(paths[0].clone()),
-            PickKind::NetInvitationOpen | PickKind::NetInvitationSave => {}
             PickKind::MappingRoot => {} // answered inside Settings (see import_tick)
         }
     }
@@ -3096,7 +3086,6 @@ impl App {
                                     settings_path: self.settings.store_path(),
                                     connected: self.remote.online(),
                                     connections: &infos,
-                                    invite_note: self.remote.invite_note(),
                                 };
                                 setup_cmds = self.setup.ui(ui, &cx);
                                 ui.add_space(14.0);
@@ -3114,14 +3103,13 @@ impl App {
                 }
                 for c in setup_cmds {
                     match c {
-                        crate::network_setup::Cmd::Invite { connection, path } => {
-                            if !self.remote.invite(&connection, path) {
-                                self.ai.notice = Some("Invitation not created: that network is no longer connected on this computer.".into());
-                            }
-                        }
                         crate::network_setup::Cmd::SaveName(n) => {
                             self.net_draft().name = n;
                             self.net_save("Name changed");
+                        }
+                        crate::network_setup::Cmd::AllowJoin(allow) => {
+                            self.net_draft().allow_join = allow;
+                            self.net_save("Updated");
                         }
                         crate::network_setup::Cmd::UsePc { credentials, network_id, host_iid, name, endpoints, on } => {
                             self.net_use_pc(&credentials, &network_id, host_iid, &name, endpoints, on);
@@ -3135,14 +3123,6 @@ impl App {
                                 n.connections.iter_mut().filter(|c| c.local_host).for_each(|c| c.enabled = true);
                             }
                             self.net_save("Updated");
-                        }
-                        crate::network_setup::Cmd::UseInvitation(on) => {
-                            self.net_draft().use_invitation = on;
-                            self.net_save("Updated");
-                        }
-                        crate::network_setup::Cmd::Browse(k) => {
-                            let w = ctx.clone();
-                            self.picker.start(k, None, move || w.request_repaint());
                         }
                     }
                 }

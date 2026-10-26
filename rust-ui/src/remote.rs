@@ -34,7 +34,6 @@ const DIM: egui::Color32 = egui::Color32::from_rgb(169, 187, 175);
 pub enum Phase {
     Off,
     Starting,
-    Pairing,
     Connecting,
     Online,
     Failed(String),
@@ -42,7 +41,6 @@ pub enum Phase {
 
 /// What a request was for (replies come back by id).
 enum Pend {
-    Pair,
     Connect,
     Register,
     Stats,
@@ -58,8 +56,6 @@ enum Pend {
     /// An empty event batch: asks the coordinator for the attempt's last accepted sequence.
     Resync,
     Estimate(String),
-    /// Writes a reusable invitation file (the bridge never returns its secret).
-    Invite,
     /// Replaces the connected client's endpoint list (token and session are kept).
     Endpoints(Vec<String>, String),
 }
@@ -181,7 +177,6 @@ enum Rx {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
-    Pair { invitation: String, name: String },
     Enable { creds: String, on: bool },
     Receive { creds: String, on: bool },
     DefaultSubmit(String),
@@ -259,13 +254,8 @@ pub struct Remote {
     /// Attempt id whose GPU slot this installation holds (empty = none).
     held: String,
     pub receive_note: Option<String>,
-    paired: Option<String>,
-    want_pair: Option<(String, String)>,
     finished: Vec<String>,
-    pub pair_invitation: String,
-    pub pair_name: String,
     pub status: Option<String>,
-    pub invite_note: Option<String>,
     /// Shutdown began: nothing new is claimed.
     closing: bool,
     wake_hint: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -281,13 +271,6 @@ pub(crate) fn default_name() -> String {
         // HOSTNAME is a shell variable, not exported to GUI launches; the kernel value matches the service's own name
         .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "Keyloom PC".into())
-}
-
-pub fn credentials_path(s: &Settings, settings_path: Option<&Path>) -> Option<PathBuf> {
-    if !s.network.credentials.trim().is_empty() {
-        return Some(PathBuf::from(s.network.credentials.trim()));
-    }
-    settings_path.and_then(Path::parent).map(|d| d.join("network").join("credentials.json"))
 }
 
 fn attempt_meta(pf: &Preflight) -> Value {
@@ -505,13 +488,8 @@ impl Remote {
             rx: Rx::Idle,
             held: String::new(),
             receive_note: None,
-            paired: None,
-            want_pair: None,
             finished: vec![],
-            pair_invitation: String::new(),
-            pair_name: default_name(),
             status: None,
-            invite_note: None,
             closing: false,
             wake_hint: None,
             sent_endpoints: vec![],
@@ -531,22 +509,9 @@ impl Remote {
     pub fn registered(&self) -> bool {
         self.registered
     }
-    pub fn pair(&mut self, invitation: String, name: String) {
-        self.want_pair = Some((invitation, name));
-        self.retry_at = None;
-        self.status = None;
-    }
-    /// The credentials path a pairing just produced (once).
-    pub fn take_paired(&mut self) -> Option<String> {
-        self.paired.take()
-    }
     /// Shots whose outputs just finished (the App re-reads them).
     pub fn take_finished(&mut self) -> Vec<String> {
         std::mem::take(&mut self.finished)
-    }
-    /// Ask the connected bridge for a reusable invitation file at `path`.
-    pub fn invite(&mut self, path: String) {
-        self.invite_note = Some(if self.online() && self.req(Op::NetworkInvite, json!({"path": path}), Pend::Invite) { "Creating the invitation…".into() } else { "Connect to a network first.".into() });
     }
     /// Why this computer may not drop this connection now (`None` = nothing would be orphaned).
     pub fn remove_blocker(&self, creds: Option<&Path>) -> Option<String> {
@@ -625,9 +590,6 @@ impl Remote {
     /// The coordinator address from the credentials file (labels and discovery's known addresses).
     pub fn url(&self) -> Option<String> {
         self.network_url.clone()
-    }
-    pub fn has_install(&self, id: &str) -> bool {
-        self.installs.iter().any(|i| i.id == id)
     }
     pub fn label(&self) -> String {
         self.network_url.as_deref().map(|u| u.trim_start_matches("https://").trim_start_matches("http://").to_owned()).or_else(|| self.ns()).unwrap_or_else(|| Path::new(&self.key).parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "network".into()))
@@ -714,10 +676,10 @@ impl Remote {
             self.run_attempt(now, env, creds.as_deref());
         }
         let enabled = env.cfg.enabled && creds.as_ref().is_some_and(|c| c.exists());
-        if !(enabled || self.want_pair.is_some()) {
+        if !enabled {
             if self.link.is_some() || self.phase != Phase::Off {
                 self.stop();
-                self.phase = if env.cfg.enabled { Phase::Failed("not paired yet: pair this computer on the Clients page".into()) } else { Phase::Off };
+                self.phase = if env.cfg.enabled { Phase::Failed("not joined yet: Join this PC on the Clients page".into()) } else { Phase::Off };
             }
             return;
         }
@@ -768,20 +730,7 @@ impl Remote {
         }
         match self.phase.clone() {
             Phase::Starting => {
-                if let Some((inv, name)) = self.want_pair.clone() {
-                    if let Some(c) = &creds {
-                        if let Some(Err(e)) = c.parent().map(private_dir) {
-                            self.want_pair = None;
-                            self.status = Some(format!("Pairing not started: the credentials folder could not be made private ({e})"));
-                            self.stop();
-                            self.phase = Phase::Off;
-                            return;
-                        }
-                        if self.req(Op::Pair, json!({"invitation_path": inv, "credentials_path": c.display().to_string(), "name": name}), Pend::Pair) {
-                            self.phase = Phase::Pairing;
-                        }
-                    }
-                } else if let Some(c) = &creds {
+                if let Some(c) = &creds {
                     let mut args = json!({"credentials_path": c.display().to_string()});
                     let eps: Vec<String> = env.cfg.endpoints.iter().take(16).cloned().collect();
                     if !eps.is_empty() {
@@ -822,17 +771,11 @@ impl Remote {
 
     fn on_reply(&mut self, p: Pend, out: Result<Value, LinkError>, now: Instant, env: &mut Env) {
         match (&p, &out) {
-            (Pend::Stats | Pend::Installs | Pend::Job(_) | Pend::JobEvents(_) | Pend::Invite, Ok(_)) => {}
+            (Pend::Stats | Pend::Installs | Pend::Job(_) | Pend::JobEvents(_), Ok(_)) => {}
             (_, Ok(v)) => nlog(&format!("{} ok {}", Self::pname(&p), v.to_string().chars().take(120).collect::<String>())),
             (_, Err(e)) => nlog(&format!("{} ERR {}", Self::pname(&p), err_text(e))),
         }
         match (p, out) {
-            (Pend::Invite, r) => {
-                self.invite_note = Some(match r {
-                    Ok(_) => "Invitation saved. It can be reused for 7 days by any PC; keep the file private.".into(),
-                    Err(e) => format!("Invitation not created ({})", err_text(&e)),
-                });
-            }
             (Pend::Endpoints(sent, prefer), r) => {
                 self.endpoints_inflight = false;
                 self.sent_endpoints = sent; // retry only when addresses or the preferred one change, or the link reconnects
@@ -840,20 +783,6 @@ impl Remote {
                 if let Err(e) = r {
                     self.status = Some(format!("Could not update host addresses: {}", err_text(&e)));
                 }
-            }
-            (Pend::Pair, Ok(v)) => {
-                let c = env.cfg.creds.clone().map(|c| c.display().to_string());
-                self.paired = c;
-                self.want_pair = None;
-                self.status = Some(format!("Paired as {}.", v.get("installation_id").and_then(Value::as_str).unwrap_or("this installation")));
-                self.stop(); // the next tick connects with the new credentials
-                self.phase = Phase::Off;
-            }
-            (Pend::Pair, Err(e)) => {
-                self.want_pair = None;
-                self.status = Some(format!("Pairing failed ({})", err_text(&e)));
-                self.stop();
-                self.phase = Phase::Off;
             }
             (Pend::Connect, Ok(v)) => {
                 self.network_url = v.get("url").and_then(Value::as_str).map(str::to_owned);
@@ -1011,8 +940,6 @@ impl Remote {
 
     fn pname(p: &Pend) -> &'static str {
         match p {
-            Pend::Pair => "pair",
-            Pend::Invite => "invite",
             Pend::Endpoints(..) => "endpoints",
             Pend::Connect => "connect",
             Pend::Register => "register",
@@ -1681,7 +1608,6 @@ impl Remote {
             Phase::Off if cfg.enabled => ("Not connected".into(), false),
             Phase::Off => ("Network client is off".into(), false),
             Phase::Starting | Phase::Connecting => ("Connecting…".into(), false),
-            Phase::Pairing => ("Pairing…".into(), false),
             Phase::Failed(w) => (format!("Not connected: {w}"), false),
         }
     }

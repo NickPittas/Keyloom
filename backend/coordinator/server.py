@@ -54,7 +54,7 @@ def trusted_peer(ip, loopback_only=False):
 
 
 _POST = {
-    r"/v1/pair": "pair", r"/v1/join": "join", r"/v1/local-join": "local_join", r"/v1/local-identity": "local_identity", r"/v1/invitations": "invite", r"/v1/session": "session", r"/v1/stats": "stats", r"/v1/claim": "claim", r"/v1/jobs": "submit",
+    r"/v1/join": "join", r"/v1/local-join": "local_join", r"/v1/local-identity": "local_identity", r"/v1/session": "session", r"/v1/stats": "stats", r"/v1/claim": "claim", r"/v1/jobs": "submit",
     r"/v1/attempts/([\w-]{1,80})/(reject|start|events)": "attempt", r"/v1/jobs/([\w-]{1,80})/cancel": "cancel",
 }
 _GET = {r"/v1/hello": "hello", r"/v1/installations": "installations", r"/v1/jobs/([\w-]{1,80})": "job", r"/v1/jobs/([\w-]{1,80})/events": "job_events"}
@@ -70,12 +70,9 @@ class Api:
         self.hello_try = Limiter(60, 60)
         self.hello_global = Limiter(600, 60)
         self.auth_fail = throttle or Limiter(10, 60)
-        self.pair_fail = Limiter(10, 60)
-        self.pair_global = Limiter(30, 300)
         self.join_enabled, self.local_token, self.advertise_url = join_enabled, local_token, advertise_url
         self.join_try = Limiter(10, 300)  # every attempt counts, successful or not
         self.join_global = Limiter(30, 300)
-        self.invite_try = Limiter(6, 3600)
 
     def handle(self, method, target, bearer, body, peer):
         u = urlsplit(target)
@@ -90,8 +87,6 @@ class Api:
             return self._hello(peer)
         if name == "local_identity":
             return self._local_identity(parse_json(body), peer)
-        if name == "pair":
-            return self._pair(parse_json(body), peer)
         if name in ("join", "local_join"):
             return self._join(name, parse_json(body), peer)
         if self.auth_fail.blocked(peer):
@@ -118,13 +113,6 @@ class Api:
                 bad("unknown query parameter")
             return s.job_events(inst, m[1], after, limit)
         b = parse_json(body)
-        if name == "invite":  # any paired (non-admin) member of this network; throttled per installation
-            obj(b, "invitations", ())
-            if self.invite_try.blocked(inst["id"]):
-                raise ApiError(429, "throttled", "too many invitations requested")
-            self.invite_try.fail(inst["id"])
-            code, exp = s.create_shared_invitation(inst)
-            return {"code": code, "expires_at": exp, "url": self.advertise_url}
         if name == "session":
             return s.register(inst, b)
         if name == "stats":
@@ -196,21 +184,6 @@ class Api:
                 self.local_identity(iid)
             except OSError:
                 pass  # the join stands; status will simply not know this PC's installation yet
-        return {"installation_id": iid, "token": token}
-
-    def _pair(self, b, peer):
-        if self.pair_fail.blocked(peer) or self.pair_global.blocked("*"):
-            raise ApiError(429, "throttled", "too many pairing attempts")
-        obj(b, "pair", ("protocol", "code", "name"))
-        if b["protocol"] != PROTOCOL or isinstance(b["protocol"], bool):
-            bad("unsupported protocol", "unsupported_protocol")
-        try:
-            iid, token = self.store.pair(b["code"], b["name"])
-        except ApiError as e:
-            if e.status == 403:
-                self.pair_fail.fail(peer)
-                self.pair_global.fail("*")
-            raise
         return {"installation_id": iid, "token": token}
 
 
