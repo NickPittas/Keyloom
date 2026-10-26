@@ -179,7 +179,7 @@ impl Page {
                 true
             }
             Err(e) => {
-                self.error = Some(e);
+                self.error = Some(format!("Not saved: {e}"));
                 false
             }
         }
@@ -283,7 +283,7 @@ impl Page {
             note(ui, p, theme::FOCUS);
         }
         if let Some(e) = &self.error {
-            note(ui, &format!("Not saved: {e}"), Color32::from_rgb(240, 120, 110));
+            note(ui, e, Color32::from_rgb(240, 120, 110));
         }
         let cat = self.cat;
         let name = CATS.iter().find(|c| c.0 == cat).map_or("", |c| c.1);
