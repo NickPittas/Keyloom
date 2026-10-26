@@ -7,6 +7,7 @@
 //! here ever releases a writer on a timeout. Credentials stay in their private file; only their path is a setting.
 use crate::metrics::{ClientTelemetry, Sample, View};
 use crate::netlink::{Link, LinkError, Op, Source, State};
+use crate::network_setup::{ep_kind, host_of};
 use crate::scheduler::JobState;
 use crate::settings::Settings;
 use crate::shared_paths::SharedRoot;
@@ -187,6 +188,7 @@ pub enum Action {
     Remove(String),
     CancelJob { creds: String, job_id: String },
     ForgetAttempt(String),
+    Prefer { creds: String, url: String },
 }
 
 /// One connection's settings for a tick (`Settings::network` lists many; each `Remote` runs exactly one).
@@ -201,6 +203,8 @@ pub struct Conn {
     pub may_claim: bool,
     /// Known https addresses of the host, sent on connect and refreshed while online.
     pub endpoints: Vec<String>,
+    /// The user's pick, already first in `endpoints` (empty = automatic).
+    pub preferred: String,
     /// Exact host installation this connection targets (empty = every member, as before).
     pub target_host: String,
     /// This PC's queue receives work; other PCs are selected through their own host connection.
@@ -595,6 +599,10 @@ impl Remote {
     pub fn ns(&self) -> Option<String> {
         self.network_id.clone().or_else(|| self.cached_ns.clone())
     }
+    /// This computer's own installation id on this network (from its last registration).
+    pub fn me(&self) -> Option<&str> {
+        self.me.as_deref()
+    }
     /// The GPU-slot key of an attempt: namespaced by connection, so two networks' attempt ids can never alias.
     fn slot(&self, attempt: &str) -> String {
         format!("{}/{attempt}", self.key)
@@ -769,6 +777,9 @@ impl Remote {
                     if !eps.is_empty() {
                         args["endpoints"] = json!(eps);
                     }
+                    if !env.cfg.preferred.is_empty() {
+                        args["prefer"] = json!(env.cfg.preferred);
+                    }
                     if self.req(Op::Connect, args, Pend::Connect) {
                         self.sent_endpoints = eps;
                         self.phase = Phase::Connecting;
@@ -778,7 +789,11 @@ impl Remote {
             Phase::Online => {
                 let want: Vec<String> = env.cfg.endpoints.iter().take(16).cloned().collect();
                 if !self.endpoints_inflight && want != self.sent_endpoints {
-                    self.endpoints_inflight = self.req(Op::Endpoints, json!({"urls": want}), Pend::Endpoints(want));
+                    let mut a = json!({"urls": want});
+                    if !env.cfg.preferred.is_empty() {
+                        a["prefer"] = json!(env.cfg.preferred);
+                    }
+                    self.endpoints_inflight = self.req(Op::Endpoints, a, Pend::Endpoints(want));
                 }
                 self.drive(now, env, creds.as_deref())
             }
@@ -1644,10 +1659,10 @@ impl Remote {
         }
     }
 
-    pub fn other_installations(&self, label: Option<&str>) -> Vec<Install> {
-        self.installs.iter().filter(|i| Some(&i.id) != self.me.as_ref() && self.host_only(&i.id)).cloned().map(|mut i| {
+    /// The installations this connection offers, minus this computer's own (`own`: every network's own id and this PC's service id).
+    pub fn other_installations(&self, own: &[String]) -> Vec<Install> {
+        self.installs.iter().filter(|i| !own.contains(&i.id) && Some(&i.id) != self.me.as_ref() && self.host_only(&i.id)).cloned().map(|mut i| {
             i.connected &= self.online();
-            if let Some(l) = label { i.name = format!("{} · {l}", i.name); }
             i
         }).collect()
     }
@@ -1731,54 +1746,75 @@ impl Remote {
         actions
     }
 
-    /// One connection's card: its own Connect / Receive / Default Batch / Remove controls and state.
-    pub fn card(&self, ui: &mut Ui, cfg: &Conn, is_default: bool, blocker: Option<String>) -> Vec<Action> {
+    /// The connection's controls, one grid cell each: ID, Connect, Accept work, Default for Batch, Remove.
+    pub fn controls(&self, ui: &mut Ui, cfg: &Conn, is_default: bool, blocker: Option<String>) -> Vec<Action> {
         let mut acts = vec![];
         let creds = self.key.clone();
-        egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        ui.label(RichText::new(self.ns().unwrap_or_default()).color(DIM).size(11.5));
+        let mut en = cfg.enabled;
+        if crate::ui::theme::checkbox(ui, &mut en, "").changed() {
+            acts.push(Action::Enable { creds: creds.clone(), on: en });
+        }
+        let mut rc = cfg.receive;
+        let accept = crate::ui::theme::checkbox(ui, &mut rc, "").on_hover_text("Receiving: a network job runs on this computer's own local client, only when it is idle and its shared locations resolve here. Only one network's job runs at a time.");
+        if accept.changed() {
+            acts.push(Action::Receive { creds: creds.clone(), on: rc });
+        }
+        let mut def = is_default;
+        if crate::ui::theme::checkbox(ui, &mut def, "").changed() && def {
+            acts.push(Action::DefaultSubmit(creds.clone()));
+        }
+        let remove = ui.add_enabled(blocker.is_none(), egui::Button::new("Remove"));
+        let remove = match &blocker { Some(b) => remove.on_disabled_hover_text(format!("Cannot remove now: {b}")), None => remove };
+        if remove.clicked() {
+            acts.push(Action::Remove(creds));
+        }
+        acts
+    }
+
+    /// One connection as a table row: Client, Kind, Address, Status, GPU, then `controls`. The caller ends the row.
+    pub fn row(&self, ui: &mut Ui, cfg: &Conn, is_default: bool, blocker: Option<String>, own: &[String]) -> Vec<Action> {
+        let mut acts = vec![];
+        let creds = self.key.clone();
+        let installs = self.other_installations(own);
+        let names: Vec<String> = installs.iter().map(|i| i.name.clone()).collect();
+        ui.label(if names.is_empty() { self.label() } else { names.join(", ") });
+        let url = self.url().unwrap_or_default();
+        let shown = if cfg.preferred.is_empty() { url.as_str() } else { cfg.preferred.as_str() };
+        ui.label(ep_kind(shown));
+        let mut cur = cfg.preferred.clone();
+        let mut opts = cfg.endpoints.clone();
+        if !url.is_empty() && !opts.contains(&url) {
+            opts.push(url.clone());
+        }
+        let label = |u: &str| format!("{} ({})", host_of(u), ep_kind(u));
+        let text = if cur.is_empty() { "Automatic".to_owned() } else { label(&cur) };
+        egui::ComboBox::from_id_salt(("conn_ep", &self.key)).selected_text(text).show_ui(ui, |ui| {
+            ui.selectable_value(&mut cur, String::new(), "Automatic");
+            for u in &opts {
+                ui.selectable_value(&mut cur, u.clone(), label(u));
+            }
+        });
+        if cur != cfg.preferred {
+            acts.push(Action::Prefer { creds: creds.clone(), url: cur });
+        }
+        ui.vertical(|ui| {
             let (line, up) = self.status_line(cfg);
-            ui.label(RichText::new(self.label()).strong());
-            ui.colored_label(if up { egui::Color32::from_rgb(150, 190, 150) } else { egui::Color32::from_rgb(224, 176, 80) }, line);
-            if let Some(m) = &self.status {
-                ui.label(RichText::new(m).color(DIM).size(12.0));
-            }
-            if let Some(m) = &self.name_note {
-                ui.label(RichText::new(m).color(DIM).size(11.5));
-            }
-            if let Some(n) = self.network_id.as_deref() {
-                ui.label(RichText::new(format!("ID {n}")).color(DIM).size(11.5));
-            }
-            ui.horizontal_wrapped(|ui| {
-                let mut en = cfg.enabled;
-                if crate::ui::theme::checkbox(ui, &mut en, "Connect").changed() {
-                    acts.push(Action::Enable { creds: creds.clone(), on: en });
-                }
-                let mut rc = cfg.receive;
-                if crate::ui::theme::checkbox(ui, &mut rc, "Accept work when GPU idle").changed() {
-                    acts.push(Action::Receive { creds: creds.clone(), on: rc });
-                }
-                let mut def = is_default;
-                if crate::ui::theme::checkbox(ui, &mut def, "Default for Batch").changed() && def {
-                    acts.push(Action::DefaultSubmit(creds.clone()));
-                }
-                let remove = ui.add_enabled(blocker.is_none(), egui::Button::new("Remove"));
-                let remove = match &blocker { Some(b) => remove.on_disabled_hover_text(format!("Cannot remove now: {b}")), None => remove };
-                if remove.clicked() {
-                    acts.push(Action::Remove(creds.clone()));
-                }
-            });
-            if cfg.receive {
-                ui.label(RichText::new("Receiving: a network job runs on this computer's own local client, only when it is idle and its shared locations resolve here. Only one network's job runs at a time.").color(DIM).size(11.5));
+            let hover: Vec<&str> = [self.status.as_deref(), self.name_note.as_deref()].into_iter().flatten().collect();
+            let status = ui.colored_label(if up { egui::Color32::from_rgb(150, 190, 150) } else { egui::Color32::from_rgb(224, 176, 80) }, line);
+            if !hover.is_empty() {
+                status.on_hover_text(hover.join("\n"));
             }
             if let Rx::Owned(m) = &self.rx {
                 ui.colored_label(egui::Color32::from_rgb(225, 110, 110), m);
-                if ui.button("I checked this computer: forget this attempt locally").clicked() {
+                if ui.small_button("Forget attempt").on_hover_text("I checked this computer: forget this attempt locally").clicked() {
                     acts.push(Action::ForgetAttempt(creds.clone()));
                 }
             }
         });
-        ui.add_space(6.0);
+        let gpus: Vec<String> = installs.iter().filter_map(|i| i.gpu.clone()).collect();
+        ui.label(if gpus.is_empty() { "Not reported".to_owned() } else { gpus.join(", ") });
+        acts.extend(self.controls(ui, cfg, is_default, blocker));
         acts
     }
 }
@@ -1799,5 +1835,15 @@ mod discovery_tests {
         assert!(r.host_only("selected-host"));
         assert!(!r.host_only("submitter"));
         assert!(!r.host_only("this-pc"));
+    }
+
+    #[test]
+    fn own_ids_hide_this_pc() {
+        let mut r = Remote::blank(Source::Off, String::new());
+        r.me = Some("X1".into());
+        let inst = |id: &str| Install { id: id.into(), name: id.into(), gpu: None, connected: true, last_seen_s: None, stats: Value::Null, received: Instant::now() };
+        r.installs = vec![inst("X1"), inst("X2"), inst("B")];
+        let left: Vec<String> = r.other_installations(&["X2".to_owned()]).into_iter().map(|i| i.id).collect();
+        assert_eq!(left, ["B"]);
     }
 }

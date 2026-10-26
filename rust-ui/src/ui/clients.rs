@@ -2,9 +2,12 @@
 //! model identity as the workers reported them, what each is running now, and the scheduling policy behind
 //! `Automatic`. Nothing here is invented: a machine that has not answered shows "not started".
 use super::viewer::{DIM, WARN};
+use crate::remote::Action;
 use crate::scheduler::{Placement, TargetStatus, TargetView, Trust};
+use crate::settings::Settings;
 use crate::ui::ai::AiUi;
 use eframe::egui::{self, Color32, RichText, Ui};
+use std::path::Path;
 
 const BAD: Color32 = Color32::from_rgb(225, 110, 110);
 
@@ -44,7 +47,8 @@ fn trust_text(t: &TargetView) -> &'static str {
     }
 }
 
-/// Availability and setup only. Dispatch, progress and load live in the Batch queue.
+/// Availability and setup only. Dispatch, progress and load live in the Batch queue. One table holds every client:
+/// this computer's local render client, then each network PC's row with its own connect and assignment controls.
 pub fn ui(
     ui: &mut Ui,
     ai: &mut AiUi,
@@ -52,45 +56,53 @@ pub fn ui(
     _local: &crate::metrics::View,
     _active: &[u32],
     _remote: &std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>,
-    paired: &[crate::remote::Install],
-) -> Option<Placement> {
+    net: &crate::remote_set::RemoteSet,
+    s: &Settings,
+    sp: Option<&Path>,
+    own_net: Option<&str>,
+    own_iid: Option<&str>,
+) -> (Option<Placement>, Vec<Action>) {
     let mut want = None;
+    let mut acts = vec![];
     ui.horizontal(|ui| {
-        ui.heading("This computer's render client");
+        ui.heading("Clients");
         if ui.button("Check workers").clicked() { ai.probe_workers(); }
     });
     ui.add_space(8.0);
     let targets = ai.scheduler().targets();
-    egui::Grid::new("client_availability").num_columns(5).striped(true).spacing(egui::vec2(24.0, 10.0)).show(ui, |ui| {
-        for heading in ["Client", "Connection", "GPU", "Status", ""] { ui.label(RichText::new(heading).strong()); }
-        ui.end_row();
-        for t in targets.iter().filter(|t| t.local) {
-            let (state, colour) = state_text(t);
-            ui.label(if t.local { "This computer" } else { &t.id });
-            ui.label(if t.local { "Local" } else { "SSH" });
-            let gpu = t.hello.as_ref().and_then(|h| h.gpu.as_ref()).map(|g| format!("{} · {:.0} GB", g.name, g.vram_gb)).unwrap_or_else(|| "Not reported".into());
-            ui.label(gpu);
-            ui.colored_label(colour, state.to_string());
-            egui::CollapsingHeader::new("Details").id_salt(("availability", &t.id)).show(ui, |ui| {
-                ui.label(format!("Model identity: {}", trust_text(t)));
-                if let Some(h) = &t.hello {
-                    let mut ready: Vec<_> = h.capabilities.tasks.iter().filter(|(_, ready)| **ready).map(|(kind, _)| kind.as_str()).collect();
-                    ready.sort_unstable();
-                    ui.add(egui::Label::new(ready.join(", ")).wrap());
+    egui::ScrollArea::horizontal().show(ui, |ui| {
+        egui::Grid::new("client_availability").num_columns(11).striped(true).spacing(egui::vec2(24.0, 10.0)).show(ui, |ui| {
+            for heading in ["Client", "Kind", "Address", "Status", "GPU", "ID", "Connect", "Accept work when GPU is idle", "Default for Batch job", "", ""] {
+                ui.label(RichText::new(heading).strong());
+            }
+            ui.end_row();
+            for (i, t) in targets.iter().filter(|t| t.local).enumerate() {
+                let (state, colour) = state_text(t);
+                ui.label("This computer");
+                ui.label("Local");
+                ui.label("—");
+                ui.colored_label(colour, state.to_string());
+                let gpu = t.hello.as_ref().and_then(|h| h.gpu.as_ref()).map(|g| format!("{} · {:.0} GB", g.name, g.vram_gb)).unwrap_or_else(|| "Not reported".into());
+                ui.label(gpu);
+                if i == 0 {
+                    acts.extend(net.local_controls(ui, s, sp));
+                } else {
+                    for _ in 0..5 { ui.label(""); }
                 }
-                if let TargetStatus::Refused(reason) | TargetStatus::Down(reason) = &t.status { ui.colored_label(BAD, reason); }
-                if t.busy_with.is_none() && ui.small_button("Recheck").clicked() { ai.scheduler_mut().reset_target(&t.id); }
-            });
-            ui.end_row();
-        }
-        for pc in paired {
-            ui.label(&pc.name);
-            ui.label("Network");
-            ui.label(pc.gpu.as_deref().unwrap_or("Not reported"));
-            ui.colored_label(if pc.connected { super::theme::ACCENT } else { DIM }, if pc.connected { "Connected" } else { "Offline" });
-            ui.label("");
-            ui.end_row();
-        }
+                egui::CollapsingHeader::new("Details").id_salt(("availability", &t.id)).show(ui, |ui| {
+                    ui.label(format!("Model identity: {}", trust_text(t)));
+                    if let Some(h) = &t.hello {
+                        let mut ready: Vec<_> = h.capabilities.tasks.iter().filter(|(_, ready)| **ready).map(|(kind, _)| kind.as_str()).collect();
+                        ready.sort_unstable();
+                        ui.add(egui::Label::new(ready.join(", ")).wrap());
+                    }
+                    if let TargetStatus::Refused(reason) | TargetStatus::Down(reason) = &t.status { ui.colored_label(BAD, reason); }
+                    if t.busy_with.is_none() && ui.small_button("Recheck").clicked() { ai.scheduler_mut().reset_target(&t.id); }
+                });
+                ui.end_row();
+            }
+            acts.extend(net.rows(ui, s, sp, own_net, own_iid));
+        });
     });
     if targets.iter().any(|t| !t.local) {
         ui.add_space(8.0);
@@ -115,5 +127,5 @@ pub fn ui(
         });
         if &cur != default { want = Some(cur); }
     });
-    want
+    (want, acts)
 }

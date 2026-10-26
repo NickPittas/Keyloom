@@ -158,6 +158,14 @@ class Client:
             if self.last not in self._known:
                 self.last = None
 
+    def prefer(self, url):
+        """The user's pick is tried first; a failure still falls back to the other addresses."""
+        c = pki.clean_endpoints([url], explicit=[self.url])
+        with self._lock:
+            if c and c[0] in self._known:
+                # ponytail: once the preferred address fails, `last` moves to the fallback until the next endpoints op re-sends the pick.
+                self.last = c[0]
+
     @property
     def endpoints(self):
         with self._lock:
