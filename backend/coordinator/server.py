@@ -191,7 +191,7 @@ class Api:
             raise ApiError(409, "local_identity_unknown", "this PC's installation is not known")
         if iid == own:
             raise ApiError(409, "cannot_retire_self", "cannot retire this PC's installation")
-        return {"retired": iid, "started_attempts": self.store.revoke(iid)}
+        return {"retired": iid, "started_attempts": self.store.revoke(iid, only_if_unused=True)}
 
     def _join(self, name, b, peer):
         """/v1/join (explicitly enabled) or /v1/local-join (loopback + the service's private token). Both mint a unique

@@ -18,6 +18,9 @@ from .schema import (ApiError, MAX_BATCH, canonical, digest, validate_claim, val
 SCHEMA_VERSION = 2
 MAX_INSTALLATIONS = 64  # joins stop here
 SESSION_TTL = 120  # s without any call before another session id may take over the installation
+# Unfinished work of one login ({i} = its id column or a placeholder, used three times).
+_IN_USE = ("(EXISTS(SELECT 1 FROM jobs j WHERE (j.target={i} OR j.submitter={i}) AND j.state IN ('queued','offered','started')) OR "
+           "EXISTS(SELECT 1 FROM attempts a WHERE a.installation_id={i} AND a.state IN ('offered','started')))")
 MAX_ACTIVE_JOBS = 2000
 
 _DDL = """
@@ -160,12 +163,15 @@ class Store:
             row = self.db.execute("SELECT last_seen FROM sessions WHERE installation_id=?", (installation_id,)).fetchone()
         return row is not None and self.clock() - row["last_seen"] < SESSION_TTL
 
-    def revoke(self, installation_id):
-        """Returns the STARTED attempts that stay fenced: revoking credentials proves nothing about a running writer."""
+    def revoke(self, installation_id, only_if_unused=False):
+        """Returns the STARTED attempts that stay fenced: revoking credentials proves nothing about a running writer.
+        only_if_unused: refuse with 409 in_use, in the same transaction, while the login still has unfinished work."""
         now = self.clock()
         with self._tx() as db:
             if not db.execute("SELECT 1 FROM installations WHERE id=?", (installation_id,)).fetchone():
                 raise ApiError(404, "unknown_installation", "no such installation")
+            if only_if_unused and db.execute("SELECT " + _IN_USE.format(i="?"), (installation_id,) * 3).fetchone()[0]:
+                raise ApiError(409, "in_use", "this login has unfinished jobs")
             db.execute("UPDATE installations SET revoked_at=? WHERE id=? AND revoked_at IS NULL", (now, installation_id))
             db.execute("UPDATE gpu_slots SET enabled=0 WHERE installation_id=?", (installation_id,))
             db.execute("DELETE FROM sessions WHERE installation_id=?", (installation_id,))
@@ -489,8 +495,7 @@ class Store:
         now = self.clock()
         with self._lock:
             rows = self.db.execute("SELECT i.id, i.name, i.created_at, s.last_seen, "
-                "EXISTS(SELECT 1 FROM jobs j WHERE (j.target=i.id OR j.submitter=i.id) AND j.state IN ('queued','offered','started')) OR "
-                "EXISTS(SELECT 1 FROM attempts a WHERE a.installation_id=i.id AND a.state IN ('offered','started')) AS in_use "
+                + _IN_USE.format(i="i.id") + " AS in_use "
                 "FROM installations i LEFT JOIN sessions s ON s.installation_id=i.id "
                 "WHERE i.revoked_at IS NULL ORDER BY i.created_at").fetchall()
         return {"installations": [{"installation_id": r["id"], "name": r["name"], "created_at": r["created_at"],

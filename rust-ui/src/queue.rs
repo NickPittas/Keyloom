@@ -59,7 +59,7 @@ impl Entry {
         if self.kind == "sent" {
             !matches!(self.state.as_str(), "succeeded" | "failed" | "cancelled" | "not sent")
         } else {
-            self.active()
+            self.active() || matches!(self.state.as_str(), "held" | "lost")
         }
     }
 }
@@ -100,11 +100,11 @@ pub fn read(p: &Path) -> (Vec<Entry>, Option<String>) {
         Some(e) => (e, None),
         None => {
             let kept = p.with_extension("json.unreadable");
-            let _ = std::fs::rename(p, &kept);
+            let _ = rename_free(p, &kept); // an earlier unreadable file is never overwritten
             (
                 vec![],
                 Some(format!(
-                    "the queue history was unreadable; kept as {}",
+                    "the queue history was unreadable; kept as {} (or the next free .N name)",
                     kept.display()
                 )),
             )
@@ -125,21 +125,27 @@ pub fn load(p: &Path) -> (Vec<Entry>, Option<String>) {
     (e, err)
 }
 
-/// Keep every unfinished entry and the newest `KEEP` finished ones, in order.
+/// Keep every unfinished entry and the newest `KEEP` finished ones (by `at`), in order.
 fn trim(all: Vec<Entry>) -> Vec<Entry> {
-    let mut finished = 0;
-    let mut keep: Vec<Entry> = all
-        .into_iter()
+    let mut ats: Vec<u64> = all.iter().filter(|e| !e.unfinished()).map(|e| e.at).collect();
+    ats.sort_unstable_by(|a, b| b.cmp(a));
+    let Some(&cut) = ats.get(KEEP.saturating_sub(1)).filter(|_| ats.len() > KEEP) else { return all };
+    // ties at the cut: keep only as many as fit
+    let mut at_cut = KEEP - ats.iter().filter(|&&a| a > cut).count();
+    all.into_iter()
         .rev()
         .filter(|e| {
-            e.unfinished() || {
-                finished += 1;
-                finished <= KEEP
-            }
+            e.unfinished()
+                || e.at > cut
+                || (e.at == cut && at_cut > 0 && {
+                    at_cut -= 1;
+                    true
+                })
         })
-        .collect();
-    keep.reverse();
-    keep
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 fn write(p: &Path, entries: Vec<Entry>) -> Result<(), String> {
@@ -161,6 +167,8 @@ fn write(p: &Path, entries: Vec<Entry>) -> Result<(), String> {
         f.write_all(&serde_json::to_vec_pretty(&v).map_err(std::io::Error::other)?)?;
         f.sync_all()?;
         drop(f);
+        #[cfg(windows)]
+        crate::remote::protect_private(&tmp, false).map_err(std::io::Error::other)?;
         std::fs::rename(&tmp, p)
     })();
     r.map_err(|e| {

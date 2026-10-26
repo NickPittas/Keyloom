@@ -333,7 +333,7 @@ fn side_file(creds: &Path, ext: &str) -> PathBuf {
 /// writer uses, `backend/coordinator/pki.py::protect_private`), then verify the list holds exactly that one entry.
 /// Fails closed. Other platforms rely on the 0600/0700 modes set at creation.
 #[cfg(windows)]
-fn protect_private(path: &Path, dir: bool) -> Result<(), String> {
+pub(crate) fn protect_private(path: &Path, dir: bool) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     let run = |prog: &str, args: &[&str]| -> Result<String, String> {
         let o = std::process::Command::new(prog).args(args).creation_flags(0x0800_0000).output().map_err(|e| format!("{prog}: {e}"))?;
@@ -1727,10 +1727,15 @@ impl Remote {
 
     pub fn has_queue(&self) -> bool { !self.jobs.is_empty() }
 
+    /// Any job of ours on this PC that has not finished.
+    pub(crate) fn has_unfinished(&self, iid: &str) -> bool {
+        self.jobs.iter().any(|j| j.installation.as_deref() == Some(iid) && !j.terminal())
+    }
+
     /// Free for Automatic: none of our jobs queued or running on it, and its last reported load is under 50%.
     /// The sample must be fresh: an unknown or stale age is not free.
     pub(crate) fn is_free(&self, iid: &str) -> bool {
-        !self.jobs.iter().any(|j| j.installation.as_deref() == Some(iid) && !j.terminal())
+        !self.has_unfinished(iid)
             && self.installs.iter().find(|i| i.id == iid).is_some_and(|i| {
                 i.connected && matches!(Sample::from_api(&i.stats), Ok(Some((s, Some(age)))) if age <= crate::metrics::REMOTE_STALE_S && lightly_loaded(&s))
             })

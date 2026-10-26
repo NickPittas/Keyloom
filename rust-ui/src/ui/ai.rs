@@ -317,6 +317,8 @@ struct AutoShot {
     project: Project,
     st: Settings,
     preset_name: Option<String>,
+    /// Failed sends so far; after 3 the shot is dropped with a notice so it cannot block the list.
+    tries: u8,
 }
 
 struct BatchRow {
@@ -2831,7 +2833,7 @@ impl AiUi {
                 continue;
             }
             if matches!(r.placement, Placement::Auto) {
-                self.auto_pending.push_back(AutoShot { row: r, plan: p, project: b.project.clone(), st: b.st.clone(), preset_name: b.preset_name.clone() });
+                self.auto_pending.push_back(AutoShot { row: r, plan: p, project: b.project.clone(), st: b.st.clone(), preset_name: b.preset_name.clone(), tries: 0 });
                 waiting += 1;
                 continue;
             }
@@ -2907,13 +2909,19 @@ impl AiUi {
                 a.row.placement = Placement::Target(id.clone());
             }
             if let Err(e) = self.submit_row(&a.project, &a.st, a.preset_name.as_deref(), &a.row, a.plan.clone()) {
-                if pc.is_some() {
-                    // A refused network PC is not the shot's fault: it waits, and the next PC in this tick gets it.
-                    a.row.placement = automatic;
-                    self.auto_pending.push_front(a);
-                } else {
-                    self.notice = Some(format!("{}: not queued, {e}", a.row.clip.display_name));
+                // A refused PC (this one included) is not necessarily the shot's fault: it waits, and the next PC in
+                // this tick gets it. The error text can't tell a bad plan from a busy PC, so it is never dropped silently.
+                a.row.placement = automatic;
+                a.tries += 1;
+                if a.tries >= 3 {
+                    self.notice = Some(format!("{}: not sent after 3 tries, removed from Automatic: {e}", a.row.clip.display_name));
+                    continue;
                 }
+                if pc.is_none() {
+                    self.notice = Some(format!("{}: not queued on this PC yet, {e}", a.row.clip.display_name));
+                }
+                // To the back, so one failing shot never blocks the others.
+                self.auto_pending.push_back(a);
             }
         }
     }

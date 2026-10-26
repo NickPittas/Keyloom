@@ -71,7 +71,9 @@ impl RemoteSet {
     pub fn free_candidates(&self, s: &Settings, sp: Option<&Path>) -> Vec<String> {
         self.automatic_candidates(s, sp).into_iter().map(|c| c.0).filter(|id| {
             let Some((ns, iid)) = id.strip_prefix("network:").and_then(|x| x.split_once('/')) else { return false };
-            self.remotes.iter().any(|r| r.ns().as_deref() == Some(ns) && r.is_free(iid))
+            // Two connections can reach one network: free only if none of them has unfinished work of ours on that PC.
+            let same = || self.remotes.iter().filter(|r| r.ns().as_deref() == Some(ns));
+            same().any(|r| r.is_free(iid)) && !same().any(|r| r.has_unfinished(iid))
         }).collect()
     }
     fn get(&mut self, creds: &str) -> Option<&mut Remote> {
@@ -79,11 +81,11 @@ impl RemoteSet {
     }
 
     /// Which network a submission belongs to. `Err` = nothing is sent (never a guess).
-    fn route(&self, target: &Option<String>, default: &str) -> Result<(usize, Option<String>), String> {
+    fn route(&self, target: &Option<String>, default: &str, conns: &[(Conn, bool)]) -> Result<(usize, Option<String>), String> {
         match target {
             Some(t) => {
                 if let Some((ns, iid)) = t.split_once('/') {
-                    let i = self.remotes.iter().position(|r| r.ns().as_deref() == Some(ns)).ok_or("that PC's network is not set up on this computer")?;
+                    let i = self.remotes.iter().enumerate().position(|(i, r)| r.ns().as_deref() == Some(ns) && r.accepts_work(&conns[i].0)).ok_or("that PC's network is not set up on this computer, or no enabled connection to it takes work")?;
                     return Ok((i, Some(iid.to_owned())));
                 }
                 Err("that PC is not known on any joined network; pick it again".into())
@@ -110,7 +112,7 @@ impl RemoteSet {
         env.ai.dispatch_auto(&free, env.metrics);
         let default = env.settings.network.default_submit.trim().to_owned();
         for mut n in env.ai.take_net_outbox() {
-            match self.route(&n.target, &default) {
+            match self.route(&n.target, &default, &conns) {
                 Ok((i, t)) => {
                     n.target = t;
                     env.cfg = conns[i].0.clone();

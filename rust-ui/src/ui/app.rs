@@ -2569,6 +2569,16 @@ impl App {
             self.ai.dispatch_auto(&[], &view); // no network: Automatic means this computer
             return;
         }
+        // The driver ticks without the UI's settings, so Leave results are finished here either way.
+        for (creds, how) in self.remote.take_left() {
+            let name = self.conn_name(&creds);
+            let tail = match how {
+                crate::remote::Leave::Retired => None,
+                crate::remote::Leave::TooOld => Some(" (that PC runs an older Keyloom)"),
+                crate::remote::Leave::Failed => Some(""),
+            };
+            self.finish_remove(&creds, tail.map(|t| format!("{name} still lists this PC; retire it from that PC's Clients page{t}.")));
+        }
         if self.driver.is_none() {
             let view = self.metrics.view(now);
             let mut env = crate::remote::Env {
@@ -2582,15 +2592,6 @@ impl App {
                 cfg: Default::default(),
             };
             self.remote.tick(now, &mut env);
-            for (creds, how) in self.remote.take_left() {
-                let name = self.conn_name(&creds);
-                let tail = match how {
-                    crate::remote::Leave::Retired => None,
-                    crate::remote::Leave::TooOld => Some(" (that PC runs an older Keyloom)"),
-                    crate::remote::Leave::Failed => Some(""),
-                };
-                self.finish_remove(&creds, tail.map(|t| format!("{name} still lists this PC; retire it from that PC's Clients page{t}.")));
-            }
             for f in self.remote.take_finished() {
                 if let Some(ctx) = self.last_ctx.clone() {
                     self.refresh_clip(&ctx, &f);
