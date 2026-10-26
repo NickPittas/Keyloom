@@ -358,7 +358,7 @@ def _read_manifest(mdir: str) -> dict | None:
     except (OSError, ValueError):
         _rej("exists", f"{path} is unreadable; it may belong to another tool")
     if not isinstance(data, dict):
-        _rej("exists", f"{path} is not a CorridorKey manifest")
+        _rej("exists", f"{path} is not a Keyloom manifest")
     return data
 
 

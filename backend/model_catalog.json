@@ -2061,7 +2061,7 @@
       ],
       "id": "corridorkey-code",
       "kind": "local_code",
-      "label": "CorridorKey 2.0 engine code (vendored)",
+      "label": "Keyloom Key engine code (vendored)",
       "layout_rel": "",
       "layout_root": "v2_package_root",
       "notes": [
@@ -2109,7 +2109,7 @@
       "gated": false,
       "id": "corridorkey-weights",
       "kind": "hf_files",
-      "label": "CorridorKey 2.0 weights",
+      "label": "Keyloom Key weights",
       "layout_rel": "weights",
       "layout_root": "v2_models_dir",
       "notes": [

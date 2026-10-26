@@ -716,7 +716,7 @@ impl JobSpec {
             return Err(problems);
         }
         let products: Vec<String> = key.outputs.keys().cloned().collect();
-        crate::pipeline::export_jobs(clip, (self.range.in_point, self.range.out_point), &pe, &key.manifest_dir, &products, &dests, || ids("x")).map_err(|x| vec![format!("deliver stage: {x}")])
+        crate::pipeline::export_jobs(clip, &key.clip_id, (self.range.in_point, self.range.out_point), &pe, &key.manifest_dir, &products, &dests, || ids("x")).map_err(|x| vec![format!("deliver stage: {x}")])
     }
 
     /// Scan the clip this PC has at `clip_root`: `<project>/clips/<folder>` with its own `Frames`/`Input` sequence.

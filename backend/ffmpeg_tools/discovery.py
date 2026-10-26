@@ -342,7 +342,7 @@ def validate_ffmpeg_install(require_probe: bool = True) -> FFmpegValidationResul
         return FFmpegValidationResult(
             ok=False,
             message=(
-                "FFmpeg not found. CorridorKey requires FFmpeg 7.0+ and FFprobe. "
+                "FFmpeg not found. Keyloom requires FFmpeg 7.0+ and FFprobe. "
                 "Install a current FFmpeg build or re-run the installer."
             ),
         )
@@ -352,7 +352,7 @@ def validate_ffmpeg_install(require_probe: bool = True) -> FFmpegValidationResul
         return FFmpegValidationResult(
             ok=False,
             message=(
-                "FFprobe not found. CorridorKey requires both FFmpeg and FFprobe. "
+                "FFprobe not found. Keyloom requires both FFmpeg and FFprobe. "
                 "Install a full FFmpeg build or re-run the installer."
             ),
             ffmpeg_path=ffmpeg,
@@ -402,7 +402,7 @@ def validate_ffmpeg_install(require_probe: bool = True) -> FFmpegValidationResul
         for label, info in programs:
             if not info.is_verified_build:
                 return _fail(
-                    f"{label} is not a build verified for CorridorKey. "
+                    f"{label} is not a build verified for Keyloom. "
                     f"Detected {info.first_line}. Unverified builds have "
                     "caused corrupted frames and failed exports. "
                     "Run Repair FFmpeg to install the verified build.",
@@ -469,8 +469,8 @@ def get_ffmpeg_install_help() -> str:
     """Return concise install guidance for the current platform."""
     if sys.platform == "win32":
         return (
-            "Use the CorridorKey Repair FFmpeg action or re-run 1-install.bat.\n"
-            "CorridorKey will install a full bundled FFmpeg build into tools\\ffmpeg."
+            "Use the Keyloom Repair FFmpeg action or re-run 1-install.bat.\n"
+            "Keyloom will install a full bundled FFmpeg build into tools\\ffmpeg."
         )
     if sys.platform == "darwin":
         return (

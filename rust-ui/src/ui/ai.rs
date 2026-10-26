@@ -3287,6 +3287,7 @@ impl AiUi {
         let exports = match &r.export {
             Some(x) => crate::pipeline::export_jobs(
                 &r.clip,
+                &plan.job.clip_id,
                 r.range,
                 &x.cfg,
                 &plan.job.manifest_dir,
@@ -3346,9 +3347,9 @@ impl AiUi {
         if m.engine != "corridorkey-v2" || m.version < 3 || m.files.is_none() {
             return Err("the existing result is not a verifiable v3 result: run Key again".into());
         }
-        if clip.clip_id.is_none() || m.clip_id != clip.clip_id {
+        let Some(clip_id) = clip.clip_id.clone().filter(|id| m.clip_id.as_ref() == Some(id)) else {
             return Err("the existing result belongs to another clip".into());
-        }
+        };
         if !m.complete && !cfg.allow_partial {
             return Err("the existing Key result is incomplete: tick 'Export the partial result' to export it".into());
         }
@@ -3369,7 +3370,7 @@ impl AiUi {
         let mut reserved = std::collections::BTreeSet::new();
         let dests = crate::pipeline::export_dests(clip, project_root, cfg, range, &mut reserved)?;
         let products: Vec<String> = m.enabled.iter().map(|e| e.to_lowercase()).collect();
-        let jobs = crate::pipeline::export_jobs(clip, range, cfg, dir, &products, &dests, new_id)?;
+        let jobs = crate::pipeline::export_jobs(clip, &clip_id, range, cfg, dir, &products, &dests, new_id)?;
         let mut ids: Vec<String> = vec![];
         for j in jobs {
             let after = ids.last().cloned().into_iter().collect();

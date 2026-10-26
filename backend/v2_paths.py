@@ -106,9 +106,9 @@ def validate_v2_assets(paths: V2AssetPaths | None = None) -> list[str]:
     problems: list[str] = []
     root = paths.package_root
     if not (root / "corridorkey" / "runtime.py").is_file():
-        problems.append(f"CorridorKeyV2 package missing runtime.py: {root}")
+        problems.append(f"Key engine (CorridorKeyV2) package missing runtime.py: {root}")
     if not (root / "third_party" / "MoGe").is_dir():
-        problems.append(f"CorridorKeyV2 third_party/MoGe missing: {root}")
+        problems.append(f"Key engine (CorridorKeyV2) third_party/MoGe missing: {root}")
     for label in ("weights", "foundation_stats", "rvm_ckpt", "moge_checkpoint"):
         problems += _check_file(label, getattr(paths, label))
     return problems + _check_cradio(paths.cradio_dir)

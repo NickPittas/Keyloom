@@ -177,7 +177,7 @@ class Worker:
         except KeyJobRejected as exc:
             return self._reject(jid, exc.code, exc.message)
         if not self.hello["capabilities"]["key"]:
-            return self._reject(jid, "invalid", "Key is unavailable on this worker: CorridorKey 2.0 "
+            return self._reject(jid, "invalid", "Key is unavailable on this worker: Keyloom Key "
                                                 "model files are missing or incomplete")
         known = self.hello["models"].get("corridorkey_v2") or {}
         for name, want in job.require["models"].items():

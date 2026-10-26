@@ -165,18 +165,18 @@ class CorridorKeyV2Engine:
             problems = validate_v2_assets(self._paths)
             if problems:
                 raise V2EngineError(
-                    "CorridorKey 2.0 assets are missing or invalid:\n  "
+                    "Keyloom Key model assets are missing or invalid:\n  "
                     + "\n  ".join(problems)
                     + "\nRun: python scripts/setup_models.py --corridorkey"
                 )
             import torch
 
             if not torch.cuda.is_available():
-                raise V2EngineError("CorridorKey 2.0 requires an NVIDIA CUDA GPU")
+                raise V2EngineError("Keyloom Key engine requires an NVIDIA CUDA GPU")
             from CorridorKeyV2.corridorkey import runtime as rt
 
             if on_status:
-                on_status("Loading CorridorKey 2.0 model...")
+                on_status("Loading the Key model...")
             paths = rt.RuntimePaths(**self._paths.as_runtime_kwargs())
             with _offline_env():
                 self._model = rt.load_model(paths, self._device)
@@ -189,7 +189,7 @@ class CorridorKeyV2Engine:
             _free_gpu_memory()
             if lease is not None:
                 lease.close()
-            raise V2EngineError(f"Failed to load CorridorKey 2.0 model: {exc}") from exc
+            raise V2EngineError(f"Failed to load the Key model: {exc}") from exc
         self._model_asset_lease = lease
         self.load_count += 1
 

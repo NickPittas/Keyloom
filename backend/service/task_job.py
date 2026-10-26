@@ -454,7 +454,7 @@ def _read_lock(path: str) -> tuple[dict | None, str | None]:
     except (OSError, ValueError):
         return None, "unreadable: not valid lock metadata"
     if not isinstance(data, dict) or not isinstance(data.get("job_id"), str):
-        return None, "unreadable: not a CorridorKey hint lock"
+        return None, "unreadable: not a Keyloom hint lock"
     return data, None
 
 
@@ -864,7 +864,7 @@ def _export_plan(job: TaskJob) -> tuple:
     if (not isinstance(r, dict) or not isinstance(files, dict) or not isinstance(stems_all, list)
             or not isinstance(files.get(p["product"]), list) or m.get("engine") != "corridorkey-v2"
             or m.get("clip_id") != job.clip_id or len(files[p["product"]]) != len(stems_all)):
-        _rej("invalid", "manifest is not a CorridorKey v3 result for this clip and product")
+        _rej("invalid", "manifest is not a Keyloom Key result for this clip and product")
     if not m.get("complete") and not p["allow_partial"]:
         _rej("invalid", "The result is incomplete; export a deliberately chosen range with allow_partial")
     a, b = job.range["in_point"] - r["in_point"], job.range["out_point"] - r["in_point"]

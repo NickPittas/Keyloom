@@ -229,7 +229,7 @@ class CorridorKeyService(
             self._device = 'cuda'
         else:
             self._device = 'cpu'
-            logger.error("CorridorKey 2.0 requires an NVIDIA CUDA GPU; keying unavailable")
+            logger.error("Keyloom Key engine requires an NVIDIA CUDA GPU; keying unavailable")
         logger.info(f"Compute device: {self._device}")
         return self._device
 

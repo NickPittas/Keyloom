@@ -145,7 +145,7 @@ class InferenceMixin:
         free = shutil.disk_usage(root).free
         if free < need:
             raise CorridorKeyError(
-                f"Not enough free disk space for CorridorKey 2.0 scratch files in {root}: "
+                f"Not enough free disk space for the Key model scratch files in {root}: "
                 f"need ~{need / 2**30:.1f} GB, have {free / 2**30:.1f} GB. "
                 "Free space or set CORRIDORKEY_V2_SCRATCH_DIR to a larger drive."
             )

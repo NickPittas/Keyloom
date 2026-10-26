@@ -172,6 +172,7 @@ pub fn export_dests(
 /// an existing result), one per Video delivery; `products` are that result's outputs. The caller chains them one after another after Key.
 pub fn export_jobs(
     clip: &Clip,
+    clip_id: &str,
     range: (usize, usize),
     e: &PipelineExport,
     manifest_dir: &Path,
@@ -202,7 +203,8 @@ pub fn export_jobs(
             fps: e.fps.unwrap_or(clip.fps),
             allow_partial: e.allow_partial,
         };
-        let job = Ctx { clip, range, job_id: new_id(), staging: PathBuf::new() }.export(&cfg)?;
+        let mut job = Ctx { clip, range, job_id: new_id(), staging: PathBuf::new() }.export(&cfg)?;
+        job.clip_id = clip_id.into();
         job.validate()?;
         jobs.push(job);
     }
@@ -236,4 +238,35 @@ pub fn collisions<'a>(plans: impl IntoIterator<Item = (&'a str, &'a KeyJob)>) ->
         out.extend(hit.map(|m| (i, m)));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::presets::{Delivery, VideoDelivery};
+
+    #[test]
+    fn export_jobs_carry_the_key_clip_id_not_the_folder_name() {
+        let root = std::env::temp_dir().join(format!("ck-export-jobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let d = root.join("clips/c1");
+        std::fs::create_dir_all(d.join("Frames")).unwrap();
+        for i in 1..=4 {
+            std::fs::write(d.join(format!("Frames/f{i}.png")), b"x").unwrap();
+        }
+        std::fs::write(d.join("clip.json"), "{}").unwrap();
+        std::fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
+        let clip = crate::project::load_project(&root, &crate::project::LoadOptions::default()).unwrap().clips.remove(0);
+        assert!(clip.clip_id.is_none());
+        let mut e = PipelineExport::default();
+        e.outputs.clear();
+        e.outputs.insert("fg".into(), Delivery::Video(VideoDelivery::default_for("mp4")));
+        e.fps = Some(24.0);
+        let dests = vec![("fg".to_string(), root.join("out.mp4"))];
+        let jobs = export_jobs(&clip, "key-clip-id", (0, 3), &e, &d, &["fg".to_string()], &dests, || "job".into());
+        let _ = std::fs::remove_dir_all(&root);
+        let jobs = jobs.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].clip_id, "key-clip-id");
+    }
 }
