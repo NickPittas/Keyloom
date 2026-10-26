@@ -21,7 +21,8 @@ from ..job_queue import GPUJobQueue
 from .model_manager import ModelManagerMixin, _ActiveModel
 from .frame_ops import FrameOpsMixin
 from .inference import InferenceMixin
-from .pipelines import PipelinesMixin
+from .pipelines_auto import AutoPipelinesMixin
+from .pipelines_guided import GuidedPipelinesMixin
 
 logger = logging.getLogger(__name__)
 
@@ -128,20 +129,12 @@ class OutputConfig:
         return out
 
 
-@dataclass
-class FrameResult:
-    """Result summary for a single processed frame (no numpy in this struct)."""
-    frame_index: int
-    input_stem: str
-    success: bool
-    warning: Optional[str] = None
-
-
 class CorridorKeyService(
     ModelManagerMixin,
     FrameOpsMixin,
     InferenceMixin,
-    PipelinesMixin,
+    AutoPipelinesMixin,
+    GuidedPipelinesMixin,
 ):
     """Main backend service — scan, validate, process, write.
 
@@ -149,10 +142,6 @@ class CorridorKeyService(
         service = CorridorKeyService()
         clips = service.scan_clips("/path/to/ClipsForInference")
         ready = service.get_clips_by_state(clips, ClipState.READY)
-
-        for clip in ready:
-            params = InferenceParams(despill_strength=0.8)
-            service.run_inference(clip, params, on_progress=my_callback)
     """
 
     def __init__(self):

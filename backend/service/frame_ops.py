@@ -8,8 +8,7 @@ import json
 import logging
 import glob
 import os
-import shutil
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
@@ -17,9 +16,6 @@ import numpy as np
 from ..clip_state import ClipAsset, ClipEntry
 from ..errors import CorridorKeyError, FrameReadError, JobCancelledError
 from ..frame_io import (
-    _linear_to_srgb,
-    _srgb_to_linear,
-    decode_video_mask_frame,
     imread_unicode,
     read_video_frames,
 )
@@ -63,36 +59,6 @@ class FrameOpsMixin:
             validate_frame_read(img, clip.name, frame_index, fpath)
             return img, input_stem, input_is_linear
 
-    def _read_alpha_frame(
-        self,
-        clip: ClipEntry,
-        frame_index: int,
-        alpha_files: list[str],
-        alpha_cap: Optional[Any],
-        *,
-        input_stem: str | None = None,
-        alpha_stem_lookup: Optional[dict[str, str]] = None,
-    ) -> Optional[np.ndarray]:
-        """Read a single alpha/mask frame and normalize to [H, W] float32."""
-        from . import read_mask_frame
-        
-        if alpha_cap:
-            ret, frame = alpha_cap.read()
-            if not ret:
-                return None
-            return decode_video_mask_frame(frame)
-        else:
-            fname: str | None = None
-            if input_stem is not None and alpha_stem_lookup is not None:
-                fname = alpha_stem_lookup.get(input_stem)
-            if fname is None:
-                if frame_index >= len(alpha_files):
-                    return None
-                fname = alpha_files[frame_index]
-            fpath = os.path.join(clip.alpha_asset.path, fname)
-            mask = read_mask_frame(fpath, clip.name, frame_index)
-            validate_frame_read(mask, clip.name, frame_index, fpath)
-            return mask
 
     def _write_image(
         self, img: np.ndarray, path: str, fmt: str, clip_name: str, frame_index: int,
@@ -122,63 +88,7 @@ class FrameOpsMixin:
                 clip_name, frame_index, path,
             )
 
-    def _write_manifest(
-        self,
-        output_root: str,
-        output_config,
-        params,
-        *,
-        source_stems: Optional[Iterable[str]] = None,
-        frame_range: Optional[Iterable[int]] = None,
-        complete: bool = False,
-        hint_keyframes: Optional[Iterable[int]] = None,
-    ) -> None:
-        """Write the v2 run manifest atomically (tmp + os.replace).
 
-        Raises on failure: a missing manifest would break resume validation.
-        """
-        manifest = {
-            "version": 2,
-            "engine": "corridorkey-v2",
-            "enabled_outputs": output_config.enabled_outputs,
-            "formats": {
-                "fg": output_config.fg_format,
-                "matte": output_config.matte_format,
-                "comp": output_config.comp_format,
-                "processed": output_config.processed_format,
-            },
-            "params": params.to_dict(),
-            "source_stems": list(source_stems) if source_stems is not None else None,
-            "frame_range": list(frame_range) if frame_range is not None else None,
-            "complete": bool(complete),
-            "alpha_convention": {
-                "processed_exr": "straight-linear",
-                "processed_png": "straight-srgb",
-            },
-        }
-        if hint_keyframes is not None:  # Keyframes mode only: effective absolute indices
-            manifest["hint_keyframes"] = [int(i) for i in hint_keyframes]
-        manifest_path = os.path.join(output_root, ".corridorkey_manifest.json")
-        tmp_path = manifest_path + ".tmp"
-        try:
-            with open(tmp_path, 'w') as f:
-                json.dump(manifest, f, indent=2)
-            os.replace(tmp_path, manifest_path)
-        except Exception as e:
-            logger.error(f"Failed to write manifest {manifest_path}: {e}")
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
-
-    @staticmethod
-    def _copy_v2_settings(settings_path: Optional[str], output_root: str) -> None:
-        """Copy the runtime settings txt into the output root (no-op if absent)."""
-        if settings_path and os.path.isfile(settings_path):
-            shutil.copyfile(
-                settings_path, os.path.join(output_root, "corridorkey_v2_settings.txt")
-            )
 
     # ------------------------------------------------------------------
     # CorridorKey 2.0 output publication
@@ -236,155 +146,9 @@ class FrameOpsMixin:
             )
         return img
 
-    @staticmethod
-    def _v2_move(src: str, final_path: str) -> None:
-        if not os.path.isfile(src):
-            raise CorridorKeyError(f"Missing CorridorKey 2.0 runtime output: {src}")
-        d, name = os.path.split(final_path)
-        tmp = os.path.join(d, f".{name}.tmp")
-        shutil.move(src, tmp)  # rename on the same filesystem, else a plain copy
-        os.replace(tmp, final_path)
 
-    def _v2_atomic_write(self, img, final_path, fmt, clip_name, frame_index, compression):
-        d, name = os.path.split(final_path)
-        tmp = os.path.join(d, f".{os.path.splitext(name)[0]}.tmp.{fmt}")
-        try:
-            self._write_image(img, tmp, fmt, clip_name, frame_index,
-                              exr_compression=compression)
-            os.replace(tmp, final_path)
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
 
-    def _publish_v2_outputs(
-        self,
-        product_dirs: dict[str, str],
-        dirs: dict[str, str],
-        source_stems: list[str],
-        output_config,
-        clip_name: str,
-        *,
-        publish_indices: Optional[Iterable[int]] = None,
-        skip_stems: Optional[set[str]] = None,
-        check_cancel: Optional[Callable[[], None]] = None,
-        on_frame: Optional[Callable[..., None]] = None,
-        on_warning: Optional[Callable[[str], None]] = None,
-    ) -> list[str]:
-        """Convert runtime float EXRs into EZ output folders. Returns published stems."""
-        cfg = output_config
-        products = self._v2_required_products(cfg)
-        fmts = {"fg": cfg.fg_format, "alpha": cfg.matte_format,
-                "checker": cfg.comp_format, "cutout": cfg.processed_format}
-        indices = range(len(source_stems)) if publish_indices is None else publish_indices
-        skip = skip_stems or set()
-        published: list[str] = []
-        for i in indices:
-            if check_cancel is not None:
-                check_cancel()
-            stem = source_stems[i]
-            if stem in skip:
-                continue
-            for product in products:
-                if product not in product_dirs:
-                    raise CorridorKeyError(f"No runtime directory for product '{product}'")
-                path = self._v2_runtime_file(product, product_dirs[product], i)
-                fmt = fmts[product]
-                ez = self.V2_PRODUCT_TO_EZ[product]
-                if fmt == "exr":
-                    # Runtime already wrote the final EXR: move/rename, never re-encode.
-                    self._v2_move(path, os.path.join(dirs[ez], f"{stem}.exr"))
-                    continue
-                img = self._v2_read(product, path)
-                if product == "alpha":
-                    out = img
-                elif product == "cutout":
-                    out = np.concatenate(
-                        [_linear_to_srgb(np.clip(img[:, :, :3], 0.0, None)),
-                         img[:, :, 3:4]], axis=-1)
-                else:
-                    out = _linear_to_srgb(np.clip(img, 0.0, None))
-                self._v2_atomic_write(
-                    np.ascontiguousarray(out, dtype=np.float32),
-                    os.path.join(dirs[ez], f"{stem}.{fmt}"),
-                    fmt, clip_name, i, cfg.exr_compression,
-                )
-            published.append(stem)
-            if on_frame is not None:
-                on_frame(i, stem)
-        return published
 
-    def _write_outputs(
-        self,
-        res: dict,
-        dirs: dict[str, str],
-        input_stem: str,
-        clip_name: str,
-        frame_index: int,
-        output_config=None,
-    ) -> None:
-        """Write output types for a single frame respecting OutputConfig."""
-        from .core import OutputConfig
-        cfg = output_config or OutputConfig()
-        logger.debug(f"Writing outputs for '{clip_name}' frame {frame_index} stem='{input_stem}'")
-
-        pred_fg = res['fg']
-        pred_alpha = res['alpha']
-
-        # FG
-        if cfg.fg_enabled:
-            fg_rgb = pred_fg
-            if cfg.fg_format == "exr":
-                fg_rgb = _srgb_to_linear(fg_rgb)
-            fg_bgr = cv2.cvtColor(fg_rgb.astype(np.float32), cv2.COLOR_RGB2BGR)
-            fg_path = os.path.join(dirs['fg'], f"{input_stem}.{cfg.fg_format}")
-            self._write_image(fg_bgr, fg_path, cfg.fg_format, clip_name, frame_index,
-                              exr_compression=cfg.exr_compression)
-
-        # Matte
-        if cfg.matte_enabled:
-            alpha = pred_alpha
-            if alpha.ndim == 3:
-                alpha = alpha[:, :, 0]
-            matte_path = os.path.join(dirs['matte'], f"{input_stem}.{cfg.matte_format}")
-            self._write_image(alpha, matte_path, cfg.matte_format, clip_name, frame_index,
-                              exr_compression=cfg.exr_compression)
-
-        # Comp
-        if cfg.comp_enabled:
-            comp_srgb = res['comp']
-            if cfg.comp_format == "exr":
-                comp_rgb = _srgb_to_linear(comp_srgb)
-                comp_bgr = cv2.cvtColor(comp_rgb.astype(np.float32), cv2.COLOR_RGB2BGR)
-            else:
-                comp_bgr = cv2.cvtColor(
-                    (np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8),
-                    cv2.COLOR_RGB2BGR,
-                )
-            comp_path = os.path.join(dirs['comp'], f"{input_stem}.{cfg.comp_format}")
-            self._write_image(comp_bgr, comp_path, cfg.comp_format, clip_name, frame_index,
-                              exr_compression=cfg.exr_compression)
-
-        # Processed (RGBA — linear premul for EXR, sRGB straight for PNG)
-        if cfg.processed_enabled and 'processed' in res:
-            proc_rgba = res['processed']  # [H,W,4] premultiplied linear float
-            if cfg.processed_format == "exr":
-                proc_bgra = cv2.cvtColor(proc_rgba, cv2.COLOR_RGBA2BGRA)
-            else:
-                # PNG needs sRGB straight alpha, not premultiplied linear.
-                # Un-premultiply, convert linear→sRGB, recombine with alpha.
-                rgb_premul = proc_rgba[:, :, :3]
-                alpha = proc_rgba[:, :, 3:4]
-                safe_alpha = np.where(alpha > 1e-6, alpha, 1.0)
-                rgb_straight = rgb_premul / safe_alpha
-                rgb_srgb = _linear_to_srgb(np.clip(rgb_straight, 0.0, 1.0))
-                proc_srgb = np.concatenate([rgb_srgb, alpha], axis=-1)
-                proc_bgra = cv2.cvtColor(proc_srgb, cv2.COLOR_RGBA2BGRA)
-            proc_path = os.path.join(dirs['processed'], f"{input_stem}.{cfg.processed_format}")
-            self._write_image(proc_bgra, proc_path, cfg.processed_format, clip_name, frame_index,
-                              exr_compression=cfg.exr_compression)
 
     def _load_first_frame_mask(
         self, clip: ClipEntry, frame_shape: tuple[int, int]

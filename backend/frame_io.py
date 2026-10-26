@@ -137,12 +137,6 @@ def write_exr(path: str, img: np.ndarray, compression: str = "dwab") -> bool:
         return False
 
 
-# Backwards-compatible aliases
-def write_exr_dwab(path: str, img: np.ndarray) -> bool:
-    """Write EXR with DWAB compression (legacy alias for write_exr)."""
-    return write_exr(path, img, compression="dwab")
-
-
 def _is_ascii(path: str) -> bool:
     """True if every character in the path is ASCII (safe for cv2's narrow API)."""
     try:
@@ -353,28 +347,6 @@ def imwrite_unicode(path: str, img: np.ndarray, params: Optional[list] = None) -
     except Exception as e:
         logger.warning(f"Failed to write image {path}: {e}")
         return False
-
-
-def recompress_exr(src_path: str, dst_path: str, compression: str = "dwab") -> bool:
-    """Recompress an EXR file to the specified compression.
-
-    Reads the source EXR (any compression) via OpenCV and writes to
-    dst_path with the requested compression via OpenEXR library.
-
-    Args:
-        src_path: Path to source EXR file.
-        dst_path: Path to write recompressed EXR.
-        compression: Target compression — "dwab", "piz", "zip", or "none".
-
-    Returns:
-        True on success, False on failure.
-    """
-    img = imread_unicode(src_path, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        logger.warning(f"Failed to read EXR for recompression: {src_path}")
-        return False
-    return write_exr(dst_path, img, compression=compression)
-
 
 
 def read_image_frame(fpath: str, gamma_correct_exr: bool = False) -> Optional[np.ndarray]:

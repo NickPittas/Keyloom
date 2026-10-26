@@ -9,19 +9,14 @@ import logging
 import os
 import re
 import shutil
-from datetime import datetime
 
 from .project import (
     is_image_file,
-    is_video_file,
-    projects_root,
     sanitize_stem,
     write_clip_json,
     write_project_json,
     read_project_json,
-    _create_clip_folder,
     _VIDEO_EXTS,
-    _HINT_KEYWORDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -262,87 +257,3 @@ def add_sequences_to_project(
     write_project_json(project_dir, data)
 
     return new_paths
-
-
-def create_project_from_media(
-    video_paths: list[str] | None = None,
-    sequence_folders: list[str] | None = None,
-    *,
-    copy_video: bool = True,
-    copy_sequences: bool = False,
-    display_name: str | None = None,
-) -> str:
-    """Create a new project from a mix of videos and/or image sequences.
-
-    Generalizes create_project() to handle both media types.
-
-    Args:
-        video_paths: Optional list of video file paths.
-        sequence_folders: Optional list of image sequence folder paths.
-        copy_video: Whether to copy video files into clip folders.
-        copy_sequences: Whether to copy image sequences into clip folders.
-        display_name: Optional project name.
-
-    Returns:
-        Absolute path to the new project folder.
-    """
-    video_paths = video_paths or []
-    sequence_folders = sequence_folders or []
-
-    if not video_paths and not sequence_folders:
-        raise ValueError("At least one video or image sequence is required")
-
-    root = projects_root()
-
-    if display_name and display_name.strip():
-        clean = display_name.strip()
-        name_stem = re.sub(r"[^\w\-]", "_", clean)
-        name_stem = re.sub(r"_+", "_", name_stem).strip("_")[:60]
-        project_display_name = clean
-    elif video_paths:
-        first_filename = os.path.basename(video_paths[0])
-        name_stem = sanitize_stem(first_filename)
-        project_display_name = name_stem.replace("_", " ")
-    else:
-        first_folder = os.path.basename(sequence_folders[0])
-        name_stem = sanitize_stem(first_folder)
-        project_display_name = name_stem.replace("_", " ")
-
-    timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
-    folder_name = f"{timestamp}_{name_stem}"
-
-    project_dir = os.path.join(root, folder_name)
-    if os.path.exists(project_dir):
-        for i in range(2, 100):
-            candidate = os.path.join(root, f"{folder_name}_{i}")
-            if not os.path.exists(candidate):
-                project_dir = candidate
-                break
-
-    clips_dir = os.path.join(project_dir, "clips")
-    os.makedirs(clips_dir, exist_ok=True)
-
-    clip_names: list[str] = []
-
-    # Add video clips
-    for video_path in video_paths:
-        clip_name = _create_clip_folder(
-            clips_dir, video_path, copy_source=copy_video,
-        )
-        clip_names.append(clip_name)
-
-    # Add sequence clips
-    for seq_folder in sequence_folders:
-        clip_name = create_clip_from_sequence(
-            clips_dir, seq_folder, copy_source=copy_sequences,
-        )
-        clip_names.append(clip_name)
-
-    write_project_json(project_dir, {
-        "version": 2,
-        "created": datetime.now().isoformat(),
-        "display_name": project_display_name,
-        "clips": clip_names,
-    })
-
-    return project_dir

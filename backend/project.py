@@ -25,7 +25,6 @@ import os
 import re
 import shutil
 import sys
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -34,16 +33,6 @@ _IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff", ".bmp
 VIDEO_FILE_FILTER = "Video Files (*.mp4 *.mov *.avi *.mkv *.mxf *.webm *.m4v *.gif);;All Files (*)"
 
 _app_dir: str | None = None
-
-
-def set_app_dir(path: str) -> None:
-    """Set the application directory. Called at startup by main.py.
-
-    In frozen builds, called twice: first with exe dir, then with
-    get_data_dir() (user-chosen install path) so projects_root() resolves correctly.
-    """
-    global _app_dir
-    _app_dir = path
 
 
 def get_data_dir() -> str:
@@ -77,23 +66,6 @@ def get_data_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".local", "share", "EZ-CorridorKey")
 
 
-def projects_root() -> str:
-    """Return the Projects root directory, creating it if needed.
-
-    In dev mode: {repo_root}/Projects/
-    In frozen mode: {install_path}/Projects/ (set via get_data_dir() at startup)
-    """
-    if _app_dir:
-        root = os.path.join(_app_dir, "Projects")
-    elif getattr(sys, 'frozen', False):
-        root = os.path.join(os.path.dirname(sys.executable), "Projects")
-    else:
-        # Fallback: two levels up from this file (backend/ -> repo root)
-        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Projects")
-    os.makedirs(root, exist_ok=True)
-    return root
-
-
 def sanitize_stem(filename: str, max_len: int = 60) -> str:
     """Clean a filename stem for use in folder names.
 
@@ -104,85 +76,6 @@ def sanitize_stem(filename: str, max_len: int = 60) -> str:
     stem = re.sub(r"[^\w\-]", "_", stem)
     stem = re.sub(r"_+", "_", stem).strip("_")
     return stem[:max_len]
-
-
-def create_project(
-    source_video_paths: str | list[str],
-    *,
-    copy_source: bool = True,
-    display_name: str | None = None,
-) -> str:
-    """Create a new project folder for one or more source videos.
-
-    Creates a v2 project with a ``clips/`` subdirectory.  Each video
-    gets its own clip subfolder inside ``clips/``.
-
-    When *copy_source* is True (default), video files are copied into
-    each clip's ``Source/`` directory.  When False, the clip stores a
-    reference to the original file path.
-
-    Creates: Projects/YYMMDD_HHMMSS_{stem}/clips/{clip_stem}/Source/...
-
-    Args:
-        source_video_paths: Single video path (str) or list of paths.
-        copy_source: Whether to copy video files into clip folders.
-        display_name: Optional project name. If provided, used for both
-            the folder name stem and display_name in project.json.
-            If None, derived from the first video filename.
-
-    Returns:
-        Absolute path to the new project folder.
-    """
-    # Accept single path for backward compat
-    if isinstance(source_video_paths, str):
-        source_video_paths = [source_video_paths]
-    if not source_video_paths:
-        raise ValueError("At least one source video path is required")
-
-    root = projects_root()
-
-    if display_name and display_name.strip():
-        clean = display_name.strip()
-        # Sanitize for folder name (no splitext — it's not a filename)
-        name_stem = re.sub(r"[^\w\-]", "_", clean)
-        name_stem = re.sub(r"_+", "_", name_stem).strip("_")[:60]
-        project_display_name = clean
-    else:
-        first_filename = os.path.basename(source_video_paths[0])
-        name_stem = sanitize_stem(first_filename)
-        project_display_name = name_stem.replace("_", " ")
-
-    timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
-    folder_name = f"{timestamp}_{name_stem}"
-
-    # Deduplicate if folder already exists (e.g. rapid imports)
-    project_dir = os.path.join(root, folder_name)
-    if os.path.exists(project_dir):
-        for i in range(2, 100):
-            candidate = os.path.join(root, f"{folder_name}_{i}")
-            if not os.path.exists(candidate):
-                project_dir = candidate
-                break
-
-    clips_dir = os.path.join(project_dir, "clips")
-    os.makedirs(clips_dir, exist_ok=True)
-
-    clip_names: list[str] = []
-    for video_path in source_video_paths:
-        clip_name = _create_clip_folder(
-            clips_dir, video_path, copy_source=copy_source,
-        )
-        clip_names.append(clip_name)
-
-    # Write project.json (v2 — project-level metadata only)
-    write_project_json(project_dir, {
-        "version": 2,
-        "created": datetime.now().isoformat(),
-        "display_name": project_display_name,
-        "clips": clip_names,
-    })
-
-    return project_dir
 
 
 def add_clips_to_project(
@@ -656,33 +549,7 @@ def find_clip_by_source(
     return None
 
 
-def find_removed_clip_by_source(project_dir: str, source_path: str) -> str | None:
-    """Find a removed clip folder that references the given source.
-
-    Returns the clip folder basename if found in removed_clips, or None.
-    Used to restore removed clips instead of creating duplicates.
-    """
-    normalised = os.path.normcase(os.path.abspath(source_path))
-    removed = get_removed_clips(project_dir)
-    if not removed:
-        return None
-    for clip_dir in get_clip_dirs(project_dir):
-        folder = os.path.basename(clip_dir)
-        if folder not in removed:
-            continue
-        data = read_clip_json(clip_dir)
-        if not data:
-            continue
-        source = data.get("source", {})
-        existing = source.get("original_path", "")
-        if existing and os.path.normcase(os.path.abspath(existing)) == normalised:
-            return folder
-    return None
-
-
 # --- Backward-compat re-exports (moved to project_media.py) ---
 from .project_media import (  # noqa: F401, E402
     create_clip_from_sequence,
-    add_sequences_to_project,
-    create_project_from_media,
 )

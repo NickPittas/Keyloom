@@ -164,6 +164,8 @@ class AnnotationModel:
         Returns:
             Path to the created VideoMamaMaskHint directory.
         """
+        from .annotation_prompts import rasterize_annotation_strokes
+
         mask_dir = os.path.join(clip_root, "VideoMamaMaskHint")
         os.makedirs(mask_dir, exist_ok=True)
 
@@ -171,7 +173,7 @@ class AnnotationModel:
             abs_idx = start_index + i
             strokes = self._strokes.get(abs_idx, [])
             if strokes:
-                mask = self._rasterize_strokes(strokes, width, height)
+                mask = rasterize_annotation_strokes(strokes, width=width, height=height)
             else:
                 # Unannotated frame: all-black (user chose "everything is background")
                 mask = np.zeros((height, width), dtype=np.uint8)
@@ -184,36 +186,6 @@ class AnnotationModel:
             f"({self.annotated_frame_count()} annotated)"
         )
         return mask_dir
-
-    @staticmethod
-    def _rasterize_strokes(strokes: list[AnnotationStroke],
-                           width: int, height: int) -> np.ndarray:
-        """Render strokes into a binary mask (0=bg, 255=fg).
-
-        Foreground strokes draw white, background strokes draw black.
-        Strokes are applied in order, so later strokes override earlier ones.
-        """
-        mask = np.zeros((height, width), dtype=np.uint8)
-
-        for stroke in strokes:
-            color = 255 if stroke.brush_type == "fg" else 0
-            radius = max(1, int(round(stroke.radius)))
-
-            # Draw circles along the stroke path
-            for px, py in stroke.points:
-                cx, cy = int(round(px)), int(round(py))
-                cv2.circle(mask, (cx, cy), radius, color, -1)
-
-            # Connect consecutive points with thick lines for smooth strokes
-            if len(stroke.points) >= 2:
-                for i in range(len(stroke.points) - 1):
-                    p1 = (int(round(stroke.points[i][0])),
-                           int(round(stroke.points[i][1])))
-                    p2 = (int(round(stroke.points[i + 1][0])),
-                           int(round(stroke.points[i + 1][1])))
-                    cv2.line(mask, p1, p2, color, radius * 2)
-
-        return mask
 
     @staticmethod
     def rasterize_holdout_mask(strokes: list[AnnotationStroke],

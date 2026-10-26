@@ -23,7 +23,7 @@ from ..ffmpeg_tools.probe import (
     validate_constant_frame_rate_timestamps,
 )
 from ..frame_io import cv2, imread_unicode
-from .source_normalization import NormalizedSource
+from .source_normalization import NormalizedSource, _atomic_json
 
 _SOURCE_MARKER = ".source_normalization.json"
 _HINT_MARKER = ".hint_normalization.json"
@@ -112,22 +112,6 @@ def _read_json(path: str, label: str) -> dict:
     if not isinstance(value, dict):
         raise HintNormalizationError(f"{label} is invalid at '{path}'; files were left untouched.")
     return value
-
-
-def _write_marker(path: str, value: dict) -> None:
-    fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
-                                     dir=os.path.dirname(path))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, indent=2, ensure_ascii=False)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
 
 
 def _fraction(value, label: str) -> Fraction:
@@ -376,12 +360,12 @@ def _invalidate_staging(staging: str, identity: dict) -> None:
                 os.unlink(path)
         if os.path.islink(marker_path):
             os.unlink(marker_path)
-        _write_marker(marker_path, {**identity, "complete": False})
+        _atomic_json(marker_path, {**identity, "complete": False})
     except OSError as exc:
         try:
             if os.path.islink(marker_path):
                 os.unlink(marker_path)
-            _write_marker(marker_path, {**identity, "complete": False, "resume_invalid": True})
+            _atomic_json(marker_path, {**identity, "complete": False, "resume_invalid": True})
         except OSError:
             pass
         raise HintNormalizationError(
@@ -594,7 +578,7 @@ def _normalize_locked(
             if os.listdir(staging):
                 raise HintNormalizationError("Unrecognized files exist in hidden hint staging; they were left untouched.")
             marker = {**identity, "complete": False}
-            _write_marker(marker_path, marker)
+            _atomic_json(marker_path, marker)
         elif marker.get("resume_invalid") is True:
             raise HintNormalizationError("Hint staging was invalidated after input mutation and cannot be resumed.")
         elif marker.get("version") != _VERSION:
@@ -609,7 +593,7 @@ def _normalize_locked(
     else:
         os.mkdir(staging)
         marker = {**identity, "complete": False}
-        _write_marker(os.path.join(staging, _HINT_MARKER), marker)
+        _atomic_json(os.path.join(staging, _HINT_MARKER), marker)
 
     if _cancelled(cancel_event):
         _confirm_input_identity(source_path, source_sha256, hint_path, hint_sha256, staging, identity)
@@ -655,11 +639,11 @@ def _normalize_locked(
         raise HintNormalizationError(f"FFmpeg produced {completed} hint frames; expected {len(stems)}.")
     _confirm_input_identity(source_path, source_sha256, hint_path, hint_sha256, staging, identity)
     marker.update({"complete": True})
-    _write_marker(os.path.join(staging, _HINT_MARKER), marker)
+    _atomic_json(os.path.join(staging, _HINT_MARKER), marker)
     _confirm_input_identity(source_path, source_sha256, hint_path, hint_sha256, staging, identity)
     if _cancelled(cancel_event):
         marker.update({"complete": False})
-        _write_marker(os.path.join(staging, _HINT_MARKER), marker)
+        _atomic_json(os.path.join(staging, _HINT_MARKER), marker)
         return None
     try:
         _rename_noreplace(staging, destination)

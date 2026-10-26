@@ -35,15 +35,6 @@ _PROXY_VARS = (
 
 _SOCKS4_SCHEMES = ("socks4://", "socks4a://")
 
-# Substrings that identify a proxy-configuration failure raised by httpx
-# or httpcore somewhere below huggingface_hub.
-_PROXY_ERROR_SIGNATURES = (
-    "unknown scheme for proxy url",
-    "socksio",
-    "socks proxy",
-)
-
-
 def _socks5_available() -> bool:
     try:
         return importlib.util.find_spec("socksio") is not None
@@ -94,20 +85,3 @@ def sanitized_proxy_env():
     finally:
         for var, value in original.items():
             os.environ[var] = value
-
-
-def friendly_proxy_error(exc: BaseException) -> str | None:
-    """Return an actionable message if *exc* is a proxy configuration error.
-
-    Returns None for anything else so callers re-raise unchanged.
-    """
-    text = str(exc).lower()
-    if not any(sig in text for sig in _PROXY_ERROR_SIGNATURES):
-        return None
-    return (
-        "Model download failed because of your system proxy settings "
-        f"({exc}).\n\n"
-        "Your proxy app is configured with a SOCKS proxy that Python "
-        "cannot use. In your proxy client, switch the system proxy to "
-        "socks5 or http, or disable the system proxy, then retry."
-    )

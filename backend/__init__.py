@@ -12,7 +12,7 @@ from .clip_scanner import scan_clips_dir, scan_project_clips
 from .errors import CorridorKeyError
 from .job_queue import GPUJob, GPUJobQueue, JobType, JobStatus
 from .project import (
-    projects_root, get_data_dir, create_project, add_clips_to_project,
+    get_data_dir, add_clips_to_project,
     sanitize_stem, get_clip_dirs, is_v2_project,
     write_project_json, read_project_json,
     write_clip_json, read_clip_json,
@@ -25,7 +25,7 @@ from .project import (
 )
 from .project_media import (
     create_clip_from_sequence,
-    add_sequences_to_project, create_project_from_media,
+    add_sequences_to_project,
 )
 from .natural_sort import natural_sort_key, natsorted
 from .service import CorridorKeyService, InferenceParams, OutputConfig
@@ -53,9 +53,7 @@ __all__ = [
     # Errors
     "CorridorKeyError",
     # Project utilities
-    "projects_root",
     "get_data_dir",
-    "create_project",
     "add_clips_to_project",
     "sanitize_stem",
     "get_clip_dirs",
@@ -79,7 +77,6 @@ __all__ = [
     "load_chroma_params",
     "create_clip_from_sequence",
     "add_sequences_to_project",
-    "create_project_from_media",
     # Natural sort
     "natural_sort_key",
     "natsorted",

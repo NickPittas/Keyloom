@@ -1,11 +1,10 @@
-"""FFmpeg subprocess wrapper for video extraction and stitching.
+"""FFmpeg subprocess wrapper for video extraction.
 
 Pure Python, no Qt deps. Provides:
 - find_ffmpeg() / find_ffprobe() — locate binaries
 - detect_hwaccel() — auto-detect best hardware decoder per platform
 - probe_video() — get fps, resolution, frame count, codec
 - extract_frames() — video -> EXR DWAB half-float image sequence
-- stitch_video() — image sequence -> video (H.264)
 - write/read_video_metadata() — sidecar JSON for roundtrip fidelity
 """
 from __future__ import annotations
@@ -24,7 +23,6 @@ from .discovery import (
     find_ffmpeg,
     find_ffprobe,
     get_ffmpeg_install_help,
-    repair_ffmpeg_install,
     require_ffmpeg_install,
     validate_ffmpeg_install,
 )
@@ -39,7 +37,6 @@ from .metadata import (
     write_video_metadata,
 )
 from .probe import probe_video
-from .stitching import stitch_video
 
 __all__ = [
     # discovery
@@ -49,7 +46,6 @@ __all__ = [
     "find_ffmpeg",
     "find_ffprobe",
     "get_ffmpeg_install_help",
-    "repair_ffmpeg_install",
     "require_ffmpeg_install",
     "validate_ffmpeg_install",
     # probe
@@ -60,8 +56,6 @@ __all__ = [
     "detect_hwaccel",
     "_recompress_to_dwab",
     "extract_frames",
-    # stitching
-    "stitch_video",
     # metadata
     "write_video_metadata",
     "build_video_metadata",

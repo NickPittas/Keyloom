@@ -259,14 +259,6 @@ def _dedupe_points(points: Iterable[tuple[float, float]]) -> list[tuple[float, f
     return result
 
 
-def _bounding_box(points: Sequence[tuple[float, float]]) -> tuple[float, float, float, float] | None:
-    if not points:
-        return None
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    return (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
-
-
 def _points_to_extents(
     points: Sequence[tuple[float, float]],
     radius: float,

@@ -20,7 +20,6 @@ import threading
 import time
 import types
 from dataclasses import dataclass, field
-from fractions import Fraction
 from types import MappingProxyType
 from typing import Callable
 

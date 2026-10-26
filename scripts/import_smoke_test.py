@@ -12,8 +12,6 @@ SKIP_PREFIXES = (
     "sam2_tracker", "main",
     # Vendored CorridorKey 2.0 engine + MoGe: imported explicitly below.
     "CorridorKeyV2",
-    # macOS-only (raises ImportError elsewhere).
-    "backend.service.apple_vision",
 )
 
 EXPLICIT = (

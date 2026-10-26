@@ -2,14 +2,10 @@
 from __future__ import annotations
 
 import importlib
-import json
 import logging
 import os
 import sys
 import warnings
-from typing import Optional
-
-import numpy as np
 
 logger = logging.getLogger(__name__)
 

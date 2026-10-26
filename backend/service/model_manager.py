@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable
 
 from .helpers import BASE_DIR, _import_matanyone2_processor_class
 

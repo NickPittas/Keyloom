@@ -29,6 +29,7 @@ _OUT = sys.stdout
 sys.stdout = sys.stderr  # stray prints must never corrupt the JSON protocol
 
 from backend import project as P  # noqa: E402
+from backend.project_media import add_sequences_to_project  # noqa: E402
 from backend.ffmpeg_tools import (  # noqa: E402
     build_video_metadata, extract_frames, probe_video, require_ffmpeg_install, write_video_metadata,
 )
@@ -311,7 +312,7 @@ def main():
             if v:
                 P.add_clips_to_project(proj, v, copy_source=True)
             else:
-                P.add_sequences_to_project(proj, q, copy_source=False)
+                add_sequences_to_project(proj, q, copy_source=False)
         except Exception as e:  # noqa: BLE001
             fatal(f"{type(e).__name__}: {e}" + (f" (partial project kept at {fresh})" if fresh else ""))
         made.append(it)
