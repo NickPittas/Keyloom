@@ -414,12 +414,14 @@ impl Page {
         for (i, r) in self.draft.shared_roots.iter_mut().enumerate() {
             card(ui, |ui| {
                 row(ui, "Shared location name", |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut r.name).id(egui::Id::new(("shared_root_name", i))).desired_width(ui.available_width().clamp(90.0, 200.0)).hint_text("e.g. NAS"));
+                    let n = ui.add(egui::TextEdit::singleline(&mut r.name).id(egui::Id::new(("shared_root_name", i))).desired_width(ui.available_width().clamp(90.0, 200.0)).hint_text("e.g. NAS"));
+                    self.map_rects.push(("name", i, n.rect));
                 });
                 row(ui, "Folder on this PC", |ui| {
                     // Leave room for Browse so the pair never overflows a narrow card.
                     let w = (ui.available_width() - 100.0).clamp(90.0, 260.0);
-                    ui.add(egui::TextEdit::singleline(&mut r.local).id(egui::Id::new(("shared_root_local", i))).desired_width(w).hint_text(if cfg!(windows) { r"Z:\Shared or \\nas\share" } else { "/mnt/nas" }));
+                    let l = ui.add(egui::TextEdit::singleline(&mut r.local).id(egui::Id::new(("shared_root_local", i))).desired_width(w).hint_text(if cfg!(windows) { r"Z:\Shared or \\nas\share" } else { "/mnt/nas" }));
+                    self.map_rects.push(("local", i, l.rect));
                     let b = ui.add_enabled(!busy, egui::Button::new("Browse…"));
                     self.map_rects.push(("browse", i, b.rect));
                     if b.clicked() {
@@ -467,7 +469,9 @@ impl Page {
         if let Some(i) = remove {
             self.draft.shared_roots.remove(i);
         }
-        if ui.add_enabled(!busy, egui::Button::new("Add shared location")).clicked() {
+        let add = ui.add_enabled(!busy, egui::Button::new("Add shared location"));
+        self.map_rects.push(("add", 0, add.rect));
+        if add.clicked() {
             self.draft.shared_roots.push(SharedRoot::default());
         }
     }
