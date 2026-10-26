@@ -404,9 +404,6 @@ impl Page {
             _ => {}
         }
         dim(ui, "Each PC names the shared storage it sees. Jobs refer to a shared location by name and a relative path; every PC resolves that under its own folder, drive or UNC share. Applies to network jobs only; AI worker target path maps are separate and unchanged.");
-        if let Some(e) = self.mapping_problem() {
-            note(ui, &format!("Not usable on this PC: {e}. Fix or remove the row; Apply is refused until then."), Color32::from_rgb(240, 120, 110));
-        }
         self.map_rects.clear();
         let (mut remove, mut test) = (None, None);
         let busy = self.browse_row.is_some();
@@ -428,16 +425,8 @@ impl Page {
                         self.browse_req = Some(i);
                     }
                 });
-                let ok = sp::check_root(r);
-                match &ok {
-                    Ok(()) => match sample_preview(r) {
-                        Ok(t) => dim(ui, &t),
-                        Err(e) => note(ui, &e, Color32::from_rgb(240, 120, 110)),
-                    },
-                    Err(e) => note(ui, e, Color32::from_rgb(240, 120, 110)),
-                }
                 row(ui, "Access", |ui| {
-                    let t = ui.add_enabled(ok.is_ok() && !testing, egui::Button::new("Test read and write"));
+                    let t = ui.add_enabled(!testing, egui::Button::new("Test read and write"));
                     self.map_rects.push(("test", i, t.rect));
                     if t.clicked() {
                         test = Some(i);
@@ -447,6 +436,9 @@ impl Page {
                     }
                 });
                 if let Some((_, a)) = self.probed.iter().find(|(p, _)| p == r) {
+                    if let Ok(t) = sample_preview(r) {
+                        dim(ui, &t);
+                    }
                     for (what, res) in [("Read", &a.read), ("Write", &a.write)] {
                         match res {
                             Ok(()) => dim(ui, &format!("{what}: OK")),
@@ -456,7 +448,13 @@ impl Page {
                 }
             });
         }
+        // Checked only on Test (here) and Apply (`store.save` validates), never while typing.
+        if let Some(e) = test.and_then(|i| sp::check_root(&self.draft.shared_roots[i]).err()) {
+            self.error = Some(format!("Not usable on this PC: {e}"));
+            test = None;
+        }
         if let Some(i) = test {
+            self.error = None;
             let (tx, rx) = channel();
             let (r, ctx) = (self.draft.shared_roots[i].clone(), ui.ctx().clone());
             std::thread::spawn(move || {

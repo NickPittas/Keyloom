@@ -2317,6 +2317,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
+        // ponytail: IME kept off. egui toggles it off/on on every focus change, and some fcitx5 / Windows IME
+        // setups then stop delivering typed text until restart. Plain key text still works (layouts, dead keys);
+        // CJK composition does not. Revisit when egui-winit/winit fix the toggle.
+        ui.ctx().output_mut(|o| o.ime = None);
     }
 }
 
