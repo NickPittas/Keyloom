@@ -45,19 +45,6 @@ pub fn footer(ui: &mut Ui, c: &Cells) {
     });
 }
 
-/// The same numbers inside a client card: values on one line, one line per GPU, then the status.
-pub fn card_block(ui: &mut Ui, c: &Cells) {
-    ui.label(txt(&format!("CPU {} · RAM {}", c.cpu, c.ram), c.dim));
-    for d in &c.detail {
-        ui.label(txt(d, c.dim));
-    }
-    if c.detail.is_empty() {
-        ui.label(txt(&c.gpu, c.dim));
-    }
-    if let Some(s) = &c.status {
-        ui.label(RichText::new(s).color(theme::TEXT_DIM).size(11.0));
-    }
-}
 
 fn sample_of(t: &crate::metrics::ClientTelemetry) -> Option<&crate::metrics::Sample> {
     use crate::metrics::{ClientTelemetry as T, View};

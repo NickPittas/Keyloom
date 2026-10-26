@@ -86,12 +86,11 @@ pub struct Interface {
 }
 
 /// Backend `InferenceParams` defaults. They seed a clip's Key workflow only until that clip (or the Qt
-/// session) has its own values; `input_is_linear` is not consumed (the clip's own interpretation is used).
+/// session) has its own values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Ai {
     pub vram_profile: String,
-    pub input_is_linear: bool,
     pub hint_mode: String,
     pub hint_quality: f32,
     pub carry_hint: bool,
@@ -226,7 +225,6 @@ impl Default for Ai {
     fn default() -> Self {
         Self {
             vram_profile: "auto".into(),
-            input_is_linear: false,
             hint_mode: "none".into(),
             hint_quality: 0.95,
             carry_hint: true,

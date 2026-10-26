@@ -817,9 +817,9 @@ impl AiUi {
                     width,
                     height,
                     mask_png,
-                    score,
+                    ..
                 } => {
-                    self.on_preview(job_id, frame_stem, width, height, mask_png, score);
+                    self.on_preview(job_id, frame_stem, width, height, mask_png);
                     continue;
                 }
                 SchedEvent::HintLock {
@@ -1072,14 +1072,7 @@ impl AiUi {
             );
             return;
         }
-        let presets: Vec<Preset> = self
-            .presets_file
-            .as_deref()
-            .map(|f| presets::load(f).0)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|p| presets::class_of(p) != PresetClass::Export)
-            .collect();
+        let presets = self.batch_presets();
         let caps_block = match &preset {
             Some(BatchPreset::Pipeline(p)) if p.export.has_video() => self
                 .local_caps()
@@ -2580,17 +2573,21 @@ impl AiUi {
         }
     }
 
-    /// Board batch controls: "Key selected N clips" starts the review (nothing is queued yet).
-    pub fn batch_ui(&mut self, ui: &mut Ui, project: &Project, st: &Settings, picks: &[usize]) {
-        // Visible preset choice before Review: the same saved file the review dropdown lists.
-        let saved: Vec<Preset> = self
-            .presets_file
+    /// Saved presets a batch can start from (the export-class ones are excluded).
+    fn batch_presets(&self) -> Vec<Preset> {
+        self.presets_file
             .as_deref()
             .map(|f| presets::load(f).0)
             .unwrap_or_default()
             .into_iter()
             .filter(|p| presets::class_of(p) != PresetClass::Export)
-            .collect();
+            .collect()
+    }
+
+    /// Board batch controls: "Key selected N clips" starts the review (nothing is queued yet).
+    pub fn batch_ui(&mut self, ui: &mut Ui, project: &Project, st: &Settings, picks: &[usize]) {
+        // Visible preset choice before Review: the same saved file the review dropdown lists.
+        let saved = self.batch_presets();
         if self.board_preset.as_ref().is_some_and(|n| !saved.iter().any(|p| &p.name == n)) {
             self.board_preset = None;
         }
@@ -3128,23 +3125,6 @@ impl AiUi {
         std::mem::take(&mut self.net_outbox)
     }
 
-    /// Run a job a coordinator handed this installation on this computer's own local client (the only executor).
-    pub fn submit_network_job(&mut self, job: crate::jobs::KeyJob) -> Result<(), String> {
-        if self.model_mutation_active {
-            return Err("model installation or repair is active".into());
-        }
-        let Some(local) = self.sched.targets().iter().find(|t| t.local && t.enabled).map(|t| t.id.clone()) else {
-            return Err("no local client is configured".into());
-        };
-        let (id, folder) = (job.job_id.clone(), job.clip_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-        self.sched
-            .submit(Submit { job, placement: Placement::Target(local), after: vec![], min_vram_gb: None })
-            .map_err(|e| self.net_submit_error("Key", &e))?;
-        self.tracked.push(Tracked { warnings: vec![], job_id: id, folder: folder.clone(), name: format!("{folder} (network)"), label: String::new() });
-        self.disk_gen += 1;
-        Ok(())
-    }
-
     /// Hold this computer's GPU for a received attempt (claim → preflight → start acknowledgement → finish).
     /// False when local work is queued or running: the claim must then be declined. Nothing dispatches locally
     /// meanwhile except this attempt's own stages.
@@ -3413,11 +3393,6 @@ impl AiUi {
             .filter(|t| t.enabled)
             .map(target_line)
             .collect()
-    }
-
-    /// For tests/QA: mode of a tracked job.
-    pub fn job_mode(&self, id: &str) -> Option<JobMode> {
-        self.sched.job(id).map(|e| e.job.mode)
     }
 }
 

@@ -661,9 +661,6 @@ impl Scheduler {
             self.net_hold = None;
         }
     }
-    pub fn net_held(&self) -> bool {
-        self.net_hold.is_some()
-    }
     /// A held GPU only serves its attempt's own jobs.
     fn held_out(&self, id: &str) -> bool {
         self.net_hold.as_ref().is_some_and(|(_, ids)| !ids.contains(id))

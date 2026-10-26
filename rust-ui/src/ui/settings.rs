@@ -23,7 +23,7 @@ pub enum Event {
 }
 
 const PENDING: &str = "Seeds the SAM tracker model of a clip whose Hint settings were never saved. A clip that already has hint settings always keeps them.";
-const AI_SEED: &str = "Seeds a clip's Key settings until that clip (or the Qt session) has its own values. \"Frame input is scene-linear\" is not used: each job freezes the clip's own interpretation in Media.";
+const AI_SEED: &str = "Seeds a clip's Key settings until that clip (or the Qt session) has its own values.";
 const LABEL_W: f32 = 190.0;
 const WIDE: f32 = 480.0;
 
@@ -370,7 +370,6 @@ impl Page {
             row(ui, "Despill strength", |ui| unit(ui, &mut d.ai.despill_strength));
         });
         card(ui, |ui| {
-            row(ui, "Frame input", |ui| theme::checkbox(ui, &mut d.ai.input_is_linear, "Frame input is scene-linear"));
             row(ui, "Cutout", |ui| theme::checkbox(ui, &mut d.ai.cutout_linear, "Linear cutout"));
         });
     }

@@ -13,7 +13,6 @@ pub struct PreviewResult {
     pub mask_png: PathBuf,
     pub width: u32,
     pub height: u32,
-    pub score: Option<f64>,
     /// Prompt/model signature when requested.
     pub sig: u64,
 }
@@ -265,7 +264,6 @@ impl AiUi {
         w: u32,
         h: u32,
         png: String,
-        score: Option<f64>,
     ) {
         let Some(t) = self.tracked.iter().find(|t| t.job_id == id) else {
             return;
@@ -294,7 +292,6 @@ impl AiUi {
                 mask_png: PathBuf::from(png),
                 width: w,
                 height: h,
-                score,
                 sig,
             },
         );
@@ -665,10 +662,6 @@ impl AiUi {
         if let Some(n) = &self.tk.orphan_note {
             ui.label(RichText::new(n).size(12.0));
         }
-    }
-
-    pub fn task_done(&self, id: &str) -> Option<&TaskDone> {
-        self.tk.done.iter().find(|d| d.job_id == id)
     }
 
     pub(super) fn task_row(&mut self, ui: &mut Ui, id: &str, with_name: bool) {

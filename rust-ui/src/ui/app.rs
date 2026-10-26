@@ -19,7 +19,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
-pub const BANNER: &str = "Import > Hint > Key > Review > Deliver | In/Out, colour and hint settings are saved in the project";
 mod driver;
 mod hint;
 mod media;

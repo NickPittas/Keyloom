@@ -90,18 +90,6 @@ pub fn explicit_hint_mode(clip: &Clip) -> Option<String> {
     clip_hint_mode(clip).filter(|_| clip.native.get("hint_mode_src").and_then(Value::as_str) != Some("preset"))
 }
 
-/// The preset the (not overridden) route/delivery was last applied from, for honest Reset labels.
-pub fn write_src(meta: &Path, key: &str, preset: Option<&str>) -> Result<(), String> {
-    update_native(meta, |n| match preset {
-        Some(p) => {
-            n.insert(format!("{key}_src"), json!(p));
-        }
-        None => {
-            n.remove(&format!("{key}_src"));
-        }
-    })
-}
-
 /// What a hint-mode pick returns to on Reset: `(value, came from a preset)` as it was before the first pick.
 pub fn hint_mode_base(clip: &Clip) -> Option<(String, bool)> {
     let b = clip.native.get("hint_mode_base")?;

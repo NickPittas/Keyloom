@@ -59,7 +59,6 @@ pub struct ModelId {
 #[serde(default)]
 pub struct Capabilities {
     pub key: bool,
-    pub generate_hint: bool,
     pub publish_modes: Vec<String>,
     /// Key job modes the worker supports (`new`, `resume`, `replace`). Empty = an older worker: new/resume only.
     pub key_modes: Vec<String>,
@@ -74,7 +73,6 @@ pub struct Capabilities {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Hello {
     pub protocol: u32,
-    pub worker_rev: String,
     pub engine: String,
     pub host: String,
     /// `sys.platform` of the worker ("linux", "win32"); informational.

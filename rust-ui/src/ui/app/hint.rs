@@ -1036,12 +1036,6 @@ impl App {
         }
     }
 
-    /// The Reset button texts of the open shot (tests), `None` = nothing overridden.
-    pub fn reset_labels_for_test(&self) -> (Option<String>, Option<String>) {
-        let l = |what, f: &shot_domains::Fields| (!f.is_empty()).then(|| Self::reset_label(what, f));
-        (l("these route fields", &self.hint.route_ov), l("these delivery fields", &self.hint.delivery_ov))
-    }
-
     /// "This shot's own hint route fields" line with its Reset (Hint page).
     pub(super) fn route_override_ui(&mut self, ui: &mut Ui, clip: &Clip) {
         if self.hint.route_ov.is_empty() {

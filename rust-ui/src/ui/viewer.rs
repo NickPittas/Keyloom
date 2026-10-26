@@ -71,7 +71,6 @@ pub struct Viewer {
     tex: HashMap<Key, Tex>,
     tex_order: Vec<Key>,
     held: Option<Key>,
-    pub shot_ready: Option<Instant>,
     /// Height of the image area at the last draw (layout tests).
     pub draw_h: f32,
 }
@@ -214,7 +213,6 @@ impl Viewer {
             tex: HashMap::new(),
             tex_order: vec![],
             held: None,
-            shot_ready: None,
             draw_h: 0.0,
         }
     }

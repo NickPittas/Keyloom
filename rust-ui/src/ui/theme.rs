@@ -81,11 +81,6 @@ pub fn checkbox(
     .inner
 }
 
-/// Replacement for the old `setup_style`.
-pub fn setup_style(ctx: &egui::Context) {
-    apply(ctx)
-}
-
 pub fn apply(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = PANEL;

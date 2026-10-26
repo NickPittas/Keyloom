@@ -12,7 +12,6 @@ pub struct Identity {
     pub height: u32,
     pub fps: f64,
     pub frames: Option<u64>,
-    pub filename: Option<String>,
 }
 
 /// What a probe of the candidate movie returned.
@@ -28,10 +27,6 @@ pub fn stored_identity(clip_root: &Path) -> Option<Identity> {
     let v: Value =
         serde_json::from_slice(&std::fs::read(clip_root.join(".video_metadata.json")).ok()?)
             .ok()?;
-    let c: Value = std::fs::read(clip_root.join("clip.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or(Value::Null);
     Some(Identity {
         width: v.get("width")?.as_u64()? as u32,
         height: v.get("height")?.as_u64()? as u32,
@@ -46,11 +41,6 @@ pub fn stored_identity(clip_root: &Path) -> Option<Identity> {
                     .and_then(Value::as_u64)
                     .filter(|n| *n > 0)
             }),
-        filename: c
-            .get("source")
-            .and_then(|s| s.get("filename"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
     })
 }
 
