@@ -72,9 +72,13 @@ pub fn ui(
     let targets = ai.scheduler().targets();
     egui::ScrollArea::horizontal().show(ui, |ui| {
         egui::Grid::new("client_availability").num_columns(11).striped(true).spacing(egui::vec2(24.0, 10.0)).show(ui, |ui| {
-            for heading in ["Client", "Kind", "Address", "Status", "GPU", "ID", "Connect", "Accept work when GPU is idle", "Default for Batch job", "", ""] {
-                ui.label(RichText::new(heading).strong());
+            // Header widths set each column's width (cells wrap inside it); drag a header's right edge to resize.
+            let wid = egui::Id::new("client_col_widths");
+            let mut widths: Vec<f32> = ui.data(|d| d.get_temp(wid)).unwrap_or_else(|| vec![140.0, 70.0, 190.0, 280.0, 220.0, 130.0, 60.0, 60.0, 60.0, 70.0, 90.0]);
+            for (heading, w) in ["Client", "Kind", "Address", "Status", "GPU", "ID", "Connect", "Accept work when GPU is idle", "Default for Batch job", "", ""].iter().zip(widths.iter_mut()) {
+                col_header(ui, heading, w);
             }
+            ui.data_mut(|d| d.insert_temp(wid, widths));
             ui.end_row();
             for (i, t) in targets.iter().filter(|t| t.local).enumerate() {
                 let (state, colour) = state_text(t);
@@ -133,4 +137,20 @@ pub fn ui(
         if &cur != default { want = Some(cur); }
     });
     (want, acts)
+}
+
+/// A grid header cell at least `w` wide, with a drag handle on its right edge that changes `w`.
+fn col_header(ui: &mut egui::Ui, text: &str, w: &mut f32) {
+    ui.horizontal(|ui| {
+        let start = ui.cursor().min.x;
+        ui.label(RichText::new(text).strong());
+        let used = ui.cursor().min.x - start;
+        ui.add_space((*w - used - 6.0).max(0.0));
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(6.0, 18.0), egui::Sense::drag());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        if resp.dragged() {
+            *w = (*w + resp.drag_delta().x).max(used + 6.0);
+        }
+        ui.painter().vline(rect.center().x, rect.y_range(), ui.visuals().widgets.noninteractive.bg_stroke);
+    });
 }
