@@ -448,6 +448,14 @@ pub(crate) fn err_text(e: &LinkError) -> String {
     format!("{}: {}", e.code, truncate(&e.message, 300))
 }
 
+/// Whole-job percent for a collapsed node. Capped below 100 until the job succeeds; a state word when nothing moved.
+fn net_overall(stages: &[NetStage], state: &str) -> String {
+    if state == "succeeded" { return "100%".into(); }
+    if stages.is_empty() || matches!(state, "failed" | "cancelled" | "not sent") || stages.iter().all(|s| !s.completed && s.done == 0) { return state.into(); }
+    let f = stages.iter().map(|s| if s.completed { 1.0 } else if s.total > 0 { (s.done as f32 / s.total as f32).min(0.99) } else { 0.0 }).sum::<f32>() / stages.len() as f32;
+    format!("{}%", (f * 100.0).floor() as u32)
+}
+
 impl Remote {
     /// Labels are meaningful before the first connection: the URL comes from the private credentials file (read for that
     /// one field only, never logged) and the network id from the persisted side file.
@@ -1675,23 +1683,29 @@ impl Remote {
             let pc = group.as_deref().and_then(|id| self.installs.iter().find(|i| i.id == id));
             let name = pc.map(|i| i.name.as_str()).unwrap_or_else(|| group.as_deref().unwrap_or("Waiting for a PC"));
             let connected = pc.is_some_and(|i| i.connected) && self.online();
+            let jobs: Vec<&NetJob> = self.jobs.iter().filter(|j| j.installation == group).collect();
+            let mut current: Vec<&NetJob> = jobs.iter().copied().filter(|j| !j.terminal()).collect();
+            if current.is_empty() { current.extend(jobs.last().copied()); }
+            let earlier: Vec<&NetJob> = jobs.iter().copied().filter(|j| !current.iter().any(|c| std::ptr::eq(*c, *j))).collect();
+            let id = ui.make_persistent_id(("netnode", &self.key, &group));
+            let st = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+            let open = st.is_open();
             egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
+                st.show_header(ui, |ui| {
                     let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 3.0, if connected { crate::ui::theme::ACCENT } else { DIM });
                     ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
                     if let Some(l) = net_label { ui.label(RichText::new(l).color(DIM).size(11.0)); }
                     if !connected { ui.label(RichText::new("Offline").color(DIM).size(11.0)); }
-                });
+                    if let (false, Some(c)) = (open, current.first()) {
+                        ui.add(egui::Label::new(RichText::new(format!("{} · {}", c.name, net_overall(&c.stages, &c.state))).color(DIM).size(11.0)).truncate());
+                    }
+                }).body(|ui| {
                 if let Some(id) = group.as_deref() {
                     crate::ui::metrics_bar::machine_meters(ui, &self.telemetry(id), &[]);
                 }
-                let jobs: Vec<_> = self.jobs.iter().filter(|j| j.installation == group).collect();
-                let finished = jobs.iter().filter(|j| j.terminal()).count();
-                let mut skip = finished.saturating_sub(12);
-                for j in jobs {
-                    if j.terminal() && skip > 0 { skip -= 1; continue; }
+                for j in current {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.add(egui::Label::new(RichText::new(&j.name).strong().size(12.0)).truncate()).on_hover_text(&j.name);
@@ -1725,6 +1739,16 @@ impl Remote {
                         if reason != "complete" { ui.add(egui::Label::new(RichText::new(reason).color(DIM).size(11.0)).wrap()); }
                     }
                 }
+                if !earlier.is_empty() {
+                    egui::CollapsingHeader::new(RichText::new(format!("Earlier ({})", earlier.len())).color(DIM).size(11.0))
+                        .id_salt(("netlog", &self.key, &group)).default_open(false).show(ui, |ui| {
+                        for j in earlier.iter().rev().take(12) {
+                            let why = j.reason.as_deref().filter(|r| *r != "complete").unwrap_or(j.state.as_str());
+                            ui.label(RichText::new(format!("{} · {}", j.name, why)).color(DIM).size(11.0));
+                        }
+                    });
+                }
+                });
             });
             ui.add_space(8.0);
         }
@@ -1799,5 +1823,14 @@ mod discovery_tests {
         assert!(r.host_only("selected-host"));
         assert!(!r.host_only("submitter"));
         assert!(!r.host_only("this-pc"));
+    }
+
+    #[test]
+    fn net_overall_is_capped_and_words() {
+        let st = |done, total, completed| NetStage { label: String::new(), done, total, completed };
+        assert_eq!(net_overall(&[st(0, 2, false)], "queued"), "queued");
+        assert_eq!(net_overall(&[st(0, 0, true), st(1, 2, false)], "running"), "75%");
+        assert_eq!(net_overall(&[st(0, 0, false)], "succeeded"), "100%");
+        assert_eq!(net_overall(&[st(1, 2, false)], "failed"), "failed");
     }
 }

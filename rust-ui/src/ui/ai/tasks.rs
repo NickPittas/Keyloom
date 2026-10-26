@@ -958,7 +958,7 @@ impl AiUi {
     }
 }
 
-fn describe(st: &JobState, msg: Option<String>) -> (String, String) {
+pub(super) fn describe(st: &JobState, msg: Option<String>) -> (String, String) {
     match st {
         JobState::Queued => ("queued".into(), String::new()),
         JobState::Dispatching { target } => ("running".into(), format!("starting on {target}")),

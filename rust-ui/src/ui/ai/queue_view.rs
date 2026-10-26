@@ -109,6 +109,14 @@ pub fn cell_of(p: &[Phase]) -> Cell {
     word(w, false)
 }
 
+/// Whole-run percent for a collapsed node: a bad stage's word, a word while nothing has started, else the mean.
+pub fn overall(run: &QueueRun) -> String {
+    let rows: Vec<&QueueRow> = run.rows.iter().filter(|r| !r.precomputed).collect();
+    if let Some(b) = rows.iter().find(|r| r.cell.bad) { return b.cell.text.clone(); }
+    if !rows.iter().any(|r| r.cell.text.ends_with('%')) { return rows.first().map(|r| r.cell.text.clone()).unwrap_or_default(); }
+    format!("{}%", (rows.iter().map(|r| r.cell.frac).sum::<f32>() / rows.len() as f32 * 100.0).floor() as u32)
+}
+
 #[derive(Clone, Debug)]
 pub struct QueueRow {
     pub stage: Stage,
@@ -130,6 +138,8 @@ pub struct QueueRun {
     pub client: String,
     pub rows: Vec<QueueRow>,
     pub active: bool,
+    /// One line: the failure or cancel reason of the run, or "Complete".
+    pub reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -304,7 +314,12 @@ impl AiUi {
             }
         }
         let active = rows.iter().any(|r| r.active) || jobs.iter().any(|f| unresolved.contains(&f.id));
-        QueueRun { client: jobs.first().map(|f| f.client.clone()).unwrap_or_else(|| "This computer".into()), rows, active }
+        let reason = jobs.iter()
+            .find(|f| matches!(phase_of(&f.state, false), Phase::Failed | Phase::Lost | Phase::Cancelled))
+            .map(|f| { let (w, d) = super::tasks::describe(&f.state, None);
+                       format!("{}: {}", f.stage.heading(), if d.is_empty() { w } else { d }) })
+            .unwrap_or_else(|| "Complete".into());
+        QueueRun { client: jobs.first().map(|f| f.client.clone()).unwrap_or_else(|| "This computer".into()), rows, active, reason }
     }
 
     /// Board queue: one block per clip. Active, queued and unresolved clips are always shown; only finished
@@ -324,47 +339,51 @@ impl AiUi {
         for client in clients {
             let target = self.sched.targets().into_iter().find(|t| t.id == client);
             let is_local = target.as_ref().is_some_and(|t| t.local);
-            ui.horizontal(|ui| {
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 3.0, super::super::theme::ACCENT);
-                ui.label(RichText::new(if is_local { "This computer" } else { &client }).strong());
-            });
             let t = if is_local { crate::metrics::ClientTelemetry::Local(local.clone()) } else {
                 telemetry.get(&client).cloned().unwrap_or_else(|| crate::metrics::ClientTelemetry::Unreported("No statistics reported".into()))
             };
-            crate::ui::metrics_bar::machine_meters(ui, &t, if is_local { active } else { &[] });
             let all: Vec<_> = all.iter().cloned().filter_map(|mut s| {
                 s.runs.retain(|r| r.client == client);
                 (!s.runs.is_empty()).then_some(s)
             }).collect();
-            if all.is_empty() { ui.label(RichText::new("Idle").color(DIM).size(11.0)); }
-        let finished = all.iter().filter(|s| !s.active()).count();
-        let mut skip = finished.saturating_sub(12);
-        let mut shown = 0;
-        for s in all {
-            if !s.active() && skip > 0 {
-                skip -= 1;
-                continue;
-            }
-            if shown > 0 { ui.add_space(12.0); }
-            shown += 1;
-            egui::Frame::new().fill(super::super::theme::CARD)
-                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(77, 94, 82)))
-                .corner_radius(5).inner_margin(14).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add(egui::Label::new(RichText::new(&s.title).strong().size(12.5)).truncate()).on_hover_text(s.root.display().to_string());
-                ui.add_space(10.0);
-                let n = s.runs.len();
-                for (r, run) in s.runs.iter().enumerate() {
-                    if n - r > 2 && !run.active && !run.rows.iter().any(|x| x.attention) { continue; }
-                    if r + 1 < n && n > 1 {
-                        ui.label(RichText::new("Earlier run").color(DIM).size(11.0));
-                    }
-                    self.run_ui(ui, run);
+            // Current = newest active run per clip; with nothing active, the last run of the newest clip.
+            let mut current: Vec<(&QueueSection, &QueueRun)> = all.iter().filter_map(|s| s.runs.iter().rev().find(|r| r.active).map(|r| (s, r))).collect();
+            if current.is_empty() { if let Some(s) = all.last() { if let Some(r) = s.runs.last() { current.push((s, r)); } } }
+            let log: Vec<String> = all.iter().flat_map(|s| s.runs.iter()
+                .filter(|r| !current.iter().any(|(_, c)| std::ptr::eq(*c, *r)))
+                .map(move |r| format!("{} · {}", s.title, r.reason))).collect();
+            let head = current.first().map(|(s, r)| format!("{} · {}", s.title, overall(r))).unwrap_or_else(|| "Idle".into());
+            let st = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("qnode", &client)), true);
+            let open = st.is_open();
+            st.show_header(ui, |ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.0, super::super::theme::ACCENT);
+                ui.label(RichText::new(if is_local { "This computer" } else { &client }).strong());
+                if !open { ui.add(egui::Label::new(RichText::new(&head).color(DIM).size(11.0)).truncate()); }
+            }).body(|ui| {
+                crate::ui::metrics_bar::machine_meters(ui, &t, if is_local { active } else { &[] });
+                if all.is_empty() { ui.label(RichText::new("Idle").color(DIM).size(11.0)); }
+                for (n, (s, run)) in current.iter().enumerate() {
+                    if n > 0 { ui.add_space(12.0); }
+                    egui::Frame::new().fill(super::super::theme::CARD)
+                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(77, 94, 82)))
+                        .corner_radius(5).inner_margin(14).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.add(egui::Label::new(RichText::new(&s.title).strong().size(12.5)).truncate()).on_hover_text(s.root.display().to_string());
+                        ui.add_space(10.0);
+                        self.run_ui(ui, run);
+                    });
+                }
+                if !log.is_empty() {
+                    egui::CollapsingHeader::new(RichText::new(format!("Earlier ({})", log.len())).color(DIM).size(11.0))
+                        .id_salt(("qlog", &client)).default_open(false).show(ui, |ui| {
+                        for line in log.iter().rev().take(12) {
+                            ui.add(egui::Label::new(RichText::new(line).color(DIM).size(11.0)).wrap());
+                        }
+                    });
                 }
             });
-        }
-        ui.add_space(10.0);
+            ui.add_space(10.0);
         }
     }
 
@@ -458,5 +477,19 @@ mod tests {
             assert!(c.frac < 1.0);
         }
         assert_eq!(cell_of(&[Failed, Lost]).text, "Lost");
+    }
+
+    fn row(text: &str, frac: f32, bad: bool, precomputed: bool) -> QueueRow {
+        QueueRow { stage: Stage::Key, heading: String::new(), cell: Cell { text: text.into(), frac, bad }, products: vec![], ids: vec![], precomputed, attention: false, active: false }
+    }
+
+    #[test]
+    fn overall_percent_and_words() {
+        let run = |rows| QueueRun { client: String::new(), rows, active: true, reason: String::new() };
+        assert_eq!(overall(&run(vec![row("Queued", 0.0, false, false), row("Queued", 0.0, false, false)])), "Queued");
+        assert_eq!(overall(&run(vec![row("100%", 1.0, false, false), row("50%", 0.5, false, false)])), "75%");
+        assert_eq!(overall(&run(vec![row("100%", 1.0, false, false), row("Failed", 0.0, true, false)])), "Failed");
+        assert_eq!(overall(&run(vec![row("100%", 1.0, false, false), row("Precomputed", 0.0, false, true)])), "100%");
+        assert_eq!(overall(&run(vec![row("100%", 1.0, false, false), row("100%", 1.0, false, false)])), "100%");
     }
 }
