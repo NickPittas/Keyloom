@@ -73,7 +73,7 @@ pub fn ui(
     egui::ScrollArea::horizontal().show(ui, |ui| {
         egui::Grid::new("client_availability").num_columns(11).striped(true).spacing(egui::vec2(24.0, 10.0)).show(ui, |ui| {
             // Header widths set each column's width (cells wrap inside it); drag a header's right edge to resize.
-            let wid = egui::Id::new("client_col_widths");
+            let wid = ui.scope_id().with("client_col_widths");
             let mut widths: Vec<f32> = ui.data(|d| d.get_temp(wid)).unwrap_or_else(|| vec![140.0, 70.0, 190.0, 280.0, 220.0, 130.0, 60.0, 60.0, 60.0, 70.0, 90.0]);
             for (heading, w) in ["Client", "Kind", "Address", "Status", "GPU", "ID", "Connect", "Accept work when GPU is idle", "Default for Batch job", "", ""].iter().zip(widths.iter_mut()) {
                 col_header(ui, heading, w);

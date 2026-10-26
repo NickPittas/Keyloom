@@ -478,6 +478,8 @@ pub struct AiUi {
     setup: Vec<(Option<String>, String)>,
     drafts: BTreeMap<String, Draft>,
     tracked: Vec<Tracked>,
+    /// Job ids of finished runs removed with "Clear finished" (hidden from the queue and its log, still tracked).
+    cleared: Vec<String>,
     /// Key job id -> the manual SAM/Chroma pre-matte it was queued on top of (display only: no job exists for it).
     precomputed: BTreeMap<String, String>,
     pub placement: Placement,
@@ -636,6 +638,7 @@ impl AiUi {
             targets,
             drafts: BTreeMap::new(),
             tracked: vec![],
+            cleared: vec![],
             precomputed: BTreeMap::new(),
             placement: Placement::Auto,
             assignment: Placement::Auto,
@@ -736,6 +739,7 @@ impl AiUi {
                 self.setup = setup_problems(&t, crate::runtime::launch(None).problem.as_deref());
                 self.targets = t;
                 self.tracked.clear();
+                self.cleared.clear();
                 self.notice = None;
                 self.disk_gen += 1;
             }

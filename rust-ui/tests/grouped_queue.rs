@@ -251,7 +251,8 @@ fn a_failed_first_stage_fails_the_chain_and_never_reads_complete() {
     let rows = app.ai().queue_view()[0].runs[0].rows.clone();
     assert!(rows.iter().all(|r| r.cell.text == "Failed" && r.cell.bad && r.cell.frac < 1.0), "{rows:?}");
     let text = screen_text(&frame(&ctx, &mut app));
-    assert!(text.lines().any(|l| l == "Details"), "{text}");
+    // A failed run is no longer shown in full: it becomes one line in the node's closed Earlier log.
+    assert!(text.lines().any(|l| l == "Earlier (1)"), "{text}");
     drop(app);
     let _ = fs::remove_dir_all(e.base);
 }

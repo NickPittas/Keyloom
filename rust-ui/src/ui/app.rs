@@ -911,14 +911,17 @@ impl App {
     }
 
     fn batch_queue(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote_set::RemoteSet, local: &crate::metrics::View, active: &[u32], telemetry: &std::collections::BTreeMap<String, crate::metrics::ClientTelemetry>) -> Vec<crate::remote::Action> {
-        ui.heading("Queue");
+        ui.horizontal(|ui| {
+            ui.heading("Queue");
+            if ui.small_button("Clear finished").on_hover_text("Removes finished, failed and cancelled jobs from the queue and its logs. Running jobs stay.").clicked() {
+                ai.clear_finished();
+                remote.clear_finished();
+            }
+        });
         let mut actions = vec![];
         egui::ScrollArea::vertical().id_salt("batch_work_queue").auto_shrink([false; 2]).show(ui, |ui| {
+            ai.queue_ui(ui, local, active, telemetry);
             actions = remote.queue_ui(ui);
-            if !ai.queue_view().is_empty() || !remote.has_queue() {
-                ai.queue_ui(ui, local, active, telemetry);
-            }
-            egui::CollapsingHeader::new("Earlier local tasks").show(ui, |ui| ai.history_ui(ui));
         });
         actions
     }

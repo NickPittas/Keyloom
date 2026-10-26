@@ -127,9 +127,6 @@ impl RemoteSet {
     pub fn quiescent(&self) -> bool {
         self.remotes.iter().all(Remote::quiescent)
     }
-    pub fn has_queue(&self) -> bool {
-        self.remotes.iter().any(Remote::has_queue)
-    }
 
     /// What Setup needs to name and offer each connection (invitations pick one explicitly).
     pub fn infos(&self) -> Vec<ConnectionInfo> {
@@ -158,6 +155,9 @@ impl RemoteSet {
         if let Some(r) = self.get(creds) {
             r.cancel_job(job_id);
         }
+    }
+    pub fn clear_finished(&mut self) {
+        self.remotes.iter_mut().for_each(Remote::clear_finished);
     }
     pub fn forget_attempt(&mut self, creds: &str) {
         if let Some(r) = self.get(creds) {

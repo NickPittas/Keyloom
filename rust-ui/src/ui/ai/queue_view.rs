@@ -196,11 +196,6 @@ fn classify(j: &crate::tasks::TaskJob) -> (Stage, String) {
     }
 }
 
-/// Index of the run holding the most recently queued job. `queued` is every tracked job id in queue order (append-only).
-fn newest_run(queued: &[&str], runs: &[Vec<&str>]) -> Option<usize> {
-    runs.iter().enumerate().max_by_key(|(_, ids)| ids.iter().filter_map(|id| queued.iter().position(|q| q == id)).max()).map(|(i, _)| i)
-}
-
 fn client_of(state: &JobState, fallback: String) -> String {
     match state {
         JobState::Dispatching { target } | JobState::Running { target, .. } | JobState::Done { target, .. } | JobState::Rejected { target, .. } | JobState::Lost { target, .. } => target.clone(),
@@ -338,27 +333,23 @@ impl AiUi {
         for run in all.iter().flat_map(|s| &s.runs) {
             if !clients.contains(&run.client) { clients.push(run.client.clone()); }
         }
-        if clients.is_empty() {
-            clients.push(self.sched.targets().iter().find(|t| t.local).map(|t| t.id.clone()).unwrap_or_else(|| "This computer".into()));
-        }
+        // This computer is always listed first, idle or not; its earlier sessions sit inside it.
+        let local_id = self.sched.targets().iter().find(|t| t.local).map(|t| t.id.clone()).unwrap_or_else(|| "This computer".into());
+        clients.retain(|c| *c != local_id);
+        clients.insert(0, local_id.clone());
         for client in clients {
             let target = self.sched.targets().into_iter().find(|t| t.id == client);
             let is_local = target.as_ref().is_some_and(|t| t.local);
             let t = if is_local { crate::metrics::ClientTelemetry::Local(local.clone()) } else {
                 telemetry.get(&client).cloned().unwrap_or_else(|| crate::metrics::ClientTelemetry::Unreported("No statistics reported".into()))
             };
+            // Finished runs the user cleared are gone; active ones are never hidden.
             let all: Vec<_> = all.iter().cloned().filter_map(|mut s| {
-                s.runs.retain(|r| r.client == client);
+                s.runs.retain(|r| r.client == client && (r.active || !r.rows.iter().flat_map(|x| &x.ids).all(|id| self.cleared.contains(id))));
                 (!s.runs.is_empty()).then_some(s)
             }).collect();
-            // Current = newest active run per clip; with nothing active, the last run of the newest clip.
-            let mut current: Vec<(&QueueSection, &QueueRun)> = all.iter().filter_map(|s| s.runs.iter().rev().find(|r| r.active).map(|r| (s, r))).collect();
-            if current.is_empty() {
-                let flat: Vec<(&QueueSection, &QueueRun)> = all.iter().flat_map(|s| s.runs.iter().map(move |r| (s, r))).collect();
-                let queued: Vec<&str> = self.tracked.iter().map(|t| t.job_id.as_str()).collect();
-                let ids: Vec<Vec<&str>> = flat.iter().map(|(_, r)| r.rows.iter().flat_map(|row| row.ids.iter().map(String::as_str)).collect()).collect();
-                current.extend(newest_run(&queued, &ids).map(|i| flat[i]));
-            }
+            // Current = the newest active run per clip; finished and failed runs are only lines in the Earlier log.
+            let current: Vec<(&QueueSection, &QueueRun)> = all.iter().filter_map(|s| s.runs.iter().rev().find(|r| r.active).map(|r| (s, r))).collect();
             let log: Vec<String> = all.iter().flat_map(|s| s.runs.iter()
                 .filter(|r| !current.iter().any(|(_, c)| std::ptr::eq(*c, *r)))
                 .map(move |r| format!("{} · {}", s.title, r.reason))).collect();
@@ -368,11 +359,11 @@ impl AiUi {
             st.show_header(ui, |ui| {
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
                 ui.painter().circle_filled(dot.center(), 3.0, super::super::theme::ACCENT);
-                ui.label(RichText::new(if is_local { "This computer" } else { &client }).strong());
+                ui.label(RichText::new(if is_local || client == local_id { "This computer" } else { &client }).strong());
                 if !open { ui.add(egui::Label::new(RichText::new(&head).color(DIM).size(11.0)).truncate()); }
             }).body(|ui| {
                 crate::ui::metrics_bar::machine_meters(ui, &t, if is_local { active } else { &[] });
-                if all.is_empty() { ui.label(RichText::new("Idle").color(DIM).size(11.0)); }
+                if current.is_empty() { ui.label(RichText::new("Idle").color(DIM).size(11.0)); }
                 for (n, (s, run)) in current.iter().enumerate() {
                     if n > 0 { ui.add_space(12.0); }
                     egui::Frame::new().fill(super::super::theme::CARD)
@@ -391,6 +382,9 @@ impl AiUi {
                             ui.add(egui::Label::new(RichText::new(line).color(DIM).size(11.0)).wrap());
                         }
                     });
+                }
+                if client == local_id {
+                    self.history_ui(ui);
                 }
             });
             ui.add_space(10.0);
@@ -491,14 +485,6 @@ mod tests {
 
     fn row(text: &str, frac: f32, bad: bool, precomputed: bool) -> QueueRow {
         QueueRow { stage: Stage::Key, heading: String::new(), cell: Cell { text: text.into(), frac, bad }, products: vec![], ids: vec![], precomputed, attention: false, active: false }
-    }
-
-    #[test]
-    fn newest_run_is_the_one_queued_last() {
-        let queued = ["a", "b", "c", "d"];
-        assert_eq!(newest_run(&queued, &[vec!["a", "d"], vec!["c"], vec!["b"]]), Some(0));
-        assert_eq!(newest_run(&queued, &[vec!["a"], vec!["c"], vec!["b"]]), Some(1));
-        assert_eq!(newest_run(&queued, &[]), None);
     }
 
     #[test]

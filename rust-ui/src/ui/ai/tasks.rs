@@ -901,6 +901,15 @@ impl AiUi {
         }
     }
 
+    /// "Clear finished": this session's finished runs leave the queue and its log; earlier sessions are dismissed.
+    pub fn clear_finished(&mut self) {
+        let done: Vec<String> = self.queue_view().into_iter().flat_map(|s| s.runs).filter(|r| !r.active).flat_map(|r| r.rows.into_iter().flat_map(|x| x.ids)).collect();
+        self.cleared.extend(done);
+        let mine: Vec<String> = self.tracked.iter().map(|t| t.job_id.clone()).collect();
+        self.tk.history.retain(|h| mine.contains(&h.id));
+        self.tk.last_saved.clear();
+    }
+
     /// Earlier sessions' entries and held jobs.
     pub fn history_ui(&mut self, ui: &mut Ui) {
         let mine: Vec<String> = self.tracked.iter().map(|t| t.job_id.clone()).collect();

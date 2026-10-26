@@ -1644,8 +1644,23 @@ impl Remote {
         }
     }
 
+    /// "Clear finished": drop finished jobs from the queue and the saved list; running ones stay.
+    pub fn clear_finished(&mut self) {
+        if !self.jobs_loaded {
+            return; // the saved list is not read yet: a write now would drop it
+        }
+        self.jobs.retain(|j| !j.terminal());
+        self.write_jobs(&PathBuf::from(&self.key));
+    }
+
     fn save_jobs(&mut self, env: &Env) {
         if let Some(c) = env.cfg.creds.clone() {
+            self.write_jobs(&c);
+        }
+    }
+
+    fn write_jobs(&mut self, c: &Path) {
+        {
             let mut finished = 0;
             let mut live: Vec<Value> = self.jobs.iter().rev().filter(|j| {
                 if j.terminal() { finished += 1; finished <= 12 } else { true }
@@ -1698,13 +1713,17 @@ impl Remote {
         for j in &self.jobs {
             if !groups.contains(&j.installation) { groups.push(j.installation.clone()); }
         }
+        // Only the PC this connection's Clients row stands for; finished jobs of other PCs on its network stay hidden.
+        let listed = |id: &str| if self.local_host { Some(id) == self.me.as_deref() } else { self.target_host.is_empty() || id == self.target_host };
         for group in groups {
+            if !self.jobs.iter().any(|j| j.installation == group && !j.terminal()) && !group.as_deref().is_some_and(listed) {
+                continue;
+            }
             let pc = group.as_deref().and_then(|id| self.installs.iter().find(|i| i.id == id));
             let name = pc.map(|i| i.name.as_str()).unwrap_or_else(|| group.as_deref().unwrap_or("Waiting for a PC"));
             let connected = pc.is_some_and(|i| i.connected) && self.online();
             let jobs: Vec<&NetJob> = self.jobs.iter().filter(|j| j.installation == group).collect();
-            let mut current: Vec<&NetJob> = jobs.iter().copied().filter(|j| !j.terminal()).collect();
-            if current.is_empty() { current.extend(jobs.last().copied()); }
+            let current: Vec<&NetJob> = jobs.iter().copied().filter(|j| !j.terminal()).collect();
             let earlier: Vec<&NetJob> = jobs.iter().copied().filter(|j| !current.iter().any(|c| std::ptr::eq(*c, *j))).collect();
             let id = ui.make_persistent_id(("netnode", &self.key, &group));
             let st = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
