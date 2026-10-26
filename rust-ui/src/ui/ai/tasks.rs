@@ -950,9 +950,9 @@ impl AiUi {
             self.tk.history.retain(|h| h.id != id);
             self.tk.last_saved.clear();
         }
-        // Same set the single Dismiss can reach: the `older` list, whatever its state.
+        // Every earlier-session entry, not only the 20 shown; this session's tracked jobs stay.
         if dismiss_all {
-            self.tk.history.retain(|h| !older.iter().any(|o| o.id == h.id));
+            self.tk.history.retain(|h| mine.contains(&h.id));
             self.tk.last_saved.clear();
         }
     }
