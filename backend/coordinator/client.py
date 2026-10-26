@@ -219,6 +219,7 @@ class Client:
     def job_events(self, job_id, after=0, limit=100): return self._call("GET", f"/v1/jobs/{job_id}/events?after={after}&limit={limit}")
     def stats(self, body): return self._call("POST", "/v1/stats", body)
     def installations(self): return self._call("GET", "/v1/installations")
+    def leave(self): return self._call("POST", "/v1/leave", {})
 
 
 def _store_new(credentials_path, issue):

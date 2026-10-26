@@ -485,6 +485,18 @@ class Store:
                                        "measured_at": now - body["measured_age_ms"] / 1000, "received_at": now}
         return {"accepted": True, "seq": body["seq"]}
 
+    def local_installations(self, own):
+        now = self.clock()
+        with self._lock:
+            rows = self.db.execute("SELECT i.id, i.name, i.created_at, s.last_seen, "
+                "EXISTS(SELECT 1 FROM jobs j WHERE (j.target=i.id OR j.submitter=i.id) AND j.state IN ('queued','offered','started')) OR "
+                "EXISTS(SELECT 1 FROM attempts a WHERE a.installation_id=i.id AND a.state IN ('offered','started')) AS in_use "
+                "FROM installations i LEFT JOIN sessions s ON s.installation_id=i.id "
+                "WHERE i.revoked_at IS NULL ORDER BY i.created_at").fetchall()
+        return {"installations": [{"installation_id": r["id"], "name": r["name"], "created_at": r["created_at"],
+                "last_seen": r["last_seen"], "connected": r["last_seen"] is not None and now - r["last_seen"] < SESSION_TTL,
+                "in_use": bool(r["in_use"]), "is_this_pc": r["id"] == own} for r in rows]}
+
     def installations(self, _inst):
         """Any paired installation may see every client's status (for per-client cards). Ages are server-computed;
         `connected` and `stats` are separate so unavailable/stale is never shown as 0."""

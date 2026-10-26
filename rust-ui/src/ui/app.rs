@@ -213,6 +213,8 @@ pub struct App {
     models_open: bool,
     /// Clients page (real machines, live state). Replaces Board/workspace while open, like Settings.
     clients_open: bool,
+    /// Remove asked to confirm: the connection's credentials path.
+    remove_confirm: Option<String>,
     /// One long-lived sampler for the whole session (see `metrics`); the footer and the local client card read it.
     metrics: driver::Held<crate::metrics::Supervisor>,
     metrics_wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -369,6 +371,7 @@ impl App {
             models,
             models_open: false,
             clients_open: false,
+            remove_confirm: None,
             metrics: driver::Held::new(opts.metrics.supervisor(opts.repo.as_deref().or(launch.repo.as_deref()), launch.python.clone())),
             metrics_wake: None,
             metrics_rect: None,
@@ -2579,6 +2582,15 @@ impl App {
                 cfg: Default::default(),
             };
             self.remote.tick(now, &mut env);
+            for (creds, how) in self.remote.take_left() {
+                let name = self.conn_name(&creds);
+                let tail = match how {
+                    crate::remote::Leave::Retired => None,
+                    crate::remote::Leave::TooOld => Some(" (that PC runs an older Keyloom)"),
+                    crate::remote::Leave::Failed => Some(""),
+                };
+                self.finish_remove(&creds, tail.map(|t| format!("{name} still lists this PC; retire it from that PC's Clients page{t}.")));
+            }
             for f in self.remote.take_finished() {
                 if let Some(ctx) = self.last_ctx.clone() {
                     self.refresh_clip(&ctx, &f);
@@ -2694,6 +2706,61 @@ impl App {
         self.net_save("Updated");
     }
 
+    fn conn_name(&mut self, creds: &str) -> String {
+        let n = self.net_draft().connections.iter().find(|c| c.credentials == creds).map(|c| c.host_name.clone()).unwrap_or_default();
+        if n.is_empty() { "That PC".into() } else { n }
+    }
+
+    /// The Remove confirmation; Remove asks the host to retire this PC's login first when online.
+    fn remove_ui(&mut self, ctx: &egui::Context) {
+        let Some(creds) = self.remove_confirm.clone() else { return };
+        let name = self.conn_name(&creds);
+        let (mut yes, mut no) = (false, false);
+        egui::Window::new("Remove")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Remove {name}? This PC's login on it is retired; finished jobs stay in History."));
+                ui.horizontal(|ui| {
+                    yes = ui.button("Remove").clicked();
+                    no = ui.button("Cancel").clicked();
+                });
+            });
+        if !(yes || no) {
+            return;
+        }
+        self.remove_confirm = None;
+        if !yes {
+            return;
+        }
+        if let Some(why) = self.remote.remove_blocker(&creds) {
+            self.ai.notice = Some(format!("Connection not removed: {why}."));
+        } else if !self.remote.leave(&creds) {
+            self.finish_remove(&creds, Some(format!("{name} still lists this PC; retire it from that PC's Clients page.")));
+        }
+    }
+
+    /// Drop the settings entry and the session, save, then delete the login file and its side files (never history or the attempt file, never the own service's login).
+    fn finish_remove(&mut self, creds: &str, notice: Option<String>) {
+        let n = self.net_draft();
+        let own = n.connections.iter().any(|c| c.credentials == creds && c.local_host);
+        n.connections.retain(|c| c.credentials != creds);
+        if n.default_submit == creds {
+            n.default_submit.clear();
+        }
+        self.remote.remove(creds);
+        self.net_save("Removed");
+        if !own {
+            for ext in ["", ".session", ".lock", ".network.json"] {
+                let _ = std::fs::remove_file(format!("{creds}{ext}"));
+            }
+        }
+        if notice.is_some() {
+            self.ai.notice = notice;
+        }
+    }
+
     fn net_action(&mut self, a: crate::remote::Action) {
         use crate::remote::Action;
         match a {
@@ -2713,19 +2780,7 @@ impl App {
                 self.net_draft().default_submit = creds;
                 self.net_save("Updated");
             }
-            Action::Remove(creds) => {
-                if let Some(why) = self.remote.remove_blocker(&creds) {
-                    self.ai.notice = Some(format!("Connection not removed: {why}."));
-                    return;
-                }
-                let n = self.net_draft();
-                n.connections.retain(|c| c.credentials != creds);
-                if n.default_submit == creds {
-                    n.default_submit.clear();
-                }
-                self.remote.remove(&creds);
-                self.net_save("Removed");
-            }
+            Action::Remove(creds) => self.remove_confirm = Some(creds),
             Action::CancelJob { creds, job_id } => self.remote.cancel_job(&creds, &job_id),
             Action::ForgetAttempt(creds) => self.remote.forget_attempt(&creds),
             Action::Prefer { creds, url } => {
@@ -3062,6 +3117,9 @@ impl App {
                                 self.ai.placement = p;
                             }
                             net_actions.extend(table_acts);
+                            if self.remote.available() {
+                                self.setup.installs_ui(ui);
+                            }
                         });
                 });
                 for a in net_actions {
@@ -3104,6 +3162,7 @@ impl App {
             egui::CentralPanel::default().show(ui, |ui| self.board(ui));
         }
         self.close_ui(&ctx);
+        self.remove_ui(&ctx);
         // Dev-only evidence capture: wait for the first frame, then write a PNG and quit.
         if let (Some(path), false) = (self.opts.screenshot.clone(), self.shot_requested) {
             let ready = self.viewer.as_ref().is_none_or(|v| {

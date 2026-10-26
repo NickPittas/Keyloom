@@ -58,6 +58,19 @@ enum Pend {
     Estimate(String),
     /// Replaces the connected client's endpoint list (token and session are kept).
     Endpoints(Vec<String>, String),
+    /// This PC retires its own login on the host (Remove).
+    Leave,
+}
+
+/// How a Remove's leave request ended; the app finishes the local removal either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leave {
+    /// The host retired this PC's login, or it was already gone.
+    Retired,
+    /// The host runs an older Keyloom without the leave route.
+    TooOld,
+    /// Offline or another error: the host still lists this PC.
+    Failed,
 }
 
 /// GPU load and VRAM use both under 50% on every GPU. A value that is missing or unknown counts as NOT free, never as free.
@@ -232,6 +245,8 @@ pub struct Remote {
     link: Option<Link>,
     pub phase: Phase,
     pend: HashMap<String, Pend>,
+    leaving: bool,
+    left: Option<Leave>,
     retry_at: Option<Instant>,
     me: Option<String>,
     network_url: Option<String>,
@@ -485,6 +500,8 @@ impl Remote {
             link: None,
             phase: Phase::Off,
             pend: HashMap::new(),
+            leaving: false,
+            left: None,
             retry_at: None,
             me: None,
             network_url: None,
@@ -632,6 +649,20 @@ impl Remote {
     pub fn label(&self) -> String {
         self.network_url.as_deref().map(|u| u.trim_start_matches("https://").trim_start_matches("http://").to_owned()).or_else(|| self.ns()).unwrap_or_else(|| Path::new(&self.key).parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "network".into()))
     }
+    /// Remove: ask the host to retire this PC's login. False = not sent (offline), so the caller removes locally.
+    pub fn leave(&mut self) -> bool {
+        if self.local_host {
+            return false; // this PC never retires its own login on its own service
+        }
+        self.leaving = self.online() && self.req(Op::Leave, json!({}), Pend::Leave);
+        self.leaving
+    }
+    pub fn leaving(&self) -> bool {
+        self.leaving
+    }
+    pub fn take_left(&mut self) -> Option<Leave> {
+        self.left.take()
+    }
     pub fn cancel_job(&mut self, job_id: &str) {
         if let Some(l) = &mut self.link {
             if let Ok(id) = l.request(Op::Cancel, json!({"job_id": job_id})) {
@@ -672,6 +703,9 @@ impl Remote {
         }
         self.link = None; // Drop kills and reaps the bridge; the coordinator keeps ownership of anything started
         self.pend.clear();
+        if std::mem::take(&mut self.leaving) {
+            self.left = Some(Leave::Failed); // the link died before the host answered
+        }
         for j in &mut self.jobs {
             j.inflight = false;
         }
@@ -744,6 +778,12 @@ impl Remote {
         let state = self.link.as_ref().map(Link::state);
         match state {
             Some(State::Ended(why)) => {
+                // An answer that arrived before the drop still counts (a Remove answered identity_revoked is Retired).
+                for r in self.link.as_mut().map(Link::poll).unwrap_or_default() {
+                    if let Some(Pend::Leave) = r.id.and_then(|id| self.pend.remove(&id)) {
+                        self.on_reply(Pend::Leave, r.outcome, now, env);
+                    }
+                }
                 self.stop();
                 self.fail(now, why);
                 return;
@@ -821,6 +861,15 @@ impl Remote {
                 if let Err(e) = r {
                     self.status = Some(format!("Could not update host addresses: {}", err_text(&e)));
                 }
+            }
+            (Pend::Leave, r) => {
+                self.leaving = false;
+                self.left = Some(match r {
+                    Ok(_) => Leave::Retired,
+                    Err(e) if e.code == "host_too_old" => Leave::TooOld,
+                    Err(e) if matches!(e.code.as_str(), "identity_revoked" | "unknown_installation" | "unauthorized") => Leave::Retired,
+                    Err(_) => Leave::Failed,
+                });
             }
             (Pend::Connect, Ok(v)) => {
                 self.network_url = v.get("url").and_then(Value::as_str).map(str::to_owned);
@@ -993,6 +1042,7 @@ impl Remote {
             Pend::Cancel(_) => "cancel",
             Pend::Resync => "resync",
             Pend::Estimate(_) => "estimate",
+            Pend::Leave => "leave",
         }
     }
 
@@ -1789,22 +1839,24 @@ impl Remote {
         let creds = self.key.clone();
         ui.label(RichText::new(self.ns().unwrap_or_default()).color(DIM).size(11.5));
         let mut en = cfg.enabled;
-        if crate::ui::theme::checkbox(ui, &mut en, "").changed() {
+        if ui.add_enabled_ui(!self.leaving, |ui| crate::ui::theme::checkbox(ui, &mut en, "")).inner.changed() {
             acts.push(Action::Enable { creds: creds.clone(), on: en });
         }
         let mut rc = cfg.receive;
-        let accept = crate::ui::theme::checkbox(ui, &mut rc, "").on_hover_text(if cfg.local_host { "This PC takes jobs that other PCs send to it" } else { "Automatic may send shots to this PC" });
+        let accept = ui.add_enabled_ui(!self.leaving, |ui| crate::ui::theme::checkbox(ui, &mut rc, "")).inner.on_hover_text(if cfg.local_host { "This PC takes jobs that other PCs send to it" } else { "Automatic may send shots to this PC" });
         if accept.changed() {
             acts.push(Action::Receive { creds: creds.clone(), on: rc });
         }
         let mut def = is_default;
-        if crate::ui::theme::checkbox(ui, &mut def, "").changed() && def {
+        if ui.add_enabled_ui(!self.leaving, |ui| crate::ui::theme::checkbox(ui, &mut def, "")).inner.changed() && def {
             acts.push(Action::DefaultSubmit(creds.clone()));
         }
-        let remove = ui.add_enabled(blocker.is_none(), egui::Button::new("Remove"));
-        let remove = match &blocker { Some(b) => remove.on_disabled_hover_text(format!("Cannot remove now: {b}")), None => remove };
-        if remove.clicked() {
-            acts.push(Action::Remove(creds));
+        if !cfg.local_host {
+            let remove = ui.add_enabled(blocker.is_none() && !self.leaving, egui::Button::new(if self.leaving { "Removing…" } else { "Remove" }));
+            let remove = match &blocker { Some(b) => remove.on_disabled_hover_text(format!("Cannot remove now: {b}")), None => remove };
+            if remove.clicked() {
+                acts.push(Action::Remove(creds));
+            }
         }
         acts
     }

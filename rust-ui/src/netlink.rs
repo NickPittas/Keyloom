@@ -61,6 +61,9 @@ pub enum Op {
     Discover,
     Endpoints,
     ServiceConfigure,
+    ServiceInstallations,
+    ServiceRetire,
+    Leave,
 }
 
 impl Op {
@@ -89,6 +92,9 @@ impl Op {
             Op::Discover => "discover",
             Op::Endpoints => "endpoints",
             Op::ServiceConfigure => "service_configure",
+            Op::ServiceInstallations => "service_installations",
+            Op::ServiceRetire => "service_retire",
+            Op::Leave => "leave",
         }
     }
 }

@@ -204,6 +204,23 @@ pub fn merge_old(p: &Path, old: Vec<Entry>) -> Result<(), String> {
     write(p, out)
 }
 
+/// Sent entries whose connection is no longer one of `live_owners` (its PC was removed), kept until the user clears them.
+pub fn orphaned(live_owners: &[String]) -> Vec<Entry> {
+    let Some(p) = history_path() else { return vec![] };
+    read(&p).0.into_iter().filter(|e| e.kind == "sent" && !live_owners.contains(&e.owner)).collect()
+}
+
+/// Remove exactly the entries with these ids, under the same lock and atomic write as `replace`.
+pub fn forget(ids: &[String]) -> Result<(), String> {
+    let Some(p) = history_path() else { return Ok(()) };
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (cur, err) = read(&p);
+    if let Some(e) = err.filter(|_| p.exists()) {
+        return Err(e); // unreadable and still in place: writing would replace it with only the kept entries
+    }
+    write(&p, cur.into_iter().filter(|e| !ids.contains(&e.id)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

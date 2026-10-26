@@ -3,17 +3,25 @@
 //! robin), and the pickers see one merged list of PCs. Assignments are namespaced `network id/PC id` (never an index).
 use crate::netlink::Source;
 use crate::network_setup::ConnectionInfo;
+use crate::queue::Entry;
 use crate::remote::{Action, Conn, Env, Remote};
 use crate::settings::Settings;
-use eframe::egui::Ui;
+use eframe::egui::{self, RichText, Ui};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const DIM: egui::Color32 = egui::Color32::from_rgb(169, 187, 175);
 
 pub struct RemoteSet {
     source: Source,
     remotes: Vec<Remote>,
     /// Round robin start for the next claim.
     rr: usize,
+    /// Sent jobs of removed PCs, read from history.json at most once a second (and after a Clear).
+    history: Option<(Instant, Vec<Entry>)>,
+    /// The last Clear that could not be saved.
+    history_err: Option<String>,
 }
 
 fn conn_of(s: &Settings, _sp: Option<&Path>) -> Vec<(Conn, bool)> {
@@ -38,7 +46,7 @@ fn key_of(c: &Conn) -> String {
 
 impl RemoteSet {
     pub fn new(source: Source) -> Self {
-        Self { source, remotes: vec![], rr: 0 }
+        Self { source, remotes: vec![], rr: 0, history: None, history_err: None }
     }
     pub fn available(&self) -> bool {
         self.source != Source::Off
@@ -165,6 +173,14 @@ impl RemoteSet {
     pub fn remove_blocker(&self, creds: &str) -> Option<String> {
         self.remotes.iter().find(|r| r.key == creds)?.remove_blocker(Some(Path::new(creds)))
     }
+    /// Start Remove's leave request; false = not sent (offline), the caller removes locally at once.
+    pub fn leave(&mut self, creds: &str) -> bool {
+        self.get(creds).is_some_and(Remote::leave)
+    }
+    /// Leave requests that just ended, by connection.
+    pub fn take_left(&mut self) -> Vec<(String, crate::remote::Leave)> {
+        self.remotes.iter_mut().filter_map(|r| Some((r.key.clone(), r.take_left()?))).collect()
+    }
     /// Drop a connection's session (the caller checked `remove_blocker`); its saved state files stay untouched.
     pub fn remove(&mut self, creds: &str) {
         self.remotes.retain(|r| r.key != creds);
@@ -178,7 +194,59 @@ impl RemoteSet {
             let label = many.then(|| r.label());
             acts.extend(r.queue_ui(ui, label.as_deref()));
         }
+        self.history_ui(ui);
         acts
+    }
+
+    /// Jobs of PCs that were removed: one collapsed History section, grouped by PC. Kept until the user clears them.
+    fn history_ui(&mut self, ui: &mut Ui) {
+        if self.history.as_ref().is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(1)) {
+            let live: Vec<String> = self.remotes.iter().map(|r| r.key.clone()).collect();
+            self.history = Some((Instant::now(), crate::queue::orphaned(&live)));
+        }
+        let Some((_, orphans)) = &self.history else { return };
+        if orphans.is_empty() {
+            return;
+        }
+        let mut groups: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
+        for e in orphans {
+            let pc = e.job.as_ref().and_then(|j| j["on"].as_str()).filter(|s| !s.is_empty()).unwrap_or("Unknown PC");
+            groups.entry(pc.to_owned()).or_default().push(e);
+        }
+        let err = self.history_err.clone();
+        let mut clear: Vec<String> = vec![];
+        egui::CollapsingHeader::new(RichText::new(format!("History ({})", orphans.len())).color(DIM).size(11.0))
+            .id_salt("queue_history")
+            .default_open(false)
+            .show(ui, |ui| {
+                if let Some(e) = &err {
+                    ui.colored_label(egui::Color32::from_rgb(225, 110, 110), e);
+                }
+                for (pc, es) in &groups {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(pc).strong());
+                        ui.label(RichText::new(format!("{} jobs", es.len())).color(DIM).size(11.0));
+                        if ui.small_button("Clear").clicked() {
+                            clear.extend(es.iter().map(|e| e.id.clone()));
+                        }
+                    });
+                    for e in es {
+                        let job = e.job.as_ref();
+                        let field = |k: &str| job.and_then(|j| j[k].as_str()).filter(|s| !s.is_empty()).unwrap_or("");
+                        let reason = field("reason");
+                        let mut parts = vec![field("name"), field("state"), reason];
+                        parts.retain(|p| !p.is_empty() && *p != "complete");
+                        ui.label(RichText::new(parts.join(" · ")).color(DIM).size(11.0));
+                    }
+                }
+                if ui.button("Clear all").clicked() {
+                    clear.extend(orphans.iter().map(|e| e.id.clone()));
+                }
+            });
+        if !clear.is_empty() {
+            self.history_err = crate::queue::forget(&clear).err();
+            self.history = None;
+        }
     }
 
     /// The Clients table's rows for the other networks' PCs. This computer's own rows are `local_controls` and the

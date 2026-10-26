@@ -36,6 +36,9 @@ Ops (args are exact; unknown keys are refused; bodies are validated by the coord
                 (a discovery-selected `fingerprint_sha256` is checked again at connection, before auth or reuse; a changed certificate
                 is never trusted)
   service_local_join  state_dir, credentials_path, name, [existing_credentials_path, existing_credentials_paths[]]
+  leave  (no args) -> {left: true}; old host -> host_too_old, rejected credentials -> identity_revoked
+  service_retire  state_dir, installation_id -> {retired, started_attempts[]}
+  service_installations  state_dir -> {installations: [{installation_id, name, created_at, last_seen, connected, in_use, is_this_pc}]}
   join_address/service_local_join reply {installation_id, credentials_path, reused, endpoints[], host_installation_id[, url, fingerprint_sha256, network_id]}
   (endpoints/host_installation_id come from a verified hello; null/[] if it could not be obtained): with
   an existing candidate pinning the SAME certificate nothing is redeemed and that identity is reused (credentials_path = the saved one);
@@ -292,6 +295,29 @@ class Bridge:
                 raise BridgeError("transport", type(e).__name__) from None
         return {**out, **self._hello_info(out["credentials_path"], (), True, url), "url": url}
 
+    def _service_call(self, a, path, required):
+        sd = _svc.state_path(self._state_dir(a, required))
+        cfg = _svc.read_config(sd) if sd.is_dir() else None
+        if not cfg or not _svc.lock_busy(sd):
+            raise BridgeError("service_unavailable", "the network service is not running on this PC")
+        token = pki.read_private(str(sd / "local-join.token")).strip()
+        self._secret(token)
+        pem = (sd / "server-cert.pem").read_text(encoding="utf-8")
+        base = {"url": f"https://127.0.0.1:{cfg['port']}", "certificate_pem": pem,
+                "fingerprint_sha256": pki.fingerprint(pem), "installation_id": "-", "token": "-"}
+        body = {"protocol": _c.PROTOCOL, "token": token}
+        if "installation_id" in a:
+            if not pki.valid_installation_id(a["installation_id"]):
+                raise BridgeError("bad_request", "invalid installation_id")
+            body["installation_id"] = a["installation_id"]
+        return _Net(Client(base, self.timeout, loopback=True))._call("POST", path, body, auth=False)
+
+    def op_service_retire(self, a):
+        return self._service_call(a, "/v1/local-retire", ("state_dir", "installation_id"))
+
+    def op_service_installations(self, a):
+        return self._service_call(a, "/v1/local-installations", ("state_dir",))
+
     def release(self):
         if self.lock:
             self.lock.close()
@@ -417,6 +443,17 @@ class Bridge:
     def op_installations(self, a):
         _need(a, ())
         return self._live().installations()
+
+    def op_leave(self, a):
+        _need(a, ())
+        try:
+            return self._live().leave()
+        except CoordinatorError as e:
+            if e.status == 404 and e.code != "unknown_installation":
+                raise BridgeError("host_too_old", "the host does not support leaving") from None
+            if e.status == 401 or e.code == "unknown_installation":
+                raise BridgeError("identity_revoked", "the host does not recognize this login; it may already be revoked") from None
+            raise
 
     # ---- request loop -----------------------------------------------------------------------------
 

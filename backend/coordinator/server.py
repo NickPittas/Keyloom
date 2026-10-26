@@ -54,6 +54,7 @@ def trusted_peer(ip, loopback_only=False):
 
 
 _POST = {
+    r"/v1/leave": "leave", r"/v1/local-retire": "local_retire", r"/v1/local-installations": "local_installations",
     r"/v1/join": "join", r"/v1/local-join": "local_join", r"/v1/local-identity": "local_identity", r"/v1/session": "session", r"/v1/stats": "stats", r"/v1/claim": "claim", r"/v1/jobs": "submit",
     r"/v1/attempts/([\w-]{1,80})/(reject|start|events)": "attempt", r"/v1/jobs/([\w-]{1,80})/cancel": "cancel",
 }
@@ -73,6 +74,7 @@ class Api:
         self.join_enabled, self.local_token, self.advertise_url = join_enabled, local_token, advertise_url
         self.join_try = Limiter(10, 300)  # every attempt counts, successful or not
         self.join_global = Limiter(30, 300)
+        self.manage_try = Limiter(60, 300)  # local-installations and local-retire: own budget, so listing never blocks Join
 
     def handle(self, method, target, bearer, body, peer):
         u = urlsplit(target)
@@ -87,6 +89,8 @@ class Api:
             return self._hello(peer)
         if name == "local_identity":
             return self._local_identity(parse_json(body), peer)
+        if name in ("local_retire", "local_installations"):
+            return self._local_manage(name, parse_json(body), peer)
         if name in ("join", "local_join"):
             return self._join(name, parse_json(body), peer)
         if self.auth_fail.blocked(peer):
@@ -113,6 +117,10 @@ class Api:
                 bad("unknown query parameter")
             return s.job_events(inst, m[1], after, limit)
         b = parse_json(body)
+        if name == "leave":
+            obj(b, "leave", ())
+            s.revoke(inst["id"])
+            return {"left": True}
         if name == "session":
             return s.register(inst, b)
         if name == "stats":
@@ -159,6 +167,31 @@ class Api:
             raise ApiError(404, "unknown_installation", "no such installation")
         self.local_identity(iid)
         return {"host_installation_id": iid}
+
+    def _local_manage(self, name, b, peer):
+        if not self.local_token or not self.info:
+            raise ApiError(404, "not_found", "no such endpoint")
+        if not trusted_peer(peer, loopback_only=True):
+            raise ApiError(403, "join_refused", "this is limited to this PC")
+        if self.manage_try.blocked(peer):
+            raise ApiError(429, "throttled", "too many attempts")
+        self.manage_try.fail(peer)
+        obj(b, name,("protocol", "token", "installation_id") if name == "local_retire" else ("protocol", "token"))
+        if b["protocol"] != PROTOCOL or isinstance(b["protocol"], bool):
+            bad("unsupported protocol", "unsupported_protocol")
+        if not (isinstance(b["token"], str) and hmac.compare_digest(b["token"].encode(), self.local_token.encode())):
+            raise ApiError(403, "join_refused", "local join token rejected")
+        own = (self.info() or {}).get("host_installation_id")
+        if name == "local_installations":
+            return self.store.local_installations(own)
+        iid = b["installation_id"]
+        if not pki.valid_installation_id(iid):
+            bad("invalid installation_id")
+        if not pki.valid_installation_id(own):
+            raise ApiError(409, "local_identity_unknown", "this PC's installation is not known")
+        if iid == own:
+            raise ApiError(409, "cannot_retire_self", "cannot retire this PC's installation")
+        return {"retired": iid, "started_attempts": self.store.revoke(iid)}
 
     def _join(self, name, b, peer):
         """/v1/join (explicitly enabled) or /v1/local-join (loopback + the service's private token). Both mint a unique

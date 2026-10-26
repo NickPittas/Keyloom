@@ -115,10 +115,23 @@ struct JoinMeta {
     eps: Vec<String>,
 }
 
+/// A login registered on this PC's own service (a PC that joined it).
+struct Install {
+    id: String,
+    name: String,
+    created_at: i64,
+    last_seen: Option<i64>,
+    connected: bool,
+    in_use: bool,
+    is_this_pc: bool,
+}
+
 enum Pend {
     Status { ensure: bool },
     Service(&'static str),
     Join(JoinMeta),
+    Installs,
+    Retire,
 }
 
 struct Item {
@@ -220,6 +233,12 @@ pub struct Setup {
     pend_allow: Option<bool>,
     out: Vec<Cmd>,
     updates: Vec<ScanUpdate>,
+    installs: Option<Vec<Install>>,
+    installs_open: bool,
+    /// Logins waiting for the user's Retire confirmation.
+    retire_ask: Option<Vec<String>>,
+    /// Confirmed logins not yet sent: one at a time, so the first error stops the rest.
+    retire_todo: VecDeque<String>,
 }
 
 fn state_dir(sp: Option<&Path>) -> Option<PathBuf> {
@@ -283,6 +302,36 @@ fn parse_svc(v: &Value) -> Svc {
         error_code: text(v, "error_code"),
         message: v.get("message").and_then(Value::as_str).unwrap_or("").to_owned(),
     }
+}
+
+fn parse_installs(v: &Value) -> Vec<Install> {
+    v.get("installations").and_then(Value::as_array).into_iter().flatten().filter_map(|i| {
+        let b = |k: &str| i.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Some(Install {
+            id: text(i, "installation_id")?,
+            name: i.get("name").and_then(Value::as_str).unwrap_or("").chars().filter(|c| !c.is_control()).take(64).collect(),
+            created_at: i.get("created_at").and_then(Value::as_f64).map(|f| f as i64).unwrap_or(0),
+            last_seen: i.get("last_seen").and_then(Value::as_f64).map(|f| f as i64),
+            connected: b("connected"),
+            in_use: b("in_use"),
+            is_this_pc: b("is_this_pc"),
+        })
+    }).collect()
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) for unix seconds; std has no calendar, so this is the civil-from-days conversion.
+fn when(secs: i64) -> String {
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rem / 3600, rem % 3600 / 60)
 }
 
 fn parse_scan(v: &Value) -> Scan {
@@ -367,6 +416,10 @@ impl Setup {
             pend_allow: None,
             out: vec![],
             updates: vec![],
+            installs: None,
+            installs_open: false,
+            retire_ask: None,
+            retire_todo: VecDeque::new(),
         }
     }
 
@@ -390,11 +443,20 @@ impl Setup {
     fn joining(&self) -> bool {
         self.pend.values().any(|p| matches!(p.0, Pend::Join(_))) || self.queue.iter().any(|q| matches!(q.p, Pend::Join(_)))
     }
+    fn retiring(&self) -> bool {
+        self.pend.values().any(|p| matches!(p.0, Pend::Retire)) || self.queue.iter().any(|q| matches!(q.p, Pend::Retire))
+    }
     fn scanning(&self) -> bool {
         self.scan_started.is_some()
     }
+    fn retire_next(&mut self) {
+        if let Some(id) = self.retire_todo.pop_front() {
+            self.push(Op::ServiceRetire, json!({"installation_id": id}), Pend::Retire);
+        }
+    }
+
     fn push(&mut self, op: Op, mut args: Value, p: Pend) {
-        if matches!(op, Op::ServiceStatus | Op::ServiceInstall | Op::ServiceStart | Op::ServiceStop | Op::ServiceRemove | Op::ServiceConfigure | Op::ServiceLocalJoin) {
+        if matches!(op, Op::ServiceStatus | Op::ServiceInstall | Op::ServiceStart | Op::ServiceStop | Op::ServiceRemove | Op::ServiceConfigure | Op::ServiceLocalJoin | Op::ServiceInstallations | Op::ServiceRetire) {
             args["state_dir"] = json!(self.dir);
         }
         self.queue.push_back(Item { op, args, p, at: Instant::now() });
@@ -608,6 +670,7 @@ impl Setup {
     fn drop_link(&mut self, why: &str, unknown: bool) {
         self.link = None;
         self.queue.clear();
+        self.retire_todo.clear();
         self.pend.clear();
         if self.ensure == Ensure::Busy {
             self.ensure = Ensure::Done;
@@ -698,6 +761,28 @@ impl Setup {
                 let why = if e.code == "paired_not_saved" || e.code == "pair_uncertain" { "the result is uncertain; check Other PCs before trying again" } else { "existing connections are unchanged" };
                 nlog(&format!("join failed: {} ({})", e.code, err_text(&e)));
                 self.note = Some(format!("Join failed; {why} ({})", err_text(&e)));
+            }
+            (Pend::Installs, Ok(v)) => self.installs = Some(parse_installs(&v)),
+            (Pend::Installs, Err(e)) => {
+                nlog(&format!("registered PCs failed: {} ({})", e.code, err_text(&e)));
+                self.note = Some(format!("Could not read the PCs registered on this PC ({})", err_text(&e)));
+            }
+            (Pend::Retire, out) => {
+                match out {
+                    Ok(_) => {
+                        self.note = Some("Login retired.".into());
+                        self.retire_next();
+                    }
+                    Err(e) => {
+                        nlog(&format!("retire failed: {} ({})", e.code, err_text(&e)));
+                        self.note = Some(format!("Retire failed ({})", err_text(&e)));
+                        self.retire_todo.clear();
+                    }
+                }
+                // The list is stale after each retire; refresh once when the last one has answered.
+                if !self.retiring() {
+                    self.push(Op::ServiceInstallations, json!({}), Pend::Installs);
+                }
             }
         }
     }
@@ -943,6 +1028,87 @@ impl Setup {
         if self.busy() { ui.label(RichText::new("Working…").color(DIM)); }
         if let Some(n) = &self.note { ui.add(egui::Label::new(RichText::new(n).color(DIM).size(12.0)).selectable(true)); }
         cmds
+    }
+
+    /// The PCs registered on this PC's own service, drawn below the Clients table. Refreshed when opened, after each
+    /// Retire, and on Refresh; never polled.
+    pub fn installs_ui(&mut self, ui: &mut Ui) {
+        if self.dir.is_empty() {
+            return;
+        }
+        let resp = egui::CollapsingHeader::new("PCs registered on this PC").id_salt("registered_pcs").default_open(false).show(ui, |ui| {
+            let idle = !self.busy();
+            let mut ask = None;
+            ui.horizontal(|ui| {
+                if ui.add_enabled(idle, egui::Button::new("Refresh").small()).clicked() {
+                    self.push(Op::ServiceInstallations, json!({}), Pend::Installs);
+                }
+                let unused: Vec<String> = self.installs.iter().flatten().filter(|i| !i.in_use && !i.is_this_pc && !i.connected).map(|i| i.id.clone()).collect();
+                if ui.add_enabled(idle && !unused.is_empty() && self.retire_ask.is_none(), egui::Button::new("Retire all unused").small()).clicked() {
+                    ask = Some(unused);
+                }
+            });
+            if let Some(ids) = self.retire_ask.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Retire {} login(s)? Those PCs must Join again to use this PC.", ids.len()));
+                    if ui.button("Retire").clicked() {
+                        self.retire_todo = ids.into();
+                        self.retire_next();
+                        self.retire_ask = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.retire_ask = None;
+                    }
+                });
+            }
+            match &self.installs {
+                None => {
+                    ui.label(RichText::new("Loading…").color(DIM));
+                }
+                Some(list) if list.is_empty() => {
+                    ui.label(RichText::new("No PCs have joined this PC.").color(DIM));
+                }
+                Some(list) => {
+                    egui::Grid::new("registered_pcs_grid").num_columns(5).striped(true).spacing(egui::vec2(18.0, 8.0)).show(ui, |ui| {
+                        for h in ["PC", "Joined", "Last seen", "Status", ""] {
+                            ui.label(RichText::new(h).strong());
+                        }
+                        ui.end_row();
+                        for i in list {
+                            ui.label(i.name.as_str());
+                            ui.label(when(i.created_at));
+                            ui.label(i.last_seen.map_or("never".to_owned(), when));
+                            ui.horizontal(|ui| {
+                                if i.in_use {
+                                    ui.colored_label(WARN, "in use");
+                                }
+                                if i.connected {
+                                    ui.colored_label(GOOD, "online");
+                                }
+                            });
+                            let why = if i.is_this_pc { "This is this PC's own login; it cannot be retired." } else if i.in_use { "This PC is in use; it cannot be retired." } else { "" };
+                            let mut btn = ui.add_enabled(idle && !i.in_use && !i.is_this_pc, egui::Button::new("Retire").small());
+                            if !why.is_empty() {
+                                btn = btn.on_disabled_hover_text(why);
+                            }
+                            if btn.clicked() {
+                                ask = Some(vec![i.id.clone()]);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                }
+            }
+            ask
+        });
+        if let Some(Some(ids)) = resp.body_returned {
+            self.retire_ask = Some(ids);
+        }
+        let open = resp.openness > 0.0;
+        if open && !self.installs_open {
+            self.push(Op::ServiceInstallations, json!({}), Pend::Installs);
+        }
+        self.installs_open = open;
     }
 }
 
