@@ -202,6 +202,8 @@ pub enum Action {
     DefaultSubmit(String),
     Remove(String),
     CancelJob { creds: String, job_id: String },
+    /// A send the PC never accepted: take it back and put the shot at the end of the Automatic list.
+    Resend { creds: String, submission_id: String },
     ForgetAttempt(String),
     Prefer { creds: String, url: String },
 }
@@ -670,6 +672,18 @@ impl Remote {
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.job_id.as_deref() == Some(job_id)) { j.cancel_requested = true; }
             }
         }
+    }
+    /// Take back a send this PC never accepted (no job id yet); false if it was accepted meanwhile.
+    pub fn take_unsent(&mut self, submission_id: &str) -> bool {
+        let Some(i) = self.jobs.iter().position(|j| j.submission_id == submission_id && j.job_id.is_none() && !j.terminal()) else { return false };
+        self.jobs.remove(i);
+        let key = self.key.clone();
+        self.write_jobs(Path::new(&key));
+        true
+    }
+    /// A send of ours that this connection still follows.
+    pub(crate) fn tracks(&self, submission_id: &str) -> bool {
+        self.jobs.iter().any(|j| j.submission_id == submission_id && !j.terminal())
     }
     pub fn receiving(&self) -> Option<String> {
         match &self.rx {
@@ -1733,11 +1747,13 @@ impl Remote {
     }
 
     /// Free for Automatic: none of our jobs queued or running on it, and its last reported load is under 50%.
-    /// The sample must be fresh: an unknown or stale age is not free.
+    /// The PC must have answered just now: the sample's age counts from its measurement to this moment, so a list kept
+    /// from before a dropped link (or a link that connects but never answers) goes stale and is not free.
     pub(crate) fn is_free(&self, iid: &str) -> bool {
-        !self.has_unfinished(iid)
+        self.online() && !self.has_unfinished(iid)
             && self.installs.iter().find(|i| i.id == iid).is_some_and(|i| {
-                i.connected && matches!(Sample::from_api(&i.stats), Ok(Some((s, Some(age)))) if age <= crate::metrics::REMOTE_STALE_S && lightly_loaded(&s))
+                i.connected && matches!(Sample::from_api(&i.stats), Ok(Some((s, Some(age))))
+                    if age + i.received.elapsed().as_secs_f64() <= crate::metrics::REMOTE_STALE_S && lightly_loaded(&s))
             })
     }
 
@@ -1795,6 +1811,8 @@ impl Remote {
                         ui.colored_label(if j.state == "failed" { egui::Color32::from_rgb(225, 110, 110) } else { DIM }, RichText::new(&j.state).size(11.0));
                         if let (Some(id), false) = (&j.job_id, j.terminal()) {
                             if ui.add_enabled(!j.cancel_requested, egui::Button::new(if j.cancel_requested { "Stopping" } else { "Cancel" }).small()).clicked() { actions.push(Action::CancelJob { creds: self.key.clone(), job_id: id.clone() }); }
+                        } else if !j.terminal() && ui.small_button("Send again").on_hover_text("This PC has not accepted it yet: take it back and give it to the next free PC (end of the Automatic list).").clicked() {
+                            actions.push(Action::Resend { creds: self.key.clone(), submission_id: j.submission_id.clone() });
                         }
                     });
                     if j.stages.is_empty() { ui.label(RichText::new(&j.state).color(DIM)); }
@@ -1981,6 +1999,7 @@ mod discovery_tests {
         let mut r = Remote::blank(Source::Off, String::new());
         let stats = json!({"gpus": [gpu(Some(10.0), 10, 100)], "measured_age_s": age});
         r.installs = vec![Install { id: "X".into(), name: "X".into(), gpu: None, connected, last_seen_s: None, stats, received: Instant::now() }];
+        r.phase = Phase::Online;
         r
     }
     fn job_on(iid: &str, state: &str) -> NetJob {
@@ -1990,9 +2009,15 @@ mod discovery_tests {
     #[test]
     fn is_free_needs_a_fresh_sample_and_no_unfinished_job() {
         assert!(free_remote(1.0, true).is_free("X"));
-        assert!(free_remote(crate::metrics::REMOTE_STALE_S, true).is_free("X"), "exactly at the limit is still fresh");
+        assert!(free_remote(crate::metrics::REMOTE_STALE_S - 0.5, true).is_free("X"), "just under the limit is still fresh");
         assert!(!free_remote(crate::metrics::REMOTE_STALE_S + 0.1, true).is_free("X"), "stale");
         assert!(!free_remote(1.0, false).is_free("X"), "not connected");
+        let mut r = free_remote(1.0, true);
+        r.installs[0].received = Instant::now() - Duration::from_secs(20);
+        assert!(!r.is_free("X"), "a list kept from before the link dropped is stale, however fresh it was then");
+        let mut r = free_remote(1.0, true);
+        r.phase = Phase::Connecting;
+        assert!(!r.is_free("X"), "offline connection");
         assert!(!free_remote(1.0, true).is_free("other"), "unknown PC");
         let mut r = free_remote(1.0, true);
         r.installs[0].stats = json!({"gpus": [gpu(Some(10.0), 10, 100)]});

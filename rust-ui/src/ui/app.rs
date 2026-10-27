@@ -2784,6 +2784,11 @@ impl App {
             }
             Action::Remove(creds) => self.remove_confirm = Some(creds),
             Action::CancelJob { creds, job_id } => self.remote.cancel_job(&creds, &job_id),
+            Action::Resend { creds, submission_id } => {
+                if self.remote.take_unsent(&creds, &submission_id) && !self.ai.requeue_sent(&submission_id) {
+                    self.ai.notice = Some("Taken back. It was sent before the app restarted, so select the clip and Key it again.".into());
+                }
+            }
             Action::ForgetAttempt(creds) => self.remote.forget_attempt(&creds),
             Action::Prefer { creds, url } => {
                 if let Some(c) = self.net_draft().connections.iter_mut().find(|c| c.credentials == creds) {

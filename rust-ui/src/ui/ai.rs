@@ -298,6 +298,7 @@ pub enum Choice {
     Replace,
 }
 
+#[derive(Clone)]
 #[allow(clippy::large_enum_variant)] // a handful of short-lived review rows
 enum RowState {
     Ready(Plan),
@@ -311,6 +312,7 @@ enum RowState {
 }
 
 /// A confirmed Automatic shot with everything its submit needs once a PC is free.
+#[derive(Clone)]
 struct AutoShot {
     row: BatchRow,
     plan: Plan,
@@ -321,6 +323,7 @@ struct AutoShot {
     tries: u8,
 }
 
+#[derive(Clone)]
 struct BatchRow {
     /// Hint-generation steps queued ahead of Key (each depends on the one before; Key on the last).
     steps: Vec<crate::tasks::TaskJob>,
@@ -359,6 +362,7 @@ struct RowBase {
 }
 
 /// The video export that follows Key for this clip (built from the chosen Key plan at confirmation).
+#[derive(Clone)]
 struct RowExport {
     cfg: presets::PipelineExport,
     /// `(product, file)` per Video delivery, in the order they run after Key.
@@ -542,6 +546,8 @@ pub struct AiUi {
     /// Confirmed Automatic shots waiting for a free PC, in order.
     // ponytail: dropped on quit, not saved; the user confirms them again.
     auto_pending: std::collections::VecDeque<AutoShot>,
+    /// Each network send's shot by submission id, while a connection follows it: "Send again" puts it back in Automatic.
+    sent_shots: std::collections::HashMap<String, AutoShot>,
     /// Why the last Automatic dispatch left shots waiting (shown after "Waiting for a free PC").
     auto_wait: Option<String>,
     /// How many clients are Automatic candidates (Connect + Accept work, online); set before each dispatch.
@@ -684,6 +690,7 @@ impl AiUi {
             net_online: false,
             net_outbox: vec![],
             auto_pending: Default::default(),
+            sent_shots: Default::default(),
             auto_wait: None,
             auto_clients: 0,
             refresh_clips: vec![],
@@ -2871,6 +2878,9 @@ impl AiUi {
         let res = if let Some(target) = network_target(&r.placement) {
             self.network_row(project, st, preset_name, r, &p, Some(target.to_owned())).map(|n| {
                 let id = n.submission_id.clone();
+                let mut row = r.clone();
+                row.placement = Placement::Auto;
+                self.sent_shots.insert(id.clone(), AutoShot { row, plan: p.clone(), project: project.clone(), st: st.clone(), preset_name: preset_name.map(str::to_owned), tries: 0 });
                 self.net_outbox.push(n);
                 id
             })
@@ -2950,6 +2960,18 @@ impl AiUi {
             View::Starting => "this PC's GPU load is unknown: starting".into(),
             View::Stale { .. } => "this PC's GPU load is unknown: the reading is stale".into(),
         })
+    }
+
+    /// A send its PC never accepted goes to the end of the Automatic list; false if this session did not send it.
+    pub fn requeue_sent(&mut self, submission_id: &str) -> bool {
+        let Some(a) = self.sent_shots.remove(submission_id) else { return false };
+        self.notice = Some(format!("{}: back in Automatic, it goes to the next free PC.", a.row.clip.display_name));
+        self.auto_pending.push_back(a);
+        true
+    }
+    /// Forget the shots of sends no connection follows any more (finished, cancelled or never routed).
+    pub fn keep_sent(&mut self, followed: impl Fn(&str) -> bool) {
+        self.sent_shots.retain(|sid, _| followed(sid));
     }
 
     /// Drop the Automatic shots still waiting for a free PC.
@@ -3613,6 +3635,29 @@ mod tests {
         let mut to: Vec<_> = sent.iter().map(|n| n.target.clone().unwrap()).collect();
         to.sort();
         assert_eq!(to, ["n/a", "n/b"]);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn send_again_puts_the_shot_at_the_end_of_automatic_and_the_next_free_pc_gets_it() {
+        let (mut ai, d) = auto_fixture("again", 2);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into()), ("n/b".into(), "B".into())];
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        let sent = ai.take_net_outbox().remove(0);
+        assert_eq!(ai.auto_pending.len(), 1);
+        assert!(ai.requeue_sent(&sent.submission_id));
+        assert_eq!(ai.auto_pending.len(), 2, "back in the list");
+        assert_eq!(ai.auto_pending.back().unwrap().row.clip.display_name, sent.name, "at the end");
+        assert!(matches!(ai.auto_pending.back().unwrap().row.placement, Placement::Auto));
+        assert!(!ai.requeue_sent(&sent.submission_id), "taken back once");
+        ai.auto_pending.pop_front();
+        ai.dispatch_auto(&["network:n/b".into()], &busy_view());
+        let again = ai.take_net_outbox();
+        assert_eq!((again.len(), again[0].target.as_deref()), (1, Some("n/b")), "resent to the next free PC");
+        assert_ne!(again[0].submission_id, sent.submission_id, "a new send, not the old one");
+        ai.keep_sent(|_| false);
+        assert!(!ai.requeue_sent(&again[0].submission_id), "no longer followed: forgotten");
         let _ = std::fs::remove_dir_all(d);
     }
 

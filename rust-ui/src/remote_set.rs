@@ -122,6 +122,8 @@ impl RemoteSet {
                 Err(e) => env.ai.notice = Some(format!("{}: not sent, {e}.", n.name)),
             }
         }
+        // After routing, so this tick's new sends are already followed.
+        env.ai.keep_sent(|sid| self.remotes.iter().any(|r| r.tracks(sid)));
         // One offer/claim/attempt at a time across networks; the next claimer is the next ready network after the last.
         let n = self.remotes.len();
         let chosen = if self.remotes.iter().any(Remote::claim_busy) {
@@ -163,6 +165,10 @@ impl RemoteSet {
         if let Some(r) = self.get(creds) {
             r.cancel_job(job_id);
         }
+    }
+    /// Take back a send its PC never accepted (see `Remote::take_unsent`).
+    pub fn take_unsent(&mut self, creds: &str, submission_id: &str) -> bool {
+        self.get(creds).is_some_and(|r| r.take_unsent(submission_id))
     }
     pub fn clear_finished(&mut self) {
         self.remotes.iter_mut().for_each(Remote::clear_finished);
