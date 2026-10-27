@@ -684,9 +684,11 @@ impl Remote {
         self.write_jobs(Path::new(&key));
         true
     }
-    /// A send of ours that this connection still follows.
-    pub(crate) fn tracks(&self, submission_id: &str) -> bool {
-        self.jobs.iter().any(|j| j.submission_id == submission_id && !j.terminal())
+    /// A send of ours this connection follows: `Ok(())` while it runs, `Err(None)` once it ended without failing
+    /// (done or cancelled), `Err(Some(why))` once it failed. `None` = not followed here.
+    pub(crate) fn sent_outcome(&self, submission_id: &str) -> Option<Result<(), Option<String>>> {
+        let j = self.jobs.iter().find(|j| j.submission_id == submission_id)?;
+        Some(if !j.terminal() { Ok(()) } else if j.state == "failed" { Err(Some(j.reason.clone().unwrap_or_else(|| "failed".into()))) } else { Err(None) })
     }
     pub fn receiving(&self) -> Option<String> {
         match &self.rx {

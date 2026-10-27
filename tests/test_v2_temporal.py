@@ -130,3 +130,10 @@ def test_auto_low_policy():
     tiny = vt.estimate_temporal_window(3840, 2160, 200, "auto", "low", 0.5)
     assert (tiny.chunk, tiny.stride, tiny.low_vram) == (1, 1, True)
     assert tiny.over_budget
+
+
+def test_auto_never_picks_a_window_that_ran_a_24gb_card_out_of_memory():
+    # Measured: 3200x1800, 24-frame normal window, ~22 GiB free -> over 20.9 GiB needed (estimate said 19.4).
+    chunk, _, low, est = rt.select_vram_profile((1800, 3200), 98, 22.0)
+    assert (chunk, low) != (24, False), (chunk, low, est)
+    assert est * rt._VRAM_MARGIN_SCALE + rt._VRAM_MARGIN_GB <= 22.0

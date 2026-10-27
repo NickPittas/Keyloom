@@ -242,3 +242,31 @@ def test_progress_cancel_forwarded_and_propagates(env):
     env.run_exc = Cancelled("stop")
     with pytest.raises(Cancelled):
         run(env)
+
+
+def test_auto_retries_with_the_next_smaller_window_on_out_of_memory(env, monkeypatch):
+    seen = []
+    real = rt.run_inference
+
+    def oom_once(m, inp, out, cfg, wcfg, **kw):
+        if cfg.auto_vram:  # what apply_auto_vram picks inside the real run, then the GPU runs out
+            cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = 24, 12, False
+            seen.append((cfg.hann_chunk, cfg.low_vram, True))
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 1.65 GiB")
+        seen.append((cfg.hann_chunk, cfg.low_vram, False))
+        return real(m, inp, out, cfg, wcfg, **kw)
+
+    monkeypatch.setattr(rt, "run_inference", oom_once)
+    status = []
+    res = run(env, on_status=status.append)
+    assert seen == [(24, False, True), (24, True, False)], seen
+    assert (res.hann_chunk, res.low_vram) == (24, True)
+    assert any("retrying with 24 frames (low VRAM)" in w for w in res.warnings), res.warnings
+    assert status and "Out of GPU memory" in status[-1]
+
+
+def test_a_fixed_window_is_never_changed_on_out_of_memory(env, monkeypatch):
+    env.run_exc = torch.OutOfMemoryError("CUDA out of memory")
+    with pytest.raises(torch.OutOfMemoryError):
+        run(env, InferenceParams(temporal_window="8/4"))
+    assert len(env.runs) == 1, "no retry with another window"

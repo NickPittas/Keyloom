@@ -85,6 +85,26 @@ def _low_vram_window_fits(shape_hw, num_frames, budget_gb) -> bool:
         for chunk in rt._VRAM_PEAK_GB[True][0])
 
 
+def _is_oom(exc: BaseException) -> bool:
+    try:
+        import torch
+        if isinstance(exc, torch.OutOfMemoryError):
+            return True
+    except (ImportError, AttributeError):
+        pass
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def _next_smaller_window(chunk: int, low_vram: bool):
+    """The window `auto` would try after (chunk, low_vram), in its own search order (biggest first, normal before
+    low VRAM at each size); None when it was already the smallest."""
+    from CorridorKeyV2.corridorkey import runtime as rt
+    table = rt._VRAM_PEAK_GB
+    order = [(c, low) for c in reversed(table[True][0]) for low in (False, True) if c in table[low][0]]
+    i = order.index((chunk, low_vram)) if (chunk, low_vram) in order else -1
+    return order[i + 1] if 0 <= i < len(order) - 1 else None
+
+
 def _free_gpu_memory() -> None:
     gc.collect()
     try:
@@ -327,12 +347,35 @@ class CorridorKeyV2Engine:
         rt.configure_low_vram_inference(self._model, rt.InferenceConfig(
             low_vram_mlp_chunk_tokens=0, low_vram_enc_frame_chunk=0,
             low_vram_swin_window_batch=0, low_vram_full_attn_query_chunk_tokens=0))
-        with _offline_env():
-            rt.run_inference(
-                self._model, str(input_path), str(output_dir), cfg,
-                WriterConfig(ffmpeg_bin=ffmpeg_bin),
-                initial_hint_path=eng_initial, hint_video_path=eng_video,
-                on_progress=on_progress, check_cancel=check_cancel)
+        # `auto` picks its window from an estimate; when the GPU runs out anyway, the next smaller window is
+        # tried (same search order) instead of failing the shot. A window the user fixed is never changed.
+        auto = cfg.auto_vram
+        while True:
+            failed = None
+            try:
+                with _offline_env():
+                    rt.run_inference(
+                        self._model, str(input_path), str(output_dir), cfg,
+                        WriterConfig(ffmpeg_bin=ffmpeg_bin),
+                        initial_hint_path=eng_initial, hint_video_path=eng_video,
+                        on_progress=on_progress, check_cancel=check_cancel)
+                break
+            except Exception as exc:
+                nxt = _next_smaller_window(cfg.hann_chunk, cfg.low_vram) if auto and _is_oom(exc) else None
+                if nxt is None:
+                    raise
+                failed = (cfg.hann_chunk, cfg.low_vram)
+            # Outside the except block, so the failed run's tensors (held by the traceback) can be freed.
+            _free_gpu_memory()
+            cfg.auto_vram = False
+            cfg.hann_chunk, cfg.low_vram = nxt
+            cfg.hann_stride = max(1, nxt[0] // 2)
+            msg = (f"Out of GPU memory with a {failed[0]}-frame window ({'low' if failed[1] else 'normal'} VRAM); "
+                   f"retrying with {nxt[0]} frames ({'low' if nxt[1] else 'normal'} VRAM)")
+            logger.warning(msg)
+            self.last_warnings.append(msg)
+            if on_status:
+                on_status(msg)
         clip = raw_clip_name(str(input_path))
         settings = os.path.join(str(output_dir), f"{clip}_settings.txt")
         return V2RunResult(

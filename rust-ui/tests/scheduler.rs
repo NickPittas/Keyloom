@@ -318,7 +318,11 @@ fn dependency_runs_after_success_and_fails_after_failure() {
             "{mode}: {:?}", state(&s, &d)
         );
         assert!(!base.join(&d).exists());
+        // The chain's outcome is the failed prerequisite itself, not the dependent's "did not start".
+        let first = s.chain_outcome(&d).expect("ended").unwrap_err();
+        assert!(!matches!(first, JobState::Failed { .. } | JobState::Cancelled), "{mode}: {first:?}");
     }
+    assert_eq!(s.chain_outcome("b"), Some(Ok(())));
     s.submit(sub(job(&base, "pc", 1, "ok"), Placement::Auto))
         .unwrap();
     s.submit(Submit {
@@ -329,6 +333,7 @@ fn dependency_runs_after_success_and_fails_after_failure() {
     s.cancel("pc");
     settle(&mut s, &["dc"]);
     assert!(matches!(state(&s, "dc"), JobState::Failed { .. }));
+    assert_eq!(s.chain_outcome("dc"), Some(Err(JobState::Cancelled)), "a cancel stays a cancel");
     std::fs::remove_dir_all(base).unwrap();
 }
 

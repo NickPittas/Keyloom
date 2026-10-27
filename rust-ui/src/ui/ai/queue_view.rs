@@ -342,6 +342,35 @@ impl AiUi {
         QueueRun { client: jobs.first().map(|f| f.client.clone()).unwrap_or_else(|| "This computer".into()), rows, active, reason }
     }
 
+    /// Automatic's waiting shots, in the order they are handed out: each can be paused, resumed or cancelled.
+    fn auto_waiting_ui(&mut self, ui: &mut Ui) {
+        let why = self.auto_wait.as_deref().map(|w| format!(": {w}")).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Waiting for a free PC ({}){why}", self.auto_pending.len())).strong());
+            if ui.small_button("Cancel all").clicked() {
+                self.cancel_auto();
+            }
+        });
+        let (mut toggle, mut drop) = (None, None);
+        for (i, a) in self.auto_pending.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                let mut line = a.row.clip.display_name.clone();
+                if a.paused { line += " · paused"; }
+                if !a.failed_on.is_empty() {
+                    let pcs: Vec<String> = a.failed_on.iter().map(|p| self.pc_label(p)).collect();
+                    line += &format!(" · failed on {}, waits for another PC", pcs.join(", "));
+                }
+                ui.add(egui::Label::new(RichText::new(line).size(12.0)).truncate());
+                if ui.small_button(if a.paused { "Resume" } else { "Pause" }).clicked() { toggle = Some(i); }
+                if ui.small_button("Cancel").clicked() { drop = Some(i); }
+            });
+        }
+        if let Some(i) = toggle { self.auto_pending[i].paused ^= true; }
+        if let Some(i) = drop { self.auto_pending.remove(i); }
+        ui.add_space(6.0);
+    }
+
     /// Board queue: one block per clip. Active, queued and unresolved clips are always shown; only finished
     /// whole clips are limited (newest 12).
     pub fn queue_ui(&mut self, ui: &mut Ui, local: &crate::metrics::View, active: &[u32]) {
@@ -349,13 +378,7 @@ impl AiUi {
         let w = ui.available_width();
         ui.set_max_width(w);
         if !self.auto_pending.is_empty() {
-            ui.horizontal(|ui| {
-                let why = self.auto_wait.as_deref().map(|w| format!(": {w}")).unwrap_or_default();
-                ui.label(format!("Waiting for a free PC ({}){why}", self.auto_pending.len()));
-                if ui.small_button("Cancel").clicked() {
-                    self.cancel_auto();
-                }
-            });
+            self.auto_waiting_ui(ui);
         }
         let all = self.queue_view();
         let mut clients = vec![];

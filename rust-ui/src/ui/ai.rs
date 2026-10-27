@@ -321,6 +321,29 @@ struct AutoShot {
     preset_name: Option<String>,
     /// Failed sends so far; after 3 the shot is dropped with a notice so it cannot block the list.
     tries: u8,
+    /// PCs whose run of this shot failed (`LOCAL_PC` or a `network:` id): never given to them again.
+    failed_on: Vec<String>,
+    /// Held in the waiting list by the user; not given to any PC until resumed.
+    paused: bool,
+    /// The PC Automatic gave it to while it runs there (`None` for a manual send).
+    on: Option<String>,
+}
+
+/// Automatic's key for this computer in `AutoShot::failed_on`/`on`.
+const LOCAL_PC: &str = "local";
+/// A shot that failed on this many PCs leaves Automatic with a notice.
+const AUTO_MAX_FAILED_PCS: usize = 3;
+
+/// Why a chain's deciding step failed, if Automatic should try another PC. A cancel is the user's choice, and a
+/// lost run whose writer is not proven stopped may still be writing to the clip: neither goes to another PC.
+fn failure_of(st: &JobState) -> Option<String> {
+    match st {
+        JobState::Failed { reason } => Some(reason.clone()),
+        JobState::Rejected { message, .. } => Some(message.clone()),
+        JobState::Lost { reason, writer_stopped: true, .. } => Some(reason.clone()),
+        JobState::Done { info, .. } if info.outcome == crate::worker::Outcome::Failed => Some(info.message.clone().unwrap_or_else(|| "failed".into())),
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -548,6 +571,8 @@ pub struct AiUi {
     auto_pending: std::collections::VecDeque<AutoShot>,
     /// Each network send's shot by submission id, while a connection follows it: "Send again" puts it back in Automatic.
     sent_shots: std::collections::HashMap<String, AutoShot>,
+    /// Automatic shots running on this computer, by the id of their chain's last job.
+    auto_live: Vec<(String, AutoShot)>,
     /// Why the last Automatic dispatch left shots waiting (shown after "Waiting for a free PC").
     auto_wait: Option<String>,
     /// How many clients are Automatic candidates (Connect + Accept work, online); set before each dispatch.
@@ -691,6 +716,7 @@ impl AiUi {
             net_outbox: vec![],
             auto_pending: Default::default(),
             sent_shots: Default::default(),
+            auto_live: vec![],
             auto_wait: None,
             auto_clients: 0,
             refresh_clips: vec![],
@@ -2846,12 +2872,12 @@ impl AiUi {
                 continue;
             }
             if matches!(r.placement, Placement::Auto) {
-                self.auto_pending.push_back(AutoShot { row: r, plan: p, project: b.project.clone(), st: b.st.clone(), preset_name: b.preset_name.clone(), tries: 0 });
+                self.auto_pending.push_back(AutoShot { row: r, plan: p, project: b.project.clone(), st: b.st.clone(), preset_name: b.preset_name.clone(), tries: 0, failed_on: vec![], paused: false, on: None });
                 waiting += 1;
                 continue;
             }
             match self.submit_row(&b.project, &b.st, b.preset_name.as_deref(), &r, p) {
-                Ok(()) => {
+                Ok(_) => {
                     queued += 1;
                     *per_client.entry(self.placement_text(&r.placement)).or_default() += 1;
                 }
@@ -2874,13 +2900,14 @@ impl AiUi {
     }
 
     /// Route one planned shot by its placement (network PC, hint pipeline, single plan or chain) and remember its edits.
-    fn submit_row(&mut self, project: &Project, st: &Settings, preset_name: Option<&str>, r: &BatchRow, p: Plan) -> Result<(), String> {
+    /// Returns the id that follows it: the chain's last local job, or the network submission.
+    fn submit_row(&mut self, project: &Project, st: &Settings, preset_name: Option<&str>, r: &BatchRow, p: Plan) -> Result<String, String> {
         let res = if let Some(target) = network_target(&r.placement) {
             self.network_row(project, st, preset_name, r, &p, Some(target.to_owned())).map(|n| {
                 let id = n.submission_id.clone();
                 let mut row = r.clone();
                 row.placement = Placement::Auto;
-                self.sent_shots.insert(id.clone(), AutoShot { row, plan: p.clone(), project: project.clone(), st: st.clone(), preset_name: preset_name.map(str::to_owned), tries: 0 });
+                self.sent_shots.insert(id.clone(), AutoShot { row, plan: p.clone(), project: project.clone(), st: st.clone(), preset_name: preset_name.map(str::to_owned), tries: 0, failed_on: vec![], paused: false, on: None });
                 self.net_outbox.push(n);
                 id
             })
@@ -2891,7 +2918,7 @@ impl AiUi {
         } else {
             self.submit_chain(&r.clip, r.steps.clone(), Some((p, r.params.clone(), r.out.clone())))
         };
-        res?;
+        let id = res?;
         if preset_name.is_some() || r.hint.is_some() {
             // The baked values equal the shot's overrides where it has any: keep their markers.
             let old = self.drafts.get(&r.clip.folder);
@@ -2905,7 +2932,7 @@ impl AiUi {
             }
             self.drafts.insert(r.clip.folder.clone(), nd);
         }
-        Ok(())
+        Ok(id)
     }
 
     /// Hand ONE waiting Automatic shot to each free PC: remote ones in `free_remote` (`network:` ids), then this computer.
@@ -2913,6 +2940,7 @@ impl AiUi {
     /// list is never split up front: a finished PC just takes the next shot.
     pub fn dispatch_auto(&mut self, free_remote: &[String], local: &crate::metrics::View) {
         self.auto_wait = None;
+        self.settle_auto_local();
         if self.auto_pending.is_empty() || self.model_mutation_active {
             return;
         }
@@ -2920,12 +2948,28 @@ impl AiUi {
         let local_free = !self.sched.running() && matches!(local, crate::metrics::View::Live(s) if crate::remote::lightly_loaded(s));
         let pcs = local_free.then_some(None).into_iter().chain(free_remote.iter().map(|id| Some(id.clone())));
         for pc in pcs {
-            let Some(mut a) = self.auto_pending.pop_front() else { break };
+            let key = pc.clone().unwrap_or_else(|| LOCAL_PC.into());
+            // The first waiting shot this PC may take: not paused, and never one that already failed on it.
+            let Some(i) = self.auto_pending.iter().position(|a| !a.paused && !a.failed_on.contains(&key)) else { continue };
+            let Some(mut a) = self.auto_pending.remove(i) else { break };
             let automatic = a.row.placement.clone();
             if let Some(id) = &pc {
                 a.row.placement = Placement::Target(id.clone());
             }
-            if let Err(e) = self.submit_row(&a.project, &a.st, a.preset_name.as_deref(), &a.row, a.plan.clone()) {
+            let sent = self.submit_row(&a.project, &a.st, a.preset_name.as_deref(), &a.row, a.plan.clone());
+            if let Ok(id) = &sent {
+                // Followed to its end: a failure brings it back for another PC.
+                a.row.placement = automatic.clone();
+                a.on = Some(key.clone());
+                if pc.is_none() {
+                    self.auto_live.push((id.clone(), a));
+                } else if let Some(s) = self.sent_shots.get_mut(id) {
+                    s.on = Some(key);
+                    s.failed_on = a.failed_on;
+                }
+                continue;
+            }
+            if let Err(e) = sent {
                 // A refused PC (this one included) is not necessarily the shot's fault: it waits, and the next PC in
                 // this tick gets it. The error text can't tell a bad plan from a busy PC, so it is never dropped silently.
                 a.row.placement = automatic;
@@ -2941,7 +2985,7 @@ impl AiUi {
                 self.auto_pending.push_back(a);
             }
         }
-        self.auto_wait = (!self.auto_pending.is_empty()).then(|| {
+        self.auto_wait = self.auto_pending.iter().any(|a| !a.paused).then(|| {
             let clients = if self.auto_clients > 0 { "every client is busy or over 50%" } else { "no client with Connect + Accept work is online" };
             [self.local_wait(local), Some(clients.to_owned())].into_iter().flatten().collect::<Vec<_>>().join("; ")
         });
@@ -2964,14 +3008,67 @@ impl AiUi {
 
     /// A send its PC never accepted goes to the end of the Automatic list; false if this session did not send it.
     pub fn requeue_sent(&mut self, submission_id: &str) -> bool {
-        let Some(a) = self.sent_shots.remove(submission_id) else { return false };
+        let Some(mut a) = self.sent_shots.remove(submission_id) else { return false };
+        a.on = None;
         self.notice = Some(format!("{}: back in Automatic, it goes to the next free PC.", a.row.clip.display_name));
         self.auto_pending.push_back(a);
         true
     }
-    /// Forget the shots of sends no connection follows any more (finished, cancelled or never routed).
-    pub fn keep_sent(&mut self, followed: impl Fn(&str) -> bool) {
-        self.sent_shots.retain(|sid, _| followed(sid));
+
+    /// Local Automatic shots whose chain ended: a failure goes back for another PC, anything else is done.
+    fn settle_auto_local(&mut self) {
+        for (id, a) in std::mem::take(&mut self.auto_live) {
+            match self.sched.chain_outcome(&id) {
+                None if self.sched.state_of(&id).is_some() => self.auto_live.push((id, a)),
+                Some(Err(st)) => match failure_of(&st) {
+                    Some(why) => self.auto_failed(a, &why),
+                    None => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    /// Network Automatic shots: `outcome(sid)` is the connection's view (see `Remote::sent_outcome`). A failed one
+    /// goes back for another PC; a finished, cancelled or no longer followed one is forgotten.
+    pub fn settle_sent(&mut self, outcome: impl Fn(&str) -> Option<Result<(), Option<String>>>) {
+        let ids: Vec<String> = self.sent_shots.keys().cloned().collect();
+        for sid in ids {
+            match outcome(&sid) {
+                Some(Ok(())) => {}
+                Some(Err(Some(why))) => {
+                    let a = self.sent_shots.remove(&sid).expect("listed");
+                    if a.on.is_some() { self.auto_failed(a, &why) }
+                }
+                _ => { self.sent_shots.remove(&sid); }
+            }
+        }
+    }
+
+    /// A shot's run failed on `a.on`: to the end of the list, never to that PC again; dropped after
+    /// `AUTO_MAX_FAILED_PCS` PCs so a broken shot cannot go round forever.
+    fn auto_failed(&mut self, mut a: AutoShot, why: &str) {
+        let pc = a.on.take().unwrap_or_else(|| LOCAL_PC.into());
+        let name = a.row.clip.display_name.clone();
+        let label = self.pc_label(&pc);
+        a.failed_on.push(pc);
+        a.tries = 0;
+        a.row.placement = Placement::Auto;
+        if a.failed_on.len() >= AUTO_MAX_FAILED_PCS {
+            self.notice = Some(format!("{name}: failed on {label} ({why}); it failed on {AUTO_MAX_FAILED_PCS} PCs, removed from Automatic."));
+            return;
+        }
+        self.notice = Some(format!("{name}: failed on {label} ({why}); back in Automatic for another PC."));
+        self.auto_pending.push_back(a);
+    }
+
+    /// A PC as people know it: "this PC", or the client's name for a `network:` id.
+    fn pc_label(&self, pc: &str) -> String {
+        if pc == LOCAL_PC {
+            return "this PC".into();
+        }
+        let id = pc.strip_prefix("network:").unwrap_or(pc);
+        self.net_targets.iter().find(|(t, _)| t == id).map(|(_, n)| n.split(" · ").next().unwrap_or(n).trim_end_matches(" (offline)").to_owned()).unwrap_or_else(|| id.to_owned())
     }
 
     /// Drop the Automatic shots still waiting for a free PC.
@@ -3614,7 +3711,7 @@ mod tests {
                 base: None,
                 location: None,
             };
-            ai.auto_pending.push_back(AutoShot { row, plan, project: p.clone(), st: st.clone(), preset_name: None, tries: 0 });
+            ai.auto_pending.push_back(AutoShot { row, plan, project: p.clone(), st: st.clone(), preset_name: None, tries: 0, failed_on: vec![], paused: false, on: None });
         }
         (ai, d)
     }
@@ -3656,8 +3753,50 @@ mod tests {
         let again = ai.take_net_outbox();
         assert_eq!((again.len(), again[0].target.as_deref()), (1, Some("n/b")), "resent to the next free PC");
         assert_ne!(again[0].submission_id, sent.submission_id, "a new send, not the old one");
-        ai.keep_sent(|_| false);
+        ai.settle_sent(|_| None);
         assert!(!ai.requeue_sent(&again[0].submission_id), "no longer followed: forgotten");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_failed_shot_goes_to_the_end_and_never_back_to_the_pc_it_failed_on() {
+        let (mut ai, d) = auto_fixture("refail", 2);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into()), ("n/b".into(), "B".into())];
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        let sent = ai.take_net_outbox().remove(0);
+        ai.settle_sent(|sid| (sid == sent.submission_id).then_some(Err(Some("CUDA out of memory".into()))));
+        assert_eq!(ai.auto_pending.len(), 2);
+        let back = ai.auto_pending.back().unwrap();
+        assert_eq!((back.row.clip.display_name.as_str(), back.failed_on.as_slice()), (sent.name.as_str(), &["network:n/a".to_owned()][..]), "at the end, marked");
+        assert!(ai.notice.as_deref().unwrap().contains("failed on A (CUDA out of memory); back in Automatic"), "{:?}", ai.notice);
+        ai.auto_pending.pop_front(); // only the failed shot is left
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        assert!(ai.take_net_outbox().is_empty(), "never back to the PC it failed on: it waits");
+        assert_eq!(ai.auto_pending.len(), 1);
+        ai.dispatch_auto(&["network:n/a".into(), "network:n/b".into()], &busy_view());
+        let again = ai.take_net_outbox();
+        assert_eq!((again.len(), again[0].target.as_deref()), (1, Some("n/b")), "another PC takes it");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_cancelled_or_finished_send_is_not_requeued_and_a_paused_shot_waits() {
+        let (mut ai, d) = auto_fixture("pause", 2);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into())];
+        ai.auto_pending[0].paused = true;
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        let sent = ai.take_net_outbox();
+        assert_eq!(sent.len(), 1, "the paused first shot is skipped, the next one goes");
+        assert!(ai.auto_pending[0].paused && ai.auto_pending.len() == 1);
+        ai.settle_sent(|_| Some(Err(None))); // cancelled by the user
+        assert_eq!(ai.auto_pending.len(), 1, "a cancel never comes back");
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        assert!(ai.take_net_outbox().is_empty(), "still paused");
+        ai.auto_pending[0].paused = false;
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        assert_eq!(ai.take_net_outbox().len(), 1, "resumed");
         let _ = std::fs::remove_dir_all(d);
     }
 

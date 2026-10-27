@@ -717,6 +717,32 @@ impl Scheduler {
         format!("{what} {why}")
     }
 
+    /// How the chain ending in `id` ended: `None` while it runs (or the id is unknown), `Ok` when every step
+    /// completed, else the state of the EARLIEST step that did not (a cancel shows as `Cancelled`, not as the
+    /// "did not start" of the steps after it).
+    pub fn chain_outcome(&self, id: &str) -> Option<Result<(), JobState>> {
+        let st = self.state_of(id)?;
+        if !st.is_terminal() {
+            return None;
+        }
+        if st.completed() {
+            return Some(Ok(()));
+        }
+        let (mut cur, mut root) = (id.to_owned(), st.clone());
+        let after = |i: &str| -> Vec<String> {
+            self.jobs.iter().find(|e| e.job.job_id == i).map(|e| e.after.clone())
+                .or_else(|| self.tasks.iter().find(|t| t.job.job_id == i).map(|t| t.after.clone()))
+                .unwrap_or_default()
+        };
+        // Bounded: a chain is acyclic and no longer than the jobs known.
+        for _ in 0..=self.jobs.len() + self.tasks.len() {
+            let Some(d) = after(&cur).into_iter().find(|d| self.state_of(d).is_some_and(|s| !s.completed())) else { break };
+            root = self.state_of(&d).cloned().unwrap_or(JobState::Cancelled);
+            cur = d;
+        }
+        Some(Err(root))
+    }
+
     pub fn state_of(&self, id: &str) -> Option<&JobState> {
         self.jobs
             .iter()

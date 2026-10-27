@@ -151,7 +151,9 @@ _VRAM_PEAK_GB = {
         (8.36, (3.25, 3.92, 5.28, 8.38, 20.78, 39.66, 64.65)),
     )),
 }
-_VRAM_MARGIN_SCALE = 1.1
+# 1.1 was too tight between the measured sizes: at 3200x1800 a 24-frame normal window was estimated at 19.4 GiB but
+# needed over 20.9 GiB, and ran a 24 GiB card out of memory with ~22 GiB free.
+_VRAM_MARGIN_SCALE = 1.25
 _VRAM_MARGIN_GB = 0.3
 
 

@@ -123,7 +123,7 @@ impl RemoteSet {
             }
         }
         // After routing, so this tick's new sends are already followed.
-        env.ai.keep_sent(|sid| self.remotes.iter().any(|r| r.tracks(sid)));
+        env.ai.settle_sent(|sid| self.remotes.iter().find_map(|r| r.sent_outcome(sid)));
         // One offer/claim/attempt at a time across networks; the next claimer is the next ready network after the last.
         let n = self.remotes.len();
         let chosen = if self.remotes.iter().any(Remote::claim_busy) {
