@@ -319,8 +319,6 @@ struct AutoShot {
     project: Project,
     st: Settings,
     preset_name: Option<String>,
-    /// Failed sends so far; after 3 the shot is dropped with a notice so it cannot block the list.
-    tries: u8,
     /// PCs whose run of this shot failed (`LOCAL_PC` or a `network:` id): never given to them again.
     failed_on: Vec<String>,
     /// Held in the waiting list by the user; not given to any PC until resumed.
@@ -331,8 +329,6 @@ struct AutoShot {
 
 /// Automatic's key for this computer in `AutoShot::failed_on`/`on`.
 const LOCAL_PC: &str = "local";
-/// A shot that failed on this many PCs leaves Automatic with a notice.
-const AUTO_MAX_FAILED_PCS: usize = 3;
 
 /// Why a chain's deciding step failed, if Automatic should try another PC. A cancel is the user's choice, and a
 /// lost run whose writer is not proven stopped may still be writing to the clip: neither goes to another PC.
@@ -2872,7 +2868,7 @@ impl AiUi {
                 continue;
             }
             if matches!(r.placement, Placement::Auto) {
-                self.auto_pending.push_back(AutoShot { row: r, plan: p, project: b.project.clone(), st: b.st.clone(), preset_name: b.preset_name.clone(), tries: 0, failed_on: vec![], paused: false, on: None });
+                self.auto_pending.push_back(AutoShot { row: r, plan: p, project: b.project.clone(), st: b.st.clone(), preset_name: b.preset_name.clone(), failed_on: vec![], paused: false, on: None });
                 waiting += 1;
                 continue;
             }
@@ -2907,7 +2903,7 @@ impl AiUi {
                 let id = n.submission_id.clone();
                 let mut row = r.clone();
                 row.placement = Placement::Auto;
-                self.sent_shots.insert(id.clone(), AutoShot { row, plan: p.clone(), project: project.clone(), st: st.clone(), preset_name: preset_name.map(str::to_owned), tries: 0, failed_on: vec![], paused: false, on: None });
+                self.sent_shots.insert(id.clone(), AutoShot { row, plan: p.clone(), project: project.clone(), st: st.clone(), preset_name: preset_name.map(str::to_owned), failed_on: vec![], paused: false, on: None });
                 self.net_outbox.push(n);
                 id
             })
@@ -2973,11 +2969,6 @@ impl AiUi {
                 // A refused PC (this one included) is not necessarily the shot's fault: it waits, and the next PC in
                 // this tick gets it. The error text can't tell a bad plan from a busy PC, so it is never dropped silently.
                 a.row.placement = automatic;
-                a.tries += 1;
-                if a.tries >= 3 {
-                    self.notice = Some(format!("{}: not sent after 3 tries, removed from Automatic: {e}", a.row.clip.display_name));
-                    continue;
-                }
                 if pc.is_none() {
                     self.notice = Some(format!("{}: not queued on this PC yet, {e}", a.row.clip.display_name));
                 }
@@ -3045,19 +3036,14 @@ impl AiUi {
         }
     }
 
-    /// A shot's run failed on `a.on`: to the end of the list, never to that PC again; dropped after
-    /// `AUTO_MAX_FAILED_PCS` PCs so a broken shot cannot go round forever.
+    /// A shot's run failed on `a.on`: to the end of the list, never to that PC again. It stays in Automatic
+    /// waiting for another suitable PC; only the user's cancel removes it.
     fn auto_failed(&mut self, mut a: AutoShot, why: &str) {
         let pc = a.on.take().unwrap_or_else(|| LOCAL_PC.into());
         let name = a.row.clip.display_name.clone();
         let label = self.pc_label(&pc);
         a.failed_on.push(pc);
-        a.tries = 0;
         a.row.placement = Placement::Auto;
-        if a.failed_on.len() >= AUTO_MAX_FAILED_PCS {
-            self.notice = Some(format!("{name}: failed on {label} ({why}); it failed on {AUTO_MAX_FAILED_PCS} PCs, removed from Automatic."));
-            return;
-        }
         self.notice = Some(format!("{name}: failed on {label} ({why}); back in Automatic for another PC."));
         self.auto_pending.push_back(a);
     }
@@ -3711,7 +3697,7 @@ mod tests {
                 base: None,
                 location: None,
             };
-            ai.auto_pending.push_back(AutoShot { row, plan, project: p.clone(), st: st.clone(), preset_name: None, tries: 0, failed_on: vec![], paused: false, on: None });
+            ai.auto_pending.push_back(AutoShot { row, plan, project: p.clone(), st: st.clone(), preset_name: None, failed_on: vec![], paused: false, on: None });
         }
         (ai, d)
     }
@@ -3781,6 +3767,22 @@ mod tests {
     }
 
     #[test]
+    fn a_shot_that_failed_on_every_pc_stays_waiting_in_automatic() {
+        let (mut ai, d) = auto_fixture("exhaust", 1);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into())];
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        let sent = ai.take_net_outbox().remove(0);
+        ai.settle_sent(|sid| (sid == sent.submission_id).then_some(Err(Some("boom".into()))));
+        assert_eq!(ai.auto_pending[0].failed_on, ["network:n/a".to_owned()], "marked on the only PC");
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        assert!(ai.take_net_outbox().is_empty(), "never back to the failed PC");
+        assert_eq!(ai.auto_pending.len(), 1, "failed on every PC and still waiting for another suitable one");
+        assert_eq!(ai.auto_pending[0].row.clip.display_name, sent.name);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn a_cancelled_or_finished_send_is_not_requeued_and_a_paused_shot_waits() {
         let (mut ai, d) = auto_fixture("pause", 2);
         ai.net_online = true;
@@ -3814,21 +3816,38 @@ mod tests {
     }
 
     #[test]
-    fn auto_failed_send_goes_to_the_back_and_is_dropped_after_three_tries() {
+    fn refused_submission_keeps_the_shot_waiting_across_many_refusals() {
         let (mut ai, d) = auto_fixture("fail", 2);
-        let first = ai.auto_pending[0].row.clip.display_name.clone();
         ai.net_online = false; // every remote send is refused
-        let free = ["network:n/a".to_owned()];
-        ai.dispatch_auto(&free, &busy_view());
-        assert_eq!(ai.auto_pending.len(), 2, "kept for the next tick");
-        assert_eq!(ai.auto_pending.back().unwrap().row.clip.display_name, first, "failed shot moved to the back");
-        assert!(matches!(ai.auto_pending.back().unwrap().row.placement, Placement::Auto), "Automatic placement restored");
-        for _ in 0..4 {
+        // Several free PCs, all refusing in one tick: the shot is requeued, never dropped.
+        let free = ["network:n/a".to_owned(), "network:n/b".to_owned(), "network:n/c".to_owned()];
+        for _ in 0..10 {
             ai.dispatch_auto(&free, &busy_view());
         }
-        // 5 ticks over 2 shots: each is popped alternately; both reach 3 failures and are removed.
-        assert!(ai.auto_pending.len() < 2, "dropped shots no longer wait");
-        assert!(ai.notice.as_deref().unwrap().contains("not sent after 3 tries"), "{:?}", ai.notice);
+        assert_eq!(ai.auto_pending.len(), 2, "refused shots keep waiting in Automatic");
+        assert!(matches!(ai.auto_pending.back().unwrap().row.placement, Placement::Auto), "Automatic placement restored");
+        assert!(ai.auto_pending.iter().all(|a| a.failed_on.is_empty()), "a send refusal is not a render failure: no PC is excluded");
+        // The local PC being busy is also no reason to give up: the shot waits for a remote one.
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into())];
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        assert_eq!(ai.take_net_outbox().len(), 1, "the busy local PC does not stop a remote send");
+        assert_eq!(ai.auto_pending.len(), 1);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn requeued_first_shot_goes_to_a_later_pc_in_the_list() {
+        let (mut ai, d) = auto_fixture("fail-later", 1);
+        ai.net_targets = vec![("n/a".into(), "A".into()), ("n/b".into(), "B".into())];
+        ai.net_online = false;
+        let a = ["network:n/a".to_owned()];
+        let b = ["network:n/b".to_owned()];
+        ai.dispatch_auto(&a, &busy_view());
+        assert_eq!(ai.auto_pending.len(), 1, "kept after the refusal");
+        ai.net_online = true;
+        ai.dispatch_auto(&b, &busy_view());
+        assert_eq!(ai.take_net_outbox().len(), 1, "the same waiting shot reaches the next free PC");
         let _ = std::fs::remove_dir_all(d);
     }
 }

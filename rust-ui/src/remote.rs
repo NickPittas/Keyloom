@@ -49,7 +49,7 @@ enum Pend {
     Start(String),
     Reject,
     Events,
-    Submit(String),
+    Submit(NetJob),
     Job(String),
     JobEvents(String),
     Cancel(String),
@@ -141,12 +141,43 @@ pub struct NetJob {
     cursor: u64,
     refreshed: bool,
     last_poll: Option<Instant>,
+    submission_attempted: bool,
     inflight: bool,
 }
 
 impl NetJob {
     fn terminal(&self) -> bool {
         matches!(self.state.as_str(), "succeeded" | "failed" | "cancelled" | "not sent")
+    }
+
+    fn can_take_unsent(&self) -> bool {
+        self.job_id.is_none() && self.submission.is_some() && !self.submission_attempted && !self.inflight && self.last_poll.is_none() && !self.terminal()
+    }
+}
+
+fn reconcile_submit(j: &mut NetJob, r: Result<Value, LinkError>, now: Instant) -> bool {
+    match r {
+        Ok(v) => {
+            j.submission = None;
+            j.inflight = false;
+            j.job_id = v.get("job_id").and_then(Value::as_str).map(str::to_owned);
+            j.state = v.get("state").and_then(Value::as_str).unwrap_or("queued").to_owned();
+            j.reason = None;
+            true
+        }
+        Err(e) if matches!(e.code.as_str(), "transport" | "not_connected") => {
+            j.inflight = false;
+            j.last_poll = Some(now);
+            j.reason = Some("Waiting to resend the same submission after reconnect".into());
+            true
+        }
+        Err(e) => {
+            j.submission = None;
+            j.inflight = false;
+            j.state = "not sent".into();
+            j.reason = Some(err_text(&e));
+            false
+        }
     }
 }
 
@@ -555,7 +586,7 @@ impl Remote {
         self.phase == Phase::Online
     }
     pub fn accepts_work(&self, cfg: &Conn) -> bool {
-        !cfg.local_host && cfg.enabled && cfg.receive && self.online()
+        !self.leaving && !cfg.local_host && cfg.enabled && cfg.receive && self.online()
     }
     pub fn registered(&self) -> bool {
         self.registered
@@ -662,8 +693,20 @@ impl Remote {
         if self.local_host {
             return false; // this PC never retires its own login on its own service
         }
-        self.leaving = self.online() && self.req(Op::Leave, json!({}), Pend::Leave);
-        self.leaving
+        if self.leaving {
+            return true;
+        }
+        if !self.online() {
+            self.leaving = false;
+            return false;
+        }
+        self.leaving = true;
+        if self.request_leave_if_ready() {
+            true
+        } else {
+            self.leaving = false;
+            false
+        }
     }
     pub fn leaving(&self) -> bool {
         self.leaving
@@ -681,17 +724,17 @@ impl Remote {
     }
     /// Take back a send this PC never accepted (no job id yet); false if it was accepted meanwhile.
     pub fn take_unsent(&mut self, submission_id: &str) -> bool {
-        let Some(i) = self.jobs.iter().position(|j| j.submission_id == submission_id && j.job_id.is_none() && !j.terminal()) else { return false };
+        let Some(i) = self.jobs.iter().position(|j| j.submission_id == submission_id && j.can_take_unsent()) else { return false };
         self.jobs.remove(i);
         let key = self.key.clone();
         self.write_jobs(Path::new(&key));
         true
     }
     /// A send of ours this connection follows: `Ok(())` while it runs, `Err(None)` once it ended without failing
-    /// (done or cancelled), `Err(Some(why))` once it failed. `None` = not followed here.
+    /// (done or cancelled), `Err(Some(why))` once it failed or the host refused it. `None` = not followed here.
     pub(crate) fn sent_outcome(&self, submission_id: &str) -> Option<Result<(), Option<String>>> {
         let j = self.jobs.iter().find(|j| j.submission_id == submission_id)?;
-        Some(if !j.terminal() { Ok(()) } else if j.state == "failed" { Err(Some(j.reason.clone().unwrap_or_else(|| "failed".into()))) } else { Err(None) })
+        Some(if !j.terminal() { Ok(()) } else if j.state == "failed" || j.state == "not sent" { Err(Some(j.reason.clone().unwrap_or_else(|| j.state.clone()))) } else { Err(None) })
     }
     pub fn receiving(&self) -> Option<String> {
         match &self.rx {
@@ -752,6 +795,43 @@ impl Remote {
             }
             Err(_) => false,
         }
+    }
+
+    // Keep credentials until a pending Submit can no longer reveal an accepted job.
+    fn leave_ready(&self) -> bool {
+        self.jobs_loaded
+            && !self.pend.values().any(|p| matches!(p, Pend::Submit(_)))
+            && self.jobs.iter().all(|j| j.terminal() && j.submission.is_none())
+    }
+
+    fn request_leave_if_ready(&mut self) -> bool {
+        if !self.leaving
+            || self.pend.values().any(|p| matches!(p, Pend::Leave))
+            || !self.leave_ready()
+        {
+            return true;
+        }
+        self.req(Op::Leave, json!({}), Pend::Leave)
+    }
+
+    fn submits_after_marker_save(
+        &mut self,
+        first: Vec<(NetJob, Value)>,
+        mut retries: Vec<(NetJob, Value)>,
+        saved: bool,
+    ) -> Vec<(NetJob, Value)> {
+        if saved {
+            retries.extend(first);
+        } else {
+            for (submitted, _) in first {
+                if let Some(j) = self.jobs.iter_mut().find(|j| j.submission_id == submitted.submission_id) {
+                    j.submission_attempted = false;
+                    j.inflight = false;
+                    j.last_poll = None;
+                }
+            }
+        }
+        retries
     }
 
     // ---- the frame tick --------------------------------------------------------------------------------------------
@@ -955,29 +1035,8 @@ impl Remote {
             (Pend::Resync, r) => self.on_resync(r, env),
             (Pend::Estimate(a), r) => self.on_estimate(a, r, env),
             (Pend::Events, r) => self.on_events(r, env),
-            (Pend::Submit(sid), r) => {
-                if let Some(j) = self.jobs.iter_mut().find(|j| j.submission_id == sid) {
-                    match r {
-                        Ok(v) => {
-                            j.submission = None;
-                            j.inflight = false;
-                            j.job_id = v.get("job_id").and_then(Value::as_str).map(str::to_owned);
-                            j.state = v.get("state").and_then(Value::as_str).unwrap_or("queued").to_owned();
-                            j.reason = None;
-                        }
-                        Err(e) if matches!(e.code.as_str(), "transport" | "not_connected") => {
-                            j.inflight = false;
-                            j.last_poll = Some(now);
-                            j.reason = Some("Waiting to resend the same submission after reconnect".into());
-                        }
-                        Err(e) => {
-                            j.submission = None;
-                            j.inflight = false;
-                            j.state = "not sent".into();
-                            j.reason = Some(err_text(&e));
-                        }
-                    }
-                }
+            (Pend::Submit(submitted), r) => {
+                self.on_submit_reply(submitted, r, now);
                 self.save_jobs(env);
             }
             (Pend::Job(jid), r) => {
@@ -1049,6 +1108,15 @@ impl Remote {
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.job_id.as_deref() == Some(jid.as_str())) { j.inflight = false; }
             }
             (Pend::Cancel(_), Ok(_)) => {}
+        }
+    }
+
+    fn on_submit_reply(&mut self, mut submitted: NetJob, r: Result<Value, LinkError>, now: Instant) {
+        let existing = self.jobs.iter().position(|j| j.submission_id == submitted.submission_id);
+        if let Some(i) = existing {
+            reconcile_submit(&mut self.jobs[i], r, now);
+        } else if reconcile_submit(&mut submitted, r, now) {
+            self.jobs.push(submitted);
         }
     }
 
@@ -1184,29 +1252,45 @@ impl Remote {
         self.poll_jobs(now);
         // 4. Receiver.
         self.receive(now, env, creds, local.as_ref().map(|t| (t.status.clone(), t.busy_with.is_some())), hello_gpu.as_ref().and_then(|g| g.verified_uuid().ok().map(str::to_owned)), sample.as_ref());
+        if self.leaving && !self.request_leave_if_ready() {
+            self.leaving = false;
+            self.left = Some(Leave::Failed);
+        }
     }
 
     fn send(&mut self, n: NetSubmit, env: &Env) {
         let stages = stage_list(&n.spec);
         let installation = n.target.clone();
         let body = json!({"submission_id": n.submission_id, "spec": serde_json::to_value(&n.spec).unwrap_or_default(), "target": n.target});
-        self.jobs.push(NetJob { submission_id: n.submission_id.clone(), submission: Some(body), installation, stages, active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: n.folder, name: n.name, state: "sending".into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, inflight: false });
+        self.jobs.push(NetJob { submission_id: n.submission_id.clone(), submission: Some(body), installation, stages, active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: n.folder, name: n.name, state: "sending".into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, submission_attempted: false, inflight: false });
         self.save_jobs(env);
     }
 
     fn poll_jobs(&mut self, now: Instant) {
-        let mut submits = vec![];
+        let mut retries = vec![];
+        let mut first = vec![];
         for j in &mut self.jobs {
             if let Some(body) = &j.submission {
                 if !j.inflight && j.last_poll.is_none_or(|t| now.saturating_duration_since(t) >= JOB_POLL_EVERY) {
                     j.inflight = true;
                     j.last_poll = Some(now);
-                    submits.push((j.submission_id.clone(), body.clone()));
+                    if !j.submission_attempted {
+                        j.submission_attempted = true;
+                        first.push((j.clone(), body.clone()));
+                    } else {
+                        retries.push((j.clone(), body.clone()));
+                    }
                 }
             }
         }
-        for (sid, body) in submits {
-            if !self.req(Op::Submit, body, Pend::Submit(sid.clone())) {
+        if !first.is_empty() {
+            let key = self.key.clone();
+            let saved = self.write_jobs(Path::new(&key));
+            retries = self.submits_after_marker_save(first, retries, saved);
+        }
+        for (submitted, body) in retries {
+            let sid = submitted.submission_id.clone();
+            if !self.req(Op::Submit, body, Pend::Submit(submitted)) {
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.submission_id == sid) {
                     j.inflight = false;
                 }
@@ -1499,6 +1583,10 @@ impl Remote {
         Self::push_event(r, "terminal", json!({"state": state, "message": truncate(msg, 900)}));
     }
 
+    fn lost_verdict(label: &str, reason: &str, writer_stopped: bool) -> Option<(&'static str, String)> {
+        writer_stopped.then(|| ("failed", format!("{label} stage was lost: {reason}")))
+    }
+
     fn run_attempt(&mut self, now: Instant, env: &mut Env, creds: Option<&Path>) {
         let Rx::Running(r) = &mut self.rx else { return };
         if !r.terminal {
@@ -1517,9 +1605,13 @@ impl Remote {
                     Some(JobState::Failed { reason }) => verdict = Some(("failed", format!("{label} stage: {reason}"))),
                     Some(JobState::Cancelled) => verdict = Some(("cancelled", format!("{label} stage cancelled"))),
                     Some(JobState::Lost { reason, writer_stopped, .. }) => {
-                        // Writer not proven stopped: nothing is released or reported terminal on a guess.
+                        // A lost stage is terminal only after the scheduler proves its writer has stopped.
                         self.receive_note = Some(format!("the {label} stage was lost ({reason}); writer {}. Inspect this computer and the storage; the coordinator keeps ownership.", if writer_stopped { "stopped" } else { "NOT proven stopped" }));
-                        active = i;
+                        if let Some((state, msg)) = Self::lost_verdict(label, &reason, writer_stopped) {
+                            verdict = Some((state, msg));
+                        } else {
+                            active = i;
+                        }
                         break;
                     }
                     Some(JobState::Running { done, total, phase, .. }) => {
@@ -1700,6 +1792,7 @@ impl Remote {
                         cursor: j.get("cursor").and_then(Value::as_u64).unwrap_or(0),
                         refreshed: false,
                         last_poll: None,
+                        submission_attempted: j.get("submission_attempted").and_then(Value::as_bool).unwrap_or_else(|| j.get("submission").is_some_and(|v| v.is_object())),
                         inflight: false,
                     });
                 }
@@ -1722,15 +1815,19 @@ impl Remote {
         }
     }
 
-    fn write_jobs(&mut self, c: &Path) {
+    fn write_jobs(&mut self, c: &Path) -> bool {
         let Some(hp) = crate::queue::history_path() else {
             self.status = Some("Could not save the list of sent jobs (no settings folder); they cannot be followed after a restart.".into());
-            return;
+            return false;
         };
         let owner = c.to_string_lossy().into_owned();
-        let add = self.jobs.iter().map(|j| sent_entry(&owner, json!({"submission_id": j.submission_id, "submission": j.submission, "installation": j.installation, "stages": j.stages, "cursor": j.cursor, "active_stage": j.active_stage, "cancel_requested": j.cancel_requested, "on": j.on, "done": j.done, "total": j.total, "reason": j.reason, "job_id": j.job_id, "folder": j.folder, "name": j.name, "state": j.state}))).collect();
-        if let Err(e) = crate::queue::replace(&hp, |e| e.kind == "sent" && e.owner == owner, add) {
-            self.status = Some(format!("Could not save the list of sent jobs ({e}); they cannot be followed after a restart."));
+        let add = self.jobs.iter().map(|j| sent_entry(&owner, json!({"submission_id": j.submission_id, "submission": j.submission, "submission_attempted": j.submission_attempted, "installation": j.installation, "stages": j.stages, "cursor": j.cursor, "active_stage": j.active_stage, "cancel_requested": j.cancel_requested, "on": j.on, "done": j.done, "total": j.total, "reason": j.reason, "job_id": j.job_id, "folder": j.folder, "name": j.name, "state": j.state}))).collect();
+        match crate::queue::replace(&hp, |e| e.kind == "sent" && e.owner == owner, add) {
+            Ok(()) => true,
+            Err(e) => {
+                self.status = Some(format!("Could not save the list of sent jobs ({e}); they cannot be followed after a restart."));
+                false
+            }
         }
     }
 
@@ -1767,7 +1864,7 @@ impl Remote {
     /// The PC must have answered just now: the sample's age counts from its measurement to this moment, so a list kept
     /// from before a dropped link (or a link that connects but never answers) goes stale and is not free.
     pub(crate) fn is_free(&self, iid: &str) -> bool {
-        self.online() && !self.has_unfinished(iid)
+        !self.leaving && self.online() && !self.has_unfinished(iid)
             && self.installs.iter().find(|i| i.id == iid).is_some_and(|i| {
                 i.connected && matches!(Sample::from_api(&i.stats), Ok(Some((s, Some(age))))
                     if age + i.received.elapsed().as_secs_f64() <= crate::metrics::REMOTE_STALE_S && lightly_loaded(&s))
@@ -1826,11 +1923,14 @@ impl Remote {
                 for j in current {
                     ui.add_space(8.0);
                     // Right to left: the buttons and state first, the name truncates into what is left (never wider).
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // One line high: an unbounded right-to-left layout takes all the remaining height.
+                    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 20.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let (Some(id), false) = (&j.job_id, j.terminal()) {
                             if ui.add_enabled(!j.cancel_requested, egui::Button::new(if j.cancel_requested { "Stopping" } else { "Cancel" }).small()).clicked() { actions.push(Action::CancelJob { creds: self.key.clone(), job_id: id.clone() }); }
-                        } else if !j.terminal() && ui.small_button("Send again").on_hover_text("This PC has not accepted it yet: take it back and give it to the next free PC (end of the Automatic list).").clicked() {
+                        } else if j.can_take_unsent() && ui.small_button("Send again").on_hover_text("This PC has not accepted it yet: take it back and give it to the next free PC (end of the Automatic list).").clicked() {
                             actions.push(Action::Resend { creds: self.key.clone(), submission_id: j.submission_id.clone() });
+                        } else if !j.terminal() {
+                            ui.label("Reconciling submission");
                         }
                         ui.colored_label(if j.state == "failed" { egui::Color32::from_rgb(225, 110, 110) } else { DIM }, RichText::new(&j.state).size(11.0));
                         ui.add(egui::Label::new(RichText::new(&j.name).strong().size(12.0)).truncate()).on_hover_text(&j.name);
@@ -2024,7 +2124,176 @@ mod discovery_tests {
         r
     }
     fn job_on(iid: &str, state: &str) -> NetJob {
-        NetJob { submission_id: "s".into(), submission: None, installation: Some(iid.into()), stages: vec![], active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: String::new(), name: String::new(), state: state.into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, inflight: false }
+        NetJob { submission_id: "s".into(), submission: None, installation: Some(iid.into()), stages: vec![], active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: String::new(), name: String::new(), state: state.into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, submission_attempted: false, inflight: false }
+    }
+
+    #[test]
+    fn an_async_host_refusal_reports_its_reason_and_terminal_sends_stay_done() {
+        let mut refused = job_on("X", "not sent");
+        refused.submission_id = "refused".into();
+        refused.reason = Some("model not available on that PC".into());
+        let mut cancelled = job_on("X", "cancelled");
+        cancelled.submission_id = "cancelled".into();
+        let mut running = job_on("X", "running");
+        running.submission_id = "running".into();
+        let r = Remote { jobs: vec![refused, cancelled, running], ..Remote::blank(Source::Off, String::new()) };
+        assert_eq!(r.sent_outcome("missing"), None, "not followed here");
+        assert_eq!(r.sent_outcome("refused"), Some(Err(Some("model not available on that PC".into()))), "a definite refusal keeps its reason, like a failure");
+        assert_eq!(r.sent_outcome("cancelled"), Some(Err(None)), "cancelled stays ended-without-failing");
+        assert_eq!(r.sent_outcome("running"), Some(Ok(())), "still running: followed");
+    }
+
+    fn recv() -> Recv {
+        Recv { last_phase: String::new(), attempt: "attempt".into(), job_id: "job".into(), meta: json!({}), stages: vec![], announced: 0, outbox: vec![], seq: 0, last_done: 0, last_total: 0, last_report: Instant::now(), last_progress: Instant::now(), inflight: false, retry_at: None, cancel_sent: false, terminal: false, report_saved: false }
+    }
+
+    #[test]
+    fn lost_terminal_requires_stopped_writer_and_is_idempotent() {
+        let mut stopped = recv();
+        let (state, msg) = Remote::lost_verdict("Key", "worker exited", true).unwrap();
+        Remote::push_terminal(&mut stopped, state, &msg);
+        Remote::push_terminal(&mut stopped, state, &msg);
+        assert_eq!(stopped.outbox.len(), 1);
+        assert_eq!(stopped.outbox[0]["type"], "terminal");
+        assert_eq!(stopped.outbox[0]["data"]["state"], "failed");
+        assert!(Remote::lost_verdict("Key", "worker exited", false).is_none());
+    }
+
+    #[test]
+    fn send_again_takes_only_a_submission_that_has_never_been_attempted() {
+        let mut r = Remote::blank(Source::Off, String::new());
+        let mut j = job_on("X", "sending");
+        j.submission = Some(json!({"submission_id": "s"}));
+        j.inflight = true;
+        j.last_poll = Some(Instant::now());
+        r.jobs.push(j);
+        assert!(!r.take_unsent("s"), "in-flight submission stays tracked");
+        r.jobs[0].inflight = false;
+        assert!(!r.take_unsent("s"), "uncertain submission stays tracked");
+        r.jobs[0].last_poll = None;
+        r.jobs[0].submission_attempted = true;
+        assert!(!r.take_unsent("s"), "persisted uncertainty stays tracked after restart");
+        r.jobs[0].submission_attempted = false;
+        assert!(r.take_unsent("s"), "a never-attempted submission can be taken back");
+    }
+
+    #[test]
+    fn failed_marker_save_blocks_first_submit_but_keeps_same_id_retry() {
+        let mut r = Remote::blank(Source::Off, String::new());
+        let now = Instant::now();
+        let body = |id: &str| json!({"submission_id": id});
+        let mut first = job_on("X", "sending");
+        first.submission_id = "first-id".into();
+        first.submission_attempted = true;
+        first.inflight = true;
+        first.last_poll = Some(now);
+        r.jobs.push(first.clone());
+        let mut retry = job_on("X", "sending");
+        retry.submission_id = "retry-id".into();
+        retry.submission_attempted = true;
+        retry.inflight = true;
+        retry.last_poll = Some(now);
+        r.jobs.push(retry.clone());
+        r.status = Some("Could not save the list of sent jobs (test failure).".into());
+        let sendable = r.submits_after_marker_save(vec![(first, body("first-id"))], vec![(retry, body("retry-id"))], false);
+        assert_eq!(sendable.len(), 1);
+        assert_eq!(sendable[0].0.submission_id, "retry-id");
+        assert_eq!(sendable[0].1["submission_id"], "retry-id");
+        assert!(!r.jobs[0].submission_attempted);
+        assert!(!r.jobs[0].inflight);
+        assert!(r.jobs[0].last_poll.is_none());
+        assert_eq!(r.status.as_deref(), Some("Could not save the list of sent jobs (test failure)."));
+    }
+
+    #[test]
+    fn poll_jobs_does_not_send_first_submit_when_marker_save_fails() {
+        crate::queue::set_settings_path(None);
+        let mut r = Remote::blank(Source::Off, String::new());
+        let now = Instant::now();
+        let mut first = job_on("X", "sending");
+        first.submission_id = "first-id".into();
+        first.submission = Some(json!({"submission_id": "first-id"}));
+        r.jobs.push(first);
+        let mut retry = job_on("X", "sending");
+        retry.submission_id = "retry-id".into();
+        retry.submission = Some(json!({"submission_id": "retry-id"}));
+        retry.submission_attempted = true;
+        r.jobs.push(retry);
+        r.poll_jobs(now);
+        assert!(!r.jobs[0].submission_attempted);
+        assert!(!r.jobs[0].inflight);
+        assert!(r.jobs[0].last_poll.is_none());
+        assert!(r.jobs[1].submission_attempted);
+        assert_eq!(r.jobs[1].submission.as_ref().unwrap()["submission_id"], "retry-id");
+        assert_eq!(r.jobs[1].last_poll, Some(now));
+        assert!(r.status.as_deref().unwrap().contains("no settings folder"));
+    }
+
+    #[test]
+    fn late_accepted_submit_reply_restores_a_tracked_job() {
+        let mut r = Remote::blank(Source::Off, String::new());
+        let now = Instant::now();
+        let mut submitted = job_on("X", "sending");
+        submitted.submission = Some(json!({"submission_id": "s"}));
+        submitted.inflight = true;
+        submitted.submission_attempted = true;
+        submitted.last_poll = Some(now);
+        r.on_submit_reply(submitted, Ok(json!({"job_id": "job_1", "state": "queued"})), now);
+        assert_eq!(r.jobs.len(), 1);
+        assert_eq!(r.jobs[0].job_id.as_deref(), Some("job_1"));
+        assert_eq!(r.jobs[0].state, "queued");
+        assert!(r.jobs[0].submission.is_none());
+    }
+
+    #[test]
+    fn leave_blocks_new_work_and_waits_for_submit_reconciliation() {
+        let mut r = free_remote(1.0, true);
+        let cfg = Conn { enabled: true, receive: true, ..Conn::default() };
+        assert!(r.accepts_work(&cfg));
+        assert!(r.is_free("X"));
+        let now = Instant::now();
+        let mut submitted = job_on("X", "sending");
+        submitted.submission = Some(json!({"submission_id": "s"}));
+        submitted.submission_attempted = true;
+        submitted.inflight = true;
+        r.leaving = true;
+        r.jobs_loaded = true;
+        assert!(!r.accepts_work(&cfg));
+        assert!(!r.is_free("X"));
+        r.jobs.push(submitted.clone());
+        assert!(r.remove_blocker(None).is_some(), "an in-flight Submit blocks Remove");
+        r.jobs.clear();
+        r.pend.insert("submit".into(), Pend::Submit(submitted.clone()));
+        assert!(!r.leave_ready(), "Leave waits for the in-flight Submit reply");
+        r.pend.remove("submit");
+        r.on_submit_reply(submitted, Ok(json!({"job_id": "job_1", "state": "queued"})), now);
+        assert_eq!(r.jobs[0].job_id.as_deref(), Some("job_1"));
+        assert!(!r.leave_ready(), "a late acceptance remains protected until the job finishes");
+        r.jobs[0].state = "succeeded".into();
+        assert!(r.leave_ready());
+    }
+
+    #[test]
+    fn a_client_with_one_running_job_is_drawn_compactly() {
+        let mut r = free_remote(1.0, true);
+        let mut j = job_on("X", "started");
+        j.job_id = Some("job_1".into());
+        j.name = "V1-0040_A001C040_261012_R4LF".into();
+        j.stages = vec![NetStage { label: "Pre-matte · GVM".into(), done: 1, total: 1, completed: true, phase: None }];
+        r.jobs.push(j);
+        let ctx = egui::Context::default();
+        let mut used = 0.0;
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 2000.0))), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                let top = ui.cursor().top();
+                r.queue_ui(ui, None);
+                used = ui.cursor().top() - top;
+            });
+            out.textures_delta.clear();
+        }
+        // Header, meters, one job line and one stage bar: a few hundred pixels at most, never the whole panel.
+        assert!(used < 300.0, "client block is {used} px tall in a 2000 px panel");
     }
 
     #[test]

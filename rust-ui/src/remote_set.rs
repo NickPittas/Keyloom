@@ -90,8 +90,8 @@ impl RemoteSet {
                 }
                 Err("that PC is not known on any joined network; pick it again".into())
             }
-            None => self.remotes.iter().position(|r| !default.is_empty() && r.key == default && r.online())
-                .or_else(|| self.remotes.iter().position(Remote::online))
+            None => self.remotes.iter().position(|r| !r.leaving() && !default.is_empty() && r.key == default && r.online())
+                .or_else(|| self.remotes.iter().position(|r| !r.leaving() && r.online()))
                 .map(|i| (i, None))
                 .ok_or_else(|| "no network is connected".into()),
         }
@@ -142,7 +142,7 @@ impl RemoteSet {
         let many = self.remotes.len() > 1;
         // A connection to this computer's own network offers the same PCs as the local one: count those once.
         let own: Vec<String> = self.remotes.iter().zip(&conns).filter(|(_, (c, _))| c.local_host).filter_map(|(r, _)| r.ns()).collect();
-        env.ai.net_targets = self.remotes.iter().filter(|r| !r.ns().is_some_and(|n| own.contains(&n))).flat_map(|r| r.targets(many.then(|| r.label()).as_deref())).collect();
+        env.ai.net_targets = self.remotes.iter().filter(|r| !r.leaving() && !r.ns().is_some_and(|n| own.contains(&n))).flat_map(|r| r.targets(many.then(|| r.label()).as_deref())).collect();
         env.ai.net_online = self.online();
     }
 

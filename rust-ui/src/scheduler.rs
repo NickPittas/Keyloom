@@ -199,7 +199,13 @@ struct Slot {
     lost_job: Option<String>,
     /// Stop was requested (`stop_*`/`force_stop`): the final status is `Stopped` once the process exits.
     stopping: bool,
+    /// When this slot's worker died on its own (not stopped by the user): a crash restarts it, at most
+    /// `CRASH_RESTARTS` times in `CRASH_WINDOW`, so queued work waits for it instead of failing.
+    crashes: Vec<Instant>,
 }
+
+const CRASH_RESTARTS: usize = 3;
+const CRASH_WINDOW: Duration = Duration::from_secs(600);
 
 /// A lost job's writer counts as stopped only with proof: a local worker whose process has exited. On Windows
 /// the venv `python.exe` is a launcher that starts the real interpreter, so the launcher exiting proves nothing
@@ -397,6 +403,7 @@ impl Scheduler {
                 sent_manifest: None,
                 preflight: None,
                 lost_job: None,
+                crashes: vec![],
                 stopping: false,
             })
             .collect();
@@ -1285,12 +1292,32 @@ impl Scheduler {
             }
             Msg::Exited { code, stderr } => {
                 let why = match code {
+                    Some(c) if c < 0 => format!("worker killed by signal {}", -c),
                     Some(c) => format!("worker exited with code {c}"),
                     None => "worker terminated by signal".into(),
                 };
                 // Mark the connection gone first so `lose` finalises the exit immediately.
+                let stopping = self.slots[i].stopping;
                 self.slots[i].conn = None;
                 self.lose(i, format!("{why}: {stderr}"), ev);
+                // A crash (not a stop or a refusal) restarts the worker: the queued work waits for it.
+                let now = Instant::now();
+                let s = &mut self.slots[i];
+                s.crashes.retain(|t| now.duration_since(*t) < CRASH_WINDOW);
+                if !stopping && matches!(s.status, TargetStatus::Down(_)) {
+                    if s.crashes.len() < CRASH_RESTARTS {
+                        s.crashes.push(now);
+                        s.job = None;
+                        s.hello = None;
+                        s.status = TargetStatus::Fresh;
+                    } else if let TargetStatus::Down(reason) = &s.status {
+                        let reason = reason.clone();
+                        s.status = TargetStatus::Down(format!(
+                            "automatic restart limit ({CRASH_RESTARTS} restarts in {} s) reached: {reason}",
+                            CRASH_WINDOW.as_secs()
+                        ));
+                    }
+                }
                 return;
             }
             Msg::Event(e) => e,
@@ -1476,7 +1503,11 @@ impl Scheduler {
             return Cand::No("disabled".into());
         }
         match &s.status {
-            TargetStatus::Refused(r) | TargetStatus::Down(r) => return Cand::No(r.clone()),
+            TargetStatus::Refused(r) => return Cand::No(r.clone()),
+            TargetStatus::Down(_) if s.conn.is_some() => {
+                return Cand::Wait(format!("{} is restarting", s.target.id));
+            }
+            TargetStatus::Down(r) => return Cand::No(r.clone()),
             TargetStatus::Stopping | TargetStatus::Stopped => return Cand::No("stopped".into()),
             TargetStatus::Fresh | TargetStatus::Starting => {
                 return Cand::Wait(format!("{} is starting", s.target.id))
@@ -1666,6 +1697,7 @@ impl Scheduler {
                 continue;
             }
             match &s.status {
+                TargetStatus::Down(_) if s.conn.is_some() => pending = Some(c),
                 TargetStatus::Refused(r) | TargetStatus::Down(r) => reasons.push(r.clone()),
                 TargetStatus::Stopping | TargetStatus::Stopped => reasons.push("stopped".into()),
                 TargetStatus::Fresh | TargetStatus::Starting => pending = Some(c),

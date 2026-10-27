@@ -386,6 +386,7 @@ pub enum Msg {
     Protocol(String),
     /// stdout closed and the process was reaped. Always last unless `Protocol` came first.
     Exited {
+        /// Exit code; on Unix a negative value is the signal number that ended the process.
         code: Option<i32>,
         stderr: String,
     },
@@ -494,7 +495,13 @@ impl WorkerConn {
         std::thread::spawn(move || {
             let code = loop {
                 match lock(&w).try_wait() {
-                    Ok(Some(s)) => break s.code(),
+                    Ok(Some(s)) => {
+                        #[cfg(unix)]
+                        if let Some(sig) = std::os::unix::process::ExitStatusExt::signal(&s) {
+                            break Some(-sig); // negative = the signal that ended it (see `Msg::Exited`)
+                        }
+                        break s.code();
+                    }
                     Ok(None) => {}
                     Err(_) => break None,
                 }

@@ -206,7 +206,7 @@ fn rejected_job_writes_nothing_and_worker_stays_usable() {
 }
 
 #[test]
-fn crash_is_lost_with_proof_for_local_and_target_stays_down_until_reset() {
+fn crash_is_lost_with_proof_and_local_worker_restarts() {
     let (base, mut s) = one("crash", json!({}));
     s.submit(sub(job(&base, "a", 3, "crash"), Placement::Auto))
         .unwrap();
@@ -221,21 +221,73 @@ fn crash_is_lost_with_proof_for_local_and_target_stays_down_until_reset() {
         panic!("{:?}", state(&s, "a"))
     };
     assert!(writer_stopped && reason.contains("code 3"), "{reason}");
-    assert!(matches!(s.targets()[0].status, TargetStatus::Down(_)));
+    assert_eq!(s.targets()[0].status, TargetStatus::Fresh);
     // Proven stopped local writer: the folder can be reused (resume is a new job id).
     let mut again = job(&base, "a2", 3, "ok");
     again.manifest_dir = base.join("a");
     again.outputs = job(&base, "a", 3, "ok").outputs;
     s.submit(sub(again, Placement::Auto)).unwrap();
     settle(&mut s, &["a2"]);
-    assert!(
-        matches!(state(&s, "a2"), JobState::Failed { reason } if reason.contains("worker exited"))
+    assert!(complete(&state(&s, "a2")));
+    assert_eq!(
+        log_lines(&base, "w0").iter().filter(|l| l["event"] == "start").count(),
+        2
     );
     s.reset_target("l0");
     s.submit(sub(job(&base, "c", 1, "ok"), Placement::Auto))
         .unwrap();
     settle(&mut s, &["c"]);
     assert!(complete(&state(&s, "c")));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn worker_restarting_after_protocol_error_keeps_unrelated_jobs_queued() {
+    let (base, mut s) = one("restart_queue", json!({}));
+    s.submit(sub(job(&base, "a", 1, "malformed"), Placement::Auto))
+        .unwrap();
+    s.submit(sub(job(&base, "b", 1, "ok"), Placement::Auto))
+        .unwrap();
+
+    wait_until("first job lost", || {
+        s.tick();
+        matches!(state(&s, "a"), JobState::Lost { .. })
+    });
+    assert_eq!(state(&s, "b"), JobState::Queued);
+    settle(&mut s, &["b"]);
+    assert!(complete(&state(&s, "b")));
+    assert_eq!(
+        log_lines(&base, "w0").iter().filter(|l| l["event"] == "start").count(),
+        2
+    );
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn repeated_worker_crashes_stop_after_bounded_restarts_with_a_terminal_reason() {
+    let (base, mut s) = one("restart_limit", json!({}));
+    let ids = ["a", "b", "c", "d", "e"];
+    for id in ids {
+        s.submit(sub(job(&base, id, 1, "crash"), Placement::Auto))
+            .unwrap();
+    }
+
+    settle(&mut s, &ids);
+    for id in &ids[..4] {
+        assert!(matches!(state(&s, id), JobState::Lost { writer_stopped: true, .. }));
+    }
+    assert!(matches!(
+        state(&s, "e"),
+        JobState::Failed { reason } if reason.contains("automatic restart limit")
+    ));
+    assert!(matches!(
+        s.targets()[0].status,
+        TargetStatus::Down(ref reason) if reason.contains("automatic restart limit")
+    ));
+    assert_eq!(
+        log_lines(&base, "w0").iter().filter(|l| l["event"] == "start").count(),
+        4
+    );
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -265,7 +317,7 @@ fn protocol_violations_kill_the_worker_and_lose_the_job() {
             reason.contains(needle) && writer_stopped,
             "{mode}: {reason}"
         );
-        assert!(matches!(s.targets()[0].status, TargetStatus::Down(_)));
+        assert_eq!(s.targets()[0].status, TargetStatus::Fresh);
         std::fs::remove_dir_all(base).unwrap();
     }
 }
@@ -527,14 +579,14 @@ fn readiness_is_pending_until_probe_finishes_then_ready() {
 }
 
 #[test]
-fn hello_deadline_kills_a_silent_worker_that_has_no_job() {
+fn hello_deadline_restarts_a_silent_worker_only_within_the_restart_limit() {
     let (base, mut s) = one("hellodl", json!({"hello_delay": 30}));
     s.hello_timeout = std::time::Duration::from_millis(300);
     s.submit(sub(job(&base, "a", 1, "ok"), Placement::Auto))
         .unwrap();
     settle(&mut s, &["a"]);
     assert!(
-        matches!(s.targets()[0].status, TargetStatus::Down(ref r) if r.contains("no hello") && r.contains("Retry"))
+        matches!(s.targets()[0].status, TargetStatus::Down(ref r) if r.contains("no hello") && r.contains("automatic restart limit"))
     );
     assert_eq!(
         s.targets()[0].startup_budget,
@@ -544,9 +596,13 @@ fn hello_deadline_kills_a_silent_worker_that_has_no_job() {
         Scheduler::new(vec![]).unwrap().hello_timeout,
         std::time::Duration::from_secs(600)
     );
-    s.tick(); // no automatic respawn
+    s.tick(); // terminal Down does not spawn again
     assert!(matches!(s.targets()[0].status, TargetStatus::Down(_)));
-    assert!(matches!(state(&s, "a"), JobState::Failed { reason } if reason.contains("no hello")));
+    assert!(matches!(state(&s, "a"), JobState::Failed { reason } if reason.contains("no hello") && reason.contains("automatic restart limit")));
+    assert_eq!(
+        log_lines(&base, "w0").iter().filter(|l| l["event"] == "start").count(),
+        4
+    );
     std::fs::remove_dir_all(base).unwrap();
 }
 

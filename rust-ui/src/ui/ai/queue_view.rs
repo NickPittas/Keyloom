@@ -364,7 +364,8 @@ impl AiUi {
         let (mut toggle, mut drop) = (None, None);
         for (i, a) in self.auto_pending.iter().enumerate() {
             // Right to left: the buttons first, the text truncates into what is left (never wider than the panel).
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // One line high: an unbounded right-to-left layout takes all the remaining height.
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 20.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Cancel").clicked() { drop = Some(i); }
                 if ui.small_button(if a.paused { "Resume" } else { "Pause" }).clicked() { toggle = Some(i); }
                 let mut line = format!("{}. {}", i + 1, a.row.clip.display_name);
