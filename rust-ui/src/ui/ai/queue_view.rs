@@ -68,6 +68,19 @@ pub struct Cell {
     pub bad: bool,
 }
 
+/// Plain name of a worker progress phase. Key runs several passes, each counted from 0, so the bar names the pass.
+pub fn pass_name(phase: &str) -> String {
+    match phase {
+        "rvm" => "pre-pass".into(),
+        "vfm" => "features".into(),
+        "stage1" => "stage 1, windows".into(),
+        "stage2" => "stage 2".into(),
+        "publish" => "writing frames".into(),
+        "export_video" => "encoding video".into(),
+        p => p.replace('_', " "),
+    }
+}
+
 /// The status of a stage made of one or more jobs (several exports aggregate into one).
 pub fn cell_of(p: &[Phase]) -> Cell {
     let n = p.len().max(1) as f32;
@@ -283,10 +296,17 @@ impl AiUi {
             } else {
                 vec![]
             };
+            let mut cell = cell_of(&phases);
+            // One job running a named pass: say which, so a pass starting at 0 never looks like a restart.
+            if let [f] = of.as_slice() {
+                if let JobState::Running { phase, .. } = &f.state {
+                    if !phase.is_empty() && !cell.bad { cell.text = format!("{} · {}", pass_name(phase), cell.text); }
+                }
+            }
             rows.push(QueueRow {
                 stage,
                 heading,
-                cell: cell_of(&phases),
+                cell,
                 products,
                 ids: of.iter().map(|f| f.id.clone()).collect(),
                 precomputed: false,
@@ -488,6 +508,13 @@ mod tests {
             assert!(c.frac < 1.0);
         }
         assert_eq!(cell_of(&[Failed, Lost]).text, "Lost");
+    }
+
+    #[test]
+    fn key_passes_have_plain_names() {
+        let names: Vec<String> = ["rvm", "vfm", "stage1", "stage2", "publish", "export_video"].iter().map(|p| pass_name(p)).collect();
+        assert_eq!(names, ["pre-pass", "features", "stage 1, windows", "stage 2", "writing frames", "encoding video"]);
+        assert_eq!(pass_name("matanyone2"), "matanyone2", "an unknown pass keeps its own name");
     }
 
     fn row(text: &str, frac: f32, bad: bool, precomputed: bool) -> QueueRow {

@@ -123,10 +123,20 @@ def crop_model_chw_to_output(x: np.ndarray, model_native_hw, pad, output_hw):
     return resize_chw_lanczos(cropped, output_hw)
 
 
+def _imread(path, flags):
+    """cv2.imread, but the file is read in one go and decoded in memory: on a network share OpenCV's own EXR reader
+    makes many small reads (about 3x slower per frame). Same codecs, same pixels; None if missing or undecodable."""
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except (OSError, ValueError):
+        return None
+    return cv2.imdecode(data, flags) if data.size else None
+
+
 def read_image_rgb(path: str | os.PathLike):
     path = str(path)
     if path.lower().endswith(".exr"):
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        img = _imread(path, cv2.IMREAD_UNCHANGED)
         if img is None:
             raise FileNotFoundError(path)
         img = img.astype(np.float32, copy=False)
@@ -135,14 +145,14 @@ def read_image_rgb(path: str | os.PathLike):
         if img.ndim == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    img = _imread(path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(path)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
 
 def read_hint_image(path: str | os.PathLike) -> np.ndarray:
-    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    img = _imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(path)
     if img.dtype == np.uint8:
@@ -561,7 +571,7 @@ class SequentialHintFrameDirWindowReader:
 
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
-            frame = cv2.imread(self.paths[self.next_t], cv2.IMREAD_UNCHANGED)
+            frame = _imread(self.paths[self.next_t], cv2.IMREAD_UNCHANGED)
             self.cache[self.next_t] = preprocess_hint_frame(frame, self.meta)
             self.next_t += 1
 

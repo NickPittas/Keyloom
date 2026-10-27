@@ -151,10 +151,10 @@ def imread_unicode(path: str, flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndar
 
     cv2.imread uses a narrow (ANSI codepage) file API on Windows and returns
     None for any path containing characters outside that codepage (accented
-    Latin, Cyrillic, CJK, Arabic, etc.). ASCII paths take the original
-    cv2.imread route unchanged (byte-identical pixels, no extra read); non-ASCII
-    paths decode from an in-memory buffer read through numpy's unicode-aware
-    file API. cv2.imread and cv2.imdecode share the same codecs, so the decoded
+    Latin, Cyrillic, CJK, Arabic, etc.). Every path is read in one go through
+    numpy's unicode-aware file API and decoded from memory: on a network share
+    cv2.imread's own EXR reader makes many small reads (about 3x slower per
+    frame). cv2.imread and cv2.imdecode share the same codecs, so the decoded
     array is identical for every format and flag combination.
 
     Args:
@@ -165,8 +165,6 @@ def imread_unicode(path: str, flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndar
         Decoded ndarray, or None if the file is missing/unreadable/undecodable
         (matching cv2.imread's None-on-failure contract).
     """
-    if _is_ascii(path):
-        return cv2.imread(path, flags)
     try:
         data = np.fromfile(path, dtype=np.uint8)
     except (OSError, ValueError):

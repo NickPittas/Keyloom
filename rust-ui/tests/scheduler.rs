@@ -311,9 +311,11 @@ fn dependency_runs_after_success_and_fails_after_failure() {
         })
         .unwrap();
         settle(&mut s, &[&p, &d]);
+        // Names the failed step and its own reason, not the id.
+        let want = if *mode == "reject" { "Key was refused: " } else { "Key failed: " };
         assert!(
-            matches!(state(&s, &d), JobState::Failed { reason } if reason.contains(&p)),
-            "{mode}"
+            matches!(state(&s, &d), JobState::Failed { reason } if reason.starts_with(want)),
+            "{mode}: {:?}", state(&s, &d)
         );
         assert!(!base.join(&d).exists());
     }

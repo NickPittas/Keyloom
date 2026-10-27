@@ -97,6 +97,9 @@ struct NetStage {
     done: u64,
     total: u64,
     completed: bool,
+    /// The worker pass the running PC reports (Key counts each pass from 0); absent from older PCs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
 }
 
 fn stage_list(spec: &JobSpec) -> Vec<NetStage> {
@@ -112,7 +115,7 @@ fn stage_list(spec: &JobSpec) -> Vec<NetStage> {
     if let Some(e) = &spec.export {
         labels.extend(e.files.keys().map(|p| format!("Deliver · {p}")));
     }
-    labels.into_iter().map(|label| NetStage { label, done: 0, total: 0, completed: false }).collect()
+    labels.into_iter().map(|label| NetStage { label, done: 0, total: 0, completed: false, phase: None }).collect()
 }
 
 /// A job this installation submitted, as the coordinator last reported it.
@@ -1017,6 +1020,7 @@ impl Remote {
                             if let Some(stage) = j.active_stage.and_then(|i| j.stages.get_mut(i)) {
                                 stage.done = done;
                                 stage.total = total;
+                                stage.phase = e["data"]["phase"].as_str().filter(|p| !p.is_empty()).map(str::to_owned);
                                 if stage.label == "Key" { j.done = done; j.total = total; }
                             } else { j.done = done; j.total = total; }
                         }
@@ -1509,9 +1513,9 @@ impl Remote {
                         active = i;
                         break;
                     }
-                    Some(JobState::Running { done, total, .. }) => {
+                    Some(JobState::Running { done, total, phase, .. }) => {
                         active = i;
-                        progress = Some((done, total.max(done)));
+                        progress = Some((done, total.max(done), phase));
                         break;
                     }
                     _ => {
@@ -1533,12 +1537,12 @@ impl Remote {
                 r.last_total = 0;
                 Self::push_event(r, "progress", json!({"done": 0, "total": 0}));
             }
-            if let Some((done, total)) = progress {
+            if let Some((done, total, phase)) = progress {
                 if (done != r.last_done || total != r.last_total) && (r.last_done == u64::MAX || now.saturating_duration_since(r.last_progress) >= PROGRESS_EVERY) {
                     r.last_done = done;
                     r.last_total = total;
                     r.last_progress = now;
-                    Self::push_event(r, "progress", json!({"done": done, "total": total}));
+                    Self::push_event(r, "progress", json!({"done": done, "total": total, "phase": phase}));
                 }
             }
         }
@@ -1824,7 +1828,8 @@ impl Remote {
                         } else if failed { (0.0, j.state.clone())
                         } else if current && stage.total > 0 {
                             let f = (stage.done as f32 / stage.total as f32).min(0.99);
-                            (f, format!("{}% · {}/{}", (f * 100.0).floor() as u32, stage.done, stage.total))
+                            let pass = stage.phase.as_deref().map(|p| format!("{} · ", crate::ui::ai::pass_name(p))).unwrap_or_default();
+                            (f, format!("{pass}{}% · {}/{}", (f * 100.0).floor() as u32, stage.done, stage.total))
                         } else if current && !j.terminal() { (0.0, "Running".into())
                         } else if j.terminal() { (0.0, "Not run".into())
                         } else if index == 0 { (0.0, j.state.clone())
@@ -1956,7 +1961,7 @@ mod discovery_tests {
 
     #[test]
     fn net_overall_is_capped_and_words() {
-        let st = |done, total, completed| NetStage { label: String::new(), done, total, completed };
+        let st = |done, total, completed| NetStage { label: String::new(), done, total, completed, phase: None };
         assert_eq!(net_overall(&[st(0, 2, false)], "queued"), "queued");
         assert_eq!(net_overall(&[st(0, 0, true), st(1, 2, false)], "running"), "75%");
         assert_eq!(net_overall(&[st(0, 0, false)], "succeeded"), "100%");

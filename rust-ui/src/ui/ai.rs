@@ -476,7 +476,7 @@ struct Batch {
 
 mod queue_view;
 mod tasks;
-pub use queue_view::{Cell, Phase, QueueRow, QueueRun, QueueSection, Stage};
+pub use queue_view::{pass_name, Cell, Phase, QueueRow, QueueRun, QueueSection, Stage};
 pub use tasks::{sig_of, PreviewResult, TaskDone};
 
 /// One shot handed to the network controller (`remote::Remote`): the frozen spec plus what to show for it.
@@ -2469,7 +2469,7 @@ impl AiUi {
                     cancel = ui.small_button("Cancel").clicked();
                 }
                 JobState::Running { target, phase, done, total } => {
-                    ui.label(format!("{target}: {}", trunc(phase)));
+                    ui.label(format!("{target}: {}", trunc(&queue_view::pass_name(phase))));
                     if *total > 0 {
                         let f = (*done).min(*total) as f32 / *total as f32;
                         ui.add(egui::ProgressBar::new(f).desired_width(120.0).text(format!("{}/{}", (*done).min(*total), total)));

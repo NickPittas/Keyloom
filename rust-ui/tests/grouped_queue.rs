@@ -130,7 +130,7 @@ fn two_clip_batch_shows_each_title_once_with_ordered_stages_and_aggregate_export
     assert_eq!(v.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["a", "b"], "one title per clip, queue order");
     assert_eq!(
         lines(&v[0]),
-        [["Pre-matte · GVM: 0%", "Hint · MatAnyone2: Waiting", "Keying: Waiting", "Export: Waiting"]]
+        [["Pre-matte · GVM: track · 0%", "Hint · MatAnyone2: Waiting", "Keying: Waiting", "Export: Waiting"]]
     );
     // Clip b's first step queues behind a on the single worker; its later steps wait on b's own chain.
     assert_eq!(lines(&v[1]), [["Pre-matte · GVM: Queued", "Hint · MatAnyone2: Waiting", "Keying: Waiting", "Export: Waiting"]]);

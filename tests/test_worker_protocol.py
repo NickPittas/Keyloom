@@ -117,12 +117,14 @@ def test_job_runs_then_same_id_is_busy_but_next_id_runs(svc, env):
     done = s.sink.wait(lambda e: e["event"] == "done")
     kinds = [e["event"] for e in s.sink.events()]
     assert kinds.index("accepted") < kinds.index("done") and done["outcome"] == "complete"
+    # The GPU is empty once the result is out: no model is kept loaded into the next job.
+    assert svc._v2_engine is None and FakeEngine.instances[0].loaded is False
     assert all(e.get("job_id") in (None, "job-aaaaaaaa") for e in s.sink.events())
     s.key(env.job())  # already ran
     assert s.sink.wait(lambda e: e["event"] == "rejected")["code"] == "busy"
     s.key(env.job(job_id="job-bbbbbbbb", mode="resume"))
     s.sink.wait(lambda e: e["event"] == "done" and e["job_id"] == "job-bbbbbbbb")
-    assert len(FakeEngine.instances) == 1  # the model stayed loaded across jobs
+    assert svc._v2_engine is None
     s.eof()
 
 

@@ -699,6 +699,24 @@ impl Scheduler {
     }
 
     /// State of a Key job or task by id.
+    /// Why a step never started: the step it waited on, by name, and that step's own failure text (not its id).
+    fn dependency_reason(&self, d: &str) -> String {
+        let (what, st) = match (self.jobs.iter().find(|e| e.job.job_id == d), self.tasks.iter().find(|t| t.job.job_id == d)) {
+            (Some(e), _) => ("Key", &e.state),
+            (_, Some(t)) => (t.job.kind.label(), &t.state),
+            _ => return format!("dependency {d} did not complete"),
+        };
+        let why = match st {
+            JobState::Cancelled => "was cancelled".to_owned(),
+            JobState::Failed { reason } => format!("did not start: {reason}"),
+            JobState::Rejected { message, .. } => format!("was refused: {message}"),
+            JobState::Lost { reason, .. } => format!("was lost: {reason}"),
+            JobState::Done { info, .. } => format!("failed: {}", info.message.as_deref().unwrap_or("no reason given")),
+            _ => "did not complete".to_owned(),
+        };
+        format!("{what} {why}")
+    }
+
     pub fn state_of(&self, id: &str) -> Option<&JobState> {
         self.jobs
             .iter()
@@ -1511,7 +1529,7 @@ impl Scheduler {
                     continue;
                 }
                 if st.is_terminal() {
-                    let reason = format!("dependency {d} did not complete");
+                    let reason = self.dependency_reason(&d);
                     self.set(j, JobState::Failed { reason }, ev);
                     break;
                 }
@@ -1685,7 +1703,7 @@ impl Scheduler {
                 }
                 if st.is_terminal() {
                     self.tasks[t].state = JobState::Failed {
-                        reason: format!("dependency {d} did not complete"),
+                        reason: self.dependency_reason(&d),
                     };
                     ev.push(SchedEvent::Changed(self.tasks[t].job.job_id.clone()));
                     break;

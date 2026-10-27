@@ -201,17 +201,28 @@ class Worker:
                     done = run_key_job(self.service, job, emit=emit, cancel=cancel, worker={
                         "host": self.hello["host"], "worker_rev": self.hello["worker_rev"],
                         "gpu": (self.hello["gpu"] or {}).get("name")})
+                    self._release_gpu()
                     self.emit(done)
                 except KeyJobRejected as exc:
+                    self._release_gpu()
                     self._reject(job.job_id, exc.code, exc.message)
                 except Exception as exc:  # noqa: BLE001 - never die silently mid-protocol
                     sys.stderr.write(f"internal worker error: {exc!r}\n")
+                    self._release_gpu()
                     self._reject(job.job_id, "invalid", f"internal error before start: {exc}")
                 finally:
                     with self._state:
                         self._thread = self._current = None
             self._thread = threading.Thread(target=run, name=f"key-{job.job_id}", daemon=True)
             self._thread.start()
+
+    def _release_gpu(self) -> None:
+        """Every job starts on an empty GPU: drop all models and PyTorch's cached memory before the result is
+        reported (so the next job, sent on that result, never finds this worker still busy unloading)."""
+        try:
+            self.service.unload_engines()
+        except Exception as exc:  # noqa: BLE001 - a failed unload must not hide the job's own result
+            sys.stderr.write(f"releasing GPU memory failed: {exc!r}\n")
 
     def _handle_task(self, msg: dict) -> None:
         from backend.service.key_job import KeyJobRejected
@@ -248,11 +259,15 @@ class Worker:
 
             def run():
                 try:
-                    self.emit(run_task_job(self.service, job, emit=emit, cancel=cancel))
+                    done = run_task_job(self.service, job, emit=emit, cancel=cancel)
+                    self._release_gpu()
+                    self.emit(done)
                 except KeyJobRejected as exc:
+                    self._release_gpu()
                     self._reject(job.job_id, exc.code, exc.message, **getattr(exc, "extra", {}))
                 except Exception as exc:  # noqa: BLE001 - never die silently mid-protocol
                     sys.stderr.write(f"internal worker error: {exc!r}\n")
+                    self._release_gpu()
                     self._reject(job.job_id, "invalid", f"internal error before start: {exc}")
                 finally:
                     with self._state:
@@ -442,6 +457,8 @@ def main(argv=None, stdin=None, out=None, service=None, hello=None) -> int:
         out = _protocol_stream()
     os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # same index meaning as nvidia-smi, before visibility
+    if sys.platform.startswith("linux"):  # PyTorch's own advice for reserved-but-unused memory; Linux-only option
+        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     if service is None:
