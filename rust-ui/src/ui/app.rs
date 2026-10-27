@@ -886,17 +886,28 @@ impl App {
     }
 
     fn batch_queue(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote_set::RemoteSet, local: &crate::metrics::View, active: &[u32]) -> Vec<crate::remote::Action> {
+        // Two tabs: the machines and what they run, and the shots still waiting for a PC.
+        let tab_id = ui.make_persistent_id("queue_tab_waiting");
+        let mut waiting = ui.data(|d| d.get_temp::<bool>(tab_id)).unwrap_or(false);
         ui.horizontal(|ui| {
             ui.heading("Queue");
-            if ui.small_button("Clear finished").on_hover_text("Removes finished, failed and cancelled jobs from the queue and its logs. Running jobs stay.").clicked() {
+            ui.add_space(8.0);
+            if ui.selectable_label(!waiting, "Machines").clicked() { waiting = false; }
+            if ui.selectable_label(waiting, format!("Waiting ({})", ai.waiting_count())).clicked() { waiting = true; }
+            if !waiting && ui.small_button("Clear finished").on_hover_text("Removes finished, failed and cancelled jobs from the queue and its logs. Running jobs stay.").clicked() {
                 ai.clear_finished();
                 remote.clear_finished();
             }
         });
+        ui.data_mut(|d| d.insert_temp(tab_id, waiting));
         let mut actions = vec![];
         egui::ScrollArea::vertical().id_salt("batch_work_queue").auto_shrink([false; 2]).show(ui, |ui| {
-            ai.queue_ui(ui, local, active);
-            actions = remote.queue_ui(ui);
+            if waiting {
+                ai.auto_waiting_ui(ui);
+            } else {
+                ai.queue_ui(ui, local, active);
+                actions = remote.queue_ui(ui);
+            }
         });
         actions
     }

@@ -342,28 +342,38 @@ impl AiUi {
         QueueRun { client: jobs.first().map(|f| f.client.clone()).unwrap_or_else(|| "This computer".into()), rows, active, reason }
     }
 
-    /// Automatic's waiting shots, in the order they are handed out: each can be paused, resumed or cancelled.
-    fn auto_waiting_ui(&mut self, ui: &mut Ui) {
-        let why = self.auto_wait.as_deref().map(|w| format!(": {w}")).unwrap_or_default();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("Waiting for a free PC ({}){why}", self.auto_pending.len())).strong());
-            if ui.small_button("Cancel all").clicked() {
-                self.cancel_auto();
-            }
-        });
+    /// How many Automatic shots wait for a PC (the Queue's Waiting tab).
+    pub fn waiting_count(&self) -> usize {
+        self.auto_pending.len()
+    }
+
+    /// The Queue's Waiting tab: Automatic's waiting shots in the order they are handed out; each can be paused,
+    /// resumed or cancelled.
+    pub fn auto_waiting_ui(&mut self, ui: &mut Ui) {
+        if self.auto_pending.is_empty() {
+            ui.label(RichText::new("No shots are waiting. Automatic shots wait here until a PC is free.").color(DIM));
+            return;
+        }
+        if let Some(w) = &self.auto_wait {
+            ui.add(egui::Label::new(RichText::new(format!("Why: {w}")).color(DIM).size(11.5)).wrap());
+        }
+        if ui.small_button("Cancel all").clicked() {
+            self.cancel_auto();
+        }
+        ui.add_space(4.0);
         let (mut toggle, mut drop) = (None, None);
         for (i, a) in self.auto_pending.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                let mut line = a.row.clip.display_name.clone();
+            // Right to left: the buttons first, the text truncates into what is left (never wider than the panel).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Cancel").clicked() { drop = Some(i); }
+                if ui.small_button(if a.paused { "Resume" } else { "Pause" }).clicked() { toggle = Some(i); }
+                let mut line = format!("{}. {}", i + 1, a.row.clip.display_name);
                 if a.paused { line += " · paused"; }
                 if !a.failed_on.is_empty() {
                     let pcs: Vec<String> = a.failed_on.iter().map(|p| self.pc_label(p)).collect();
                     line += &format!(" · failed on {}, waits for another PC", pcs.join(", "));
                 }
-                ui.add(egui::Label::new(RichText::new(line).size(12.0)).truncate());
-                if ui.small_button(if a.paused { "Resume" } else { "Pause" }).clicked() { toggle = Some(i); }
-                if ui.small_button("Cancel").clicked() { drop = Some(i); }
+                ui.add(egui::Label::new(RichText::new(&line).size(12.0)).truncate()).on_hover_text(&line);
             });
         }
         if let Some(i) = toggle { self.auto_pending[i].paused ^= true; }
@@ -377,9 +387,6 @@ impl AiUi {
         // Never let the content ask the panel for more than it has been given.
         let w = ui.available_width();
         ui.set_max_width(w);
-        if !self.auto_pending.is_empty() {
-            self.auto_waiting_ui(ui);
-        }
         let all = self.queue_view();
         let mut clients = vec![];
         for run in all.iter().flat_map(|s| &s.runs) {

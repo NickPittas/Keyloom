@@ -96,11 +96,10 @@ def _is_oom(exc: BaseException) -> bool:
 
 
 def _next_smaller_window(chunk: int, low_vram: bool):
-    """The window `auto` would try after (chunk, low_vram), in its own search order (biggest first, normal before
-    low VRAM at each size); None when it was already the smallest."""
+    """The window `auto` would try after (chunk, low_vram), in its own order (`runtime.vram_profile_order`); None when
+    it was already the last."""
     from CorridorKeyV2.corridorkey import runtime as rt
-    table = rt._VRAM_PEAK_GB
-    order = [(c, low) for c in reversed(table[True][0]) for low in (False, True) if c in table[low][0]]
+    order = rt.vram_profile_order()
     i = order.index((chunk, low_vram)) if (chunk, low_vram) in order else -1
     return order[i + 1] if 0 <= i < len(order) - 1 else None
 

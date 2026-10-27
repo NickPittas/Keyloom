@@ -132,8 +132,12 @@ def test_auto_low_policy():
     assert tiny.over_budget
 
 
-def test_auto_never_picks_a_window_that_ran_a_24gb_card_out_of_memory():
-    # Measured: 3200x1800, 24-frame normal window, ~22 GiB free -> over 20.9 GiB needed (estimate said 19.4).
-    chunk, _, low, est = rt.select_vram_profile((1800, 3200), 98, 22.0)
-    assert (chunk, low) != (24, False), (chunk, low, est)
-    assert est * rt._VRAM_MARGIN_SCALE + rt._VRAM_MARGIN_GB <= 22.0
+def test_auto_picks_what_fits_on_a_24gb_card_measured():
+    # Measured on Endor (RTX 4090, 20.3 GiB available, 3200x1800 padded to 3200x1920, 2026-10-27):
+    #   8 normal: ok, peak 10.6 GiB allocated / 12.5 GiB reserved;
+    #   24 normal and 24 low: out of memory (over 17.7 GiB allocated / 20.8 GiB reserved).
+    chunk, _, low, est = rt.select_vram_profile((1920, 3200), 98, 20.3)
+    assert (chunk, low) == (8, False), "the largest window that really fits, on the GPU"
+    assert est * rt._VRAM_MARGIN_SCALE + rt._VRAM_MARGIN_GB >= 12.5, "the requirement covers the measured reserve"
+    # A 12 GiB card (about 11 GiB free) cannot hold 8 normal (12.5 GiB measured): 8 in low-VRAM mode.
+    assert rt.select_vram_profile((1920, 3200), 98, 11.0)[:3] == (8, 4, True)

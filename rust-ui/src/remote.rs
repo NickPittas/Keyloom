@@ -151,6 +151,9 @@ impl NetJob {
 }
 
 struct Recv {
+    /// The worker pass last announced (sent as a "pass: …" note: every host accepts notes, but rejects unknown
+    /// fields in progress events).
+    last_phase: String,
     attempt: String,
     job_id: String,
     /// manifest_dir / clip_root / exports of the attempt, kept in its durable file for restart reconciliation.
@@ -1010,6 +1013,10 @@ impl Remote {
                     j.events_done = j.terminal() && v.get("events").and_then(Value::as_array).is_some_and(|e| e.len() < 50);
                     for e in v.get("events").and_then(Value::as_array).into_iter().flatten() {
                         if e.get("type").and_then(Value::as_str) == Some("note") {
+                            if let Some(p) = e["data"]["message"].as_str().and_then(|m| m.strip_prefix("pass: ")) {
+                                if let Some(stage) = j.active_stage.and_then(|i| j.stages.get_mut(i)) { stage.phase = Some(p.to_owned()); }
+                                continue;
+                            }
                             j.stage = e["data"]["message"].as_str().map(|m| truncate(m, 80));
                             if let Some(index) = j.stage.as_deref().and_then(|m| m.strip_prefix("stage ")).and_then(|m| m.split_once(" of ")).and_then(|(n, _)| n.parse::<usize>().ok()).and_then(|n| n.checked_sub(1)).filter(|n| *n < j.stages.len()) {
                                 j.active_stage = Some(index);
@@ -1022,7 +1029,7 @@ impl Remote {
                             if let Some(stage) = j.active_stage.and_then(|i| j.stages.get_mut(i)) {
                                 stage.done = done;
                                 stage.total = total;
-                                stage.phase = e["data"]["phase"].as_str().filter(|p| !p.is_empty()).map(str::to_owned);
+
                                 if stage.label == "Key" { j.done = done; j.total = total; }
                             } else { j.done = done; j.total = total; }
                         }
@@ -1428,7 +1435,7 @@ impl Remote {
             self.receive_note = Some(format!("not launched: ownership could not be saved ({e})"));
             return;
         }
-        let mut rv = Recv { attempt: attempt.clone(), job_id: job_id.clone(), meta: meta.clone(), stages: stages.clone(), announced: 0, outbox: vec![], seq: 0, last_done: 0, last_total: 0, last_report: Instant::now(), last_progress: Instant::now(), inflight: false, retry_at: None, cancel_sent: false, terminal: false, report_saved: false };
+        let mut rv = Recv { last_phase: String::new(), attempt: attempt.clone(), job_id: job_id.clone(), meta: meta.clone(), stages: stages.clone(), announced: 0, outbox: vec![], seq: 0, last_done: 0, last_total: 0, last_report: Instant::now(), last_progress: Instant::now(), inflight: false, retry_at: None, cancel_sent: false, terminal: false, report_saved: false };
         nlog(&format!("attempt {attempt} started; running {} stage(s) for {job_id} on the local client", stages.len()));
         match env.ai.submit_network_plan(&self.slot(&attempt), pf.stages) {
             Ok(()) => {
@@ -1462,7 +1469,7 @@ impl Remote {
         let Rx::Resync { attempt, state, message } = std::mem::replace(&mut self.rx, Rx::Idle) else { return };
         match r {
             Ok(v) => {
-                let mut rv = Recv { attempt: attempt.clone(), job_id: attempt.clone(), meta: Value::Null, stages: vec![], announced: 0, outbox: vec![], seq: v.get("last_seq").and_then(Value::as_u64).unwrap_or(0), last_done: 0, last_total: 0, last_report: Instant::now(), last_progress: Instant::now(), inflight: false, retry_at: None, cancel_sent: false, terminal: false, report_saved: false };
+                let mut rv = Recv { last_phase: String::new(), attempt: attempt.clone(), job_id: attempt.clone(), meta: Value::Null, stages: vec![], announced: 0, outbox: vec![], seq: v.get("last_seq").and_then(Value::as_u64).unwrap_or(0), last_done: 0, last_total: 0, last_report: Instant::now(), last_progress: Instant::now(), inflight: false, retry_at: None, cancel_sent: false, terminal: false, report_saved: false };
                 Self::push_terminal(&mut rv, state, &message);
                 self.receive_note = Some(format!("attempt {attempt} reconciled after a restart: {state}"));
                 self.rx = Rx::Running(rv);
@@ -1544,7 +1551,11 @@ impl Remote {
                     r.last_done = done;
                     r.last_total = total;
                     r.last_progress = now;
-                    Self::push_event(r, "progress", json!({"done": done, "total": total, "phase": phase}));
+                    if phase != r.last_phase && !phase.is_empty() {
+                        Self::push_event(r, "note", json!({"message": format!("pass: {phase}")}));
+                        r.last_phase = phase;
+                    }
+                    Self::push_event(r, "progress", json!({"done": done, "total": total}));
                 }
             }
         }
@@ -1800,7 +1811,9 @@ impl Remote {
                 st.show_header(ui, |ui| {
                     let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 3.0, if connected { crate::ui::theme::ACCENT } else { DIM });
-                    ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
+                    // Only the LAST widget may truncate (it takes the rest of the line); one before others pushes
+                    // them past the edge and the resizable panel widens every frame.
+                    ui.label(RichText::new(name).strong());
                     if let Some(l) = net_label { ui.label(RichText::new(l).color(DIM).size(11.0)); }
                     if !connected { ui.label(RichText::new("Offline").color(DIM).size(11.0)); }
                     if let (false, Some(c)) = (open, current.first()) {
@@ -1812,14 +1825,15 @@ impl Remote {
                 }
                 for j in current {
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Label::new(RichText::new(&j.name).strong().size(12.0)).truncate()).on_hover_text(&j.name);
-                        ui.colored_label(if j.state == "failed" { egui::Color32::from_rgb(225, 110, 110) } else { DIM }, RichText::new(&j.state).size(11.0));
+                    // Right to left: the buttons and state first, the name truncates into what is left (never wider).
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let (Some(id), false) = (&j.job_id, j.terminal()) {
                             if ui.add_enabled(!j.cancel_requested, egui::Button::new(if j.cancel_requested { "Stopping" } else { "Cancel" }).small()).clicked() { actions.push(Action::CancelJob { creds: self.key.clone(), job_id: id.clone() }); }
                         } else if !j.terminal() && ui.small_button("Send again").on_hover_text("This PC has not accepted it yet: take it back and give it to the next free PC (end of the Automatic list).").clicked() {
                             actions.push(Action::Resend { creds: self.key.clone(), submission_id: j.submission_id.clone() });
                         }
+                        ui.colored_label(if j.state == "failed" { egui::Color32::from_rgb(225, 110, 110) } else { DIM }, RichText::new(&j.state).size(11.0));
+                        ui.add(egui::Label::new(RichText::new(&j.name).strong().size(12.0)).truncate()).on_hover_text(&j.name);
                     });
                     if j.stages.is_empty() { ui.label(RichText::new(&j.state).color(DIM)); }
                     for (index, stage) in j.stages.iter().enumerate() {

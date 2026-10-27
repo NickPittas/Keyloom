@@ -828,11 +828,15 @@ pub fn plan(i: &Inputs, intent: Intent) -> Result<Plan, Blocked> {
             } else {
                 "The lock does not name a job, so it cannot be released from here."
             };
+            // A fresh heartbeat means that PC is writing this clip now: say so plainly instead of a recovery prompt.
+            let live = lock.heartbeat_age.is_some_and(|a| a.as_secs() < 60);
+            let reason = if live {
+                format!("already rendering on {}; wait for it to finish, or cancel it in the Queue", lock.host.as_deref().unwrap_or("another PC"))
+            } else {
+                format!("This folder is locked by {}. {why}", describe_lock(&lock))
+            };
             return Err(Blocked {
-                reasons: vec![format!(
-                    "This folder is locked by {}. {why}",
-                    describe_lock(&lock)
-                )],
+                reasons: vec![reason],
                 lock: Some(lock),
                 lock_dir: Some(mdir),
                 leftovers,

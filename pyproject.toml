@@ -1,6 +1,6 @@
 [project]
 name = "keyloom"
-version = "2.4.0"
+version = "2.5.0"
 description = "Keyloom — powered by CorridorKey: AI chroma keyer"
 license = {text = "CC-BY-NC-SA-4.0"}
 requires-python = ">=3.11,<3.14"

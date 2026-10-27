@@ -259,9 +259,9 @@ def test_auto_retries_with_the_next_smaller_window_on_out_of_memory(env, monkeyp
     monkeypatch.setattr(rt, "run_inference", oom_once)
     status = []
     res = run(env, on_status=status.append)
-    assert seen == [(24, False, True), (24, True, False)], seen
-    assert (res.hann_chunk, res.low_vram) == (24, True)
-    assert any("retrying with 24 frames (low VRAM)" in w for w in res.warnings), res.warnings
+    assert seen == [(24, False, True), (8, False, False)], seen
+    assert (res.hann_chunk, res.low_vram) == (8, False)
+    assert any("retrying with 8 frames (normal VRAM)" in w for w in res.warnings), res.warnings
     assert status and "Out of GPU memory" in status[-1]
 
 

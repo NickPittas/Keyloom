@@ -1,6 +1,6 @@
 [package]
 name = "keyloom-ui"
-version = "2.4.0"
+version = "2.5.0"
 edition = "2021"
 default-run = "keyloom-ui"
 description = "Keyloom native project viewer: imports footage into new projects (first slice, provisional toolkit)"
