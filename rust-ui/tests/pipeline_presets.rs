@@ -86,6 +86,8 @@ fn start(e: &Env, folders: &[&str], p: &Pipeline) -> (egui::Context, App) {
         &ctx,
         AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), ..Default::default() },
     );
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
+
     for _ in 0..12 {
         run(&ctx, &mut app, vec![]);
     }
@@ -407,6 +409,8 @@ fn choosing_a_saved_preset_in_the_batch_dropdown_recomputes_the_rows_and_chain()
         &ctx,
         AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), ..Default::default() },
     );
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
+
     for _ in 0..12 {
         run(&ctx, &mut app, vec![]);
     }
@@ -418,26 +422,28 @@ fn choosing_a_saved_preset_in_the_batch_dropdown_recomputes_the_rows_and_chain()
     }
     let plain = app.ai().batch_summary().join("\n");
     assert!(plain.contains("a: new") && !plain.contains("export"), "{plain}");
-    // Open the dropdown and click the saved preset.
-    let at = app.ai().batch_preset_rect.expect("preset dropdown drawn").center();
+    // The review has no preset choice: the Board's selector picks it, and a clean Key queues at once.
+    app.ai_mut().cancel_batch();
+    for _ in 0..4 {
+        run(&ctx, &mut app, vec![]);
+    }
+    let at = app.ai().board_preset_rect.expect("Board preset selector drawn").center();
     click_on(&ctx, &mut app, at);
     for _ in 0..4 {
         run(&ctx, &mut app, vec![]);
     }
-    let items = app.ai().batch_preset_items.clone();
+    let items = app.ai().board_preset_items.clone();
     let names: Vec<&str> = items.iter().map(|i| i.0.as_str()).collect();
     assert_eq!(names, ["", "full", "old"], "disk presets listed, legacy included");
     let full_at = items.iter().find(|i| i.0 == "full").unwrap().1.center();
     click_on(&ctx, &mut app, full_at);
-    pump(&ctx, &mut app, "recomputed", |a| a.ai().batch_ready() && a.ai().batch_summary().join("").contains("export matte ->"));
-    for _ in 0..12 {
+    for _ in 0..4 {
         run(&ctx, &mut app, vec![]);
     }
     assert!(app.ai().scheduler().task_snapshot().is_empty(), "choosing queues nothing");
-    confirm(&ctx, &mut app);
-    for _ in 0..3 {
-        run(&ctx, &mut app, vec![]);
-    }
+    let key = app.ai().board_key_rect.expect("Key button drawn").center();
+    click_on(&ctx, &mut app, key);
+    pump(&ctx, &mut app, "queued", |a| a.ai().scheduler().task_snapshot().len() == 3);
     let kinds: Vec<TaskKind> = app.ai().scheduler().task_snapshot().iter().map(|t| t.job.kind).collect();
     assert_eq!(kinds, [TaskKind::Birefnet, TaskKind::Matanyone2, TaskKind::ExportVideo]);
     drop(app);
@@ -543,6 +549,8 @@ fn queue_pipeline_runs_the_open_clip_without_a_review_and_reports_why_it_cannot(
     let e = env("oneoff", &[("a", 3, 24.0, None)], json!({"version": 2}));
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(&ctx, AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), ..Default::default() });
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
+
     for _ in 0..12 {
         run(&ctx, &mut app, vec![]);
     }
@@ -564,6 +572,8 @@ fn queue_pipeline_runs_the_open_clip_without_a_review_and_reports_why_it_cannot(
 fn open_app(e: &Env) -> (egui::Context, App) {
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(&ctx, AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), ..Default::default() });
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
+
     for _ in 0..12 {
         run(&ctx, &mut app, vec![]);
     }
@@ -592,9 +602,9 @@ fn board_preset_selector_is_visible_before_review_and_drives_the_plan() {
     }
     let key = app.ai().board_key_rect.expect("Key button drawn").center();
     click_on(&ctx, &mut app, key);
-    pump(&ctx, &mut app, "review", |a| a.ai().batch_ready());
-    let sum = app.ai().batch_summary().join("\n");
-    assert!(sum.contains("export matte ->"), "the chosen preset's pipeline is planned: {sum}");
+    pump(&ctx, &mut app, "queued", |a| !a.ai().scheduler().task_snapshot().is_empty());
+    let kinds: Vec<TaskKind> = app.ai().scheduler().task_snapshot().iter().map(|t| t.job.kind).collect();
+    assert!(kinds.contains(&TaskKind::ExportVideo), "the chosen preset's pipeline is planned: {kinds:?}");
     drop(app);
     let _ = fs::remove_dir_all(e.base);
 }
@@ -667,6 +677,8 @@ fn existing_key_result_is_delivered_without_a_new_key_in_sequence_and_never_over
     // The actual Deliver button uses the same existing-result path, with no Key job.
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(&ctx, AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), open_clip: Some("a".into()), tab: Some(ck::ui::Tab::Deliver), ..Default::default() });
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
+
     pump(&ctx, &mut app, "local capabilities", |a| a.ai().local_caps().is_some());
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, None);
     for _ in 0..12 { run(&ctx, &mut app, vec![]); }

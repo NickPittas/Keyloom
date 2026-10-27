@@ -20,24 +20,20 @@ fn root(n: &str, l: &str) -> SharedRoot {
     SharedRoot { name: n.into(), local: l.into(), ..Default::default() }
 }
 
-const OLD: &str = r#"{"version":1,"future_key":{"a":1},"ai_targets":[{"id":"gpu-box","kind":"ssh","host":"h","user":null,"port":null,"python":"/p","repo":"/r","gpu":0,"storage":"shared","path_map":[["/mnt/NAS","/srv/nas"]],"enabled":true}]}"#;
+const OLD: &str = r#"{"version":1,"future_key":{"a":1},"playback":{"cache_mib":512},"ai_targets":[{"id":"gpu-box","kind":"ssh","host":"h","user":null,"port":null,"python":"/p","repo":"/r","gpu":0,"storage":"shared","path_map":[["/mnt/NAS","/srv/nas"]],"enabled":true},{"id":"l0","kind":"local","repo":"/r","python":"/p","gpu":0}]}"#;
 
 #[test]
-fn old_settings_load_unchanged_and_survive_a_save() {
+fn old_ssh_targets_are_dropped_on_load_and_the_rest_survives() {
     let p = tmp("old").join("s.json");
     fs::write(&p, OLD).unwrap();
-    let mut st = Store::load(Some(p.clone()));
+    let st = Store::load(Some(p));
     assert!(st.problem.is_none(), "{:?}", st.problem);
-    let s = st.saved().clone();
+    let s = st.saved();
+    assert_eq!(s.ai_targets.len(), 1);
+    assert_eq!(s.ai_targets[0].id, "l0");
     assert!(s.shared_roots.is_empty());
-    assert_eq!(s.ai_targets[0].path_map, vec![("/mnt/NAS".into(), "/srv/nas".into())]);
-    let mut n = s.clone();
-    n.shared_roots.push(root("NAS", "/mnt/nas"));
-    st.save(n).unwrap();
-    let again = Store::load(Some(p));
-    assert_eq!(again.saved().ai_targets, s.ai_targets, "SSH target map is not converted");
-    assert_eq!(again.saved().extra["future_key"]["a"], 1);
-    assert_eq!(again.saved().shared_roots, vec![root("NAS", "/mnt/nas")]);
+    assert_eq!(s.playback.cache_mib, 512);
+    assert_eq!(s.extra["future_key"]["a"], 1);
 }
 
 #[test]

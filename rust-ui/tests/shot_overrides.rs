@@ -75,6 +75,7 @@ fn start_tab(e: &Env, open: Option<&str>, tab: Tab) -> (egui::Context, App) {
         &ctx,
         AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), open_clip: open.map(Into::into), tab: Some(tab), ..Default::default() },
     );
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
     frames(&ctx, &mut app, 20);
     (ctx, app)
 }
@@ -185,12 +186,13 @@ fn legacy_batch_preset_and_single_shot_apply_follow_the_same_rules() {
     // Board of a fresh session, both shots selected, review with the legacy preset chosen in the dropdown.
     let (ctx, mut app) = start(&e, None);
     app.select_folders(&["a", "b"]);
-    app.key_selected(&ctx);
-    pump(&ctx, &mut app, "review", |a| a.ai().batch_ready());
-    let at = app.ai().batch_preset_rect.expect("dropdown").center();
+    frames(&ctx, &mut app, 3);
+    let at = app.ai().board_preset_rect.expect("Board preset selector").center();
     click(&ctx, &mut app, at);
-    let old = app.ai().batch_preset_items.iter().find(|i| i.0 == "old").expect("legacy listed").1.center();
+    let old = app.ai().board_preset_items.iter().find(|i| i.0 == "old").expect("legacy listed").1.center();
     click(&ctx, &mut app, old);
+    let key = app.ai().board_key_rect.expect("Key button drawn").center();
+    click(&ctx, &mut app, key); // shot a keeps its own value, so the review opens instead of queueing
     pump(&ctx, &mut app, "legacy rows", |a| a.ai().batch_ready() && a.ai().batch_row_settings("b").is_some_and(|r| r.0.temporal_window == "8/4"));
     let (pa, pb) = (app.ai().batch_row_settings("a").unwrap().0, app.ai().batch_row_settings("b").unwrap().0);
     assert_eq!((pa.temporal_window.as_str(), pb.temporal_window.as_str()), ("1/1", "8/4"));

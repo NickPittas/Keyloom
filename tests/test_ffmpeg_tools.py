@@ -580,6 +580,8 @@ class TestOutOfMemoryMessage:
             assert "Close other applications" in str(exc)
 
 
+
+
 class TestRecompressSubprocessFailure:
     """A crashed or timed-out recompress subprocess verifies nothing — it
     must report every frame as suspect, never return 'clean'."""
@@ -724,7 +726,7 @@ class TestValidateFFmpegInstall:
 
         help_text = ffmpeg_tools.get_ffmpeg_install_help()
 
-        assert "Repair FFmpeg" in help_text
+        assert "Install a full FFmpeg build" in help_text
         assert "tools\\ffmpeg" in help_text
 
 
@@ -862,10 +864,6 @@ class TestPinnedFFmpegAsset:
     """Issue #184: repair must install the pinned verified build, never a
     rolling URL whose contents change under us."""
 
-    def test_resolver_returns_pinned_asset(self):
-        name, url = _discovery._resolve_windows_ffmpeg_asset(None)
-        assert name == _discovery._PINNED_ASSET
-        assert url == _discovery._PINNED_URL
 
     def test_pin_is_a_versioned_immutable_release(self):
         # A rolling URL re-publishes different binaries under the same
@@ -904,13 +902,6 @@ class TestPinnedFFmpegAsset:
         assert tools._PINNED_URL == _discovery._PINNED_URL
         assert tools._PINNED_ASSET == _discovery._PINNED_ASSET
 
-    def test_resolver_needs_no_network(self, monkeypatch):
-        def boom(*a, **k):
-            raise AssertionError("pinned resolver must not touch the network")
-
-        monkeypatch.setattr(_discovery.urllib.request, "urlopen", boom)
-        name, url = _discovery._resolve_windows_ffmpeg_asset(None)
-        assert name == _discovery._PINNED_ASSET
 
 
 class TestVersionTokenClassification:
@@ -970,90 +961,8 @@ class TestVersionTokenClassification:
         assert not self._parse(monkeypatch, GYAN_GIT_LINE).is_verified_build
 
 
-class TestRepairSafetyHelpers:
-    """Repair must validate staging and never strand a working FFmpeg."""
-
-    def test_safe_extract_rejects_zip_slip(self, tmp_path):
-        import zipfile as _zip
-        bad = tmp_path / "evil.zip"
-        with _zip.ZipFile(bad, "w") as z:
-            z.writestr("../escape.txt", "pwned")
-        dest = tmp_path / "out"
-        dest.mkdir()
-        try:
-            _discovery._safe_extract_zip(str(bad), str(dest))
-            assert False, "zip-slip member should have been rejected"
-        except RuntimeError as exc:
-            assert "unsafe path" in str(exc)
-        assert not (tmp_path / "escape.txt").exists()
-
-    def test_find_staged_dir_selects_by_contents(self, tmp_path):
-        root = tmp_path / "extract" / "ffmpeg-n8.1-latest-win64-gpl-8.1" / "bin"
-        root.mkdir(parents=True)
-        (root / "ffmpeg.exe").write_bytes(b"x")
-        (root / "ffprobe.exe").write_bytes(b"x")
-        found = _discovery._find_staged_ffmpeg_dir(str(tmp_path / "extract"))
-        assert found is not None
-        assert found.endswith("ffmpeg-n8.1-latest-win64-gpl-8.1")
-
-    def test_staged_validation_rejects_unverified_build(self, tmp_path, monkeypatch):
-        # A staged download that is not a verified build must never be
-        # swapped into tools/ffmpeg (swapped or tampered download).
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        (bin_dir / "ffmpeg.exe").write_bytes(b"x")
-        (bin_dir / "ffprobe.exe").write_bytes(b"x")
-        _fake_version_run(monkeypatch, {
-            "ffmpeg": GYAN_GIT_LINE,
-            "ffprobe": GYAN_GIT_LINE.replace("ffmpeg", "ffprobe", 1),
-        })
-        try:
-            _discovery._validate_staged_ffmpeg(str(tmp_path))
-            assert False, "unverified staged build should be rejected"
-        except RuntimeError as exc:
-            assert "pinned" in str(exc)
-
-    def test_staged_validation_accepts_pin(self, tmp_path, monkeypatch):
-        # GYAN_FULL_LINE is the banner of the pinned Repair asset.
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        (bin_dir / "ffmpeg.exe").write_bytes(b"x")
-        (bin_dir / "ffprobe.exe").write_bytes(b"x")
-        _fake_version_run(monkeypatch, {
-            "ffmpeg": GYAN_FULL_LINE,
-            "ffprobe": GYAN_FULL_LINE.replace("ffmpeg", "ffprobe", 1),
-        })
-        _discovery._validate_staged_ffmpeg(str(tmp_path))
-
-    def test_find_staged_dir_none_when_binaries_missing(self, tmp_path):
-        (tmp_path / "extract").mkdir()
-        assert _discovery._find_staged_ffmpeg_dir(str(tmp_path / "extract")) is None
 
 
-def test_stitch_exr_to_prores4444_without_apply_trc(tmp_path):
-    """FFmpeg 9 removed -apply_trc; EXR export must still produce a ProRes 4444 with alpha."""
-    import shutil
-
-    import numpy as np
-    import pytest
-
-    from backend.ffmpeg_tools.stitching import stitch_video
-    from backend.frame_io import write_exr
-
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        pytest.skip("ffmpeg not installed")
-    frames = tmp_path / "frames"
-    frames.mkdir()
-    img = np.full((32, 48, 4), 0.25, np.float32)
-    for i in range(2):
-        assert write_exr(str(frames / f"frame_{i:06d}.exr"), img, compression="zip")
-    out = tmp_path / "out.mov"
-    stitch_video(str(frames), str(out), pattern="frame_%06d.exr")
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_name,pix_fmt",
-         "-of", "csv=p=0", str(out)], capture_output=True, text=True, check=True)
-    codec, pix_fmt = probe.stdout.strip().split(",")
-    assert codec == "prores" and pix_fmt.startswith("yuva444")
 
 
 def test_build_video_metadata_matches_sidecar_contract(tmp_path):

@@ -104,6 +104,8 @@ fn env(tag: &str, repo_cfg: Value, key_result: bool) -> Env {
 fn open(e: &Env, tab: Tab) -> (egui::Context, App) {
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(&ctx, AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), open_clip: Some("a".into()), tab: Some(tab), ..Default::default() });
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
+
     pump(&ctx, &mut app, "worker caps", |a| a.ai().local_caps().is_some());
     frames(&ctx, &mut app, 12);
     (ctx, app)

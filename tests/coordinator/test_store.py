@@ -316,18 +316,11 @@ def test_revoked_token_refused(store, clock):
     assert e.value.status == 401
 
 
-def test_pairing_one_use_expiry_and_hashes_only(store, clock, tmp_path):
-    code_ = store.create_pairing()
-    iid, tok = store.pair(code_, "a")
-    with pytest.raises(ApiError) as e:
-        store.pair(code_, "b")
-    assert e.value.status == 403
-    old = store.create_pairing(ttl=5)
-    clock.t += 6
-    with pytest.raises(ApiError):
-        store.pair(old, "c")
+def test_join_stores_token_hash_only(store, clock, tmp_path):
+    iid, tok = store.join("a")
+    assert store.authenticate(f"{iid}.{tok}")["id"] == iid
     raw = open(tmp_path / "c.sqlite3", "rb").read()
-    assert tok.encode() not in raw and code_.replace("-", "").encode() not in raw
+    assert tok.encode() not in raw
 
 
 def test_corrupt_or_newer_db_is_preserved(tmp_path, clock):

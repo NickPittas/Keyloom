@@ -242,23 +242,51 @@ mod tests {
             detail: String::new(),
             at: 1,
             job: None,
+            kind: "local".into(),
+            owner: "c".into(),
         }
+    }
+
+    /// A fresh temp folder per test; never the real settings folder.
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ck-queue-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn round_trip_keeps_entries_as_stored() {
+        let p = dir("round").join(FILE);
+        let mut sent = e("s", "succeeded");
+        sent.kind = "sent".into();
+        sent.owner = "conn-1".into();
+        let all = vec![e("a", "complete"), sent];
+        write(&p, all.clone()).unwrap();
+        let (got, err) = read(&p);
+        assert!(err.is_none());
+        assert_eq!(got, all);
     }
 
     #[test]
     fn active_entries_come_back_held_and_history_is_bounded() {
-        let d = std::env::temp_dir().join(format!("ck-queue-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let mut all: Vec<Entry> = (0..150)
-            .map(|i| e(&format!("old{i}"), "complete"))
+        let p = dir("held").join(FILE);
+        let mut all: Vec<Entry> = (0..250)
+            .map(|i| {
+                let mut x = e(&format!("old{i}"), "complete");
+                x.at = i + 2;
+                x
+            })
             .collect();
         all.push(e("run", "running"));
         all.push(e("q", "queued"));
-        save(&d, &all).unwrap();
-        let (got, err) = load(&d);
+        write(&p, all).unwrap();
+        let (got, err) = load(&p);
         assert!(err.is_none());
-        assert_eq!(got.len(), 100);
+        // the newest 200 finished entries plus the 2 unfinished ones
+        assert_eq!(got.len(), 202);
+        assert!(got.iter().any(|x| x.id == "old249"));
+        assert!(!got.iter().any(|x| x.id == "old0"));
         let held: Vec<_> = got
             .iter()
             .filter(|x| x.state == "held")
@@ -269,21 +297,34 @@ mod tests {
             got.iter().all(|x| !x.active()),
             "nothing is ever restored as running"
         );
-        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
     fn unreadable_history_is_kept_aside() {
-        let d = std::env::temp_dir().join(format!("ck-queue-bad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(path(&d), "{not json").unwrap();
-        let (got, err) = load(&d);
+        let p = dir("bad").join(FILE);
+        std::fs::write(&p, "{not json").unwrap();
+        let (got, err) = load(&p);
         assert!(got.is_empty() && err.is_some());
         assert_eq!(
-            std::fs::read(d.join(".ck_queue.json.unreadable")).unwrap(),
+            std::fs::read(p.with_extension("json.unreadable")).unwrap(),
             b"{not json"
         );
-        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn two_owners_do_not_lose_each_other() {
+        let p = dir("owners").join(FILE);
+        let sent = |id: &str, owner: &str| {
+            let mut x = e(id, "succeeded");
+            x.kind = "sent".into();
+            x.owner = owner.into();
+            x
+        };
+        replace(&p, |x| x.owner == "a", vec![sent("a1", "a"), sent("a2", "a")]).unwrap();
+        replace(&p, |x| x.owner == "b", vec![sent("b1", "b")]).unwrap();
+        // owner a rewrites its own entries; b's entry must survive
+        replace(&p, |x| x.owner == "a", vec![sent("a2", "a")]).unwrap();
+        let ids: Vec<_> = read(&p).0.into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, ["a2", "b1"]);
     }
 }

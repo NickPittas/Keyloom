@@ -1,11 +1,10 @@
 import copy
 import threading
-import time
 
 import pytest
 
 from backend.coordinator import pki
-from backend.coordinator.client import Client
+from backend.coordinator.client import join_to_file
 from backend.coordinator.server import CoordinatorServer
 from backend.coordinator.store import Store
 
@@ -40,7 +39,9 @@ def store(tmp_path, clock):
 
 
 def make_inst(store, name="pc", admin=False):
-    iid, tok = store.pair(store.create_pairing(admin), name)
+    iid, tok = store.join(name)
+    if admin:
+        store.db.execute("UPDATE installations SET is_admin=1 WHERE id=?", (iid,))
     return store.authenticate(f"{iid}.{tok}"), f"{iid}.{tok}"
 
 
@@ -59,7 +60,7 @@ def tls_server(tmp_path, store):
     c, k = tmp_path / "cert.pem", tmp_path / "key.pem"
     pki.write_private_new(str(k), key_pem)
     c.write_text(cert_pem)
-    srv = CoordinatorServer(("127.0.0.1", 0), pki.server_context(str(c), str(k)), store)
+    srv = CoordinatorServer(("127.0.0.1", 0), pki.server_context(str(c), str(k)), store, join_enabled=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"https://127.0.0.1:{srv.server_address[1]}"
     yield srv, url, cert_pem
@@ -68,6 +69,8 @@ def tls_server(tmp_path, store):
 
 
 def paired_client(store, url, cert_pem, admin=False):
-    code = store.create_pairing(admin)
-    inv = {"url": url, "certificate_pem": cert_pem, "fingerprint_sha256": pki.fingerprint(cert_pem), "code": code}
-    return Client.pair(inv, "pc"), inv
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        path = directory + "/credentials.json"
+        join_to_file(url, path, "pc", pem=cert_pem)
+        return pki.read_credentials(path), None

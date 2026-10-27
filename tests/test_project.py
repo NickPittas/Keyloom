@@ -1,20 +1,16 @@
 """Tests for backend.project module — project folder creation and metadata."""
-import json
 import os
 import tempfile
 from unittest.mock import patch
 
-import pytest
 
 from backend.project import (
     sanitize_stem,
-    create_project,
     add_clips_to_project,
     get_clip_dirs,
     get_removed_clips,
     add_removed_clip,
     clear_removed_clip,
-    is_v2_project,
     write_project_json,
     read_project_json,
     write_clip_json,
@@ -25,8 +21,6 @@ from backend.project import (
     load_in_out_range,
     save_project_output_dir,
     load_project_output_dir,
-    save_custom_output_dir,
-    load_custom_output_dir,
     is_video_file,
 )
 
@@ -181,165 +175,6 @@ class TestInOutRangeStorage:
             assert load_in_out_range(tmpdir) is None
 
 
-class TestCreateProject:
-    def test_creates_v2_structure(self):
-        """Single video creates v2 project with clips/ subdirectory."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            video = os.path.join(tmpdir, "Woman_Jumps.mp4")
-            with open(video, "wb") as f:
-                f.write(b"\x00" * 100)
-
-            with patch("backend.project.projects_root", return_value=tmpdir):
-                project_dir = create_project(video)
-
-            assert os.path.isdir(project_dir)
-            assert is_v2_project(project_dir)
-            assert os.path.isdir(os.path.join(project_dir, "clips"))
-
-            # Clip subfolder created
-            clip_dirs = get_clip_dirs(project_dir)
-            assert len(clip_dirs) == 1
-            clip_dir = clip_dirs[0]
-            assert os.path.isdir(os.path.join(clip_dir, "Source"))
-
-            # Video copied into clip subfolder
-            source_files = os.listdir(os.path.join(clip_dir, "Source"))
-            assert "Woman_Jumps.mp4" in source_files
-
-            # clip.json written per clip
-            clip_data = read_clip_json(clip_dir)
-            assert clip_data is not None
-            assert clip_data["source"]["filename"] == "Woman_Jumps.mp4"
-
-            # project.json written at project level (v2)
-            proj_data = read_project_json(project_dir)
-            assert proj_data is not None
-            assert proj_data["version"] == 2
-            assert "Woman" in proj_data["display_name"]
-            assert "clips" in proj_data
-
-    def test_multi_video_creates_one_project(self):
-        """Multiple videos create ONE project with multiple clips."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            videos = []
-            for name in ["Woman_Jumps.mp4", "Man_Walks.mp4", "Dog_Runs.mp4"]:
-                path = os.path.join(tmpdir, name)
-                with open(path, "wb") as f:
-                    f.write(b"\x00" * 100)
-                videos.append(path)
-
-            with patch("backend.project.projects_root", return_value=tmpdir):
-                project_dir = create_project(videos)
-
-            clip_dirs = get_clip_dirs(project_dir)
-            assert len(clip_dirs) == 3
-
-            # Each clip dir has a source video (name matches clip stem)
-            clip_source_files = set()
-            for cdir in clip_dirs:
-                source_dir = os.path.join(cdir, "Source")
-                files = os.listdir(source_dir)
-                assert len(files) == 1
-                clip_source_files.add(files[0])
-            assert clip_source_files == {"Woman_Jumps.mp4", "Man_Walks.mp4", "Dog_Runs.mp4"}
-
-            # project.json lists all clips
-            proj_data = read_project_json(project_dir)
-            assert len(proj_data["clips"]) == 3
-
-    def test_folder_naming(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            video = os.path.join(tmpdir, "test.mp4")
-            with open(video, "wb") as f:
-                f.write(b"\x00" * 100)
-
-            with patch("backend.project.projects_root", return_value=tmpdir):
-                project_dir = create_project(video)
-
-            folder_name = os.path.basename(project_dir)
-            # Should start with YYMMDD_HHMMSS_
-            parts = folder_name.split("_")
-            assert len(parts) >= 3
-            # Date part: YYMMDD (6 digits)
-            assert len(parts[0]) == 6
-            assert parts[0].isdigit()
-
-    def test_rapid_import_deduplicates(self):
-        """Rapid duplicate import creates separate project folders."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            video = os.path.join(tmpdir, "test.mp4")
-            with open(video, "wb") as f:
-                f.write(b"\x00" * 100)
-
-            with patch("backend.project.projects_root", return_value=tmpdir):
-                project_dir1 = create_project(video)
-                project_dir2 = create_project(video)
-
-            # Should get different project folders
-            assert project_dir1 != project_dir2
-            # Both should have clip subfolders with source videos
-            clips1 = get_clip_dirs(project_dir1)
-            clips2 = get_clip_dirs(project_dir2)
-            assert os.path.isfile(os.path.join(clips1[0], "Source", "test.mp4"))
-            assert os.path.isfile(os.path.join(clips2[0], "Source", "test.mp4"))
-
-    def test_duplicate_clip_names_deduplicated(self):
-        """Same filename imported twice in one project gets deduped clip names."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            video = os.path.join(tmpdir, "test.mp4")
-            with open(video, "wb") as f:
-                f.write(b"\x00" * 100)
-
-            with patch("backend.project.projects_root", return_value=tmpdir):
-                project_dir = create_project([video, video])
-
-            clip_dirs = get_clip_dirs(project_dir)
-            assert len(clip_dirs) == 2
-            names = [os.path.basename(d) for d in clip_dirs]
-            assert len(set(names)) == 2  # no duplicates
-
-    def test_custom_display_name(self):
-        """display_name sets project.json name and folder stem."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            videos = []
-            for name in ["clip_a.mp4", "clip_b.mp4"]:
-                path = os.path.join(tmpdir, name)
-                with open(path, "wb") as f:
-                    f.write(b"\x00" * 100)
-                videos.append(path)
-
-            with patch("backend.project.projects_root", return_value=tmpdir):
-                project_dir = create_project(
-                    videos, display_name="My Cool Project",
-                )
-
-            # Folder name uses sanitized display_name
-            folder = os.path.basename(project_dir)
-            assert "My_Cool_Project" in folder
-
-            # project.json stores the original display_name
-            proj_data = read_project_json(project_dir)
-            assert proj_data["display_name"] == "My Cool Project"
-
-    def test_no_copy_source(self):
-        """copy_source=False stores reference without copying."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            video = os.path.join(tmpdir, "test.mp4")
-            with open(video, "wb") as f:
-                f.write(b"\x00" * 100)
-
-            with patch("backend.project.projects_root", return_value=tmpdir):
-                project_dir = create_project(video, copy_source=False)
-
-            clip_dir = get_clip_dirs(project_dir)[0]
-            source_dir = os.path.join(clip_dir, "Source")
-            # Source/ dir exists but is empty (no copy)
-            assert os.path.isdir(source_dir)
-            assert len(os.listdir(source_dir)) == 0
-
-            # clip.json records copied=False
-            clip_data = read_clip_json(clip_dir)
-            assert clip_data["source"]["copied"] is False
 
 
 class TestAddClipsToProject:
@@ -351,8 +186,10 @@ class TestAddClipsToProject:
                 with open(v, "wb") as f:
                     f.write(b"\x00" * 100)
 
-            with patch("backend.project.projects_root", return_value=tmpdir):
-                project_dir = create_project(video1)
+            project_dir = os.path.join(tmpdir, "project")
+            os.makedirs(os.path.join(project_dir, "clips"))
+            write_project_json(project_dir, {"version": 2, "clips": []})
+            add_clips_to_project(project_dir, [video1])
 
             new_paths = add_clips_to_project(project_dir, [video2])
             assert len(new_paths) == 1
@@ -497,8 +334,10 @@ class TestRemovedClips:
             with open(video, "wb") as f:
                 f.write(b"\x00" * 100)
 
-            with patch("backend.project.projects_root", return_value=tmpdir):
-                project_dir = create_project(video)
+            project_dir = os.path.join(tmpdir, "project")
+            os.makedirs(os.path.join(project_dir, "clips"))
+            write_project_json(project_dir, {"version": 2, "clips": []})
+            add_clips_to_project(project_dir, [video])
 
             # Mark a clip as removed
             data = read_project_json(project_dir)

@@ -3,6 +3,7 @@ import threading
 import pytest
 
 from backend.coordinator import pki
+from backend.coordinator.client import join_to_file
 from backend.coordinator.server import CoordinatorServer
 from backend.coordinator.store import Store
 from backend.netlink import Bridge
@@ -15,7 +16,7 @@ def env(tmp_path):
     c, k = tmp_path / "cert.pem", tmp_path / "key.pem"
     pki.write_private_new(str(k), key)
     c.write_text(pem)
-    srv = CoordinatorServer(("127.0.0.1", 0), pki.server_context(str(c), str(k)), store)
+    srv = CoordinatorServer(("127.0.0.1", 0), pki.server_context(str(c), str(k)), store, join_enabled=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"https://127.0.0.1:{srv.server_address[1]}"
     d = tmp_path / "client"
@@ -26,10 +27,6 @@ def env(tmp_path):
     store.close()
 
 
-def invite(env, name="inv.json", admin=False):
-    p = env["dir"] / name
-    pki.write_invitation(str(p), env["url"], env["pem"], env["store"].create_pairing(admin), 4_000_000_000)
-    return str(p)
 
 
 def call(bridge, op, args=None, rid="r1"):
@@ -45,6 +42,6 @@ def connected(env, name="pc"):
     """A bridge that has paired and connected a fresh installation; returns (bridge, creds_path)."""
     b = Bridge()
     creds = str(env["dir"] / f"{name}.json")
-    assert call(b, "pair", {"invitation_path": invite(env, name + "-inv.json"), "credentials_path": creds, "name": name})["ok"]
+    join_to_file(env["url"], creds, name, pem=env["pem"])
     assert call(b, "connect", {"credentials_path": creds})["ok"]
     return b, creds

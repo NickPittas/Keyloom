@@ -482,8 +482,8 @@ mod tests {
 
     #[test]
     fn op_names_match_the_bridge() {
-        let names: Vec<_> = [Op::Pair, Op::Connect, Op::Register, Op::Submit, Op::Claim, Op::Start, Op::Reject, Op::Events, Op::Stats, Op::Cancel, Op::Job, Op::JobEvents, Op::Installations].map(Op::name).to_vec();
-        assert_eq!(names, ["pair", "connect", "register", "submit", "claim", "start", "reject", "events", "stats", "cancel", "job", "job_events", "installations"]);
+        let names: Vec<_> = [Op::Connect, Op::Register, Op::Submit, Op::Claim, Op::Start, Op::Reject, Op::Events, Op::Stats, Op::Cancel, Op::Job, Op::JobEvents, Op::Installations, Op::Leave, Op::ServiceRetire, Op::ServiceInstallations].map(Op::name).to_vec();
+        assert_eq!(names, ["connect", "register", "submit", "claim", "start", "reject", "events", "stats", "cancel", "job", "job_events", "installations", "leave", "service_retire", "service_installations"]);
     }
 
     #[test]

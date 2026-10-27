@@ -8,8 +8,48 @@ import pytest
 
 from backend.coordinator import pki
 from backend.coordinator.client import Client, CoordinatorError
+from backend.coordinator.schema import ApiError
+from backend.coordinator.server import Api
 
-from .conftest import CAPS, SPEC, claim_body, paired_client, session, sid
+from .conftest import SPEC, claim_body, make_inst, paired_client, session, sid
+
+
+def test_leave_revokes_only_caller(store, tls_server):
+    _, url, pem = tls_server
+    first, _ = paired_client(store, url, pem)
+    second, _ = paired_client(store, url, pem)
+    bearer = first["installation_id"] + "." + first["token"]
+    headers = {"Content-Type": "application/json"}
+    assert raw(url, pem, "POST", "/v1/leave", b"{}", headers, bearer)[0] == 200
+    assert raw(url, pem, "POST", "/v1/leave", b"{}", headers, bearer)[0] == 401
+    assert Client(second).installations()["installations"]
+
+
+@pytest.mark.parametrize("route", ["local-retire", "local-installations"])
+def test_local_management_requires_loopback_and_token(store, route):
+    own, _ = make_inst(store)
+    api = Api(store, local_token="secret", info=lambda: {"host_installation_id": own["id"]})
+    body = {"protocol": 1, "token": "secret"}
+    if route == "local-retire":
+        body["installation_id"] = own["id"]
+    for peer, token in [("192.0.2.1", "secret"), ("127.0.0.1", "bad")]:
+        with pytest.raises(ApiError) as error:
+            api.handle("POST", "/v1/" + route, None, json.dumps({**body, "token": token}).encode(), peer)
+        assert error.value.status == 403
+    if route == "local-installations":
+        assert api.handle("POST", "/v1/" + route, None, json.dumps(body).encode(), "127.0.0.1")["installations"]
+
+
+def test_local_retire_refuses_self_and_in_use(store):
+    own, _ = make_inst(store)
+    other, _ = make_inst(store)
+    api = Api(store, local_token="secret", info=lambda: {"host_installation_id": own["id"]})
+    store.submit(other, {"submission_id": sid(1), "spec": SPEC, "target": None})
+    for installation, code in [(own, "cannot_retire_self"), (other, "in_use")]:
+        body = {"protocol": 1, "token": "secret", "installation_id": installation["id"]}
+        with pytest.raises(ApiError) as error:
+            api.handle("POST", "/v1/local-retire", None, json.dumps(body).encode(), "127.0.0.1")
+        assert (error.value.status, error.value.code) == (409, code)
 
 
 def raw(url, cert_pem, method, path, body=b"", headers=None, bearer=None):
@@ -75,19 +115,6 @@ def test_wrong_certificate_and_fingerprint_refused(store, tls_server):
         pki.generate_identity(["0.0.0.0"])
 
 
-def test_pairing_reuse_and_rate_limit(store, tls_server):
-    srv, url, pem = tls_server
-    creds, inv = paired_client(store, url, pem)
-    with pytest.raises(CoordinatorError) as e:
-        Client.pair(inv, "again")
-    assert e.value.status == 403
-    inv2 = {**inv, "code": "AAAAA-AAAAA"}
-    for _ in range(9):
-        with pytest.raises(CoordinatorError):
-            Client.pair(inv2, "x")
-    with pytest.raises(CoordinatorError) as e:
-        Client.pair(inv2, "x")
-    assert e.value.status == 429
 
 
 def test_framing_and_limits(store, tls_server):

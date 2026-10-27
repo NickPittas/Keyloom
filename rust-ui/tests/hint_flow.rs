@@ -24,6 +24,9 @@ fn png(p: &std::path::Path) {
 #[test]
 fn saved_route_generates_the_hint_then_keys_and_history_survives_a_restart() {
     let base = tmp("flow");
+    // history.json lives beside the settings file; point that at this test's temp folder.
+    queue::set_settings_path(Some(base.join("settings.json")));
+    let history = base.join(queue::FILE);
     let proj = base.join("proj");
     let clip_root = proj.join("clips/c1");
     std::fs::create_dir_all(clip_root.join("Frames")).unwrap();
@@ -141,7 +144,7 @@ fn saved_route_generates_the_hint_then_keys_and_history_survives_a_restart() {
         clip_root.join("AlphaHint/f_1101.png").is_file(),
         "hint published by the worker"
     );
-    let (hist, err) = queue::load(&proj);
+    let (hist, err) = queue::load(&history);
     assert!(err.is_none());
     assert_eq!(
         hist.iter().filter(|e| e.state == "complete").count(),
@@ -153,10 +156,8 @@ fn saved_route_generates_the_hint_then_keys_and_history_survives_a_restart() {
     let mut e = hist[0].clone();
     e.id = "stuck".into();
     e.state = "running".into();
-    let mut all = hist.clone();
-    all.push(e);
-    queue::save(&proj, &all).unwrap();
-    let (again, _) = queue::load(&proj);
+    queue::replace(&history, |_| false, vec![e]).unwrap();
+    let (again, _) = queue::load(&history);
     assert_eq!(
         again.iter().find(|x| x.id == "stuck").unwrap().state,
         "held"

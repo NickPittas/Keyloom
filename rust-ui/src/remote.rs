@@ -1954,4 +1954,53 @@ mod discovery_tests {
         let left: Vec<String> = r.other_installations(&["X2".to_owned()]).into_iter().map(|i| i.id).collect();
         assert_eq!(left, ["B"]);
     }
+    fn gpu(util: Option<f64>, used: u64, total: u64) -> Value {
+        let mut g = json!({"uuid": "GPU-1", "vram_used_bytes": used, "vram_total_bytes": total});
+        if let Some(u) = util {
+            g["utilization_percent"] = json!(u);
+        }
+        g
+    }
+    fn sample(gpus: Value) -> Sample {
+        Sample::from_api(&json!({"gpus": gpus})).unwrap().unwrap().0
+    }
+
+    #[test]
+    fn lightly_loaded_needs_both_gpu_load_and_vram_under_half() {
+        assert!(lightly_loaded(&sample(json!([gpu(Some(49.0), 49, 100)]))));
+        assert!(!lightly_loaded(&sample(json!([gpu(Some(50.0), 49, 100)]))), "load at 50%");
+        assert!(!lightly_loaded(&sample(json!([gpu(Some(49.0), 50, 100)]))), "VRAM at 50%");
+        assert!(!lightly_loaded(&sample(json!([gpu(None, 10, 100)]))), "unknown load");
+        assert!(!lightly_loaded(&sample(json!([{"uuid": "GPU-1", "utilization_percent": 1.0}]))), "unknown VRAM");
+        assert!(!lightly_loaded(&sample(json!([gpu(Some(1.0), 1, 100), gpu(Some(80.0), 1, 100)]))), "one busy GPU");
+        assert!(!lightly_loaded(&sample(json!([]))), "no GPU present");
+        assert!(!lightly_loaded(&Sample::from_api(&json!({})).unwrap().unwrap().0), "GPUs unreadable");
+    }
+
+    fn free_remote(age: f64, connected: bool) -> Remote {
+        let mut r = Remote::blank(Source::Off, String::new());
+        let stats = json!({"gpus": [gpu(Some(10.0), 10, 100)], "measured_age_s": age});
+        r.installs = vec![Install { id: "X".into(), name: "X".into(), gpu: None, connected, last_seen_s: None, stats, received: Instant::now() }];
+        r
+    }
+    fn job_on(iid: &str, state: &str) -> NetJob {
+        NetJob { submission_id: "s".into(), submission: None, installation: Some(iid.into()), stages: vec![], active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: String::new(), name: String::new(), state: state.into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, inflight: false }
+    }
+
+    #[test]
+    fn is_free_needs_a_fresh_sample_and_no_unfinished_job() {
+        assert!(free_remote(1.0, true).is_free("X"));
+        assert!(free_remote(crate::metrics::REMOTE_STALE_S, true).is_free("X"), "exactly at the limit is still fresh");
+        assert!(!free_remote(crate::metrics::REMOTE_STALE_S + 0.1, true).is_free("X"), "stale");
+        assert!(!free_remote(1.0, false).is_free("X"), "not connected");
+        assert!(!free_remote(1.0, true).is_free("other"), "unknown PC");
+        let mut r = free_remote(1.0, true);
+        r.installs[0].stats = json!({"gpus": [gpu(Some(10.0), 10, 100)]});
+        assert!(!r.is_free("X"), "no age means unknown, not free");
+        let mut r = free_remote(1.0, true);
+        r.jobs.push(job_on("X", "sending"));
+        assert!(!r.is_free("X") && r.has_unfinished("X"), "our job is queued there");
+        r.jobs[0].state = "succeeded".into();
+        assert!(r.is_free("X"), "a finished job frees the PC");
+    }
 }

@@ -253,7 +253,7 @@ fn key(k: egui::Key) -> Vec<Event> {
 }
 
 #[test]
-fn open_clip_settings_works_from_the_top_bar_and_from_the_card() {
+fn open_clip_settings_works_from_the_card() {
     let tag = format!("btn-{}", std::process::id());
     let root = std::env::temp_dir().join(format!("ck-nav-{tag}"));
     let _ = fs::remove_dir_all(&root);
@@ -281,20 +281,6 @@ fn open_clip_settings_works_from_the_top_bar_and_from_the_card() {
     run(&ctx, &mut app, click(at));
     run(&ctx, &mut app, vec![]);
     assert!(!app.in_workspace());
-    // Top-bar button needs exactly one selected clip.
-    app.select_folders(&["b"]);
-    for _ in 0..2 {
-        run(&ctx, &mut app, vec![]);
-    }
-    let r = app
-        .open_settings_rects()
-        .iter()
-        .find(|(i, _)| i.is_none())
-        .unwrap()
-        .1;
-    run(&ctx, &mut app, click(r.center()));
-    run(&ctx, &mut app, vec![]);
-    assert!(app.in_workspace(), "top button opens the selected clip");
 }
 
 #[test]

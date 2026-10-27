@@ -3,14 +3,13 @@
 #![allow(dead_code)]
 use ck::contracts::RangeIdentity;
 use ck::jobs::{JobMode, KeyJob, Require};
-use ck::worker::{Storage, Target, TargetKind};
+use ck::worker::{Target, TargetKind};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 pub const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_worker.py");
-pub const FAKE_SSH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_ssh.sh");
 pub const PY: &str = "/usr/bin/python3";
 
 pub fn tmp(tag: &str) -> PathBuf {
@@ -64,8 +63,6 @@ pub fn local(id: &str, gpu: u32, repo: &Path) -> Target {
         },
         gpu,
         enabled: true,
-        storage: Storage::Shared,
-        path_map: vec![],
     }
 }
 

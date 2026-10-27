@@ -1117,16 +1117,15 @@ mod discovery_contract_tests {
     use super::*;
 
     #[test]
-    fn checkbox_and_invitation_send_full_certificate_pin() {
+    fn checkbox_sends_full_certificate_pin() {
         let fp = "abcdef01".repeat(8);
         let scan = parse_scan(&json!({"pcs": [{"network_id": &fp[..16], "fingerprint_sha256": fp,
             "endpoints": [{"url": "https://100.64.1.2:8443", "reachable": true}]}]}));
         let pc = &scan.pcs[0];
         assert_eq!(pc.network_id.len(), 16);
-        for args in [pc.join_args("https://100.64.1.2:8443", "PC"), pc.invitation_route()] {
-            assert_eq!(args["fingerprint_sha256"], fp);
-            assert_eq!(args["endpoints"][0], "https://100.64.1.2:8443");
-        }
+        let args = pc.join_args("https://100.64.1.2:8443", "PC");
+        assert_eq!(args["fingerprint_sha256"], fp);
+        assert_eq!(args["endpoints"][0], "https://100.64.1.2:8443");
         assert!(parse_scan(&json!({"pcs": [{"network_id": &fp[..16], "fingerprint_sha256": &fp[..16]}]})).pcs.is_empty());
     }
 

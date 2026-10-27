@@ -64,6 +64,8 @@ fn pump(ctx: &egui::Context, app: &mut App, what: &str, mut done: impl FnMut(&Ap
 fn open(e: &Env) -> (egui::Context, App) {
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(&ctx, AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), ..Default::default() });
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
+
     for _ in 0..12 {
         frame(&ctx, &mut app);
     }

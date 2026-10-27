@@ -26,7 +26,7 @@ def png():
 
 
 gpu = int(sys.argv[sys.argv.index("--gpu") + 1]) if "--gpu" in sys.argv else 0
-log({"event": "start", "pid": os.getpid(), "argv": sys.argv, "cwd": os.getcwd(), "ssh_argv": os.environ.get("FAKE_SSH_ARGV")})
+log({"event": "start", "pid": os.getpid(), "argv": sys.argv, "cwd": os.getcwd()})
 cmds = queue.Queue()
 eof = False
 

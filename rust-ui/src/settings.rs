@@ -773,4 +773,55 @@ mod tests {
         assert!(!st.needs_repair());
         assert!(!Store::load(None).needs_repair());
     }
+    fn load_json(name: &str, body: &str) -> (Store, PathBuf) {
+        let d = dir(name);
+        let p = d.join("s.json");
+        std::fs::write(&p, body).unwrap();
+        (Store::load(Some(p)), d)
+    }
+
+    #[test]
+    fn use_invitation_becomes_allow_join_turned_around() {
+        for (body, want) in [
+            (r#"{"version":1,"network":{"use_invitation":true}}"#, false),
+            (r#"{"version":1,"network":{"use_invitation":false}}"#, true),
+            (r#"{"version":1,"network":{}}"#, true),
+        ] {
+            let (st, _) = load_json("inv", body);
+            assert!(st.problem.is_none(), "{:?}", st.problem);
+            assert_eq!(st.saved().network.allow_join, want, "{body}");
+            assert!(!st.saved().network.extra.contains_key("use_invitation"), "old key survived: {body}");
+        }
+    }
+
+    #[test]
+    fn old_single_connection_migrates_only_when_its_file_exists() {
+        let d = dir("mig");
+        let creds = d.join("c.json");
+        std::fs::write(&creds, "{}").unwrap();
+        let body = |c: &Path| format!(r#"{{"version":1,"network":{{"enabled":true,"credentials":{:?}}}}}"#, c.display().to_string());
+        let (st, _) = load_json("mig-yes", &body(&creds));
+        let n = &st.saved().network;
+        assert_eq!(n.connections.len(), 1);
+        assert_eq!(n.connections[0].credentials, creds.display().to_string());
+        assert!(n.connections[0].enabled);
+        assert_eq!(n.extra.get("connections_migrated"), Some(&Value::Bool(true)));
+        let (st, _) = load_json("mig-no", &body(&d.join("missing.json")));
+        assert!(st.saved().network.connections.is_empty());
+        assert!(!st.saved().network.extra.contains_key("connections_migrated"));
+    }
+
+    #[test]
+    fn migrated_empty_list_stays_empty_and_unknown_keys_survive() {
+        let d = dir("mig-empty");
+        std::fs::create_dir_all(d.join("network")).unwrap();
+        std::fs::write(d.join("network/credentials.json"), "{}").unwrap(); // the default file exists, yet the user removed it
+        let p = d.join("s.json");
+        std::fs::write(&p, r#"{"version":1,"top_new":1,"network":{"connections_migrated":true,"connections":[],"net_new":"x"}}"#).unwrap();
+        let st = Store::load(Some(p));
+        assert!(st.problem.is_none(), "{:?}", st.problem);
+        assert!(st.saved().network.connections.is_empty());
+        assert_eq!(st.saved().network.extra.get("net_new"), Some(&Value::from("x")));
+        assert_eq!(st.saved().extra.get("top_new"), Some(&Value::from(1)));
+    }
 }

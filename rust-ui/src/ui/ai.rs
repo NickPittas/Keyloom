@@ -542,6 +542,10 @@ pub struct AiUi {
     /// Confirmed Automatic shots waiting for a free PC, in order.
     // ponytail: dropped on quit, not saved; the user confirms them again.
     auto_pending: std::collections::VecDeque<AutoShot>,
+    /// Why the last Automatic dispatch left shots waiting (shown after "Waiting for a free PC").
+    auto_wait: Option<String>,
+    /// How many clients are Automatic candidates (Connect + Accept work, online); set before each dispatch.
+    pub auto_clients: usize,
     /// Shots whose clip.json was rewritten here: the App re-reads them (route/markers/bases) on its next tick.
     refresh_clips: Vec<String>,
     /// Re-reads the driver found necessary (published/ended jobs), drained by the UI.
@@ -680,6 +684,8 @@ impl AiUi {
             net_online: false,
             net_outbox: vec![],
             auto_pending: Default::default(),
+            auto_wait: None,
+            auto_clients: 0,
             refresh_clips: vec![],
             refreshes: vec![],
             temporal_items: vec![],
@@ -2896,6 +2902,7 @@ impl AiUi {
     /// A PC given a shot is busy at once (a remote job counts from "sending", a local job from its submit), and the
     /// list is never split up front: a finished PC just takes the next shot.
     pub fn dispatch_auto(&mut self, free_remote: &[String], local: &crate::metrics::View) {
+        self.auto_wait = None;
         if self.auto_pending.is_empty() || self.model_mutation_active {
             return;
         }
@@ -2924,6 +2931,25 @@ impl AiUi {
                 self.auto_pending.push_back(a);
             }
         }
+        self.auto_wait = (!self.auto_pending.is_empty()).then(|| {
+            let clients = if self.auto_clients > 0 { "every client is busy or over 50%" } else { "no client with Connect + Accept work is online" };
+            [self.local_wait(local), Some(clients.to_owned())].into_iter().flatten().collect::<Vec<_>>().join("; ")
+        });
+    }
+
+    /// Why this computer is not free for an Automatic shot, in the order it is checked; None = free.
+    fn local_wait(&self, local: &crate::metrics::View) -> Option<String> {
+        use crate::metrics::View;
+        if self.sched.running() {
+            return Some("this PC is busy".into());
+        }
+        Some(match local {
+            View::Live(s) if crate::remote::lightly_loaded(s) => return None,
+            View::Live(_) => "this PC is over 50% GPU or VRAM".into(),
+            View::Unavailable(s) => format!("this PC's GPU load is unknown: {s}"),
+            View::Starting => "this PC's GPU load is unknown: starting".into(),
+            View::Stale { .. } => "this PC's GPU load is unknown: the reading is stale".into(),
+        })
     }
 
     /// Drop the Automatic shots still waiting for a free PC.
@@ -3507,7 +3533,6 @@ mod tests {
                 newver: None,
                 resume: Some(plan_for(&clip)),
                 replace: None,
-                replace_why: None,
             },
             choice: Choice::Resume,
             placement: Placement::Auto,
@@ -3532,6 +3557,94 @@ mod tests {
         assert!(row(Some(HintCfg::default()), vec![]).plan().is_some(), "no regeneration: resume is fine");
         assert!(row(None, vec![step.clone()]).plan().is_some(), "non-pipeline rows keep their behaviour");
         assert!(row(Some(HintCfg::default()), vec![step]).plan().is_none(), "regenerated hint: never resume");
+        let _ = std::fs::remove_dir_all(d);
+    }
+    fn auto_fixture(tag: &str, n: usize) -> (AiUi, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("ck-auto-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for i in 0..n {
+            std::fs::create_dir_all(d.join(format!("clips/c{i}/Frames"))).unwrap();
+            std::fs::write(d.join(format!("clips/c{i}/Frames/f_1101.png")), b"x").unwrap();
+        }
+        std::fs::write(d.join("project.json"), r#"{"version":2}"#).unwrap();
+        let p = load_project(&d, &LoadOptions::default()).unwrap();
+        let mut st = Settings::default();
+        st.shared_roots = vec![crate::shared_paths::SharedRoot { name: "NAS".into(), local: d.display().to_string(), extra: Default::default() }];
+        let mut ai = AiUi::new(&st, None);
+        for clip in &p.clips {
+            let mut plan = plan_for(clip);
+            plan.job.mode = crate::jobs::JobMode::New;
+            plan.job.require.models.insert("corridorkey_v2".into(), None);
+            plan.values = serde_json::json!({"resolution": "1920x1080", "date": "2026-10-27", "version": 1});
+            let row = BatchRow {
+                steps: vec![],
+                clip: clip.clone(),
+                params: Params::default(),
+                out: OutputCfg::default(),
+                range: (0, 0),
+                state: RowState::Ready(plan.clone()),
+                choice: Choice::Resume,
+                placement: Placement::Auto,
+                hint: None,
+                note: None,
+                export: None,
+                overrides: vec![],
+                base: None,
+                location: None,
+            };
+            ai.auto_pending.push_back(AutoShot { row, plan, project: p.clone(), st: st.clone(), preset_name: None, tries: 0 });
+        }
+        (ai, d)
+    }
+
+    fn busy_view() -> crate::metrics::View {
+        crate::metrics::View::Unavailable("no sample".into())
+    }
+
+    #[test]
+    fn auto_sends_one_shot_to_each_free_pc() {
+        let (mut ai, d) = auto_fixture("two", 3);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into()), ("n/b".into(), "B".into())];
+        ai.dispatch_auto(&["network:n/a".into(), "network:n/b".into()], &busy_view());
+        let sent = ai.take_net_outbox();
+        assert_eq!(sent.len(), 2, "one shot per free PC, the third waits");
+        assert_eq!(ai.auto_pending.len(), 1);
+        let mut to: Vec<_> = sent.iter().map(|n| n.target.clone().unwrap()).collect();
+        to.sort();
+        assert_eq!(to, ["n/a", "n/b"]);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn auto_waits_without_free_pc_and_when_models_change() {
+        let (mut ai, d) = auto_fixture("none", 2);
+        ai.net_online = true;
+        ai.dispatch_auto(&[], &busy_view());
+        assert_eq!((ai.auto_pending.len(), ai.take_net_outbox().len()), (2, 0));
+        ai.model_mutation_active = true;
+        ai.net_targets = vec![("n/a".into(), "A".into())];
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        assert_eq!((ai.auto_pending.len(), ai.take_net_outbox().len()), (2, 0));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn auto_failed_send_goes_to_the_back_and_is_dropped_after_three_tries() {
+        let (mut ai, d) = auto_fixture("fail", 2);
+        let first = ai.auto_pending[0].row.clip.display_name.clone();
+        ai.net_online = false; // every remote send is refused
+        let free = ["network:n/a".to_owned()];
+        ai.dispatch_auto(&free, &busy_view());
+        assert_eq!(ai.auto_pending.len(), 2, "kept for the next tick");
+        assert_eq!(ai.auto_pending.back().unwrap().row.clip.display_name, first, "failed shot moved to the back");
+        assert!(matches!(ai.auto_pending.back().unwrap().row.placement, Placement::Auto), "Automatic placement restored");
+        for _ in 0..4 {
+            ai.dispatch_auto(&free, &busy_view());
+        }
+        // 5 ticks over 2 shots: each is popped alternately; both reach 3 failures and are removed.
+        assert!(ai.auto_pending.len() < 2, "dropped shots no longer wait");
+        assert!(ai.notice.as_deref().unwrap().contains("not sent after 3 tries"), "{:?}", ai.notice);
         let _ = std::fs::remove_dir_all(d);
     }
 }

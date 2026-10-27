@@ -330,7 +330,8 @@ impl AiUi {
         ui.set_max_width(w);
         if !self.auto_pending.is_empty() {
             ui.horizontal(|ui| {
-                ui.label(format!("Waiting for a free PC ({})", self.auto_pending.len()));
+                let why = self.auto_wait.as_deref().map(|w| format!(": {w}")).unwrap_or_default();
+                ui.label(format!("Waiting for a free PC ({}){why}", self.auto_pending.len()));
                 if ui.small_button("Cancel").clicked() {
                     self.cancel_auto();
                 }

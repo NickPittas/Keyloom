@@ -1,7 +1,5 @@
 """Regression tests for the round-1 review findings."""
-import os
 import socket
-import ssl
 import threading
 import time
 
@@ -9,12 +7,12 @@ import pytest
 
 from backend.coordinator import pki
 from backend.coordinator.__main__ import main
-from backend.coordinator.client import Client, CoordinatorError
+from backend.coordinator.client import Client
 from backend.coordinator.schema import ApiError
 from backend.coordinator.server import CoordinatorServer
 from backend.coordinator.store import SESSION_TTL, Store
 
-from .conftest import CAPS, SPEC, claim_body, make_inst, paired_client, session, sid, spec
+from .conftest import SPEC, claim_body, make_inst, paired_client, session, sid, spec
 from .test_store import ev, setup_pair
 
 
@@ -42,7 +40,7 @@ def quick_server(tmp_path, store):
     c, k = tmp_path / "cert.pem", tmp_path / "key.pem"
     pki.write_private_new(str(k), key)
     c.write_text(pem)
-    srv = CoordinatorServer(("127.0.0.1", 0), pki.server_context(str(c), str(k)), store, conn_deadline=0.8, max_connections=2)
+    srv = CoordinatorServer(("127.0.0.1", 0), pki.server_context(str(c), str(k)), store, conn_deadline=0.8, max_connections=2, join_enabled=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield srv, f"https://127.0.0.1:{srv.server_address[1]}", pem
     srv.shutdown()
@@ -108,28 +106,8 @@ def _invite(store, tls, tmp_path, name="inv.json"):
     return p
 
 
-def test_cli_pair_checks_destination_before_redeeming(store, tls_server, tmp_path):
-    inv = _invite(store, tls_server, tmp_path)
-    existing = tmp_path / "exists.json"
-    existing.write_text("keep me")
-    assert main(["pair", "--invitation", inv, "--credentials", str(existing), "--name", "n"]) == 1
-    assert existing.read_text() == "keep me"
-    if os.name != "nt" and os.geteuid() != 0:
-        ro = tmp_path / "ro"
-        ro.mkdir(mode=0o500)
-        assert main(["pair", "--invitation", inv, "--credentials", str(ro / "c.json"), "--name", "n"]) == 1
-    good = str(tmp_path / "good.json")
-    assert main(["pair", "--invitation", inv, "--credentials", good, "--name", "n"]) == 0  # same code still unspent
-    assert Client(pki.read_credentials(good)).installations()["installations"]
 
 
-def test_cli_pair_failed_redemption_leaves_no_file(store, tls_server, tmp_path):
-    _, url, pem = tls_server
-    inv = str(tmp_path / "bad.json")
-    pki.write_invitation(inv, url, pem, "AAAAA-AAAAA", 4_000_000_000)  # unknown code -> 403
-    dest = tmp_path / "c.json"
-    assert main(["pair", "--invitation", inv, "--credentials", str(dest), "--name", "n"]) == 1
-    assert not dest.exists()
 
 
 # ---- 4/5. operator commands ----------------------------------------------------------------------
@@ -299,23 +277,8 @@ def test_windows_read_time_acl_validation(tmp_path, monkeypatch):
     with pytest.raises(pki.SecurityError) as e:
         pki.read_credentials(p)
     assert "cannot verify" in str(e.value)
-    inv = str(tmp_path / "i.json")
-    state.update(broken=False)
-    pki.write_invitation(inv, "https://127.0.0.1:1", pki.generate_identity(["127.0.0.1"])[0], "AAAAA-AAAAA", 4_000_000_000)
-    state["widened"] = True
-    with pytest.raises(pki.SecurityError):
-        pki.read_invitation(inv)
 
 
-def test_cli_pair_save_failure_message(store, tls_server, tmp_path, monkeypatch, capsys):
-    _, url, pem = tls_server
-    inv = str(tmp_path / "i.json")
-    pki.write_invitation(inv, url, pem, store.create_pairing(), 4_000_000_000)
-    monkeypatch.setattr(pki, "fill_reserved", lambda *a: (_ for _ in ()).throw(OSError(28, "full")))
-    dest = tmp_path / "c.json"
-    assert main(["pair", "--invitation", inv, "--credentials", str(dest), "--name", "n"]) == 1
-    err = capsys.readouterr().err
-    assert "USED" in err and "revoke inst_" in err and not dest.exists()
 
 
 def test_malformed_query_string_is_400_not_500(store, tls_server):
@@ -355,15 +318,13 @@ def test_windows_acl_principal_must_match_exactly(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("iid,tok", [("inst_ok", "a.b" + "c" * 20), ("in.st", "c" * 30), ("", "c" * 30), ("inst_ok", "short"),
                                      ("inst_ok", "c" * 200), (5, "c" * 30), ("inst_ok", None), ("inst_ok", "has space " + "c" * 20)])
-def test_pair_rejects_unusable_credentials_and_never_succeeds(tls_server, store, tmp_path, monkeypatch, iid, tok):
+def test_join_rejects_unusable_credentials_and_never_succeeds(tls_server, store, tmp_path, monkeypatch, iid, tok):
     from backend.coordinator import client as cl
     _, url, pem = tls_server
-    inv_path = str(tmp_path / "i.json")
-    pki.write_invitation(inv_path, url, pem, store.create_pairing(), 4_000_000_000)
     monkeypatch.setattr(cl.Client, "_call", lambda self, *a, **k: {"installation_id": iid, "token": tok})
     dest = tmp_path / "c.json"
     with pytest.raises(pki.PairingUncertain):
-        cl.redeem_to_file(pki.read_invitation(inv_path), str(dest), "n")
+        cl.join_to_file(url, str(dest), "n", pem=pem)
     assert not dest.exists()
 
 

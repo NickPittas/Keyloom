@@ -54,8 +54,7 @@ fn env(tag: &str) -> Env {
     let repo = common::make_repo(&base, "repo", json!({}));
     let settings = base.join("settings.json");
     fs::write(&settings, json!({"version":1,"ai_targets":[
-        {"id":"l0","kind":"local","repo":repo,"python":common::PY,"gpu":0},
-        {"id":"far","kind":"ssh","host":"h","user":null,"port":null,"python":"/p","repo":"/r","gpu":0,"storage":"shared","path_map":[],"enabled":true}]}).to_string()).unwrap();
+        {"id":"l0","kind":"local","repo":repo,"python":common::PY,"gpu":0}]}).to_string()).unwrap();
     Env { base, project, settings }
 }
 fn fixture(e: &Env) -> PathBuf {

@@ -2566,6 +2566,7 @@ impl App {
         }
         if !self.remote.available() {
             let view = self.metrics.view(now);
+            self.ai.auto_clients = 0;
             self.ai.dispatch_auto(&[], &view); // no network: Automatic means this computer
             return;
         }
@@ -4114,5 +4115,41 @@ mod lock_order_tests {
             app.metrics.hold();
             app.release_shared();
         }
+    }
+}
+
+#[cfg(test)]
+mod finish_remove_tests {
+    use super::*;
+
+    #[test]
+    fn finishing_a_remove_drops_the_entry_and_login_files_but_keeps_history() {
+        let d = std::env::temp_dir().join(format!("ck-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (gone, kept) = (d.join("gone.json").display().to_string(), d.join("kept.json").display().to_string());
+        let conn = |c: &str| serde_json::json!({"credentials": c, "enabled": true});
+        let sp = d.join("settings.json");
+        std::fs::write(&sp, serde_json::json!({"version": 1, "network": {"connections_migrated": true, "default_submit": gone, "connections": [conn(&gone), conn(&kept)]}}).to_string()).unwrap();
+        let files: Vec<String> = ["", ".session", ".lock", ".network.json"].iter().map(|e| format!("{gone}{e}")).collect();
+        for f in files.iter().chain([&kept]) {
+            std::fs::write(f, "x").unwrap();
+        }
+        let (hist, attempt) = (d.join("history.json"), format!("{gone}.attempt.json"));
+        std::fs::write(&hist, "[]").unwrap();
+        std::fs::write(&attempt, "{}").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { settings_path: Some(sp.clone()), ..Default::default() });
+        app.finish_remove(&gone, Some("still listed".into()));
+
+        let saved = crate::settings::Store::load(Some(sp));
+        let left: Vec<&str> = saved.saved().network.connections.iter().map(|c| c.credentials.as_str()).collect();
+        assert_eq!(left, [kept.as_str()]);
+        assert!(saved.saved().network.default_submit.is_empty(), "the removed default is cleared");
+        assert!(files.iter().all(|f| !std::path::Path::new(f).exists()), "login and side files are deleted");
+        assert!(std::path::Path::new(&kept).exists() && hist.exists() && std::path::Path::new(&attempt).exists());
+        assert_eq!(app.ai.notice.as_deref(), Some("still listed"));
+        let _ = std::fs::remove_dir_all(d);
     }
 }

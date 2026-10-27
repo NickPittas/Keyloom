@@ -851,7 +851,7 @@ fn failure_after_claiming_a_new_project_names_the_partial_folder_and_keeps_it() 
     let d = tmp("partial");
     png_seq(&d.join("seq"), 2, "png");
     let parent = d.join("parent");
-    let boom = "def boom(*a, **k): raise OSError('disk full')\nm.P.add_sequences_to_project = boom";
+    let boom = "def boom(*a, **k): raise OSError('disk full')\nm.add_sequences_to_project = boom";
     let mut c = pinned_new(&d, &parent, &d.join("seq"), boom);
     let _open = c.stdin.take();
     let out = c.wait_with_output().unwrap();

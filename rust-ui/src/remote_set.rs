@@ -109,6 +109,7 @@ impl RemoteSet {
         }
         self.remotes.sort_by_key(|r| conns.iter().position(|(c, _)| key_of(c) == r.key));
         let free = self.free_candidates(env.settings, env.settings_path);
+        env.ai.auto_clients = self.automatic_candidates(env.settings, env.settings_path).len();
         env.ai.dispatch_auto(&free, env.metrics);
         let default = env.settings.network.default_submit.trim().to_owned();
         for mut n in env.ai.take_net_outbox() {

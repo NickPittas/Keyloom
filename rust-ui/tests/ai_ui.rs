@@ -156,11 +156,14 @@ fn pump(ctx: &egui::Context, app: &mut App, what: &str, mut done: impl FnMut(&Ap
 
 /// Open the batch review for the selected clips and confirm it (real click on the Queue button).
 fn confirm_batch(ctx: &egui::Context, app: &mut App) {
+    // Automatic waits for a free PC with a live GPU sample; these tests run on the one local target.
+    let session = std::mem::replace(&mut app.ai_mut().placement, ck::scheduler::Placement::Target("l0".into()));
     app.key_selected(ctx);
     pump(ctx, app, "batch review", |a| a.ai().batch_ready());
     settle(ctx, app);
     let r = app.ai().batch_confirm_rect.expect("Queue button drawn");
     click_on(ctx, app, r.center());
+    app.ai_mut().placement = session;
 }
 
 fn states(app: &App) -> Vec<JobState> {
@@ -500,6 +503,7 @@ fn batch_review_shows_paths_then_places_clips_and_offers_a_new_version_for_exist
     let ctx = egui::Context::default();
     let mut app = app_for(&e, &ctx, None);
     app.select_folders(&["a", "b", "z"]);
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into());
     app.key_selected(&ctx);
     pump(&ctx, &mut app, "review", |a| a.ai().batch_ready());
     // Reviewed BEFORE anything is queued: resolved destination per clip, the blocked one named.
@@ -1124,26 +1128,11 @@ fn ai_targets_roundtrip_in_settings_and_keep_unknown_keys() {
     n.playback.decode_workers = 2;
     st.save(n).unwrap();
     assert_eq!(st.saved().ai_targets.len(), 1);
-    // A Windows SSH target with drive/UNC mappings is accepted; POSIX paths for a Windows worker are not.
-    let win = |repo: &str| -> ck::worker::Target {
-        serde_json::from_value(json!({"id": "w", "kind": "ssh", "os": "windows", "host": "win1", "user": null, "port": null,
-            "python": r"C:\\CK\\.venv\\Scripts\\python.exe", "repo": repo, "ssh": null, "gpu": 0,
-            "path_map": [["/mnt/NAS", r"Z:\\"], ["/mnt/NAS2", r"\\\\nas\\share"]]}))
-        .unwrap()
-    };
-    let mut n = st.saved().clone();
-    n.ai_targets.push(win("/opt/ck"));
-    assert!(st.save(n.clone()).is_err());
-    n.ai_targets[1] = win(r"C:\\CK");
-    st.save(n).unwrap();
-    assert_eq!(Store::load(Some(p.clone())).saved().ai_targets.len(), 2);
     let v: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
     assert_eq!(v["future"], 1);
     assert_eq!(v["ai_targets"][0]["id"], "l0");
     let _ = fs::remove_dir_all(d);
 }
-
-const FAKE_SSH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_ssh.sh");
 
 fn manifest_dir_of(app: &App, id: &str) -> PathBuf {
     app.ai()
@@ -1205,86 +1194,6 @@ fn a_lock_owned_by_an_active_job_of_this_session_cannot_be_released_from_the_gat
     assert!(!ghost.join(".corridorkey_job.lock").exists());
     app.ai_mut().cancel(&id);
     pump(&ctx, &mut app, "cancelled", all_terminal);
-    fs::remove_dir_all(e.base).unwrap();
-}
-
-#[test]
-fn a_lost_unproven_job_is_released_only_through_the_scheduler_confirm() {
-    let e = env(
-        "lock-lost",
-        &[("crash1", 5, matte_png())],
-        json!({"version": 2}),
-    );
-    let repo = e.base.join("repo");
-    fs::write(
-        &e.settings,
-        json!({"version": 1, "ai_targets": [
-            {"id": "l0", "kind": "local", "repo": repo, "python": "/usr/bin/python3", "gpu": 0},
-            {"id": "r0", "kind": "ssh", "os": "linux", "host": "fakehost", "user": null, "port": null,
-             "python": "/usr/bin/python3", "repo": repo, "ssh": FAKE_SSH, "gpu": 0, "path_map": [[e.base, e.base]]}]})
-        .to_string(),
-    )
-    .unwrap();
-    let ctx = egui::Context::default();
-    let mut app = app_for(&e, &ctx, None);
-    // The local worker is the trusted model reference; only then may the (fake-ssh) remote run the job.
-    app.ai_mut().scheduler_mut().probe(Some("l0"));
-    pump(&ctx, &mut app, "local ready", |a| {
-        a.ai().scheduler().reference().is_some()
-    });
-    app.ai_mut().placement = ck::scheduler::Placement::Target("r0".into());
-    app.select_folders(&["crash1"]);
-    confirm_batch(&ctx, &mut app);
-    pump(&ctx, &mut app, "lost", |a| {
-        states(a).iter().any(|s| matches!(s, JobState::Lost { .. }))
-    });
-    let id = app.ai().job_ids()[0].clone();
-    assert!(
-        matches!(
-            &states(&app)[0],
-            JobState::Lost {
-                writer_stopped: false,
-                ..
-            }
-        ),
-        "an ssh client dying proves nothing: {:?}",
-        states(&app)
-    );
-    let dir = manifest_dir_of(&app, &id);
-    let lock = dir.join(".corridorkey_job.lock");
-    fs::write(
-        &lock,
-        json!({"job_id": id, "host": "fakehost", "pid": 1}).to_string(),
-    )
-    .unwrap();
-    assert_eq!(app.ai().lock_owner(&id), ck::ui::ai::LockOwner::Session);
-    assert!(
-        app.ai_mut().release_lock(&dir, &id).is_err() && lock.exists(),
-        "no bypass of the dedicated confirm"
-    );
-    assert_eq!(
-        app.ai().scheduler().needs_attention().len(),
-        1,
-        "it stays reachable"
-    );
-    app.ai_mut().begin_stop();
-    pump(&ctx, &mut app, "all worker processes stopped", |a| {
-        a.ai().all_stopped()
-    });
-    assert!(app.ai().scheduler().needs_attention().len() == 1);
-    assert!(
-        !app.ai().model_asset_mutation_safe(),
-        "observed process exit alone does not clear an unresolved Lost fence"
-    );
-    // The dedicated confirm keeps fence and proof coherent and does the cleanup.
-    let rec = app
-        .ai_mut()
-        .scheduler_mut()
-        .confirm_writer_stopped(&id)
-        .expect("recovery runs");
-    assert!(rec.lock_removed && !lock.exists(), "{rec:?}");
-    assert_eq!(app.ai().lock_owner(&id), ck::ui::ai::LockOwner::Ended);
-    assert!(app.ai().model_asset_mutation_safe());
     fs::remove_dir_all(e.base).unwrap();
 }
 

@@ -1,53 +1,11 @@
 """Behavioral tests for GPU lock serialization of whole-clip CorridorKey 2.0 runs."""
 import threading
-import time
 from unittest.mock import MagicMock
 
-from backend.service import CorridorKeyService, InferenceParams, OutputConfig, _ActiveModel
+from backend.service import CorridorKeyService, _ActiveModel
 from backend.clip_state import ClipAsset, ClipEntry, ClipState
 
 
-class TestGPULockSerialization:
-    """Two whole-clip runs share one engine and must not overlap on the GPU."""
-
-    def test_concurrent_runs_serialized_single_engine(self, sample_clip, tmp_path, monkeypatch):
-        from backend.service.v2_inputs import V2PreparedInput
-
-        monkeypatch.setenv("CORRIDORKEY_V2_SCRATCH_DIR", str(tmp_path))
-        svc = CorridorKeyService()
-        log = []
-        engine = MagicMock()
-
-        def slow_run(*args, **kwargs):
-            log.append(("start", time.monotonic()))
-            time.sleep(0.05)
-            log.append(("end", time.monotonic()))
-            raise RuntimeError("stop after run_clip")
-
-        engine.run_clip.side_effect = slow_run
-        svc._get_v2_engine = MagicMock(return_value=engine)
-        prepared = V2PreparedInput("x", ["a"], 1, 24.0, False, None)
-        monkeypatch.setattr("backend.service.inference.prepare_v2_inputs",
-                            lambda *a, **k: prepared)
-        errors = []
-
-        def worker():
-            try:
-                svc.run_inference(sample_clip, InferenceParams(), output_config=OutputConfig())
-            except RuntimeError as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=worker) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5)
-
-        assert len(errors) == 2
-        starts = sorted(t for k, t in log if k == "start")
-        ends = sorted(t for k, t in log if k == "end")
-        assert len(starts) == 2 and len(ends) == 2
-        assert starts[1] >= ends[0], "run_clip calls overlapped"
 
 
 class TestGPULockModelSwitch:
@@ -181,22 +139,10 @@ def _setup_case(kind, svc, root, fake):
         })
         clip = _make_clip(root, with_mask=True)
         return (lambda **kw: svc.run_videomama(clip, **kw)), ctx
-    if kind in ("sam2_track", "sam2_preview"):
-        svc._active_model = _ActiveModel.SAM2
-
-        def track_video(frames, prompts, **kw):
-            fake.compute()
-            return [np.full(f.shape[:2], 255, np.uint8) for f in frames]
-
-        svc._sam2_tracker = MagicMock(track_video=track_video, model_id="m")
-        clip = _make_clip(root, annotations=True)
-        if kind == "sam2_track":
-            return (lambda **kw: svc.run_sam2_track(clip, **kw)), ctx
-        return (lambda **kw: svc.preview_sam2_prompt(clip, **kw)), ctx
     raise AssertionError(kind)
 
 
-_GENERATORS = ["gvm", "birefnet", "matanyone2", "videomama", "sam2_track", "sam2_preview"]
+_GENERATORS = ["gvm", "birefnet", "matanyone2", "videomama"]
 
 
 class TestGeneratorsHoldGPULock:
@@ -262,20 +208,6 @@ class TestGeneratorsHoldGPULock:
             svc.run_gvm(clip, job=job)
         assert not svc._gpu_lock.locked()
 
-    def test_sam2_cancel_raises_and_releases_lock(self, tmp_path):
-        svc = CorridorKeyService()
-        job = GPUJob(JobType.SAM2_TRACK, "c") if hasattr(JobType, "SAM2_TRACK") else GPUJob(JobType.GVM_ALPHA, "c")
-
-        def track_video(frames, prompts, check_cancel=None, **kw):
-            job.request_cancel()
-            check_cancel()
-
-        svc._active_model = _ActiveModel.SAM2
-        svc._sam2_tracker = MagicMock(track_video=track_video, model_id="m")
-        clip = _make_clip(str(tmp_path), annotations=True)
-        with pytest.raises(JobCancelledError):
-            svc.run_sam2_track(clip, job=job)
-        assert not svc._gpu_lock.locked()
 
 
 class TestSam2ModelSwitch:

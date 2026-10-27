@@ -1,7 +1,6 @@
 import io
 import json
 import os
-import stat
 import subprocess
 import sys
 
@@ -12,7 +11,7 @@ from backend.coordinator import pki
 from backend.netlink import Bridge
 
 from ..coordinator.specs import CAPS, SPEC
-from .conftest import call, connected, invite
+from .conftest import call, connected
 
 GPU = {"uuid": "GPU-aaaaaaaa", "name": "RTX", "vram_total_mb": 24000, "ram_total_mb": 64000}
 SUBMISSION = "submission-0000001"
@@ -87,24 +86,6 @@ def test_error_messages_redact_secrets():
 
 # ---- real TLS loopback ---------------------------------------------------------------------------
 
-def test_pair_never_echoes_token_and_files_are_private(env):
-    b = Bridge()
-    creds = str(env["dir"] / "c.json")
-    r = call(b, "pair", {"invitation_path": invite(env), "credentials_path": creds, "name": "pc"})
-    token = pki.read_credentials(creds)["token"]
-    assert r["ok"] and r["result"]["installation_id"] and "token" not in r["result"] and token not in json.dumps(r)
-    c = call(b, "connect", {"credentials_path": creds})
-    assert token not in json.dumps(c)
-    if os.name != "nt":
-        for p in (creds, creds + ".session"):
-            assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
-    again = call(b, "pair", {"invitation_path": invite(env, "i2.json"), "credentials_path": creds, "name": "pc"})
-    assert again["error"]["code"] == "io" and pki.read_credentials(creds)["token"] == token  # never clobbers
-    assert env["store"].create_pairing()  # and the second code was not spent
-    expired = env["dir"] / "old.json"
-    pki.write_invitation(str(expired), env["url"], env["pem"], "AAAAA-AAAAA", 1)
-    r = call(b, "pair", {"invitation_path": str(expired), "credentials_path": str(env["dir"] / "n.json"), "name": "x"})
-    assert r["error"]["code"] == "security" and "AAAAA" not in json.dumps(r)
 
 
 def test_full_flow_through_bridge_and_session_is_stable(env):
@@ -183,7 +164,7 @@ def test_persistent_subprocess_over_pipes(env, tmp_path):
 
     try:
         assert json.loads(proc.stdout.readline())["event"] == "ready"
-        assert ask("1", "pair", {"invitation_path": invite(env, "pp.json"), "credentials_path": creds, "name": "p"})["ok"]
+        cl.join_to_file(env["url"], creds, "p", pem=env["pem"])
         assert ask("2", "connect", {"credentials_path": creds})["ok"]
         assert ask("3", "installations")["result"]["installations"][0]["name"] == "p"  # same process kept its client
         token = pki.read_credentials(creds)["token"]
@@ -219,56 +200,12 @@ def test_non_string_credentials_are_structured_security_errors(tmp_path, field, 
     assert call(b, "installations")["error"]["code"] == "not_connected"  # the helper keeps serving
 
 
-@pytest.mark.parametrize("value", [12345, None, ""])
-def test_bad_invitation_code_types(env, value):
-    p = env["dir"] / "i.json"
-    pki.write_invitation(str(p), env["url"], env["pem"], "AAAAA-AAAAA", 4_000_000_000)
-    d = json.loads(p.read_text())
-    d["code"] = value
-    p.write_text(json.dumps(d))
-    dest = env["dir"] / "d.json"
-    b = Bridge()
-    r = call(b, "pair", {"invitation_path": str(p), "credentials_path": str(dest), "name": "x"})
-    assert r["error"]["code"] == "security" and not dest.exists()
-    assert b._redact(12345) == "12345"  # redaction itself can no longer throw
 
 
-def test_pair_readonly_directory_leaves_code_unused(env):
-    if os.name == "nt" or os.geteuid() == 0:
-        pytest.skip("posix permissions")
-    ro = env["dir"] / "ro"
-    ro.mkdir(mode=0o500)
-    inv = invite(env)
-    r = call(Bridge(), "pair", {"invitation_path": inv, "credentials_path": str(ro / "c.json"), "name": "x"})
-    assert r["error"]["code"] == "io"
-    good = str(env["dir"] / "ok.json")
-    assert call(Bridge(), "pair", {"invitation_path": inv, "credentials_path": good, "name": "x"})["ok"]  # code was never spent
 
 
-def test_pair_save_failure_after_redeem_is_distinct(env, monkeypatch):
-    inv, dest = invite(env), env["dir"] / "d.json"
-
-    def boom(path, data):
-        raise OSError(28, "No space left")
-    monkeypatch.setattr(pki, "fill_reserved", boom)
-    r = call(Bridge(), "pair", {"invitation_path": inv, "credentials_path": str(dest), "name": "x"})
-    assert r["error"]["code"] == "paired_not_saved" and "inst_" in r["error"]["message"] and "revoke" in r["error"]["message"]
-    assert not dest.exists()  # no half-written secret
-    monkeypatch.undo()
-    assert call(Bridge(), "pair", {"invitation_path": inv, "credentials_path": str(dest), "name": "x"})["error"]["code"] == "pairing_rejected"
 
 
-def test_pair_transport_failure_says_maybe_used_and_cert_failure_says_unsent(env, monkeypatch):
-    inv, dest = invite(env), env["dir"] / "d.json"
-    monkeypatch.setattr(cl.Client, "pair", classmethod(lambda c, i, n, e=None: (_ for _ in ()).throw(TimeoutError())))
-    r = call(Bridge(), "pair", {"invitation_path": inv, "credentials_path": str(dest), "name": "x"})
-    assert r["error"]["code"] == "pair_uncertain" and "MAY" in r["error"]["message"] and not dest.exists()
-    monkeypatch.undo()
-    other, _ = pki.generate_identity(["127.0.0.1"])
-    forged = env["dir"] / "forged-inv.json"
-    pki.write_invitation(str(forged), env["url"], other, env["store"].create_pairing(), 4_000_000_000)
-    r = call(Bridge(), "pair", {"invitation_path": str(forged), "credentials_path": str(dest), "name": "x"})
-    assert r["error"]["code"] == "security" and "nothing was sent" in r["error"]["message"] and not dest.exists()
 
 
 @pytest.mark.parametrize("exc,code", [(__import__("socket").gaierror(-2, "Name or service not known"), "transport"),
@@ -359,11 +296,6 @@ def test_malformed_replies_are_transport(env, monkeypatch, status, body):
     assert r["error"]["code"] == "transport", r
 
 
-def test_malformed_pairing_reply_is_uncertain(env, monkeypatch):
-    _canned(monkeypatch, 200, b'{"installation_id":5}')
-    dest = env["dir"] / "d.json"
-    r = call(Bridge(), "pair", {"invitation_path": invite(env), "credentials_path": str(dest), "name": "x"})
-    assert r["error"]["code"] == "pair_uncertain" and not dest.exists()
 
 
 def test_non_ascii_reply_near_the_size_limit_is_raw_utf8_and_not_expanded():

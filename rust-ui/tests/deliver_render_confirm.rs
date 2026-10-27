@@ -105,6 +105,8 @@ fn open_with(tag: &str, have: Have) -> (egui::Context, App, PathBuf) {
     fs::write(&settings, json!({"version":1,"ai_targets":[{"id":"l0","kind":"local","repo":repo,"python":common::PY,"gpu":0}]}).to_string()).unwrap();
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(&ctx, AppOptions { project: Some(project), settings_path: Some(settings), open_clip: Some("a".into()), tab: Some(Tab::Deliver), ..Default::default() });
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
+
     pump(&ctx, &mut app, "local capabilities", |a| a.ai().local_caps().is_some());
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18)), ("processed", video("mov_prores4444", "prores4444", 9))], None, false, None);
     frames(&ctx, &mut app, 12);
@@ -188,6 +190,8 @@ fn a_shot_without_results_still_runs_directly() {
     drop(app);
     let ctx2 = egui::Context::default();
     let mut app = App::with_ctx(&ctx2, AppOptions { project: Some(base.join("proj")), settings_path: Some(base.join("settings.json")), open_clip: Some("a".into()), tab: Some(Tab::Deliver), ..Default::default() });
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
+
     pump(&ctx2, &mut app, "caps", |a| a.ai().local_caps().is_some());
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, None);
     frames(&ctx2, &mut app, 12);

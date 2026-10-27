@@ -6,7 +6,6 @@ mod common;
 use ck::hints::{Final, HintCfg, Producer};
 use ck::presets::{pipeline_preset, Delivery, Pipeline, PipelineExport, VideoDelivery};
 use ck::project::{load_project, LoadOptions};
-use ck::settings::Settings;
 use ck::tasks::TaskKind;
 use ck::ui::{App, AppOptions, Tab};
 use ck::workflow::{OutputCfg, Params};
@@ -71,6 +70,7 @@ fn env(tag: &str) -> Env {
 fn open(e: &Env, clip: Option<&str>, tab: Tab) -> (egui::Context, App) {
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(&ctx, AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), open_clip: clip.map(Into::into), tab: Some(tab), ..Default::default() });
+    app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
     if clip.is_some() {
         pump(&ctx, &mut app, "worker caps", |a| a.ai().local_caps().is_some());
     }
@@ -268,7 +268,11 @@ fn route_reset_by_a_deliberate_apply_and_from_batch_for_a_never_opened_shot() {
     assert!(app.ai().batch_summary().iter().any(|l| l.starts_with("b:") && l.contains("hint route: mask_cleanup.grow")));
     let at = app.ai().batch_reset_rects.iter().find(|r| r.0 == "b").expect("Use preset values drawn").1.center();
     click(&ctx, &mut app, at);
-    pump(&ctx, &mut app, "rebuilt", |a| a.ai().batch_ready() && !a.ai().batch_summary().iter().any(|l| l.starts_with("b:") && l.contains("hint route")));
+    // A clean batch queues by itself; otherwise the review is open.
+    pump(&ctx, &mut app, "rebuilt", |a| !a.ai().batch_open() || a.ai().batch_ready() && !a.ai().batch_summary().iter().any(|l| l.starts_with("b:") && l.contains("hint route")));
+    if !app.ai().batch_open() {
+        assert!(!app.ai().scheduler().task_snapshot().is_empty(), "the clean batch queued");
+    }
     app.ai_mut().cancel_batch();
     let n = native(&e, "b");
     assert!(n.get("route_override").is_none());
@@ -341,7 +345,11 @@ fn delivery_reset_is_saved_and_reloads_and_a_batch_reset_uses_the_selected_prese
     board_batch(&ctx, &mut app, "p");
     let at = app.ai().batch_reset_rects.iter().find(|r| r.0 == "a").expect("Use preset values drawn").1.center();
     click(&ctx, &mut app, at);
-    pump(&ctx, &mut app, "rebuilt", |a| a.ai().batch_ready() && !a.ai().batch_summary().iter().any(|l| l.starts_with("a:") && l.contains("delivery:")));
+    // A clean batch queues by itself; otherwise the review is open.
+    pump(&ctx, &mut app, "rebuilt", |a| !a.ai().batch_open() || a.ai().batch_ready() && !a.ai().batch_summary().iter().any(|l| l.starts_with("a:") && l.contains("delivery:")));
+    if !app.ai().batch_open() {
+        assert!(!app.ai().scheduler().task_snapshot().is_empty(), "the clean batch queued");
+    }
     app.ai_mut().cancel_batch();
     let n = native(&e, "a");
     assert!(n.get("delivery_override").is_none());

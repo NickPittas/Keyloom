@@ -1,5 +1,4 @@
 """Self is the loopback-verified service, never an address collision; virtual adapters are not advertised; pair uses matching routes."""
-import pytest
 
 from backend import discovery, netlink
 from backend.coordinator import pki
@@ -16,19 +15,8 @@ def test_virtual_adapters_not_advertised(monkeypatch):
         "https://192.168.1.5:8443", "https://10.147.1.2:8443", "https://100.64.0.9:8443"]
 
 
-def test_routes_match_exact_pin_only():
-    v = [{"fingerprint_sha256": FP.upper(), "endpoints": ["https://10.0.0.2:8443"]},
-         {"fingerprint_sha256": OTHER, "endpoints": ["https://10.0.0.3:8443"]}]
-    assert netlink._routes(v, FP) == ["https://10.0.0.2:8443"]
 
 
-@pytest.mark.parametrize("bad", [{}, [1], [{"fingerprint_sha256": FP}], [{"fingerprint_sha256": "x", "endpoints": []}],
-                                 [{"fingerprint_sha256": FP, "endpoints": ["http://x"]}], [{"fingerprint_sha256": FP, "endpoints": [], "x": 1}],
-                                 [{"fingerprint_sha256": FP, "endpoints": ["https://10.0.0.2"] * 17}],
-                                 [{"fingerprint_sha256": FP, "endpoints": []}] * 65])
-def test_routes_validate(bad):
-    with pytest.raises(netlink.BridgeError):
-        netlink._routes(bad, FP)
 
 
 def test_hello_info_uses_given_url_not_stale_credentials(monkeypatch):

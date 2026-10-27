@@ -112,44 +112,6 @@ fn conflicts_are_nested_or_equal_manifest_folders() {
 }
 
 #[test]
-fn path_map_longest_prefix_whole_components_and_unmappable() {
-    let x = j(2);
-    let map = |p: &[(&str, &str)]| {
-        p.iter()
-            .map(|(a, b)| (a.to_string(), b.to_string()))
-            .collect::<Vec<_>>()
-    };
-    let m = x
-        .mapped(&map(&[
-            ("/mnt/NAS", "/srv/nas"),
-            ("/mnt/NAS/out", "/data/render/"),
-        ]))
-        .unwrap();
-    assert_eq!(m.manifest_dir, Path::new("/data/render/a"));
-    assert_eq!(
-        m.outputs["matte"][1],
-        Path::new("/data/render/a/clip_1102.png")
-    );
-    assert!(m.path_map.is_empty()); // the wire job carries no map once paths are mapped
-    assert_eq!(x.job_id, m.job_id); // original untouched
-                                    // /mnt/NAS2 is not covered by /mnt/NAS.
-    assert!(x
-        .mapped(&map(&[("/mnt/NAS2", "/x")]))
-        .unwrap_err()
-        .contains("no path_map entry"));
-    // clip_root /mnt/NAS/out/a_clip is covered, so a map for only a sub-folder leaves it unmapped.
-    assert!(x.mapped(&map(&[("/mnt/NAS/out/a", "/x")])).is_err());
-    assert!(x.mapped(&[]).is_err());
-    // Mapping that splits outputs from the manifest folder is caught by re-validation.
-    let e = x.mapped(&map(&[
-        ("/mnt/NAS/out/a_clip", "/c"),
-        ("/mnt/NAS/out/a", "/y"),
-        ("/mnt/NAS/out", "/z"),
-    ]));
-    assert!(e.is_ok());
-}
-
-#[test]
 fn resolves_templated_and_legacy_outputs_with_source_frame_numbers() {
     let loc = OutputLocation {
         root: "/mnt/NAS/Masks".into(),
@@ -342,35 +304,6 @@ fn validation_mirrors_the_python_worker() {
 }
 
 #[test]
-fn remapped_wire_job_equals_original_except_paths_and_empty_map() {
-    let x = j(3);
-    let m = x
-        .mapped(&[("/mnt/NAS".to_string(), r"Z:\Shared".to_string())])
-        .unwrap();
-    assert!(m.path_map.is_empty());
-    assert_eq!(m.manifest_dir, Path::new(r"Z:\Shared\out\a"));
-    assert_eq!(
-        m.outputs["matte"][2],
-        Path::new(r"Z:\Shared\out\a\clip_1103.png")
-    );
-    // Everything but the paths is untouched.
-    let (mut a, mut b) = (
-        serde_json::to_value(&x).unwrap(),
-        serde_json::to_value(&m).unwrap(),
-    );
-    for k in ["clip_root", "manifest_dir", "outputs"] {
-        a[k] = Value::Null;
-        b[k] = Value::Null;
-    }
-    assert_eq!(a, b);
-    // UNC target root.
-    let u = x
-        .mapped(&[("/mnt/NAS".to_string(), r"\\nas\share".to_string())])
-        .unwrap();
-    assert_eq!(u.manifest_dir, Path::new(r"\\nas\share\out\a"));
-}
-
-#[test]
 fn sha1_matches_known_vectors_and_the_backends_tmp_tags() {
     assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
     assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
@@ -445,35 +378,6 @@ fn recovery_removes_only_this_jobs_exact_backend_lock_and_temps() {
     assert!(!r.lock_removed && r.lock_left.is_some());
     assert_eq!(x.manifest_path(), d.join(".corridorkey_manifest.json"));
     fs::remove_dir_all(&base).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn recovery_of_a_remapped_job_hashes_the_workers_paths_but_cleans_local_files() {
-    let base = tmp("recmap");
-    let x = job(&base, "rj-1", 1, "ok");
-    let wire = x
-        .mapped(&[(base.to_str().unwrap().to_string(), "/srv/nas".to_string())])
-        .unwrap();
-    std::fs::create_dir_all(&x.manifest_dir).unwrap();
-    let theirs = format!(
-        ".ck-rj-1-{}.png",
-        &sha1_hex(wire.outputs["matte"][0].to_str().unwrap().as_bytes())[..12]
-    );
-    let ours = format!(
-        ".ck-rj-1-{}.png",
-        &sha1_hex(x.outputs["matte"][0].to_str().unwrap().as_bytes())[..12]
-    );
-    std::fs::write(x.manifest_dir.join(&theirs), "t").unwrap();
-    std::fs::write(
-        x.manifest_dir.join(&ours),
-        "not what the worker would have written",
-    )
-    .unwrap();
-    let r = x.recover_as_sent(&wire);
-    assert_eq!(r.temps_removed, vec![x.manifest_dir.join(&theirs)]);
-    assert!(x.manifest_dir.join(&ours).exists());
-    std::fs::remove_dir_all(&base).unwrap();
 }
 
 #[cfg(unix)]
