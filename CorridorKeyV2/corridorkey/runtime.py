@@ -178,22 +178,25 @@ def estimate_peak_vram_gb(megapixels: float, frames: int, low_vram: bool) -> flo
 
 
 def select_vram_profile(shape_hw, num_frames: int, budget_gb: float):
-    """Hann window for `budget_gb`, as (chunk, stride, low_vram, estimate), tried in `vram_profile_order`.
+    """Hann window for `budget_gb`, as (chunk, stride, low_vram, estimate).
 
     Normal mode first: low-VRAM mode runs stage 1 on the CPU and is many times slower, so it is only used when no
     normal window fits. Falls back to a single-frame window when nothing is estimated to fit.
     """
     megapixels = shape_hw[0] * shape_hw[1] / 1e6
-    for chunk, low_vram in vram_profile_order():
-        estimate = estimate_peak_vram_gb(megapixels, min(chunk, num_frames), low_vram)
-        if estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB <= budget_gb:
-            return chunk, max(1, chunk // 2), low_vram, estimate
+    for low_vram in (False, True):
+        for chunk in reversed(_VRAM_PEAK_GB[low_vram][0]):
+            estimate = estimate_peak_vram_gb(megapixels, min(chunk, num_frames), low_vram)
+            if estimate * _VRAM_MARGIN_SCALE + _VRAM_MARGIN_GB <= budget_gb:
+                return chunk, max(1, chunk // 2), low_vram, estimate
     return 1, 1, True, estimate
 
 
 def vram_profile_order():
-    """(chunk, low_vram) in the order `auto` tries them: every normal window, largest first, then low-VRAM ones."""
-    return [(c, low) for low in (False, True) for c in reversed(_VRAM_PEAK_GB[low][0])]
+    """(chunk, low_vram) windows in descending chunk order, normal before low at equal sizes."""
+    return sorted(
+        [(c, low) for low in (False, True) for c in _VRAM_PEAK_GB[low][0]],
+        key=lambda profile: (-profile[0], profile[1]))
 
 
 def apply_auto_vram(cfg: InferenceConfig, shape_hw, num_frames: int) -> None:

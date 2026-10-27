@@ -96,12 +96,13 @@ def _is_oom(exc: BaseException) -> bool:
 
 
 def _next_smaller_window(chunk: int, low_vram: bool):
-    """The window `auto` would try after (chunk, low_vram), in its own order (`runtime.vram_profile_order`); None when
-    it was already the last."""
+    """Next smaller retry after (chunk, low_vram); None when it was already the last."""
     from CorridorKeyV2.corridorkey import runtime as rt
     order = rt.vram_profile_order()
-    i = order.index((chunk, low_vram)) if (chunk, low_vram) in order else -1
-    return order[i + 1] if 0 <= i < len(order) - 1 else None
+    same_chunk_low = (chunk, True)
+    if not low_vram and same_chunk_low in order:
+        return same_chunk_low
+    return next((profile for profile in order if profile[1] == low_vram and profile[0] < chunk), None)
 
 
 def _free_gpu_memory() -> None:

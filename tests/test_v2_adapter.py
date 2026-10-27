@@ -248,20 +248,21 @@ def test_auto_retries_with_the_next_smaller_window_on_out_of_memory(env, monkeyp
     seen = []
     real = rt.run_inference
 
-    def oom_once(m, inp, out, cfg, wcfg, **kw):
+    def oom_twice(m, inp, out, cfg, wcfg, **kw):
         if cfg.auto_vram:  # what apply_auto_vram picks inside the real run, then the GPU runs out
-            cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = 24, 12, False
-            seen.append((cfg.hann_chunk, cfg.low_vram, True))
+            cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = 8, 4, False
+        seen.append((cfg.hann_chunk, cfg.low_vram))
+        if len(seen) < 3:
             raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 1.65 GiB")
-        seen.append((cfg.hann_chunk, cfg.low_vram, False))
         return real(m, inp, out, cfg, wcfg, **kw)
 
-    monkeypatch.setattr(rt, "run_inference", oom_once)
+    monkeypatch.setattr(rt, "run_inference", oom_twice)
     status = []
     res = run(env, on_status=status.append)
-    assert seen == [(24, False, True), (8, False, False)], seen
-    assert (res.hann_chunk, res.low_vram) == (8, False)
-    assert any("retrying with 8 frames (normal VRAM)" in w for w in res.warnings), res.warnings
+    assert seen == [(8, False), (8, True), (4, True)], seen
+    assert (res.hann_chunk, res.low_vram) == (4, True)
+    assert any("retrying with 8 frames (low VRAM)" in w for w in res.warnings), res.warnings
+    assert any("retrying with 4 frames (low VRAM)" in w for w in res.warnings), res.warnings
     assert status and "Out of GPU memory" in status[-1]
 
 
