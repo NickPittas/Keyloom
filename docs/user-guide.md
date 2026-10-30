@@ -1,6 +1,6 @@
 # Keyloom user guide
 
-Screenshots show the real native app. Some workflow captures predate the Keyloom rename and retain the CorridorKey title; the illustrated controls are unchanged.
+Screenshots show the native app. Clients and queue captures use clearly labelled, isolated example data. Some other workflow captures predate the Keyloom rename; use the accompanying text for current control names. Example hardware readings are not performance measurements.
 
 This guide follows one shot from import to delivery, then covers batches, settings and models. For rendering on several computers see [Network rendering](network-rendering.md).
 
@@ -51,17 +51,17 @@ What import does:
 
 Opening a project shows the batch board; import may open the new clip directly. Use **Back to batch** to return.
 
-![Batch board](screenshots/native/04-batch.png)
+![Current batch board and Machines queue](screenshots/native/15-batch-progress.png)
 
-The captured queue shows results from earlier work; no render was submitted for this screenshot.
+This isolated example uses simulated media, a running pipeline and three waiting shots.
 
 - One card per clip, with thumbnail, name, range and a summary of what exists (frames, hint, results).
-- **All** and the per-clip checkboxes select clips; **N selected** shows the count.
-- **Open clip** opens the one selected clip (it needs frames).
-- **Assign selected to** + **Apply to N** choose which computer renders the selected clips (see [Network rendering](network-rendering.md)).
+- **All** and the per-clip checkboxes select clips; **Assign N selected to** shows the selection count.
+- **Open** on a card opens that clip (it needs frames).
+- **Assign N selected to** + **Apply to N** choose which computer renders the selected clips (see [Network rendering](network-rendering.md)).
 - **Preset** and **Key selected N clips…** start a batch (see [section 9](#9-key-many-shots-at-once)).
-- The **Queue** panel on the right tracks work. **Earlier local tasks** holds history.
-- **Import clips…**, **Import folder…**, **Open another project…** and **Relink missing footage…** are on the board.
+- The **Queue** panel on the right has **Machines** and **Waiting (N)** tabs. Each PC keeps completed runs under **Earlier (N)**; see [queue controls](#queue-machines).
+- **Import clips…** and **Import folder…** add media. Use **File → Open project…** to switch projects; missing source media has relink/recovery actions.
 - **Clients** and **Settings** are in the top bar.
 
 ## 4. Media
@@ -188,6 +188,8 @@ Each shot keeps its own In/Out, input colour and hint prompts. SAM and Chroma pr
 
 Open **Clients** in the top bar to manage PCs, not to monitor renders.
 
+**Keep Keyloom running on every rendering PC**, with its window open or in configured background mode. A PC whose app has quit can still be found because its daemon/service is running, but it will not receive work or render shots. **File → Quit** stops the app; closing its window is different when background mode is enabled. See [background running](#background-running).
+
 ![Clients page with discovery and the unified client table](screenshots/native/12-clients.png)
 
 *Isolated documentation example with simulated PCs, addresses and hardware.*
@@ -218,7 +220,7 @@ Finished, failed and cancelled runs go into **Earlier (N)** under the PC. **Clea
 
 *Isolated example: Studio_03 is paused; Studio_02 and Studio_04 remain eligible.*
 
-**Waiting (N)** lists confirmed **Automatic** shots that do not have a PC yet. Each free PC takes one eligible shot, then takes another when it finishes; the batch is not divided between PCs in advance. The **Why:** line explains why work is still waiting. Network PCs need **Connect** and **Accept work** enabled; Automatic requires fresh GPU readings with both GPU utilization and VRAM usage below 50%.
+**Waiting (N)** lists confirmed **Automatic** shots that do not have a PC yet. Each free PC takes one eligible shot, then takes another when it finishes; the batch is not divided between PCs in advance. The **Why:** line explains why work is still waiting. Network PCs need their **Keyloom app running**, plus **Connect** and **Accept work** enabled; daemon-only discoverability is not enough. Automatic requires fresh GPU readings with both GPU utilization and VRAM usage below 50%.
 
 - **Pause** keeps a shot in the list but prevents assignment. Other eligible shots can proceed.
 - **Resume** makes it eligible again. These controls do not pause or resume an already-running job.
@@ -252,6 +254,8 @@ Under **Settings → Interface**:
 - **Start in the background when I sign in to this computer** – starts hidden when *you* sign in (not at boot, no system service), so your mapped drives (for example `R:` or `Y:`) exist for the same user. Turning it off removes only the entry Keyloom created.
 
 ## Models
+
+**Model weights are not bundled with the installers.** After installation, the model manager downloads selected models from their creators' published repositories/storage, or reuses verified existing files. **Each model's use is governed by its creator's licence and terms**, which can differ for code and weights. See the [creator attributions, download sources and notices](../README.md#model-creators-and-download-terms); Keyloom's licence does not grant additional model rights.
 
 **Settings → Models & runtime…** (also **Models…** when the status bar says *Models need attention*) shows every model with its status. **Install full profile** downloads everything (large, resumable); **Install required models** the minimum; **Verify all** re-checks files; **Refresh status**; **Cancel operation**. Model changes are blocked while Key work is running; stop workers first.
 

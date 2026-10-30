@@ -1,8 +1,8 @@
-# Standalone installers (L7)
+# Standalone installer build tooling
 
-Private, local-only build pipeline. No publishing or redistribution clearance is implied
-(see `docs/design/rust-ui/standalone-release-plan.md` §8). Activation configures the per-user network host automatically
-unless the user removed it. Firewall permissions remain OS-managed. Online installers also fetch the large public wheels.
+The source repository is public. **Only the latest Linux and Windows online installers are distributed**; see the [installation guide](../docs/install.md) for public downloads. This tooling can still generate full/offline artifacts internally, but that is a build capability, not an available offline release or a promise to publish one.
+
+Build success and public availability do not establish redistribution clearance or upstream endorsement; see [Licence and sharing](../README.md#licence-and-sharing). Activation configures the per-user network host automatically unless the user removed it. Firewall permissions remain OS-managed. Online installers fetch missing large public wheels.
 
 ## What a bundle contains
 `bin/keyloom-ui` (Rust UI) · `app/` (Python helper tree: backend, engines, `scripts/setup_models.py`,
@@ -76,7 +76,9 @@ The build ends with a real launch validation of the staged tree (`selfcheck.py` 
 Regenerate a lock after editing `runtime.in`:
 `uv pip compile packaging/runtime.in --python-version 3.11 --python-platform x86_64-unknown-linux-gnu|x86_64-pc-windows-msvc --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match --generate-hashes --emit-index-url -o packaging/locks/<os>-x86_64.txt`
 
-## Linux: `Keyloom-<id>-linux-x86_64.run`
+## Internal full Linux artifact: `Keyloom-<id>-linux-x86_64.run`
+
+This section documents an internal build output, **not a distributed installer**. Public downloads use `Keyloom-online-<id>-linux-x86_64.run` as described in the [installation guide](../docs/install.md).
 Needs only sh/tar/gzip/awk/sha256sum. `./X.run [--prefix DIR] [--models full|skip] [--model-arg ARG]... [--repair]`
 (default prefix `~/.local/opt/Keyloom`). Each `--model-arg` takes ONE argument, forwarded verbatim (spaces/globs
 preserved) to `scripts/setup_models.py`, e.g. `--model-arg --hf-cache --model-arg "/my cache"`. Those are the manager's
@@ -90,8 +92,8 @@ keyloom.desktop` (Exec scrubs PYTHONPATH/PYTHONHOME), `PREFIX/bin/{keyloom,keylo
 version/pointer/shortcuts (or removes everything on a first install); a crash leaves a journal that the next run
 (`keyloom-setup recover`, also automatic) finishes.
 Exit 0 = everything Ready; **3 = app installed but models incomplete/skipped**; 2 = refused/failed; 130 = interrupted.
-Release upload (GitHub 2 GiB/asset limit): add `--split` to `bundle.py linux` to also write `X.run.partNNN` (<=1900 MiB each) +
-`X.run.parts.sha256`. User: `sha256sum -c X.run.parts.sha256 && cat X.run.part[0-9][0-9][0-9] > X.run && sha256sum -c X.run.sha256 && chmod +x X.run`. The unsplit `.run` is unchanged.
+Internal splitting (not a public offline release): the canonical build's `split` setting also writes `X.run.partNNN` (<=1900 MiB each) +
+`X.run.parts.sha256`. Do not compose a separate `bundle.py` build. User: `sha256sum -c X.run.parts.sha256 && cat X.run.part[0-9][0-9][0-9] > X.run && sha256sum -c X.run.sha256 && chmod +x X.run`. The unsplit `.run` is unchanged.
 **OS prerequisites (not bundled; checked before install, with an apt hint for Debian/Ubuntu/Mint):** GL/EGL, X11 or Wayland client,
 xkbcommon, fontconfig, freetype, glib, dbus, libstdc++, and the proprietary NVIDIA driver (`libcuda.so.1`; a missing driver only warns,
 since models can still be installed). Python, Rust, FFmpeg, the CUDA toolkit and GCC are NOT needed on the target.
@@ -100,7 +102,9 @@ server mode: `PREFIX/bin/keyloom-coordinator {serve|pair|revoke|abandon} ...` (r
 `X.run --repair` restores damaged files from the payload (models re-verified only with `--models full`).
 Two versions are kept (active + previous). Concurrent installers on one prefix are not supported.
 
-## Windows: `Keyloom-<id>-windows-x86_64-setup.exe` (Inno Setup, per-user by default)
+## Internal full Windows artifact: `Keyloom-<id>-windows-x86_64-setup.exe`
+
+This is an internal build output, **not a distributed installer**. Public downloads use the online `.exe`, its `.bin` slice(s) and checksums; see the [installation guide](../docs/install.md). The full internal artifact uses Inno Setup, per-user by default.
 Installs to `%LOCALAPPDATA%\Programs\Keyloom\versions\<id>`, then runs the same `lifecycle.py`
 (validation, Start Menu shortcut, receipt, optional full models task with a visible console). Drive-root folders and an
 already-installed identical build are refused; a failed launch validation sets a nonzero setup exit code
@@ -133,8 +137,8 @@ the exe directly, so it does not scrub PYTHONPATH (the Rust side must). Repair o
 reinstall after uninstall. `/TASKS="!models"` makes a silent app-only install; the checked-by-default `firewall` task adds the Windows Firewall rules (one UAC prompt), so unattended installs that must not prompt use `/MERGETASKS="!firewall"` (or `/TASKS="!models,!firewall"`). Linux `.run` installers configure UFW by default; `--no-firewall` skips it. Every install appends to `<prefix>/install.log` (a header per step: installer kind, version, time; all supervised output, wait lines and failure reasons); the app writes service errors to `<settings>/network/service.log`. The supervisor prints a declared wait reason once and then every 20 s (plus `wait finished`); the one-second heartbeat only runs outside waits. Native build and installation checks are recorded in the acceptance document below.
 
 ## Online installers (smaller .run / .exe, large public wheels downloaded)
-Build host = target OS; the offline targets above are unchanged and stay the complete, self-contained option. The source repo stays private
-and **installation never contacts GitHub**: no sign-in, client id, token or private release manifest. You hand the installer to a user once;
+Build host = target OS. Only online installers are distributed; the full/offline targets above remain internal build capabilities. The source repository is public,
+but **installation never contacts GitHub**: no sign-in, client id, token or private release manifest. Users download the installer from the public GitHub release;
 it carries Keyloom itself (app, Rust UI, FFmpeg, the standalone Python/stdlib, certifi, lifecycle/`online.py`, the custom git-built SAM2 CUDA
 extension and every small dependency). Only wheels that PyPI / `download.pytorch.org` serve publicly are downloaded at install time:
 `torch`, `triton` / `triton-windows` and `nvidia-*` (a first install is several GB; an update reuses files and downloads nothing the

@@ -1,7 +1,6 @@
-# EZ-CorridorKey2 — CorridorKey 2.0 fork (private, personal use)
+# Archived fork and upstream README
 
-> **EZ-CorridorKey2 is a personal-use fork of EZ-CorridorKey whose keyer is CorridorKey 2.0 (NVIDIA CUDA only).**
-> The CorridorKey v1 engine is replaced; this is not a general release. Upstream: [edenaion/EZ-CorridorKey](https://github.com/edenaion/EZ-CorridorKey) v2.1.5.
+> **Historical snapshot, not current Keyloom instructions.** The fork notes and upstream README below retain their original setup commands, paths and distribution assumptions. Current source and linked release assets are public; this is not additional redistribution permission. Use the current [README](../README.md), [installation guide](install.md) and [user guide](user-guide.md). Upstream: [edenaion/EZ-CorridorKey](https://github.com/edenaion/EZ-CorridorKey) v2.1.5.
 
 ## Requirements and setup
 
@@ -20,7 +19,7 @@
 
 ## Licensing and provenance
 
-- Engine provenance: [`CorridorKeyV2/VENDORED.md`](CorridorKeyV2/VENDORED.md); engine license: [`CorridorKeyV2/LICENSE`](CorridorKeyV2/LICENSE); third-party notices: [`CorridorKeyV2/THIRD_PARTY_NOTICES.md`](CorridorKeyV2/THIRD_PARTY_NOTICES.md).
+- Engine provenance: [`CorridorKeyV2/VENDORED.md`](../CorridorKeyV2/VENDORED.md); engine license: [`CorridorKeyV2/LICENSE`](../CorridorKeyV2/LICENSE); third-party notices: [`CorridorKeyV2/THIRD_PARTY_NOTICES.md`](../CorridorKeyV2/THIRD_PARTY_NOTICES.md).
 - The upstream EZ-CorridorKey repo has no standalone license file at its root; its README states CC BY-NC-SA 4.0 (see "Licensing & Attribution" below).
 - Personal use only; do not redistribute.
 
@@ -41,7 +40,7 @@
 
 <p><img alt="🇺🇸 English" src="https://img.shields.io/static/v1?label=%F0%9F%87%BA%F0%9F%87%B8&message=English&color=FFF203&labelColor=141300&style=flat-square"> <a href="docs/i18n/README.fr.md"><img alt="🇫🇷 Français" src="https://img.shields.io/static/v1?label=%F0%9F%87%AB%F0%9F%87%B7&message=Fran%C3%A7ais&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.de.md"><img alt="🇩🇪 Deutsch" src="https://img.shields.io/static/v1?label=%F0%9F%87%A9%F0%9F%87%AA&message=Deutsch&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.es.md"><img alt="🇪🇸 Español" src="https://img.shields.io/static/v1?label=%F0%9F%87%AA%F0%9F%87%B8&message=Espa%C3%B1ol&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.it.md"><img alt="🇮🇹 Italiano" src="https://img.shields.io/static/v1?label=%F0%9F%87%AE%F0%9F%87%B9&message=Italiano&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.pt.md"><img alt="🇧🇷 Português (Brasil)" src="https://img.shields.io/static/v1?label=%F0%9F%87%A7%F0%9F%87%B7&message=Portugu%C3%AAs%20%28Brasil%29&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.ja.md"><img alt="🇯🇵 日本語" src="https://img.shields.io/static/v1?label=%F0%9F%87%AF%F0%9F%87%B5&message=%E6%97%A5%E6%9C%AC%E8%AA%9E&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.ko.md"><img alt="🇰🇷 한국어" src="https://img.shields.io/static/v1?label=%F0%9F%87%B0%F0%9F%87%B7&message=%ED%95%9C%EA%B5%AD%EC%96%B4&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.zh.md"><img alt="🇨🇳 简体中文" src="https://img.shields.io/static/v1?label=%F0%9F%87%A8%F0%9F%87%B3&message=%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.ru.md"><img alt="🇷🇺 Русский" src="https://img.shields.io/static/v1?label=%F0%9F%87%B7%F0%9F%87%BA&message=%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.pl.md"><img alt="🇵🇱 Polski" src="https://img.shields.io/static/v1?label=%F0%9F%87%B5%F0%9F%87%B1&message=Polski&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.tr.md"><img alt="🇹🇷 Türkçe" src="https://img.shields.io/static/v1?label=%F0%9F%87%B9%F0%9F%87%B7&message=T%C3%BCrk%C3%A7e&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.hi.md"><img alt="🇮🇳 हिन्दी" src="https://img.shields.io/static/v1?label=%F0%9F%87%AE%F0%9F%87%B3&message=%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.id.md"><img alt="🇮🇩 Bahasa Indonesia" src="https://img.shields.io/static/v1?label=%F0%9F%87%AE%F0%9F%87%A9&message=Bahasa%20Indonesia&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.vi.md"><img alt="🇻🇳 Tiếng Việt" src="https://img.shields.io/static/v1?label=%F0%9F%87%BB%F0%9F%87%B3&message=Ti%E1%BA%BFng%20Vi%E1%BB%87t&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.uk.md"><img alt="🇺🇦 Українська" src="https://img.shields.io/static/v1?label=%F0%9F%87%BA%F0%9F%87%A6&message=%D0%A3%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%81%D1%8C%D0%BA%D0%B0&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="docs/i18n/README.zh-Hant.md"><img alt="🇹🇼 繁體中文" src="https://img.shields.io/static/v1?label=%F0%9F%87%B9%F0%9F%87%BC&message=%E7%B9%81%E9%AB%94%E4%B8%AD%E6%96%87&color=454430&labelColor=0E0D00&style=flat-square"></a></p>
 
-> **Latest release: [v2.1.5](https://github.com/edenaion/EZ-CorridorKey/releases/tag/v2.1.5):** Matte quality fix. AI alpha mattes no longer trace a thin dark band around the subject on high-resolution footage ([#179](https://github.com/edenaion/EZ-CorridorKey/issues/179)), and alpha is now clamped to the valid range after upscaling so premultiplied output stays clean. See the [full changelog](CHANGELOG.md).
+> **Latest release: [v2.1.5](https://github.com/edenaion/EZ-CorridorKey/releases/tag/v2.1.5):** Matte quality fix. AI alpha mattes no longer trace a thin dark band around the subject on high-resolution footage ([#179](https://github.com/edenaion/EZ-CorridorKey/issues/179)), and alpha is now clamped to the valid range after upscaling so premultiplied output stays clean. See the [full changelog](../CHANGELOG.md).
 
 A full desktop GUI for [Niko Pueringer's CorridorKey](https://github.com/nikopueringer/CorridorKey) — the AI chroma keyer by Corridor Digital that physically unmixes foreground from background, preserving hair, motion blur, and translucency.
 
@@ -49,7 +48,7 @@ This GUI replaces the CLI drag-and-drop workflow with a complete desktop applica
 
 Official site, install guide, and downloads: **[ezcorridorkey.com](https://ezcorridorkey.com)**
 
-![EZ-CorridorKey](docs/screenshots/EZ-CorridorKey_Inference_Done.jpg)
+![EZ-CorridorKey](screenshots/EZ-CorridorKey_Inference_Done.jpg)
 
 ### Contents
 
@@ -137,7 +136,7 @@ The installer includes everything — Python runtime, AI models, GPU libraries �
 
 ### Alternate Installation: Docker
 
-For Linux users or remote/cloud setups, EZ-CorridorKey can run inside Docker with browser-based access via noVNC. See [docker/README.md](docker/README.md) for setup instructions. The native install above is recommended for Windows and macOS.
+For Linux users or remote/cloud setups, EZ-CorridorKey can run inside Docker with browser-based access via noVNC. See [docker/README.md](https://github.com/edenaion/EZ-CorridorKey/blob/v2.1.5/docker/README.md) for setup instructions. The native install above is recommended for Windows and macOS.
 
 ---
 
@@ -533,7 +532,7 @@ VRAM mode selection / `CORRIDORKEY_OPT_MODE` / `--opt-mode`: (Removed in Corrido
 
 EZ-CorridorKey's optimizations (Hiera FlashAttention, TF32 tensor cores, torch.compile, tiled refiner) produce output identical to upstream CorridorKey within float32 noise floor — verified across PSNR, SSIM, MS-SSIM, LPIPS, and DeltaE 2000.
 
-![Quality Comparison](docs/screenshots/quality_comparison_v1.5.0.png)
+![Quality Comparison](screenshots/quality_comparison_v1.5.0.png)
 
 ---
 
@@ -559,7 +558,7 @@ Starting with v1.10.0, every GitHub release ships a signed manifest (`manifest.j
 
 This means even if the GitHub account were compromised, the attacker could not push a malicious update to installed users without also possessing the offline signing key.
 
-The verification code is open source: [`backend/update_verify.py`](backend/update_verify.py).
+The verification code is open source: [`backend/update_verify.py`](https://github.com/edenaion/EZ-CorridorKey/blob/v2.1.5/backend/update_verify.py).
 
 ### Checksums
 
@@ -630,7 +629,7 @@ EZ-CorridorKey supports translation into any language. All UI strings are extrac
 3. Compile it: `pyside6-lrelease ui/translations/corridorkey_fr.ts`
 4. Submit a pull request with both the `.ts` and `.qm` files
 
-Full instructions with examples are in [`ui/translations/TRANSLATING.md`](ui/translations/TRANSLATING.md).
+Full instructions with examples are in [`ui/translations/TRANSLATING.md`](https://github.com/edenaion/EZ-CorridorKey/blob/v2.1.5/ui/translations/TRANSLATING.md).
 
 **Current languages:** English plus German, Spanish, French, Hindi, Indonesian, Italian, Japanese, Korean, Polish, Portuguese (Brazil), Russian, Turkish, Ukrainian, Vietnamese, Chinese (Simplified), and Chinese (Traditional, Taiwan). Pick yours in Edit > Preferences. Want to see your language here or improve upon a translation? PRs welcome.
 
@@ -648,8 +647,8 @@ EZ-CorridorKey is a labor of love — built and maintained by one man from Brook
 - **Star this repo** if you find it useful -- it helps others discover the project
 - **Purchase a plugin** -- I pour my heart into [EZSCAPE plugins](https://www.ezscape.space)
 - **Report bugs** via [GitHub Issues](https://github.com/edenaion/EZ-CorridorKey/issues)
-- **Contribute code** -- see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines
-- **Security issues** -- see [SECURITY.md](SECURITY.md) for responsible disclosure
+- **Contribute code** -- see [CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines
+- **Security issues** -- see [SECURITY.md](../SECURITY.md) for responsible disclosure
 
 Need GPU compute for inference? [RunPod](https://runpod.io?ref=2k18fmnh) offers on-demand cloud GPUs — great for batch processing large shoots without tying up your local machine. Using my referral link will enable me to build more tools for all!
 

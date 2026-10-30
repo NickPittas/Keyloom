@@ -1,5 +1,7 @@
 # Keyloom 2.3.0 release record
 
+> **Historical build record, not a current download guide.** This preserves the original snapshot, including its then-private distribution wording. Only the latest online installers are distributed now; use the [installation guide](install.md). Source and linked release assets are public; redistribution permissions are described in the [README](../README.md#licence-and-sharing).
+
 Keyloom — powered by CorridorKey. The payload source is commit `e7da0e28ba7d72a912bb3f915dc2149eff9cbf54`; later documentation updates do not change these payloads. The repository and release downloads remain private.
 
 ## Changes

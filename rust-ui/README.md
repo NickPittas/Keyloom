@@ -1,6 +1,8 @@
-# keyloom-ui — native viewer + importer (first slice)
+# keyloom-ui — native application developer guide
 
-A native Rust window (eframe/egui, wgpu backend — **provisional toolkit**, final choice is milestone R1) that imports
+For current downloads and end-user instructions, use [installation](../docs/install.md), the [user guide](../docs/user-guide.md) and [network rendering](../docs/network-rendering.md). The source repository is public; only the latest online installers are distributed. Build tooling and dated acceptance records do not establish redistribution clearance or clean-machine certification.
+
+A native Rust window (eframe/egui, wgpu backend) that imports
 footage or opens an existing CorridorKey project and shows its source and existing outputs in the selected layout:
 Batch Board → clip workspace (Media · Hint · Key · Review · Deliver) with a persistent 7-node graph, a Properties panel,
 and one shared viewer (mode chips top-right, A/B wipe top-centre, icon transport centred, scrubbable timeline,
@@ -21,18 +23,20 @@ the interpreter). Cancel stops after the current step; an unfinished movie keeps
 *Resume extraction*. Frames are extracted into a hidden `.frames_importing` folder and renamed to `Frames/` only when complete,
 so partial frames never look playable. Companion alpha/mask movies are copied at import; extracting them into hint frames is done from the Hint page (*Import alpha / mask movie*, through the worker's validated normalization).
 
-Settings writes a separate user preferences file. **Key** runs in a real Python worker process (`backend.worker` over stdio) — inference runs outside the UI process: result files appear only when a worker publishes them and its manifest says so. The Key tab queues the open clip confined to its In/Out; the Board queues selected clips as a batch (each clip its stored In/Out, else the whole clip) after a per-clip review that never replaces existing results (skip / resume / write as *vNNN*). A queue panel tracks, cancels and stops jobs; one job runs at a time per worker target. A submission persists its options and result folder (`workflow`, `output_values` and `key_result` in `clip.json`). Saving a Deliver output location writes `project.json`. In/Out, input colour, hint settings, annotations and the workspace (open clip, page, view, frame, graph layout) are saved in the project (see *Saved state*); the queue history is saved and anything running at shutdown comes back as *held*, never restarted. An unknown output or hint lock found on disk requires explicit confirmation in the UI before release.
+Settings writes a separate user preferences file. **Key** runs in a real Python worker process (`backend.worker` over stdio) — inference runs outside the UI process: result files appear only when a worker publishes them and its manifest says so. The Key tab queues the open clip confined to its In/Out; the Board queues selected clips as a batch (each clip its stored In/Out, else the whole clip) after validation, showing **Review batch** only when decisions are needed (OK / Skip / new version; never a silent overwrite). The Machines/Waiting queue tracks assigned and unassigned work;  one job runs at a time per worker target. A submission persists its options and result folder (`workflow`, `output_values` and `key_result` in `clip.json`). Saving a Deliver output location writes `project.json`. In/Out, input colour, hint settings, annotations and the workspace (open clip, page, view, frame, graph layout) are saved in the project (see *Saved state*); the queue history is saved and anything running at shutdown comes back as *held*, never restarted. An unknown output or hint lock found on disk requires explicit confirmation in the UI before release.
 
 ## Run
 
 ```sh
 cd rust-ui
-cargo run --release -- ../Projects/261022_122316_V1-0047_A001C055_261012_R4LF_1080   # or pick a folder in the UI
+cargo run --release -- /absolute/path/to/project   # or pick a folder in the UI
 cargo run --release                                                                     # landing: Import clips… / Import folder… / Open project…
-cargo run --release -- --data-dir /tmp/ck --import a.mp4 --import b.mov --auto-confirm      # QA: import at launch
+bash tools/virtual-display-test.sh /usr/bin/cargo run --release -- --data-dir /tmp/ck --import /absolute/path/a.mp4 --auto-confirm --screenshot target/import.png # isolated QA
 ```
 
-Useful options (all optional; see `--help`): `--global-output-dir D` (stands in for the Qt-only global output
+Developer launches require explicit approval; keep QA/tests inside the isolation wrappers below and use temporary fixtures, never user projects. Build installers only through the approved canonical command in [packaging](../packaging/README.md), on the target OS.
+
+Useful options (all optional; see `--help`): `--global-output-dir D` (stands in for the former Qt global output
 preference, which is not read), `--cache-mb N` (frame cache budget in MB; default = half of the available RAM, 1–8 GB), `--open-clip NAME`,
 `--tab media|hint|key|review|deliver`, `--view input|hint|fg|matte|comp|processed`, `--ab VIEW`, `--frame N`, `--play`,
 `--window WxH`, QA options `--keys i,Shift+Right,click:605x66,rclick:605x66` (synthetic egui events, one per 400 ms, state printed to
@@ -84,9 +88,9 @@ Loader tests build temporary projects at run time and prove the loader changes n
 - Reads v1/v2 projects: `project.json`, `clips/*/clip.json`, `removed_clips`, `.corridorkey_session.json` (project
   root or clips dir; input-colour map, params, output config), `.video_metadata.json` (fps/size), manifests,
   keyframe sidecars (strict port of the Python parser incl. stale stems; reported, never repaired), `AlphaHint/`, `VideoMamaMaskHint/`.
-- Source precedence as in the Qt scanner: non-empty `Frames/` → `Input/` → `Source/` video (or clip.json original file) →
+- Source precedence retained from the former Qt scanner: non-empty `Frames/` → `Input/` → `Source/` video (or clip.json original file) →
   external sequence (missing folder = **Error** state with its message) → root `Input.*` video. Clips with no source are
-  not listed, as in Qt; the Board notes each skipped clip. The clip's display name (not the folder) keys the output
+  not listed, as in the former Qt app; the Board notes each skipped clip. The clip's display name (not the folder) keys the output
   join and the session colour map; the folder stays the identity. Natural-sorted stems; the timeline is
   the union of stems over all views, so **holes stay holes** ("No file on disk"); outside the In/Out range output
   views say "Outside In/Out". Output root precedence: clip `output_dir` → project `output_dir/<clip>` →
@@ -112,7 +116,7 @@ Loader tests build temporary projects at run time and prove the loader changes n
 
 ## Settings
 
-The **Settings** button (Board, and the bottom bar of a clip workspace) opens a page for the decoded-frame RAM budget (0 = Auto, half the
+The top-bar **Settings** button opens a page for the decoded-frame RAM budget (0 = Auto, half the
 available RAM, 1–8 GB), decode workers (0 = Auto), default looping and UI scale, plus the **AI worker targets** and the AI defaults that seed a new clip's Key options;
 mask defaults are saved but not used yet.
 A target is a local checkout (repo folder, optional Python, GPU index); an empty list =
@@ -121,20 +125,22 @@ to see the same shared storage (no transfer copies); other PCs are used through 
 Preferences live in `$XDG_CONFIG_HOME/keyloom/settings.json` (never in project data). UI scale applies on Apply; RAM, workers
 and looping apply to the next clip you open, and `--cache-mb` overrides the saved RAM budget. Back/Esc/Cancel discard unsaved edits.
 
-## Hint, Media, Deliver and recovery (implemented; Linux only so far)
+## Hint, Media, Deliver and recovery
 
 - **Hint page**: routes Import alpha / GVM / BiRefNet (all variants) / Chroma key / MatAnyone2 / VideoMaMa, Bypass (keeps settings and assets), SAM tracker model, SAM points / one box / paint on the Input frame (source-pixel coordinates), preview, track mask, sparse keyframe marks, a separate chroma holdout (`holdout_strokes.json`, not SAM paint), chroma colour pick. Generated hints are staged outside the clip and published by the worker, replacing only the frames of In/Out; the previous hint stays until the new set validates. Route availability comes from the worker's real model readiness.
 - **Media**: frame extraction, relink of a missing image sequence (stored In/Out and result stems must match) or movie (size, rate and frame count checked first; a partial match needs your confirmation), companion alpha/mask movie import, and companion alpha/mask **image-sequence** import (PNG/EXR, stems/size/In-Out coverage checked, existing hint frames never replaced; the clip's hint lock is held during the copy).
 - **Key**: one-off and batch review, hint steps chained ahead of Key (explicit prerequisites), *Temporal awareness* labels over the exact wire presets, **Replace** of an app-owned result (same files and range; confirmation required; needs a worker advertising `key_modes: replace`), New version and Resume (Resume is unavailable when a pipeline regenerates hints).
 - **Deliver**: one row per enabled output, independently set to an EXR/PNG image sequence or a video. MP4 offers H.264/H.265, MOV offers ProRes 422/4444, and WebM offers VP9; each video keeps its own codec and CRF/qscale. EXR compression is shared. Videos never overwrite existing files and contain no audio. “Export existing Key result” encodes videos without running Key again.
-- **Batch presets**: configure Hint, Key and Deliver, then save the workflow preset from Key or Deliver. On the main batch screen choose **Preset**, select clips and click **Key selected…**, then review and queue. Each clip uses its own range, input colour, client, prompts and marks. Hints disabled means Key only. SAM and Chroma pre-mattes must already cover that clip's required frames; missing ones block the clip with a precompute instruction. GVM and BiRefNet generate pre-mattes automatically. Direct uses that pre-matte as the hint; MatAnyone2/VideoMaMa refine it first. Key runs next, followed by every video delivery, in order. Image sequences are the Key outputs. A default output location uses each clip's own output folder; applying it resets a project-wide custom location. Version 2 single-video presets remain readable; legacy parameter/output presets are labelled partial.
-- **Batch queue**: each clip has its own section with ordered Pre-matte, Hint, Keying and Export rows for the steps it uses. Progress comes from the worker; queued steps show Waiting or Queued. Multiple video exports share an Export row with per-product statuses. Precomputed SAM/Chroma guides are labelled Precomputed. Cancel is beside each live stage; Details retains warnings and recovery controls.
+- **Batch presets**: configure Hint, Key and Deliver, then save the workflow preset from Key or Deliver. On the main batch screen choose **Preset**, select clips and click **Key selected…**. Valid shots queue directly; the review appears when decisions are needed. Each clip uses its own range, input colour, client, prompts and marks. Hints disabled means Key only. SAM and Chroma pre-mattes must already cover that clip's required frames; missing ones block the clip with a precompute instruction. GVM and BiRefNet generate pre-mattes automatically. Direct uses that pre-matte as the hint; MatAnyone2/VideoMaMa refine it first. Key runs next, followed by every video delivery, in order. Image sequences are the Key outputs. A default output location uses each clip's own output folder; applying it resets a project-wide custom location. Version 2 single-video presets remain readable; legacy parameter/output presets are labelled partial.
+- **Batch queue**: the **Machines** tab groups assigned shots and their Pre-matte, Hint, Keying and Export stages by PC. Meters show CPU/RAM/GPU/VRAM; earlier runs are collapsed into logs. **Waiting (N)** lists Automatic shots still awaiting a PC, with Pause/Resume/Cancel controls. Progress comes from the worker; multiple exports share an Export row. Details retains local recovery controls. See the [current queue contract](../docs/network-rendering.md#6-watch-the-batch-queue).
 - **Saved state**: `clip.json` (`in_out_range` plus boundary stems, `ck_native` hint route/annotations), the session file (input colour), `project.json` (`ck_native.workspace`), `presets.json` beside the preferences, `.ck_queue.json` in the project. Unknown keys are preserved; unreadable files are set aside, not overwritten.
-- **Tasks run on the local worker only** (remote scheduling is deferred). One GPU job at a time, shared with Key.
+- **Whole-shot scheduling** can target this computer or a connected PC, with hint tasks, Key and exports ordered on that receiver. Automatic takes the next eligible waiting shot as a PC becomes free. A running receiver retains output ownership across reconnects; loss of contact is not proof that writing has stopped.
 
-## Not implemented / not accepted
+## Limits and acceptance evidence
 
-Linux standalone installation, all 30 model assets, real GPU routes, one-off and batch workflows are verified in the [local acceptance record](../docs/design/rust-ui/local-workflow-acceptance.md). The Windows installer has also been built and installed natively, with full-profile models Ready and passing installed-file and runtime checks; platform-specific workflow evidence is in the same record. Remote Windows NAS access remains unresolved. No board thumbnails; no JPEG/TIFF/DPX sequences (refused at import); native annotations are not shared with the Qt app's `annotations.json`; movie relink references the movie in place (not copied); remote task scheduling; audio retention in exports. Qt's global output preference (QSettings) is not read. Matte display intentionally differs from the Qt app (no 0.85 gamma lift). Playback speed on 3200x1800 frames is measured by `ck-bench`, not assumed. Arbitrary production-media coverage is not established by the synthetic acceptance checks. Release scope and gates: [standalone release plan](../docs/design/rust-ui/standalone-release-plan.md).
+Current Linux and Windows online installers are described in the [installation guide](../docs/install.md); the old release/acceptance records describe their dated snapshots, not universal certification. See the [local acceptance record](../docs/design/rust-ui/local-workflow-acceptance.md) for its exact tested platforms, workflows and limitations.
+
+JPEG/TIFF/DPX sequences are refused at import. Native annotations are not shared with the former Qt app's `annotations.json`; movie relink references the movie in place rather than copying it. Exports do not retain audio. Former Qt global output preferences (QSettings) are not read. Matte display intentionally differs from that old app (no 0.85 gamma lift). Board thumbnails and whole-shot network scheduling are implemented. Playback speed on 3200×1800 frames is measured by `ck-bench`, not assumed. Arbitrary production-media or Windows/NAS compatibility is not established by synthetic checks. The [standalone release plan](../docs/design/rust-ui/standalone-release-plan.md) is a historical engineering plan, not a current installation guide.
 
 Evidence: [feedback validation](../docs/design/rust-ui/feedback-validation.md), [native validation](../docs/design/rust-ui/native-validation.md), [remote validation](../docs/design/rust-ui/remote-validation.md) (synthetic 256x256 clips only).
 

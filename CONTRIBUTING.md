@@ -12,34 +12,37 @@ Keyloom is a GUI built on top of [Niko Pueringer's CorridorKey](https://github.c
 
 - Python 3.11
 - A virtual environment (`python -m venv .venv`)
-- GPU with CUDA support (recommended), or Apple Silicon for MLX backend
+- NVIDIA GPU and driver for inference; CPU-only fixture tests do not need models
+- Rust/Cargo and the native build prerequisites in [rust-ui/README.md](rust-ui/README.md)
+- Linux or Windows x86_64; macOS/MLX is not supported by this fork
 
 ### Dev Setup
 
 ```bash
-git clone https://github.com/edenaion/EZ-CorridorKey.git
+git clone https://github.com/NickPittas/Keyloom.git
 cd Keyloom
 python -m venv .venv
 .venv/Scripts/activate      # Windows
-source .venv/bin/activate    # macOS / Linux
+source .venv/bin/activate    # Linux
 pip install -e ".[dev]"
 ```
 
 ### Running the App
 
 The desktop app is the native Rust program in `rust-ui/` (`cargo build --release`, binary `keyloom-ui`); the Python code
-under `backend/` is its worker and network service. Installers are built only with `python packaging/build_release.py`
-(see `packaging/README.md`).
+under `backend/` is its worker and network service. See [native development](rust-ui/README.md) for build/run details. Installer builds require approval and use only `python packaging/build_release.py` on the target OS (see [packaging](packaging/README.md)); only online installers are distributed. Never install or launch an installer as part of a build.
 
 ### Running Tests
 
+Run all tests through the isolated wrappers described in [rust-ui/AGENTS.md](rust-ui/AGENTS.md), never on a live desktop. From the repository root on Linux, for example:
+
 ```bash
-pytest                       # run all tests
-pytest -v                    # verbose
-pytest -m "not gpu"          # skip GPU-dependent tests
+REPO="$PWD"
+bash "$REPO/rust-ui/tools/isolated-test.sh" "$REPO/.venv/bin/python" -m pytest "$REPO/tests" -m "not gpu"
+bash "$REPO/rust-ui/tools/isolated-test.sh" /usr/bin/cargo test --offline
 ```
 
-Most tests run in seconds and don't require a GPU or model weights.
+Use absolute interpreter and test paths. GPU/installed-app acceptance is separate from fixture tests and requires explicit approval. Follow [command monitoring and timing](AGENTS.md#command-monitoring-and-timing-gates-persistent-user-requirements) when executing commands.
 
 ### Linting and Formatting
 
@@ -62,7 +65,7 @@ In your PR description, focus on **why** you made the change, not just what chan
 
 ### What Makes a Good Contribution
 
-- **Bug fixes** — especially platform-specific issues (Windows, macOS, Linux), EXR/linear workflows, or color space handling
+- **Bug fixes** — especially platform-specific issues (Windows and Linux), EXR/linear workflows, or color space handling
 - **Tests** — more coverage is always welcome, particularly for the inference pipeline and clip management
 - **Documentation** — better explanations, usage examples, or clarifying comments
 - **Performance** — reducing VRAM usage, speeding up frame processing, or optimizing I/O
@@ -80,7 +83,7 @@ Model checkpoints (CorridorKey, GVM, VideoMaMa, MatAnyone2) are **not** in the g
 
 ## Reporting Bugs
 
-Open a [GitHub issue](https://github.com/edenaion/EZ-CorridorKey/issues) with:
+Open a [Keyloom GitHub issue](https://github.com/NickPittas/Keyloom/issues) with:
 
 - OS and GPU info
 - Steps to reproduce
@@ -93,4 +96,4 @@ Please **do not** open public issues for security vulnerabilities. See [SECURITY
 
 ## Questions?
 
-Join the [Discord](https://discord.gg/TyxNjcWeF3) — it's the fastest way to get help or discuss ideas before opening a PR.
+Use this repository's [issues](https://github.com/NickPittas/Keyloom/issues) for Keyloom questions and proposals. Upstream community links are for their respective projects, not a promise of support for this fork.

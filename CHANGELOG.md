@@ -1,10 +1,32 @@
 # Changelog
 
-All notable changes to EZ-CorridorKey are documented here.
+Notable changes to Keyloom are documented here; older fork and upstream entries are retained below as history.
 
-> **Updating:** Hotfix and patch releases (the third version number, like 2.1.1 or 2.1.2) ship as in-app updates only. They do not come with a fresh full installer. Get them by clicking the update button in the app, or run `3-update.bat` (Windows) or `3-update.sh` (macOS/Linux) for source installs.
+> **Updating Keyloom:** use the latest Linux or Windows **online installer** from the [installation guide](docs/install.md). Only the latest release's online installers are distributed. Keyloom does not use the upstream in-app updater or `3-update` scripts.
+
+## Keyloom 2.5.0
+
+### Changed
+- Clients setup now combines local and joined PCs in one table with address selection, Connect, Accept work and default-assignment controls.
+- The Batch queue separates **Machines** and **Waiting** views. Machines show current pipeline stages and Earlier logs; waiting Automatic shots have Pause, Resume and Cancel controls.
+- Automatic assigns whole shots as PCs become free rather than dividing batches in advance. Failed shots wait for another suitable PC, with improved worker-failure recovery.
+- User, installation and network guides now describe the current native UI, online-only downloads and public-source versus installer-redistribution permissions. Clients, queue and waiting-list screenshots use clearly labelled isolated examples.
+
+The existing Linux and Windows 2.5.0 application payloads were built from `fa29ec3`; subsequent main changes described here are documentation/instruction changes, not a new binary build. See [installation](docs/install.md), [usage](docs/user-guide.md) and [network rendering](docs/network-rendering.md).
+
+## Earlier Keyloom release records
+
+- [2.3.0 build/release record](docs/release-2.3.0.md)
+- [2.2.0 build/release record](docs/release-2.2.0.md)
+- 2.4-era [branding](docs/branding-migration-validation.md), [network discovery](docs/network-discovery-validation.md) and [stability](docs/stability-validation.md) evidence.
+
+These records describe their original snapshots; previous release assets are not retained as current downloads.
 
 ---
+
+## Historical fork and upstream entries
+
+The entries below preserve earlier behaviour, names and release practices. References to Qt, old setup/updater scripts, private distribution or unsupported platforms are historical, not instructions for current Keyloom.
 
 ## EZ-CorridorKey2 (CorridorKey 2.0 fork) — 2026-10-21
 
@@ -223,7 +245,7 @@ Private personal-use fork of EZ-CorridorKey v2.1.5.
 - **SAM2 tracker crashed on repeated runs or after MatAnyone2** -- hydra's global state poisoned sam2's config registration. If diffusers or MatAnyone2 touched hydra first, sam2's YAML configs never registered and `compose()` failed with "GlobalHydra is not initialized." Now explicitly clears and re-initializes hydra with sam2's config module before every predictor build. Also added two-pass `reset_state` between forward/reverse propagation passes.
 - **MatAnyone2 and imageio missing from frozen builds** ([#101](https://github.com/edenaion/EZ-CorridorKey/issues/101), [#103](https://github.com/edenaion/EZ-CorridorKey/issues/103)) -- the PyInstaller spec's `collect_data_files` silently dropped .py source files from the matanyone2 vendored package (only bundled .yaml configs). Added a custom tree walker to include all matanyone2 code. Also added `imageio` to `copy_metadata` and `hiddenimports` because `imageio/__init__.py` queries `importlib.metadata.version("imageio")` at import time and crashed with `PackageNotFoundError` on Auto GVM. Belt-and-braces: 22 packages now have explicit `copy_metadata` entries to prevent future hook regressions.
 - **macOS spec under-specified** -- the macOS PyInstaller spec was missing most hiddenimports, collect_submodules, copy_metadata, and tree walkers that the Windows spec had. Mirrored all Windows hardening into the macOS spec.
-- **Docker: unauthenticated services** — VNC now requires a password (was `-nopw`), filebrowser now requires login (was `--noauth`). Both use `EZ-CorridorKey` as the default password so local/single-user setups have one deterministic credential to remember. See [`docker/README.md`](docker/README.md) for how to change it.
+- **Docker: unauthenticated services** — VNC now requires a password (was `-nopw`), filebrowser now requires login (was `--noauth`). Both use `EZ-CorridorKey` as the default password so local/single-user setups have one deterministic credential to remember. See [`docker/README.md`](https://github.com/edenaion/EZ-CorridorKey/blob/v2.1.5/docker/README.md) for how to change it.
 - **Docker: ports bound to all interfaces** — all exposed ports (5900, 6080, 6081) now bind to `127.0.0.1` only, preventing LAN/WAN access.
 - **macOS Processing backend switch needed an app restart** -- the Preferences > Processing backend dropdown saved the new MLX / MPS value to settings but the engine pool had already been lazy-loaded and was never dropped. Inference kept using the old backend until the next launch. The pool now clears when the backend selection changes so the next inference call rebuilds on the newly selected backend with no restart.
 

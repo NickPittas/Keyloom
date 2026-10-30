@@ -1,5 +1,7 @@
 # Keyloom 2.2.0 release record
 
+> **Historical build record, not a current download guide.** This preserves the original snapshot, including its then-private distribution wording. Only the latest online installers are distributed now; use the [installation guide](install.md). Source and linked release assets are public; redistribution permissions are described in the [README](../README.md#licence-and-sharing).
+
 Keyloom — powered by CorridorKey. Separate Linux and Windows installers are distributed in the private repository. The source payload was built from commit `db179cc` (later documentation commits do not alter the payload). Full downloadable asset sizes and SHA256 hashes are in [the asset manifest](release-2.2.0-assets.json).
 
 | Platform | Payload identity | Downloads |

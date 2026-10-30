@@ -1,4 +1,4 @@
-> EZ-CorridorKey2: personal-use fork using CorridorKey 2.0 (NVIDIA CUDA only); updates disabled. See the English [README](../../README.md).
+> **Historical upstream translation — not the Keyloom 2.5.0 guide.** The text below describes the older EZ-CorridorKey app; its installers, updater, macOS/Docker instructions and screenshots do not describe current Keyloom. Use the current English [README](../../README.md), [installation guide](../install.md) and [user guide](../user-guide.md).
 
 <p><a href="../../README.md"><img alt="🇺🇸 English" src="https://img.shields.io/static/v1?label=%F0%9F%87%BA%F0%9F%87%B8&message=English&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.fr.md"><img alt="🇫🇷 Français" src="https://img.shields.io/static/v1?label=%F0%9F%87%AB%F0%9F%87%B7&message=Fran%C3%A7ais&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.de.md"><img alt="🇩🇪 Deutsch" src="https://img.shields.io/static/v1?label=%F0%9F%87%A9%F0%9F%87%AA&message=Deutsch&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.es.md"><img alt="🇪🇸 Español" src="https://img.shields.io/static/v1?label=%F0%9F%87%AA%F0%9F%87%B8&message=Espa%C3%B1ol&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.it.md"><img alt="🇮🇹 Italiano" src="https://img.shields.io/static/v1?label=%F0%9F%87%AE%F0%9F%87%B9&message=Italiano&color=454430&labelColor=0E0D00&style=flat-square"></a> <img alt="🇧🇷 Português (Brasil)" src="https://img.shields.io/static/v1?label=%F0%9F%87%A7%F0%9F%87%B7&message=Portugu%C3%AAs%20%28Brasil%29&color=FFF203&labelColor=141300&style=flat-square"> <a href="README.ja.md"><img alt="🇯🇵 日本語" src="https://img.shields.io/static/v1?label=%F0%9F%87%AF%F0%9F%87%B5&message=%E6%97%A5%E6%9C%AC%E8%AA%9E&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.ko.md"><img alt="🇰🇷 한국어" src="https://img.shields.io/static/v1?label=%F0%9F%87%B0%F0%9F%87%B7&message=%ED%95%9C%EA%B5%AD%EC%96%B4&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.zh.md"><img alt="🇨🇳 简体中文" src="https://img.shields.io/static/v1?label=%F0%9F%87%A8%F0%9F%87%B3&message=%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.ru.md"><img alt="🇷🇺 Русский" src="https://img.shields.io/static/v1?label=%F0%9F%87%B7%F0%9F%87%BA&message=%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.pl.md"><img alt="🇵🇱 Polski" src="https://img.shields.io/static/v1?label=%F0%9F%87%B5%F0%9F%87%B1&message=Polski&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.tr.md"><img alt="🇹🇷 Türkçe" src="https://img.shields.io/static/v1?label=%F0%9F%87%B9%F0%9F%87%B7&message=T%C3%BCrk%C3%A7e&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.hi.md"><img alt="🇮🇳 हिन्दी" src="https://img.shields.io/static/v1?label=%F0%9F%87%AE%F0%9F%87%B3&message=%E0%A4%B9%E0%A4%BF%E0%A4%A8%E0%A5%8D%E0%A4%A6%E0%A5%80&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.id.md"><img alt="🇮🇩 Bahasa Indonesia" src="https://img.shields.io/static/v1?label=%F0%9F%87%AE%F0%9F%87%A9&message=Bahasa%20Indonesia&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.vi.md"><img alt="🇻🇳 Tiếng Việt" src="https://img.shields.io/static/v1?label=%F0%9F%87%BB%F0%9F%87%B3&message=Ti%E1%BA%BFng%20Vi%E1%BB%87t&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.uk.md"><img alt="🇺🇦 Українська" src="https://img.shields.io/static/v1?label=%F0%9F%87%BA%F0%9F%87%A6&message=%D0%A3%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D1%81%D1%8C%D0%BA%D0%B0&color=454430&labelColor=0E0D00&style=flat-square"></a> <a href="README.zh-Hant.md"><img alt="🇹🇼 繁體中文" src="https://img.shields.io/static/v1?label=%F0%9F%87%B9%F0%9F%87%BC&message=%E7%B9%81%E9%AB%94%E4%B8%AD%E6%96%87&color=454430&labelColor=0E0D00&style=flat-square"></a></p>
 
@@ -12,13 +12,13 @@
 [![Website](https://img.shields.io/badge/Website-ezcorridorkey.com-FFF203?style=flat-square&labelColor=141300)](https://ezcorridorkey.com)
 [![Plataforma](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-454430?style=flat-square&labelColor=141300)]()
 
-> **Lançamento mais recente: [v2.1.5](https://github.com/edenaion/EZ-CorridorKey/releases/tag/v2.1.5):** Correção da qualidade do matte. Os mattes alfa por IA não traçam mais uma faixa escura fina ao redor do sujeito em filmagens de alta resolução ([#179](https://github.com/edenaion/EZ-CorridorKey/issues/179)), e o alfa agora é limitado à faixa válida após o upscaling para que a saída premultiplied permaneça limpa. Veja o [changelog completo](CHANGELOG.md).
+> **Lançamento mais recente: [v2.1.5](https://github.com/edenaion/EZ-CorridorKey/releases/tag/v2.1.5):** Correção da qualidade do matte. Os mattes alfa por IA não traçam mais uma faixa escura fina ao redor do sujeito em filmagens de alta resolução ([#179](https://github.com/edenaion/EZ-CorridorKey/issues/179)), e o alfa agora é limitado à faixa válida após o upscaling para que a saída premultiplied permaneça limpa. Veja o [changelog completo](../../CHANGELOG.md).
 
 Uma GUI desktop completa para o [CorridorKey de Niko Pueringer](https://github.com/nikopueringer/CorridorKey), o chroma keyer por IA da Corridor Digital que separa fisicamente o primeiro plano do fundo, preservando cabelo, motion blur e translucidez.
 
 Esta GUI substitui o fluxo CLI de arrastar e soltar por um aplicativo desktop completo, mantendo 100% de compatibilidade retroativa (`python main.py --cli` ainda executa o assistente original).
 
-![EZ-CorridorKey](docs/screenshots/EZ-CorridorKey_Inference_Done.jpg)
+![EZ-CorridorKey](../screenshots/EZ-CorridorKey_Inference_Done.jpg)
 
 ### Conteúdo
 
@@ -131,7 +131,7 @@ O instalador inclui tudo: runtime Python, modelos de IA e bibliotecas de GPU. Ne
 
 ### Instalação alternativa: Docker
 
-Para usuários Linux ou configurações remotas/cloud, o EZ-CorridorKey pode rodar dentro do Docker com acesso pelo navegador via noVNC. Consulte [docker/README.md](docker/README.md) para instruções de configuração. A instalação nativa acima é recomendada para Windows e macOS.
+Para usuários Linux ou configurações remotas/cloud, o EZ-CorridorKey pode rodar dentro do Docker com acesso pelo navegador via noVNC. Consulte [docker/README.md](https://github.com/edenaion/EZ-CorridorKey/blob/v2.1.5/docker/README.md) para instruções de configuração. A instalação nativa acima é recomendada para Windows e macOS.
 
 ---
 
@@ -555,7 +555,7 @@ Geradores de alfa (SAM2, GVM, VideoMaMa, MatAnyone2) sempre rodam em PyTorch MPS
 
 As otimizações do EZ-CorridorKey (Hiera FlashAttention, tensor cores TF32, torch.compile, refinador em tiles) produzem saída idêntica ao CorridorKey upstream dentro do ruído de float32, verificada em PSNR, SSIM, MS-SSIM, LPIPS e DeltaE 2000.
 
-![Comparação de qualidade](docs/screenshots/quality_comparison_v1.5.0.png)
+![Comparação de qualidade](../screenshots/quality_comparison_v1.5.0.png)
 
 ---
 
@@ -583,7 +583,7 @@ A partir da v1.10.0, todo lançamento no GitHub inclui um manifest assinado (`ma
 
 Isso significa que, mesmo que a conta do GitHub fosse comprometida, o invasor não poderia enviar uma atualização maliciosa aos usuários instalados sem também possuir a chave de assinatura offline.
 
-O código de verificação é open source: [`backend/update_verify.py`](backend/update_verify.py).
+O código de verificação é open source: [`backend/update_verify.py`](https://github.com/edenaion/EZ-CorridorKey/blob/v2.1.5/backend/update_verify.py).
 
 ### Checksums
 
@@ -655,7 +655,7 @@ O EZ-CorridorKey aceita tradução para qualquer idioma. Todas as strings da UI 
 3. Compile: `pyside6-lrelease ui/translations/corridorkey_fr.ts`
 4. Envie um pull request com os arquivos `.ts` e `.qm`
 
-Instruções completas com exemplos estão em [`ui/translations/TRANSLATING.md`](ui/translations/TRANSLATING.md).
+Instruções completas com exemplos estão em [`ui/translations/TRANSLATING.md`](https://github.com/edenaion/EZ-CorridorKey/blob/v2.1.5/ui/translations/TRANSLATING.md).
 
 **Idiomas atuais:** inglês mais alemão, espanhol, francês, hindi, indonésio, italiano, japonês, coreano, polonês, português (Brasil), russo, turco, ucraniano, vietnamita, chinês (simplificado) e chinês (tradicional, Taiwan). Escolha o seu em Edit > Preferences. Quer ver seu idioma aqui ou melhorar uma tradução existente? PRs são bem-vindos.
 
@@ -676,9 +676,9 @@ O EZ-CorridorKey é um trabalho de amor, criado e mantido por um homem do Brookl
 
 ☼ **Reporte bugs** via [GitHub Issues](https://github.com/edenaion/EZ-CorridorKey/issues)
 
-☼ **Contribua com código**. Veja [CONTRIBUTING.md](CONTRIBUTING.md) para as diretrizes
+☼ **Contribua com código**. Veja [CONTRIBUTING.md](../../CONTRIBUTING.md) para as diretrizes
 
-☼ **Problemas de segurança**. Veja [SECURITY.md](SECURITY.md) para divulgação responsável
+☼ **Problemas de segurança**. Veja [SECURITY.md](../../SECURITY.md) para divulgação responsável
 
 Precisa de computação GPU para inferência? [RunPod](https://runpod.io?ref=2k18fmnh) oferece GPUs cloud sob demanda, ótimas para processamento em lote de filmagens grandes sem prender sua máquina local. Usar meu link de referência me ajuda a criar mais ferramentas para todos.
 

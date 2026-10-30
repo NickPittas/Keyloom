@@ -4,6 +4,8 @@ Keyloom — powered by CorridorKey can send work to other Windows and Linux PCs 
 
 Every installation hosts its own network service, can submit work, and can receive work. There is nothing to type: no host address, port or "Add network" form.
 
+**Keyloom must be running on every PC that renders shots**, not just the submitting PC. Keep the app window open, or enable background mode and leave the app running after its window closes. **File → Quit** or terminating the app stops receiving work. The daemon/service can stay running and keep a PC discoverable even after Keyloom quits, but **that daemon-only PC will not get work or render shots**. Discovery/reachability is not proof that a renderer is available.
+
 **This PC** (top of **Clients**) shows the PC name, the addresses the service answers on (every LAN, Tailscale and ZeroTier interface at once), whether it is running, and four buttons: **Start**, **Stop**, **Remove** (click twice) and **Refresh**. **Save** next to the name is the only thing that changes the global PC name; it is sent to every connected PC.
 
 **Other PCs** lists discovered PCs you have not joined yet. Keyloom scans once when Clients is first opened and again only when you press **ReScan** (there is an elapsed timer and **Cancel**; a scan is cut off after 35 s). Each row shows the name, addresses, network type (LAN, Tailscale, ZeroTier), reachability and join status. Tick an available PC to join it. Once joined, it moves to the **Clients** table below; it is not duplicated in the discovery list. PCs are identified by certificate, never by name, so two PCs may have the same name.
@@ -16,7 +18,7 @@ The first time Keyloom starts it installs this PC's per-user service (a `systemd
 - **Remove** removes the service and remembers that you did; Keyloom does not install it again until you press **Start**. Its database keeps the network identity, so starting again changes nothing for other PCs.
 - Every request has a 45 s limit. If it passes, the state shows as *unknown*; press **Refresh** before trying again.
 
-The first run may show an OS firewall prompt: allow it on your trusted/private network only. On Linux Keyloom does not open the firewall for you.
+The installer offers network firewall configuration: Windows may request administrator approval; Linux can configure an active UFW firewall with your approval. The app itself does not silently open ports. If configuration was skipped or failed, see [firewall setup](install.md#windows-firewall). Allow access only on trusted/private networks.
 
 ![Clients page with service controls, discovery and the unified client table](screenshots/native/12-clients.png)
 
@@ -117,12 +119,12 @@ A shot assigned explicitly to a PC is not load-balanced in advance by Automatic.
 | Shared files unavailable | Open the share as the desktop user and test the mapping in Keyloom. |
 | PC missing from the list | ReScan. Check that Keyloom is running there and the PCs share a network (LAN, Tailscale or ZeroTier). Do not delete a service folder: that would create a different network and orphan every joined PC. |
 
-Pairing credentials and the service database stay on local disk, outside projects. Keep their tokens private. Renaming the app preserves the existing settings and model locations.
+Pairing credentials and the service database stay on local disk, outside projects. Keep their tokens private. Updates to an existing Keyloom install preserve its identities and settings. Keyloom does not read or migrate an older CorridorKey install or its preferences.
 
 ## Limits
 
 - Every PC must run Keyloom 2.4 or newer to be found; earlier versions have no discovery and must be updated.
-- The OS firewall must allow the Keyloom service (TCP 8443-8452 and UDP 44554); Keyloom never opens ports itself.
+- The OS firewall must allow the Keyloom service (TCP 8443-8452 and UDP 44554). The installer can configure supported firewalls with approval; otherwise configure them manually.
 - Discovery uses LAN broadcast plus Tailscale's peer list and known addresses. Networks that block broadcast or Tailscale ACLs that block the ports can hide PCs from the list; correct reachability and ReScan. The current UI has no manual-address or invitation-file fallback.
 - The background service is separate from the Keyloom window: **Stop** keeps it stopped until **Start** or the next sign-in.
 - If the host's identity was revoked, Keyloom reports "identity revoked" and leaves your state untouched. There is no automatic re-issue: restore the host database or recover the identity manually; joining again alone does not restore it.
