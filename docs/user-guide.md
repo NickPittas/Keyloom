@@ -176,23 +176,56 @@ Each enabled output (FG, Matte, Comp, Processed) has its own card.
 On the batch board:
 
 1. Tick the clips.
-2. Choose a **Preset** (or **Current settings (no preset)**).
-3. Press **Key selected N clips…**.
+2. Choose a **Preset** (or **Current settings (no preset)**) when presets are available.
+3. Choose **Automatic** or a particular PC using each clip's assignment menu. To change several at once, use **Assign N selected to** and **Apply to N**; **All** selects every clip.
+4. Press **Key selected N clips…**. Keyloom checks the shots and queues them directly when no decisions are needed.
 
-![Batch confirmation](screenshots/native/14-batch-confirm.png)
+If a decision is needed, **Review batch** lists the affected clips. Existing results offer a new version rather than overwriting them: choose **OK** to accept the proposed action or **Skip** to leave a shot out, then **Queue N clips**. Blocked clips show the reason and cannot be accepted until it is fixed. Where a preset conflicts with a shot's own settings, **Use preset values** takes the preset instead.
 
-**Review batch** shows, per clip, the frame range, a **new result** with a **queue** checkbox (existing results offer **skip**, **write as vNNN**, **resume** or **replace**), the steps that run first (for example *first: GVM > Key*), the export products and the folder they go to.
+Each shot keeps its own In/Out, input colour and hint prompts. SAM and Chroma pre-mattes must already cover the clip's frames; otherwise the shot is blocked. GVM and BiRefNet generate theirs automatically.
 
-- Each shot keeps its **own** In/Out, input colour and hint prompts. A shot that has its own overrides shows **keeps this shot's own: …**; press **Use preset values** to take the preset instead.
-- SAM and Chroma pre-mattes must already cover the clip's frames; otherwise the clip is blocked with an instruction. GVM and BiRefNet generate theirs automatically.
-- **Render client** (per shot) and **Run on** (whole batch) choose the computer; see [Network rendering](network-rendering.md).
-- **Queue N clips** starts the work.
+### Clients and assignment
 
-![Batch progress](screenshots/native/15-batch-progress.png)
+Open **Clients** in the top bar to manage PCs, not to monitor renders.
 
-Example from the earlier real two-PC run.
+![Clients page with discovery and the unified client table](screenshots/native/12-clients.png)
 
-In the **Queue** panel each clip has its own section with ordered rows: **Pre-matte, Hint, Keying, Export**, each with a progress bar (for example *45% · 11/24*), *Waiting* or *Running*, and a **Cancel** beside live stages. Videos share the Export row. **Details** keeps warnings and recovery options. CPU, RAM, GPU and VRAM bars show how busy each computer is. Cancelling is cooperative: the worker stops at a safe point and frames already written are kept.
+*Isolated documentation example with simulated PCs, addresses and hardware.*
+
+- **This PC** shows service controls, **Let other PCs join this PC**, and the name other PCs see.
+- **Other PCs** shows newly discovered PCs. Tick one to join it; it then moves into the **Clients** table.
+- The **Clients** table combines this computer and joined PCs, with their addresses, status and reported GPUs. **Connect** enables a connection. **Accept work** allows Automatic to send to a network PC; on this computer's own connection it enables receiving from other PCs.
+- **Check workers** probes local workers. **Default assignment** sets the session's placement; individual clips can override it.
+- **Default for Batch job** selects a preferred network for submissions without a specific PC, not a fixed destination for every Automatic shot.
+
+See [Network rendering](network-rendering.md) for setup, address selection, access controls and shared-path mapping.
+
+### Queue: Machines
+
+![Queue Machines tab with computer meters and pipeline stages](screenshots/native/15-batch-progress.png)
+
+*Isolated example: one simulated pipeline is running, with three shots still waiting for a PC. Hardware readings are example values, not measured performance.*
+
+The **Queue** panel groups assigned work by computer. In **Machines**, expand a PC to see CPU, RAM, GPU and VRAM meters and its current shots. Collapse it to keep the current shot and overall status in the header.
+
+Each pipeline shows its applicable stages in order: **Pre-matte**, **Hint**, **Keying**, **Export**, with progress and cancellation controls. **Waiting** on a stage means its earlier dependency has not finished; it is different from an unassigned shot in the Waiting tab. Multiple video outputs share an Export row. **Details** holds local warnings and recovery options.
+
+Finished, failed and cancelled runs go into **Earlier (N)** under the PC. **Clear finished** removes finished entries and logs, not running work or rendered files. History for removed PCs remains under **History** until cleared. Cancelling running work is cooperative: the worker stops at a safe point and keeps frames already written.
+
+### Queue: Waiting list
+
+![Queue Waiting tab showing ordered shots, including a paused shot](screenshots/native/16-batch-waiting.png)
+
+*Isolated example: Studio_03 is paused; Studio_02 and Studio_04 remain eligible.*
+
+**Waiting (N)** lists confirmed **Automatic** shots that do not have a PC yet. Each free PC takes one eligible shot, then takes another when it finishes; the batch is not divided between PCs in advance. The **Why:** line explains why work is still waiting. Network PCs need **Connect** and **Accept work** enabled; Automatic requires fresh GPU readings with both GPU utilization and VRAM usage below 50%.
+
+- **Pause** keeps a shot in the list but prevents assignment. Other eligible shots can proceed.
+- **Resume** makes it eligible again. These controls do not pause or resume an already-running job.
+- **Cancel** removes one waiting shot. **Cancel all** removes every waiting shot, including paused shots, without cancelling work already assigned.
+- A failed Automatic shot returns to the end of the list for another suitable PC. It does not retry a PC where it already failed in this session, and stays waiting if none remains suitable.
+
+An explicitly assigned shot keeps its chosen destination. Running network jobs are not reassigned while their receiver may still be writing. See [queue details](network-rendering.md#6-watch-the-batch-queue) for network recovery.
 
 ## 10. Settings
 
