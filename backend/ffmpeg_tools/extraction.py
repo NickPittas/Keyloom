@@ -451,10 +451,16 @@ def recompress_one(args):
         # Unicode-safe read: cv2.imread fails on non-ASCII paths on Windows.
         # This standalone script cannot import the backend.frame_io facade, so
         # the imdecode(np.fromfile(...)) pattern is inlined here.
-        try:
-            img = cv2.imdecode(np.fromfile(src, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-        except (OSError, ValueError):
-            img = None
+        # On Windows parallel EXR decodes sometimes fail on a good frame (OpenCV decodes EXR through a temp
+        # file); one more try keeps a false "corrupt" from triggering a full re-extraction.
+        img = None
+        for _ in range(2):
+            try:
+                img = cv2.imdecode(np.fromfile(src, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+            except (OSError, ValueError):
+                img = None
+            if img is not None:
+                break
         if img is None:
             return False
         exr = OpenEXR.InputFile(src)
@@ -510,16 +516,15 @@ if __name__ == "__main__":
     workers = max(1, min((os.cpu_count() or 4) // 2, 16, total))
     work = [(os.path.join(out_dir, f), os.path.join(out_dir, f + ".tmp"))
             for f in files]
-    cancelled = threading.Event()
-    def listen_for_cancel():
-        for line in sys.stdin:
-            if line.strip() == "CANCEL":
-                cancelled.set()
-                return
-    threading.Thread(target=listen_for_cancel, daemon=True).start()
+    # Cancel is a marker file the parent creates. Not stdin: on Windows a supervisor with a thread blocked
+    # reading a stdin pipe never got past the pool shutdown, so every import hung after its last frame.
+    cancel_path = sys.argv[2]
+    class _Cancelled:
+        def is_set(self):
+            return os.path.exists(cancel_path)
+    cancelled = _Cancelled()
     done = 0
-    # This supervisor already has a stdin listener thread; spawn avoids forking
-    # Python with live threads and deadlocking the workers on some runtimes.
+    # spawn: never fork a Python that may hold live threads (deadlocks the workers on some runtimes).
     pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
     futs = {pool.submit(recompress_one, item): item for item in work}
     pending = set(futs)
@@ -556,14 +561,19 @@ if __name__ == "__main__":
 '''
 
     script_path = os.path.join(out_dir, "_dwab_recompress.py")
+    cancel_path = os.path.join(out_dir, "_dwab_recompress.cancel")
     with open(script_path, 'w') as f:
         f.write(script_content)
+    try:
+        os.remove(cancel_path)  # a leftover from an earlier run must not cancel this one
+    except FileNotFoundError:
+        pass
 
     logger.info(f"Recompressing {total} EXR frames to DWAB (subprocess)...")
 
     proc = subprocess.Popen(
-        [python, script_path, out_dir],
-        stdin=subprocess.PIPE,
+        [python, script_path, out_dir, cancel_path],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -591,9 +601,8 @@ if __name__ == "__main__":
 
     def cancel_and_join() -> None:
         try:
-            if getattr(proc, "stdin", None) is not None:
-                proc.stdin.write("CANCEL\n")
-                proc.stdin.flush()
+            with open(cancel_path, "w"):
+                pass
             proc.wait(timeout=15)
         except (OSError, subprocess.TimeoutExpired):
             stop_process_tree(proc)
@@ -648,10 +657,11 @@ if __name__ == "__main__":
                 except OSError:
                     pass
         reader_thread.join(timeout=5)
-        try:
-            os.remove(script_path)
-        except OSError:
-            pass
+        for leftover in (script_path, cancel_path):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
 
     if proc.returncode != 0:
         # Log the TAIL of stderr — the actual exception sits at the bottom

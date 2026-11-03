@@ -552,6 +552,8 @@ def test_recompress_subprocess_cancellation_joins_descendant_workers(tmp_path, m
     def observe(cmd, **kwargs):
         proc = original_popen(cmd, **kwargs)
         if len(cmd) > 1 and str(cmd[1]).endswith("_dwab_recompress.py"):
+            # Never a stdin pipe: on Windows the supervisor then never finished (every import hung).
+            assert kwargs.get("stdin") is extraction.subprocess.DEVNULL
             processes.append(proc)
         return proc
 
@@ -568,6 +570,7 @@ def test_recompress_subprocess_cancellation_joins_descendant_workers(tmp_path, m
     assert result == [] and len(processes) == 1
     assert processes[0].poll() is not None
     assert not (out_dir / "_dwab_recompress.py").exists()
+    assert not (out_dir / "_dwab_recompress.cancel").exists()
     if os.name != "nt":
         with pytest.raises(ProcessLookupError):
             os.killpg(processes[0].pid, 0)
