@@ -25,14 +25,14 @@ Only **online installers** are distributed, and only the latest release is retai
 
 Download **all three files** from the [Windows release](https://github.com/NickPittas/Keyloom/releases/tag/v2.5.0-windows) into the **same folder**:
 
-- `Keyloom-online-2.5.0-5804bedd5c-windows-x86_64.exe`
-- `Keyloom-online-2.5.0-5804bedd5c-windows-x86_64-1.bin`
-- `Keyloom-online-2.5.0-5804bedd5c-windows-x86_64.exe.sha256`
+- `Keyloom-online-2.5.0-8f35288d65-windows-x86_64.exe`
+- `Keyloom-online-2.5.0-8f35288d65-windows-x86_64-1.bin`
+- `Keyloom-online-2.5.0-8f35288d65-windows-x86_64.exe.sha256`
 
 Check both installer files in PowerShell:
 
 ```powershell
-Get-Content .\Keyloom-online-2.5.0-5804bedd5c-windows-x86_64.exe.sha256 | ForEach-Object {
+Get-Content .\Keyloom-online-2.5.0-8f35288d65-windows-x86_64.exe.sha256 | ForEach-Object {
   $hash, $name = $_ -split '\s+', 2
   $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $name).Hash
   if ($got -ine $hash) { throw "SHA256 mismatch: $name" }
