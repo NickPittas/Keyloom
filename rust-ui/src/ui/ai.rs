@@ -547,6 +547,9 @@ pub struct AiUi {
     pending_targets: Option<Vec<Target>>,
     /// Model assets are being installed or repaired; do not start workers against a changing tree.
     model_mutation_active: bool,
+    /// A stop was asked for a model change or capability refresh: once the worker has exited it is made
+    /// startable again (never left "Stopped" for the next action to fail on).
+    pub(crate) rearm_after_stop: bool,
     /// Screen rectangles from the last frame (click tests).
     pub key_rect: Option<egui::Rect>,
     pub batch_confirm_rect: Option<egui::Rect>,
@@ -701,6 +704,7 @@ impl AiUi {
             lock_remove_temps: false,
             pending_targets: None,
             model_mutation_active: false,
+            rearm_after_stop: false,
             key_rect: None,
             batch_confirm_rect: None,
             batch_preset_rect: None,
@@ -3345,8 +3349,14 @@ impl AiUi {
     }
     pub fn set_model_mutation_active(&mut self, active: bool) {
         self.model_mutation_active = active;
+        if self.rearm_after_stop && !active && self.sched.all_stopped() {
+            self.sched.rearm_stopped();
+            self.rearm_after_stop = false;
+        }
     }
-    /// Model assets are safe to change only after observed worker exits and resolved job fences.
+    /// Model assets are safe to change only after observed worker exits and resolved job fences. A live idle
+    /// worker reads as "not yet safe"; the Models page (given `worker_activity()`) stops it itself and waits for
+    /// the exit, so only a job that really runs or an unresolved fence refuses the change.
     pub fn model_asset_mutation_safe(&self) -> bool {
         self.sched.all_stopped()
             && self.sched.needs_attention().is_empty()
@@ -3365,7 +3375,9 @@ impl AiUi {
     }
     /// Graceful stop of everything: queued jobs are cancelled, workers get EOF and finish their `done`.
     pub fn begin_stop(&mut self) {
+        self.rearm_after_stop = true;
         self.sched.stop_all();
+        self.sched.mark_rearm();
         self.disk_gen += 1;
     }
     pub fn all_stopped(&self) -> bool {
@@ -3605,6 +3617,64 @@ impl Drop for AiUi {
 mod tests {
     use super::*;
     use crate::project::{load_project, LoadOptions};
+
+    /// A fake repo whose `python -m backend.worker` is the AI fake worker (idle until given a job).
+    fn fake_ai(tag: &str) -> AiUi {
+        let base = std::env::temp_dir().join(format!("ck-ai-unit-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("backend/worker")).unwrap();
+        std::fs::write(repo.join("backend/__init__.py"), "").unwrap();
+        std::fs::write(repo.join("backend/worker/__init__.py"), "").unwrap();
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ai_fake_worker.py");
+        std::fs::write(repo.join("backend/worker/__main__.py"), format!("import runpy\nrunpy.run_path({fake:?}, run_name='__main__')\n")).unwrap();
+        let st: Settings = serde_json::from_value(serde_json::json!({"version": 1, "ai_targets": [{"id": "l0", "kind": "local", "repo": repo, "python": "/usr/bin/python3", "gpu": 0}]})).unwrap();
+        AiUi::new(&st, None)
+    }
+    fn until(ai: &mut AiUi, what: &str, mut ok: impl FnMut(&mut AiUi) -> bool) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !ok(ai) {
+            assert!(std::time::Instant::now() < end, "timed out: {what}");
+            ai.sched.tick();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn model_changes_are_safe_with_no_worker_alive() {
+        let ai = AiUi::new(&Settings::default(), None);
+        assert!(ai.model_asset_mutation_safe());
+        assert!(!ai.workers_need_stop_for_model_change());
+        assert!(!ai.unresolved_model_fences());
+    }
+
+    #[test]
+    fn an_idle_worker_never_blocks_actions_and_is_restartable_after_a_model_change() {
+        let mut ai = fake_ai("idle");
+        assert!(ai.local_worker_unstarted(), "a fresh worker counts as available");
+        ai.sched.probe(None);
+        assert!(ai.local_worker_unstarted(), "a starting (probing) worker counts as available");
+        until(&mut ai, "worker ready", |a| a.local_caps().is_some());
+        // Live and idle: no job, so it is Idle (never "working") and a model change may stop it.
+        assert_eq!(ai.worker_activity(), crate::ui::models::WorkerActivity::Idle);
+        assert!(ai.workers_alive() && !ai.model_asset_mutation_safe() && ai.workers_need_stop_for_model_change());
+        assert!(!ai.unresolved_model_fences());
+        // The Models page stops it for a model change; the change is active while it runs.
+        ai.begin_stop();
+        ai.set_model_mutation_active(true);
+        until(&mut ai, "worker exited", |a| a.all_stopped());
+        ai.set_model_mutation_active(true);
+        assert!(ai.sched.targets()[0].status == TargetStatus::Stopped, "stays stopped while the change runs");
+        assert!(ai.model_asset_mutation_safe());
+        // The change ended: the target is startable again, so the next action (or Receive jobs) starts it.
+        ai.set_model_mutation_active(false);
+        assert_eq!(ai.sched.targets()[0].status, TargetStatus::Fresh);
+        assert!(ai.local_worker_unstarted() && !ai.rearm_after_stop);
+        ai.sched.probe(None);
+        until(&mut ai, "worker restarted", |a| a.local_caps().is_some());
+        let _ = ai.begin_stop();
+        until(&mut ai, "worker exited", |a| a.all_stopped());
+    }
 
     fn plan_for(clip: &Clip) -> Plan {
         let job: crate::jobs::KeyJob = serde_json::from_value(serde_json::json!({

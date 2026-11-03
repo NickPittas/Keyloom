@@ -201,14 +201,23 @@ class HashCache:
 
     def __init__(self, path: Path):
         self.path = path
+        self.load_error: str | None = None  # why saved verdicts are missing (absent file is normal)
+        self.save_error: str | None = None  # why the last save failed
         self._cache = self._load()
 
     def _load(self) -> dict:
+        self.load_error = None
         try:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
+            if not isinstance(data, dict):
+                self.load_error = "the verification record has an unexpected format"
+                return {}
+            return data
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as e:
+            self.load_error = f"the verification record could not be read ({e})"
             return {}
 
     def reload(self) -> None:
@@ -241,6 +250,7 @@ class HashCache:
 
     def save(self) -> bool:
         tmp = None
+        self.save_error = None
         try:
             for ancestor in reversed((self.path.parent, *self.path.parent.parents)):
                 try:
@@ -249,17 +259,20 @@ class HashCache:
                     continue
                 attrs = getattr(st, "st_file_attributes", 0)
                 if stat.S_ISLNK(st.st_mode) or attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+                    self.save_error = f"{ancestor} is a link"
                     return False
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if os.path.lexists(self.path) and (self.path.is_symlink() or not self.path.is_file()):
+                self.save_error = f"{self.path} is not a regular file"
                 return False
             tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.{time.time_ns()}.tmp")
             with open(tmp, "x", encoding="utf-8") as f:
                 json.dump(self._cache, f, indent=1, sort_keys=True)
             os.replace(tmp, self.path)
             return True
-        except OSError:
-            return False  # cache write failure never blocks offline status
+        except OSError as e:
+            self.save_error = str(e)
+            return False  # cache write failure never blocks offline status, but verify() reports it
         finally:
             if tmp is not None:
                 try:
@@ -371,6 +384,8 @@ class StatusChecker:
                                      "digest; artifact stays unverified")
         elif verify_note:
             result["verify_note"] = verify_note
+        elif state == "installed" and not verified and self.hash_cache.load_error:
+            result["verify_note"] = f"Verify needed: {self.hash_cache.load_error}"
         return result
 
     def _cached_verify(self, art: Artifact) -> bool | None:
@@ -444,7 +459,13 @@ class StatusChecker:
     def verify(self, artifact_ids: list[str] | None = None) -> list[dict]:
         ids = artifact_ids or sorted(self.catalog.artifacts)
         results = [self.verify_artifact(self.catalog.get(i)) for i in ids]
-        self.hash_cache.save()
+        if not self.hash_cache.save():
+            # Say so: otherwise the next start shows "Verify needed" and Repair looks like the cure.
+            err = self.hash_cache.save_error or "unknown error"
+            for r in results:
+                # Only files that passed may be called fine; a failed one keeps its problems and Repair stays the cure.
+                fine = " Files are fine: Repair is not needed." if r["verified"] else ""
+                r["verify_note"] = f"Verification result not saved: {err}; it is lost on restart.{fine}"
         return results
 
     # -- aggregate -------------------------------------------------------

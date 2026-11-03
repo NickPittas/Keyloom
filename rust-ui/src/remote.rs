@@ -1174,9 +1174,11 @@ impl Remote {
         let local = env.ai.scheduler().targets().into_iter().find(|t| t.local && t.enabled);
         let hello_gpu = local.as_ref().and_then(|t| t.hello.as_ref()).and_then(|h| h.gpu.clone());
         let sample = if let View::Live(s) = env.metrics { Some(s.clone()) } else { None };
-        if env.cfg.local_host && hello_gpu.is_none() && due(self.last_probe, Duration::from_secs(60)) {
+        // Only "Receive jobs" starts the worker ahead of work ("Ready receive jobs"): it must report its GPU to accept
+        // offers. An idle worker never blocks local actions or model repair (Models stops it).
+        if env.cfg.local_host && env.cfg.receive && hello_gpu.is_none() && due(self.last_probe, Duration::from_secs(60)) {
             self.last_probe = Some(now);
-            env.ai.probe_workers(); // start the local client so its GPU identity is known
+            env.ai.probe_workers();
         }
         // A renamed PC registers again right away; a host that cannot take names keeps the old registration.
         if self.registered && !self.reg_inflight && !self.name_unsupported && self.reg_name != truncate(env.cfg.name.trim(), 64) {
@@ -1200,7 +1202,7 @@ impl Remote {
                     }
                     Err(e) => self.register_note = Some(format!("this computer cannot take network work: {e}")),
                 },
-                (None, _) => self.register_note = Some("waiting for the local client's GPU identity (Clients > Check workers)".into()),
+                (None, _) => self.register_note = Some(if env.cfg.receive { "waiting for the local client's GPU identity (Clients > Check workers)" } else { "the GPU is identified when you queue work or turn on Receive jobs" }.into()),
                 (_, None) => self.register_note = Some("waiting for system metrics".into()),
             }
         }

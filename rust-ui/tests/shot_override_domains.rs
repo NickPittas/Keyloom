@@ -72,7 +72,8 @@ fn open(e: &Env, clip: Option<&str>, tab: Tab) -> (egui::Context, App) {
     let mut app = App::with_ctx(&ctx, AppOptions { project: Some(e.project.clone()), settings_path: Some(e.settings.clone()), open_clip: clip.map(Into::into), tab: Some(tab), ..Default::default() });
     app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
     if clip.is_some() {
-        pump(&ctx, &mut app, "worker caps", |a| a.ai().local_caps().is_some());
+        // Opening a clip no longer starts the worker, so there is no capability reply to wait for: let the clip load.
+        pump(&ctx, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && a.ai().local_worker_unstarted());
     }
     frames(&ctx, &mut app, 8);
     (ctx, app)

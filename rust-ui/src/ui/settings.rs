@@ -55,6 +55,8 @@ pub struct Page {
     error: Option<String>,
     models_rect: Option<egui::Rect>,
     apply_rect: Option<egui::Rect>,
+    /// Cancel/Reset/leave undid a theme preview: the app re-applies the saved theme.
+    restore_theme: bool,
     cancel_rect: Option<egui::Rect>,
     cat: Cat,
     search: String,
@@ -80,6 +82,7 @@ impl Page {
             error: None,
             models_rect: None,
             apply_rect: None,
+            restore_theme: false,
             cancel_rect: None,
             cat: Cat::Playback,
             search: String::new(),
@@ -186,10 +189,15 @@ impl Page {
     }
     pub fn cancel(&mut self) {
         self.open();
+        self.restore_theme = true;
+    }
+    pub fn take_restore_theme(&mut self) -> bool {
+        std::mem::take(&mut self.restore_theme)
     }
     /// Factory defaults into the form only; unknown keys (top-level and nested) survive.
     pub fn reset(&mut self) {
         self.draft.reset_keeping_unknown();
+        self.restore_theme = true;
     }
 
     pub fn ui(&mut self, ui: &mut Ui) -> Event {
@@ -223,12 +231,12 @@ impl Page {
             egui::Panel::left("settings_categories")
                 .resizable(false)
                 .exact_size(210.0)
-                .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(12))
+                .frame(egui::Frame::new().fill(theme::canvas_fill(ui)).inner_margin(12))
                 .show(ui, |ui| {
                     self.nav(ui, &mut ev, true);
                 });
         }
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::PANEL).inner_margin(24)).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(24)).show(ui, |ui| {
             if !wide {
                 self.nav(ui, &mut ev, false);
                 ui.separator();
@@ -280,10 +288,10 @@ impl Page {
 
     fn body(&mut self, ui: &mut Ui) {
         if let Some(p) = &self.store.problem {
-            note(ui, p, theme::FOCUS);
+            note(ui, p, theme::warn(ui));
         }
         if let Some(e) = &self.error {
-            note(ui, e, Color32::from_rgb(240, 120, 110));
+            note(ui, e, theme::error(ui));
         }
         let cat = self.cat;
         let name = CATS.iter().find(|c| c.0 == cat).map_or("", |c| c.1);
@@ -332,6 +340,17 @@ impl Page {
         let d = &mut self.draft;
         dim(ui, "UI scale applies as soon as you press Apply.");
         card(ui, |ui| {
+            row(ui, "Theme", |ui| {
+                egui::ComboBox::from_id_salt("settings_theme")
+                    .selected_text(&d.interface.theme)
+                    .show_ui(ui, |ui| {
+                        for theme_name in cfg::THEMES {
+                            if ui.selectable_value(&mut d.interface.theme, theme_name.to_string(), theme_name).changed() {
+                                theme::apply_preference(ui.ctx(), &d.interface.theme);
+                            }
+                        }
+                    });
+            });
             row(ui, "UI scale", |ui| {
                 ui.add(egui::Slider::new(&mut d.interface.ui_scale, cfg::UI_SCALE).step_by(0.05));
             });
@@ -441,7 +460,7 @@ impl Page {
                     for (what, res) in [("Read", &a.read), ("Write", &a.write)] {
                         match res {
                             Ok(()) => dim(ui, &format!("{what}: OK")),
-                            Err(e) => note(ui, &format!("{what}: {e}"), Color32::from_rgb(240, 120, 110)),
+                            Err(e) => note(ui, &format!("{what}: {e}"), theme::error(ui)),
                         }
                     }
                 }
@@ -485,7 +504,7 @@ impl Page {
             show(ui, "Runtime repo", launch.repo.as_ref().map_or(none.into(), |p| p.display().to_string()));
             show(ui, "Python", launch.python.as_ref().map_or("developer default (CK_PYTHON, then <repo>/.venv)".into(), |p| p.display().to_string()));
             if let Some(p) = &launch.problem {
-                note(ui, p, theme::FOCUS);
+                note(ui, p, theme::warn(ui));
             }
         });
     }
@@ -501,8 +520,8 @@ fn sample_preview(r: &SharedRoot) -> Result<String, String> {
 /// Raised grouped card.
 fn card(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
     egui::Frame::new()
-        .fill(theme::CARD)
-        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(77, 94, 82)))
+        .fill(theme::card_fill(ui))
+        .stroke(theme::card_stroke(ui))
         .corner_radius(6.0)
         .inner_margin(12.0)
         .show(ui, |ui| {
@@ -614,7 +633,7 @@ fn targets_ui(ui: &mut Ui, targets: &mut Vec<Target>) {
 }
 
 fn dim(ui: &mut Ui, t: &str) {
-    ui.label(RichText::new(t).color(theme::TEXT_DIM).size(12.0));
+    ui.label(RichText::new(t).color(theme::text_dim(ui)).size(12.0));
 }
 fn note(ui: &mut Ui, t: &str, c: Color32) {
     ui.label(RichText::new(t).color(c));

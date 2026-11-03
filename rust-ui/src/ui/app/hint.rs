@@ -678,7 +678,7 @@ impl App {
             if !left.is_empty() {
                 self.hint.note = Some(format!("An interrupted hint publication left {} aside; running any hint job on this clip (or clearing its lock) restores it.", left.join(", ")));
             }
-            self.ai.probe_workers();
+            // No worker probe here: it starts on demand when work is queued (an idle worker must never block anything).
         }
         let src = stems_of(clip);
         let stem = v
@@ -1528,7 +1528,9 @@ impl App {
     /// then Source / Import when there is something to prepare. The inspector only chooses; every run starts here.
     pub(super) fn hint_actions(&mut self, ui: &mut Ui, clip: &Clip) {
         let local = self.ai.local_caps();
-        let ready = |k: TaskKind| local.as_ref().is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false));
+        // A worker that was never started reports nothing: actions queue and the worker starts with the job.
+        let lazy = local.is_none() && self.ai.local_worker_unstarted();
+        let ready = |k: TaskKind| lazy || local.as_ref().is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false));
         let busy = self.ai.task_busy(&clip.folder);
         let (guide, fin) = (self.hint.cfg.guide, self.hint.cfg.finish);
         let guide_ready = ready(guide.task());
@@ -1742,13 +1744,14 @@ impl App {
 
     pub(super) fn hint_props(&mut self, ui: &mut Ui, clip: &Clip) {
         let caps = self.ai.local_caps();
+        let lazy = caps.is_none() && self.ai.local_worker_unstarted();
         let cfg_before = self.hint.cfg.clone();
         let ctx = ui.ctx().clone();
         let (pre_stale, hint_stale) = (self.stale(&ctx, Node::PreMatte), self.stale(&ctx, Node::Hint));
         let bypass = theme::checkbox(ui, &mut self.hint.cfg.bypass, "Bypass hint (keeps every setting and asset)");
         self.hint.preset_rects.push(("bypass", bypass.rect));
         ui.add_space(4.0);
-        let ok = |k: TaskKind| caps.as_ref().is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false));
+        let ok = |k: TaskKind| lazy || caps.as_ref().is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false));
         ui.add_enabled_ui(!self.hint.cfg.bypass, |ui| {
             card(ui, "Pre-matte", pre_stale, |ui| {
                 pair(ui, "Producer", |ui| {
@@ -2154,7 +2157,7 @@ impl App {
     /// Deliver action when any output is a video: Key, then every video output (core queues the chain).
     pub(super) fn deliver_action(&mut self, ui: &mut Ui, clip: &Clip) {
         self.sync_deliveries(clip);
-        let ffmpeg = self.ai.local_caps().is_some_and(|c| c.tasks.get("export_video").copied().unwrap_or(false));
+        let ffmpeg = self.ai.local_worker_unstarted() || self.ai.local_caps().is_some_and(|c| c.tasks.get("export_video").copied().unwrap_or(false));
         let busy = self.ai.task_busy(&clip.folder);
         let range = self.ai_open_range();
         let pl = self.capture_pipeline(clip);
@@ -2288,7 +2291,7 @@ fn codec_text(c: &crate::presets::VideoCodec) -> String {
 
 fn reason(caps: &Option<crate::worker::Capabilities>, what: &str) -> String {
     match caps {
-        None => "The worker is not ready yet (starting or unavailable).".into(),
+        None => "The worker is starting or unavailable: see Settings > Clients.".into(),
         Some(c) if c.task_unavailable.is_empty() => {
             format!("{what} is not installed or verified on the worker: see Settings > Models.")
         }

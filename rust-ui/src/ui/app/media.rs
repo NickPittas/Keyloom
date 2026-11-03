@@ -315,7 +315,7 @@ impl App {
         let mut cancel = false;
         theme::section(ui, "Media preparation", |ui| {
             if let Some(m) = self.media.movie.as_ref().filter(|m| m.folder == clip.folder) {
-                let ready = self.ai.local_caps().as_ref().is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false))
+                let ready = prepare_source_worker_ok(self.ai.local_worker_unstarted(), self.ai.local_caps().as_ref().is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false)))
                     && (matches!(m.verdict, Some(Ok(true))) || matches!(m.verdict, Some(Ok(false))) && m.confirm);
                 extract = ui.add_enabled(ready, egui::Button::new("Extract frames from this movie").fill(theme::ACCENT)).clicked();
             }
@@ -567,5 +567,21 @@ impl App {
         if let Some(r) = clip.result_range_text() {
             ui.label(RichText::new(format!("Result covers {r}")).color(DIM).size(11.5));
         }
+    }
+}
+
+/// An unstarted worker is fine: the job queues and the scheduler starts it.
+fn prepare_source_worker_ok(unstarted: bool, capable: bool) -> bool {
+    unstarted || capable
+}
+
+#[cfg(test)]
+mod prepare_source_tests {
+    use super::prepare_source_worker_ok as ok;
+    #[test]
+    fn available_before_the_worker_starts() {
+        assert!(ok(true, false));
+        assert!(ok(false, true));
+        assert!(!ok(false, false));
     }
 }

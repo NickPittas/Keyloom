@@ -904,6 +904,88 @@ pub fn covers(dir: &Path, stems: &[String], range: (usize, usize)) -> bool {
     stems[range.0..=range.1].iter().all(|s| have.contains(s))
 }
 
+/// One produced range of a hint folder (`ranges` in `.corridorkey_hint.json`, written by the worker).
+/// `legacy` = synthesised from an old file with only kind/range/params: no digests, and it covers only the
+/// images inside its recorded in/out stems (older frames merged in by later partial jobs are uncertified).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HintRange {
+    pub stems: Vec<String>,
+    pub digests: BTreeMap<String, String>,
+    pub legacy: bool,
+    pub kind: Option<String>,
+    pub job_id: Option<String>,
+    /// The full record as written (settings, source/prompt/upstream identities), for the shared reuse check.
+    pub record: Value,
+}
+
+/// Never fails: a missing, unreadable or malformed file reads as no records (nothing certified).
+pub fn read_hint_ranges(dir: &Path) -> Vec<HintRange> {
+    let Some(v) = std::fs::read(dir.join(".corridorkey_hint.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    else {
+        return vec![];
+    };
+    let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_owned);
+    if let Some(list) = v.get("ranges") {
+        return list
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                let stems = r
+                    .get("stems")?
+                    .as_array()?
+                    .iter()
+                    .map(|s| s.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()?;
+                let digests = match r.get("digests") {
+                    None => BTreeMap::new(),
+                    Some(d) => d
+                        .as_object()?
+                        .iter()
+                        .map(|(k, x)| Some((k.clone(), x.as_str()?.to_owned())))
+                        .collect::<Option<_>>()?,
+                };
+                Some(HintRange {
+                    stems,
+                    digests,
+                    legacy: r.get("legacy").and_then(Value::as_bool).unwrap_or(false),
+                    kind: text(r, "kind"),
+                    job_id: text(r, "job_id"),
+                    record: r.clone(),
+                })
+            })
+            .collect();
+    }
+    let (Some(lo), Some(hi)) = (
+        v.pointer("/range/in_stem").and_then(Value::as_str),
+        v.pointer("/range/out_stem").and_then(Value::as_str),
+    ) else {
+        return vec![];
+    };
+    let all: Vec<String> = crate::project::list_images(dir).into_iter().map(|h| h.0).collect();
+    // Same as the worker: the images between in/out by natural sort, even if an end stem was deleted.
+    let (lo, hi) = (lo.to_owned(), hi.to_owned());
+    let stems: Vec<String> = all
+        .into_iter()
+        .filter(|s| {
+            crate::natural_sort::natural_cmp(s, &lo).is_ge() && crate::natural_sort::natural_cmp(s, &hi).is_le()
+        })
+        .collect();
+    if stems.is_empty() {
+        return vec![];
+    }
+    vec![HintRange {
+        stems,
+        digests: BTreeMap::new(),
+        legacy: true,
+        kind: text(&v, "kind"),
+        job_id: text(&v, "job_id"),
+        record: v,
+    }]
+}
+
 /// Builds the hint-generation jobs of one clip from a frozen config (the UI passes its live annotations,
 /// the batch/Key planner loads the saved ones).
 pub struct Gen<'a> {
@@ -1146,6 +1228,36 @@ mod tests {
         assert_eq!(m[2 * 16 + 7], 255); // between the two stroke points
         assert_eq!(m[8 * 16 + 2], 0); // background strokes never paint
         assert_eq!(m[9 * 16 + 15], 0);
+    }
+
+    #[test]
+    fn hint_ranges_read_new_legacy_and_malformed_provenance() {
+        let d = std::env::temp_dir().join(format!("ck-ranges-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let w = |t: &str| std::fs::write(d.join(".corridorkey_hint.json"), t).unwrap();
+        assert!(read_hint_ranges(&d).is_empty()); // no file
+        for bad in ["{", "[]", "null", r#"{"ranges":5}"#, r#"{"ranges":[1,{"stems":3}]}"#, r#"{"range":{"in_stem":1}}"#] {
+            w(bad);
+            assert!(read_hint_ranges(&d).is_empty(), "{bad}");
+        }
+        w(r#"{"ranges":[{"stems":["a","b"],"digests":{"a":"x"},"kind":"gvm","job_id":"j"},{"stems":[1]}]}"#);
+        let r = read_hint_ranges(&d);
+        assert_eq!(r.len(), 1);
+        assert_eq!((r[0].stems.clone(), r[0].legacy, r[0].job_id.as_deref()), (vec!["a".into(), "b".into()], false, Some("j")));
+        assert_eq!(r[0].digests["a"], "x");
+        for n in ["f1", "f2", "f3", "f4"] {
+            std::fs::write(d.join(format!("{n}.png")), b"x").unwrap();
+        }
+        w(r#"{"kind":"gvm","job_id":"old","range":{"in_stem":"f2","out_stem":"f3"}}"#);
+        let r = read_hint_ranges(&d);
+        assert_eq!((r.len(), r[0].legacy, r[0].stems.clone()), (1, true, vec!["f2".to_string(), "f3".to_string()]));
+        assert!(r[0].digests.is_empty());
+        // an in/out stem that no longer exists still bounds the range (natural sort, like the worker)
+        std::fs::remove_file(d.join("f2.png")).unwrap();
+        w(r#"{"kind":"gvm","job_id":"old","range":{"in_stem":"f2","out_stem":"f3"}}"#);
+        assert_eq!(read_hint_ranges(&d)[0].stems, vec!["f3".to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

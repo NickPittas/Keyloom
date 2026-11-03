@@ -8,6 +8,7 @@ failure or cancel leaves the old folder untouched). See docs/design/rust-ui/stan
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -29,6 +30,7 @@ import numpy as np
 from ..clip_state import MASK_TRACK_MANIFEST, ClipAsset, ClipEntry, ClipState
 from ..errors import CorridorKeyError, JobCancelledError
 from ..frame_io import imread_unicode, imwrite_unicode
+from ..natural_sort import natural_sort_key
 from .key_job import (
     MANIFEST_NAME, PROTOCOL, KeyJobRejected, PublishError, _clean_abs, _freeze, _inside,
     _check_source_map, _is_int, _JOB_ID_RE, _KeyClip, _boot_id, _proc_start_ticks, _link_noclobber, _make_dirs_or_reject, _rm, _rollback,
@@ -391,6 +393,84 @@ def _atomic_json(path: str, data: dict) -> None:
     os.replace(tmp, path)  # our own marker/provenance file, never user data
 
 
+def _sha(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _stat_id(path: str) -> list:
+    st = os.stat(path)
+    return [st.st_size, st.st_mtime_ns]
+
+
+def read_hint_ranges(folder: str) -> list:
+    """Per-range records of ``folder``'s ``.corridorkey_hint.json``; never raises.
+
+    Each record: ``stems`` + ``digests`` (stem -> sha256) + the identities the frames were made from.
+    Legacy provenance (no ``ranges``) yields one ``legacy`` record, no digests, covering only the images
+    inside its recorded in/out stems; frames merged in from older jobs are uncertified. Malformed -> []."""
+    try:
+        with open(os.path.join(folder, HINT_PROVENANCE), encoding="utf-8") as f:
+            prov = json.load(f)
+        if not isinstance(prov, dict):
+            return []
+        if "ranges" in prov:
+            ok = lambda r: (isinstance(r, dict) and isinstance(r.get("stems"), list)  # noqa: E731
+                            and all(isinstance(x, str) for x in r["stems"])
+                            and isinstance(r.get("digests", {}), dict))
+            return [r for r in prov["ranges"] if ok(r)] if isinstance(prov["ranges"], list) else []
+        # in/out stems need not exist any more: the frames between them by natural sort are the range
+        rng = prov.get("range") or {}
+        lo, hi = natural_sort_key(rng["in_stem"]), natural_sort_key(rng["out_stem"])
+        stems = sorted((s for s in _images(folder) if lo <= natural_sort_key(s) <= hi), key=natural_sort_key)
+        return [{"legacy": True, "kind": prov.get("kind"), "job_id": prov.get("job_id"), "range": rng,
+                 "params": prov.get("params"), "stems": stems, "digests": {}}] if stems else []
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+
+
+def certified_stems(folder: str) -> dict:
+    """stem -> its record, for frames whose file still matches the digest recorded when it was made.
+    A frame whose (size, mtime_ns) equals the recorded ``stats`` identity is trusted without re-reading it;
+    any other frame is re-hashed. Legacy records certify nothing (no digests); callers decide what a legacy
+    folder may be reused for."""
+    have, out = _images(folder), {}
+    for r in read_hint_ranges(folder):
+        stats = r.get("stats") if isinstance(r.get("stats"), dict) else {}
+        for stem, dig in r["digests"].items():
+            try:
+                if stem not in r["stems"] or stem not in have:
+                    continue
+                path = os.path.join(folder, have[stem])
+                # ponytail: a same-size same-mtime rewrite is missed; drop the stat shortcut if that ever matters
+                if stats.get(stem) == _stat_id(path) or _sha(path) == dig:
+                    out[stem] = r
+            except OSError:
+                pass
+    return out
+
+
+def _merge_ranges(old: list, record: dict | None, new_dir: str, stems: list, digests: dict) -> list:
+    """Old records minus the replaced stems (overlaps shrink or vanish), plus this job's record.
+    ``digests`` were hashed in local staging; here each frame only gets its stat identity (no re-read)."""
+    have = _images(new_dir)
+    stems = [s for s in stems if s in have]
+    replaced = set(stems)
+    out = []
+    for r in old:
+        keep = [s for s in r["stems"] if s not in replaced and s in have]
+        if keep:
+            out.append({**r, "stems": keep, "digests": {s: d for s, d in r.get("digests", {}).items() if s in keep},
+                        "stats": {s: d for s, d in (r.get("stats") or {}).items() if s in keep}})
+    if record is not None:
+        out.append({**record, "stems": list(stems), "digests": {s: d for s, d in digests.items() if s in stems},
+                    "stats": {s: _stat_id(os.path.join(new_dir, have[s])) for s in stems}})
+    return out
+
+
 class _LockBusy(TaskRejected):
     """The hint lock exists; ``extra['lock']`` is what ``inspect_hint_lock`` reports about it."""
     def __init__(self, message: str, lock: dict):
@@ -672,9 +752,16 @@ def publish_hint_dir(staged: str, final: str, stems: list, job: TaskJob, provena
             for stem, fname in _images(final).items():
                 if stem not in replaced:
                     _link(os.path.join(final, fname), os.path.join(new, fname))
+        staged_imgs = _images(staged)
+        digests = {s: _sha(os.path.join(staged, staged_imgs[s])) for s in stems if s in staged_imgs} \
+            if provenance.get("record") is not None else {}
         for fname in os.listdir(staged):
             if not fname.startswith("."):
                 shutil.move(os.path.join(staged, fname), os.path.join(new, fname))
+        provenance = dict(provenance)
+        record = provenance.pop("record", None)
+        provenance["ranges"] = _merge_ranges(read_hint_ranges(final) if os.path.isdir(final) else [],
+                                             record, new, stems, digests)
         _atomic_json(os.path.join(new, HINT_PROVENANCE), provenance)
         if guard:
             guard()  # lock ownership, immediately before the swap
@@ -991,6 +1078,42 @@ def _cleanup_staged(job: TaskJob, ctx: _Ctx, staged: str, cancel) -> None:
             raise CorridorKeyError(f"Cannot clean up mask for {stem}")
 
 
+def _prompt_fp(prompts: dict) -> str:
+    enc = lambda o: hashlib.sha256(o.tobytes()).hexdigest() if isinstance(o, np.ndarray) else str(o)  # noqa: E731
+    return hashlib.sha256(json.dumps(prompts, sort_keys=True, default=enc).encode()).hexdigest()
+
+
+def _hint_record(job: TaskJob, ctx: _Ctx) -> dict:
+    """What this range of frames was made from. The whole job range is the temporal conditioning window;
+    Key-only settings are deliberately absent."""
+    k, p = job.kind, job.params
+    src = os.path.join(ctx.clip.input_asset.path, "")
+    # ponytail: source identity is size+mtime_ns per frame (cheap); a same-size same-mtime rewrite is missed
+    # A frame or mask that vanished mid-job records "unknown": the finished job must not fail for it.
+    source = {}
+    for stem, f in zip(ctx.stems, ctx.files):
+        try:
+            source[stem] = _stat_id(src + f)
+        except OSError:
+            source[stem] = "unknown"
+    upstream = {}
+    if k in ("videomama", "matanyone2", "prematte_hint"):
+        for s, m in ctx.masks.items():
+            if s in ctx.stems:
+                try:
+                    upstream[s] = _sha(m)
+                except OSError:
+                    upstream[s] = "unknown"
+    return {"kind": k, "job_id": job.job_id, "range": _thaw(job.range), "conditioning_range": _thaw(job.range),
+            "params": _thaw(p), "seed": p.get("seed"), "colour": p.get("input_is_linear"),
+            "model": SAM_IDS.get(p.get("tracker_model")) if k == "sam_track" else None,
+            "prompt_fp": _prompt_fp(ctx.prompts) if k == "sam_track" else None,
+            "cleanup": _thaw(stage_cleanup(k, job.publish_dir, p.get("mask_cleanup"))),
+            "source": source,
+            "upstream": upstream,
+            "written": time.time()}
+
+
 def _run_hint(svc, job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     prog = _Progress(ev, job.kind)
     status = lambda m: ev("status", message=m)  # noqa: E731
@@ -1032,7 +1155,8 @@ def _run_hint(svc, job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     if cancel.is_set():
         raise JobCancelledError(view.name, 0)
     prov = {"kind": k, "job_id": job.job_id, "clip_id": job.clip_id, "range": _thaw(job.range),
-            "params": _thaw(job.params), "frames": n, "written": time.time()}
+            "params": _thaw(job.params), "frames": n, "written": time.time(),
+            "record": _hint_record(job, ctx)}
     prog(view.name, n, n)
     ev("status", message="Publishing hints...")
     published = publish_hint_dir(staged, job.publish_dir, ctx.stems, job, prov, guard=ctx.lock.verify)

@@ -58,6 +58,7 @@ pub const TRACKER_MODELS: [(&str, &str, &str); 3] = [
 pub const CACHE_MIB: std::ops::RangeInclusive<u32> = 64..=65536;
 pub const WORKERS: std::ops::RangeInclusive<u32> = 0..=32;
 pub const UI_SCALE: std::ops::RangeInclusive<f32> = 0.75..=2.0;
+pub const THEMES: [&str; 3] = ["System", "Dark", "Light"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -76,6 +77,7 @@ pub struct Playback {
 #[serde(default)]
 pub struct Interface {
     pub ui_scale: f32,
+    pub theme: String,
     /// Closing the window minimizes it instead of quitting, so the network client stays available.
     pub background: bool,
     /// Start minimized when the user signs in (per-user autostart; needs `background`).
@@ -216,6 +218,7 @@ impl Default for Interface {
     fn default() -> Self {
         Self {
             ui_scale: 1.0,
+            theme: "System".into(),
             background: false,
             launch_at_login: false,
             extra: Map::new(),
@@ -641,6 +644,20 @@ mod tests {
         s.playback.cache_mib = 300;
         assert_eq!(s.cache_mb(None), 300);
         assert_eq!(s.workers(), crate::frames::default_workers());
+    }
+
+    #[test]
+    fn theme_defaults_for_old_files_and_round_trips() {
+        for theme in ["Dark", "Light"] {
+            let raw = serde_json::json!({"version": 1, "interface": {"theme": theme}});
+            let loaded: Settings = serde_json::from_value(raw).unwrap();
+            assert_eq!(loaded.interface.theme, theme);
+            let saved = serde_json::to_value(loaded).unwrap();
+            let reloaded: Settings = serde_json::from_value(saved).unwrap();
+            assert_eq!(reloaded.interface.theme, theme);
+        }
+        let old: Settings = serde_json::from_str(r#"{"version":1,"interface":{"ui_scale":1.0}}"#).unwrap();
+        assert_eq!(old.interface.theme, "System");
     }
 
     #[test]

@@ -305,3 +305,25 @@ fn key_after_two_chained_writers_is_accepted_but_a_stranger_still_collides() {
     assert!(matches!(s.submit(key("k0", vec![])), Err(SubmitError::Collision { .. })));
     assert_eq!(s.submit(key("k1", vec!["h2".into()])), Ok(()));
 }
+
+#[test]
+fn a_task_submitted_while_a_refresh_stop_runs_waits_and_dispatches_after_the_restart() {
+    let (base, mut s) = sched("rearm_wait", json!({}));
+    s.probe(None);
+    wait_until("worker ready", || {
+        s.tick();
+        s.targets().iter().any(|t| t.hello.is_some())
+    });
+    s.stop_all();
+    s.mark_rearm();
+    s.submit_task(task(&base, "r1", TaskKind::Gvm, "ok"), vec![]).unwrap();
+    wait_until("worker exited", || {
+        s.tick();
+        s.all_stopped()
+    });
+    s.tick();
+    assert_eq!(st(&s, "r1"), JobState::Queued, "waits while the target is stopped for a refresh");
+    s.rearm_stopped();
+    settle(&mut s, &["r1"]);
+    assert!(ok(&st(&s, "r1")));
+}

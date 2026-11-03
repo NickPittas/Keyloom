@@ -164,6 +164,37 @@ impl AiUi {
             .find(|t| t.local && t.enabled && t.hello.is_some())
             .and_then(|t| t.hello.map(|h| h.capabilities))
     }
+    /// The local worker has not been started, is starting, or is being refreshed after a model change, and told
+    /// us nothing yet. Actions then queue normally (the scheduler starts or waits for it): only Down/Refused
+    /// (and a worker the user stopped) make an action unavailable.
+    pub fn local_worker_unstarted(&self) -> bool {
+        let refreshing = self.rearm_after_stop;
+        self.sched.targets().iter().any(|t| {
+            t.local
+                && t.enabled
+                && t.hello.is_none()
+                && match t.status {
+                    TargetStatus::Fresh | TargetStatus::Starting | TargetStatus::Ready => true,
+                    TargetStatus::Stopping | TargetStatus::Stopped => refreshing,
+                    _ => false,
+                }
+        })
+    }
+
+    /// Truthful worker state for the Models page and labels: working on a step only while a job really runs;
+    /// an idle or still-starting worker is just idle.
+    pub fn worker_activity(&self) -> crate::ui::models::WorkerActivity {
+        use crate::ui::models::WorkerActivity as W;
+        if let Some(job) = self.sched.targets().into_iter().filter(|t| t.local && t.enabled).find_map(|t| t.busy_with) {
+            let step = self.tracked.iter().find(|t| t.job_id == job).map(|t| t.label.clone()).filter(|l| !l.is_empty());
+            return W::Working(step.unwrap_or_else(|| "a job".into()));
+        }
+        // Queued work or an unresolved fence must not be stopped from under: report it as working.
+        if self.sched.running() || !self.sched.needs_attention().is_empty() || !self.sched.task_attention().is_empty() {
+            return W::Queued;
+        }
+        if self.sched.all_stopped() { W::Stopped } else { W::Idle }
+    }
     /// Start the local worker now so capabilities are known before the user asks for work.
     pub fn probe_workers(&mut self) {
         if !self.model_mutation_active {

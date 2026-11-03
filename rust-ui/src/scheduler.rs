@@ -199,6 +199,8 @@ struct Slot {
     lost_job: Option<String>,
     /// Stop was requested (`stop_*`/`force_stop`): the final status is `Stopped` once the process exits.
     stopping: bool,
+    /// The stop is a refresh (model change): a task submitted meanwhile waits for the restart instead of failing.
+    rearm: bool,
     /// When this slot's worker died on its own (not stopped by the user): a crash restarts it, at most
     /// `CRASH_RESTARTS` times in `CRASH_WINDOW`, so queued work waits for it instead of failing.
     crashes: Vec<Instant>,
@@ -405,6 +407,7 @@ impl Scheduler {
                 lost_job: None,
                 crashes: vec![],
                 stopping: false,
+                rearm: false,
             })
             .collect();
         Ok(Self {
@@ -976,6 +979,14 @@ impl Scheduler {
         }
     }
 
+    /// Make every exited, jobless `Stopped` target startable again (after a model change or a capability
+    /// refresh stopped it); the next action or probe starts it.
+    pub fn rearm_stopped(&mut self) {
+        self.slots.iter_mut().for_each(|s| s.rearm = false);
+        let ids: Vec<String> = self.slots.iter().filter(|s| s.status == TargetStatus::Stopped && s.conn.is_none() && s.job.is_none()).map(|s| s.target.id.clone()).collect();
+        ids.iter().for_each(|i| self.reset_target(i));
+    }
+
     /// A job still in its preflight was never sent: drop it as `Cancelled` (nothing was written, no worker saw
     /// it), instead of letting a later send hit a closed pipe and look like a lost writer.
     fn cancel_pending_preflight(&mut self, c: usize, ev: &mut Vec<SchedEvent>) {
@@ -1004,6 +1015,11 @@ impl Scheduler {
                 s.status = TargetStatus::Stopped;
             }
         }
+    }
+
+    /// Mark every target's stop as a refresh: tasks submitted until `rearm_stopped` wait instead of failing.
+    pub fn mark_rearm(&mut self) {
+        self.slots.iter_mut().for_each(|s| s.rearm = true);
     }
 
     /// Graceful stop of everything; queued jobs are cancelled. Poll `tick` until `all_stopped`.
@@ -1699,6 +1715,7 @@ impl Scheduler {
             match &s.status {
                 TargetStatus::Down(_) if s.conn.is_some() => pending = Some(c),
                 TargetStatus::Refused(r) | TargetStatus::Down(r) => reasons.push(r.clone()),
+                TargetStatus::Stopping | TargetStatus::Stopped if s.rearm => pending = Some(c),
                 TargetStatus::Stopping | TargetStatus::Stopped => reasons.push("stopped".into()),
                 TargetStatus::Fresh | TargetStatus::Starting => pending = Some(c),
                 TargetStatus::Ready => {

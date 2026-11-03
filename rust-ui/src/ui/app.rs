@@ -296,10 +296,10 @@ impl App {
 
     /// Same, with the file-dialog backend replaced (tests never open a real dialog).
     pub fn with_picker(ctx: &egui::Context, opts: AppOptions, dialogs: Backend) -> Self {
-        super::theme::apply(ctx);
         let settings_path = opts.settings_path.clone().or_else(default_path);
         crate::queue::set_settings_path(settings_path.clone());
         let settings = SettingsPage::new(Store::load(settings_path));
+        super::theme::apply_preference(ctx, &settings.saved().interface.theme);
         ctx.set_zoom_factor(settings.saved().interface.ui_scale);
         let settings_saved = settings.saved().clone();
         let models = super::models::Page::new(opts.repo.as_deref());
@@ -1253,8 +1253,10 @@ impl App {
         cfg: &crate::hints::HintCfg,
     ) -> Vec<(Node, Option<String>, Vec<(graph::Action, String, bool)>)> {
         let local = self.ai.local_caps();
+        // Same rule as the panel buttons: a worker that was never started queues the job and starts with it.
+        let lazy = local.is_none() && self.ai.local_worker_unstarted();
         let ready = |k: crate::tasks::TaskKind| {
-            local
+            lazy || local
                 .as_ref()
                 .is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false))
         };
@@ -2197,6 +2199,14 @@ fn board_status(c: &Clip) -> String {
     parts.join(" · ")
 }
 
+impl App {
+    fn stop_worker_for_models(&mut self) {
+        if self.models.take_stop_request() {
+            self.ai.begin_stop();
+        }
+    }
+}
+
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.net_logic(ctx);
@@ -2985,6 +2995,9 @@ impl App {
 
     fn frame_inner(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        if self.settings.take_restore_theme() {
+            super::theme::apply_preference(&ctx, &self.settings.saved().interface.theme);
+        }
         self.import_tick(&ctx);
         self.ai
             .set_model_mutation_active(self.models.blocks_worker_launch());
@@ -3014,7 +3027,9 @@ impl App {
             self.ai.workers_need_stop_for_model_change(),
             self.ai.unresolved_model_fences(),
         );
+        self.models.set_worker_activity(Some(self.ai.worker_activity()));
         self.models.tick(&ctx);
+        self.stop_worker_for_models(); // also when the Models page is closed: its ui() is the other consumer
         self.ai
             .set_model_mutation_active(self.models.blocks_worker_launch());
         self.close_tick(&ctx);
@@ -3090,6 +3105,7 @@ impl App {
                             self.settings.set_error(format!("Settings saved, but the sign-in entry could not be updated: {e}"));
                         }
                         ctx.set_zoom_factor(self.settings.saved().interface.ui_scale);
+                        super::theme::apply_preference(&ctx, &self.settings.saved().interface.theme);
                         self.ai
                             .set_targets(self.settings.saved(), self.opts.repo.as_deref());
                     }
@@ -3245,6 +3261,18 @@ impl App {
 mod settings_handoff_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_models_stop_request_is_acted_on_while_the_page_is_closed() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions::default());
+        assert!(!app.models_open);
+        app.models.raise_stop_request_for_test();
+        app.ai.rearm_after_stop = false;
+        app.stop_worker_for_models();
+        assert!(app.ai.rearm_after_stop, "begin_stop ran");
+        assert!(!app.models.take_stop_request(), "request consumed once");
+    }
 
     #[test]
     fn settings_opens_models_without_discarding_its_draft() {
@@ -3624,6 +3652,24 @@ mod settings_handoff_tests {
         );
         pump(&ctx, &mut app, |_| true);
         (ctx, app)
+    }
+
+    #[test]
+    fn graph_node_actions_are_enabled_while_the_worker_is_not_started() {
+        let (repo, _log) = stub_repo("lazymenu");
+        let a = repo.parent().unwrap().join("A");
+        project_with_clip(&a);
+        let (ctx, mut app) = app_on(&repo, &a);
+        app.open_clip(&ctx, 0);
+        pump(&ctx, &mut app, |x| x.draft_clips.contains("a"));
+        assert!(app.ai.local_caps().is_none() && app.ai.local_worker_unstarted(), "opening a clip must not start the worker");
+        let clip = app.clip_for_test();
+        let menu = app.node_menu(&clip, &crate::hints::HintCfg::default());
+        for node in [Node::PreMatte, Node::Hint] {
+            let acts = &menu.iter().find(|m| m.0 == node).unwrap().2;
+            let run: Vec<_> = acts.iter().filter(|a| a.0 != graph::Action::Open).collect();
+            assert!(!run.is_empty() && run.iter().all(|a| a.2), "{node:?} generate actions enabled: {run:?}");
+        }
     }
 
     #[test]
