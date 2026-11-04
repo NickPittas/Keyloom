@@ -92,20 +92,18 @@ fn listener_is_ours(port: u16) -> bool {
 
 #[cfg(windows)]
 fn listener_is_ours(port: u16) -> bool {
-    // netstat lists every TCP listener with its owning pid, IPv4 and IPv6, without CIM
-    let out = std::process::Command::new("netstat").args(["-ano", "-p", "TCP"]).output().expect("netstat");
-    let v6 = std::process::Command::new("netstat").args(["-ano", "-p", "TCPv6"]).output().expect("netstat v6");
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&v6.stdout));
-    let me = std::process::id().to_string();
-    let hit = text.lines().any(|l| {
-        let f: Vec<&str> = l.split_whitespace().collect();
-        f.len() == 5 && f[3] == "LISTENING" && f[1].rsplit(':').next() == Some(&port.to_string()) && f[4] == me
-    });
-    if !hit {
-        eprintln!("listener_is_ours({port}) pid {me}: no LISTENING row; rows for the port: {:?}",
-            text.lines().filter(|l| l.contains(&format!(":{port} "))).collect::<Vec<_>>());
-    }
-    hit
+    // netstat on Kamino-3 omits the dual-stack `::` listener; Get-NetTCPConnection shows it (State is blank there,
+    // so no State filter). A closed port is an empty answer, not an error.
+    let me = std::process::id();
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | Where-Object OwningProcess -eq {me} | Where-Object {{ -not $_.RemoteAddress -or $_.RemoteAddress -in '0.0.0.0','::' }} | Select-Object -ExpandProperty OwningProcess"),
+        ])
+        .output()
+        .expect("query listening port owner");
+    String::from_utf8_lossy(&out.stdout).lines().any(|l| l.trim() == me.to_string())
 }
 
 #[cfg(target_os = "linux")]
