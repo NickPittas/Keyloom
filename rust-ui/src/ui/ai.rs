@@ -327,9 +327,17 @@ struct AutoShot {
 
 /// A send its PC refused for good (the PC's name as people know it, and its reason).
 struct Refused {
+    sid: String,
     shot: AutoShot,
     pc: String,
     why: String,
+}
+
+/// A re-send waiting for its NEW plan, built from the shot's current state. `was` = the refused record it replaces.
+struct Replan {
+    shot: AutoShot,
+    was: Option<String>,
+    batch: Option<Batch>,
 }
 
 /// Automatic's key for this computer in `AutoShot::failed_on`/`on`.
@@ -629,6 +637,8 @@ pub struct AiUi {
     sent_shots: std::collections::HashMap<String, AutoShot>,
     /// Sends a PC refused for good: kept with the reason until the user clears them or sends them again.
     refused: Vec<Refused>,
+    /// Re-sends being planned again from the shots' current state (see `resend_tick`).
+    replans: Vec<Replan>,
     /// Automatic shots running on this computer, by the id of their chain's last job.
     auto_live: Vec<(String, AutoShot)>,
     /// Why the last Automatic dispatch left shots waiting (shown after "Waiting for a free PC").
@@ -780,6 +790,7 @@ impl AiUi {
             cancel_rects: vec![],
             sent_shots: Default::default(),
             refused: vec![],
+            replans: vec![],
             auto_live: vec![],
             auto_wait: None,
             auto_clients: 0,
@@ -1218,6 +1229,19 @@ impl AiUi {
         preset: Option<BatchPreset>,
         preset_name: Option<String>,
     ) {
+        self.batch = Some(self.plan_batch(ctx, project, st, picks, preset, preset_name));
+    }
+
+    /// The planning a Board "Key selected" and every re-send share: rows computed off-thread from the clips' current state.
+    fn plan_batch(
+        &mut self,
+        ctx: &egui::Context,
+        project: &Project,
+        st: &Settings,
+        picks: &[usize],
+        preset: Option<BatchPreset>,
+        preset_name: Option<String>,
+    ) -> Batch {
         let presets = self.batch_presets();
         let caps_block = match &preset {
             Some(BatchPreset::Pipeline(p)) if p.export.has_video() => self
@@ -1465,7 +1489,7 @@ impl AiUi {
             let _ = tx.send(rows);
             ctx.request_repaint();
         });
-        self.batch = Some(Batch {
+        Batch {
             rows: vec![],
             pending: Some(rx),
             project: project.clone(),
@@ -1475,7 +1499,7 @@ impl AiUi {
             preset_name,
             auto: false,
             quick: false,
-        });
+        }
     }
 
     /// The batch review is computed and waiting for confirmation (tests).
@@ -2956,17 +2980,14 @@ impl AiUi {
                 errs.push(format!("{}: export: {w}", r.clip.display_name));
                 continue;
             }
-            if matches!(r.placement, Placement::Auto) {
-                self.auto_pending.push_back(AutoShot { row: r, plan: p, project: b.project.clone(), st: b.st.clone(), preset_name: b.preset_name.clone(), failed_on: vec![], paused: false, on: None });
-                waiting += 1;
-                continue;
-            }
-            match self.submit_row(&b.project, &b.st, b.preset_name.as_deref(), &r, p) {
-                Ok(_) => {
+            let (place, name) = (self.placement_text(&r.placement), r.clip.display_name.clone());
+            match self.queue_row(&b.project, &b.st, b.preset_name.as_deref(), r, p) {
+                Ok(true) => waiting += 1,
+                Ok(false) => {
                     queued += 1;
-                    *per_client.entry(self.placement_text(&r.placement)).or_default() += 1;
+                    *per_client.entry(place).or_default() += 1;
                 }
-                Err(e) => errs.push(format!("{}: {e}", r.clip.display_name)),
+                Err(e) => errs.push(format!("{name}: {e}")),
             }
         }
         let on: Vec<String> = per_client.iter().map(|(k, n)| format!("{n} on {k}")).collect();
@@ -2985,6 +3006,15 @@ impl AiUi {
             m += &format!(" Not queued: {}", errs.join(" "));
         }
         self.notice = Some(m);
+    }
+
+    /// Automatic waits for a free PC (`Ok(true)`); a chosen client gets it now (`Ok(false)`).
+    fn queue_row(&mut self, project: &Project, st: &Settings, preset_name: Option<&str>, r: BatchRow, p: Plan) -> Result<bool, String> {
+        if matches!(r.placement, Placement::Auto) {
+            self.auto_pending.push_back(AutoShot { row: r, plan: p, project: project.clone(), st: st.clone(), preset_name: preset_name.map(str::to_owned), failed_on: vec![], paused: false, on: None });
+            return Ok(true);
+        }
+        self.submit_row(project, st, preset_name, &r, p).map(|_| false)
     }
 
     /// Route one planned shot by its placement (network PC, hint pipeline, single plan or chain) and remember its edits.
@@ -3093,14 +3123,23 @@ impl AiUi {
         })
     }
 
-    /// A send its PC never accepted goes to the end of the Automatic list; false if this session did not send it.
+    /// "Send again" on a send its PC never accepted: planned again from the shot's current state, to the end of the
+    /// Automatic list; false if this session did not send it.
     pub fn requeue_sent(&mut self, submission_id: &str) -> bool {
         let Some(mut a) = self.sent_shots.remove(submission_id) else { return false };
         a.on = None;
         a.row.placement = Placement::Auto;
+        self.replans.push(Replan { shot: a, was: None, batch: None });
+        true
+    }
+
+    /// The PC was not free when the shot arrived: the same plan waits at the end of the Automatic list (nothing changed).
+    fn back_to_auto(&mut self, submission_id: &str) {
+        let Some(mut a) = self.sent_shots.remove(submission_id) else { return };
+        a.on = None;
+        a.row.placement = Placement::Auto;
         self.notice = Some(format!("{}: back in Automatic, it goes to the next free PC.", a.row.clip.display_name));
         self.auto_pending.push_back(a);
-        true
     }
 
     /// The PC refused this send for good: the shot stays visible with the reason (Clear / Send again) instead of
@@ -3115,7 +3154,7 @@ impl AiUi {
         let pc = a.on.clone().or_else(|| match &a.row.placement { Placement::Target(t) => Some(t.clone()), Placement::Auto => None });
         let pc = pc.map_or_else(|| "the PC".to_owned(), |p| self.pc_label(&p));
         self.notice = Some(format!("{}: refused by {pc}: {why}", a.row.clip.display_name));
-        self.refused.push(Refused { shot: a, pc, why: why.to_owned() });
+        self.refused.push(Refused { sid: submission_id.to_owned(), shot: a, pc, why: why.to_owned() });
         true
     }
 
@@ -3126,22 +3165,86 @@ impl AiUi {
         }
     }
 
-    /// Plan a refused shot again: to the PC it was sent to, or into Automatic.
+    /// Plan a refused shot again from its current state, with a new submission id: to the PC it was sent to, or into
+    /// Automatic. The refused entry stays until the new plan is accepted (`resend_tick`).
     pub fn resend_refused(&mut self, i: usize, automatic: bool) {
-        if i >= self.refused.len() {
+        let Some(r) = self.refused.get(i) else { return };
+        if self.replans.iter().any(|p| p.was.as_deref() == Some(&r.sid)) {
             return;
         }
-        let Refused { mut shot, pc, why } = self.refused.remove(i);
+        let mut shot = r.shot.clone();
         shot.failed_on.clear();
         shot.on = None;
         if automatic {
             shot.row.placement = Placement::Auto;
-            self.auto_pending.push_back(shot);
-            return;
         }
-        if let Err(e) = self.submit_row(&shot.project, &shot.st, shot.preset_name.as_deref(), &shot.row, shot.plan.clone()) {
-            self.notice = Some(format!("{}: not sent, {e}", shot.row.clip.display_name));
-            self.refused.push(Refused { shot, pc, why });
+        self.replans.push(Replan { shot, was: Some(r.sid.clone()), batch: None });
+    }
+
+    /// Drive the re-sends: plan each shot again from the OPEN project's current state (the same planning as the Board's
+    /// "Key selected"), then queue it where the old one went. Called every frame; a shot that cannot be planned now
+    /// shows why and keeps its old record.
+    pub fn resend_tick(&mut self, ctx: &egui::Context, project: Option<&Project>, st: &Settings) {
+        for mut rp in std::mem::take(&mut self.replans) {
+            if rp.batch.is_none() {
+                let open = project.filter(|p| p.root == rp.shot.project.root);
+                let pick = open.and_then(|p| p.clips.iter().position(|c| c.folder == rp.shot.row.clip.folder));
+                let (Some(p), Some(i)) = (open, pick) else {
+                    self.resend_failed(rp, "the project is not open".into());
+                    continue;
+                };
+                let name = rp.shot.preset_name.clone();
+                match resolve_preset(&self.batch_presets(), &name) {
+                    Ok(preset) => rp.batch = Some(self.plan_batch(ctx, p, st, &[i], preset, name)),
+                    Err(e) => {
+                        self.resend_failed(rp, e);
+                        continue;
+                    }
+                }
+            }
+            let b = rp.batch.as_mut().expect("planned");
+            let Some(rx) = &b.pending else { continue };
+            match rx.try_recv() {
+                Err(TryRecvError::Empty) => self.replans.push(rp),
+                Err(TryRecvError::Disconnected) => self.resend_failed(rp, "the check was interrupted".into()),
+                Ok(rows) => {
+                    let b = rp.batch.take().expect("planned");
+                    let Some(mut row) = rows.into_iter().next() else {
+                        self.resend_failed(rp, "the clip is gone from the project".into());
+                        continue;
+                    };
+                    row.placement = rp.shot.row.placement.clone(); // the target stays: the same PC, or Automatic
+                    let Some(plan) = row.plan().cloned() else {
+                        let why = row_problem(&row, &self.net_targets).map_or_else(|| "nothing to send".into(), |p| p.0);
+                        self.resend_failed(rp, why);
+                        continue;
+                    };
+                    if let Some(why) = row_problem(&row, &self.net_targets).filter(|p| !p.1).map(|p| p.0) {
+                        self.resend_failed(rp, why);
+                        continue;
+                    }
+                    match self.queue_row(&b.project, &b.st, b.preset_name.as_deref(), row, plan) {
+                        Ok(waiting) => {
+                            if let (true, Some(a)) = (waiting, self.auto_pending.back_mut()) {
+                                a.failed_on = rp.shot.failed_on.clone();
+                            }
+                            if let Some(sid) = &rp.was {
+                                self.refused.retain(|r| &r.sid != sid); // replaced by the new submission
+                            }
+                            self.notice = Some(format!("{}: planned again from its current settings.", rp.shot.row.clip.display_name));
+                        }
+                        Err(e) => self.resend_failed(rp, e),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A re-send could not be planned or queued: say why. The old record stays (a refused entry, or the shot back in Automatic).
+    fn resend_failed(&mut self, rp: Replan, why: String) {
+        self.notice = Some(format!("{}: not sent, {why}", rp.shot.row.clip.display_name));
+        if rp.was.is_none() {
+            self.auto_pending.push_back(rp.shot);
         }
     }
 
@@ -3168,9 +3271,7 @@ impl AiUi {
                 Some(Ok(())) => {}
                 // The PC was no longer free when the shot arrived: not the shot's fault and not a failure of that PC; it keeps waiting
                 // for the next free PC (the Remote already counts the refusing PC as busy until it answers again).
-                Some(Err(Some(why))) if why.starts_with("not_free") => {
-                    self.requeue_sent(&sid);
-                }
+                Some(Err(Some(why))) if why.starts_with("not_free") => self.back_to_auto(&sid),
                 Some(Err(Some(why))) => {
                     let a = self.sent_shots.remove(&sid).expect("listed");
                     if a.on.is_some() { self.auto_failed(a, &why) }
@@ -4055,6 +4156,76 @@ mod tests {
         crate::metrics::View::Unavailable("no sample".into())
     }
 
+    /// Drive the re-sends until every one is planned or failed (the planning runs off-thread).
+    fn replan_to_end(ai: &mut AiUi, p: Option<&Project>, st: &Settings) {
+        let ctx = egui::Context::default();
+        for _ in 0..250 {
+            ai.resend_tick(&ctx, p, st);
+            if ai.replans.is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the re-send was never planned");
+    }
+
+    #[test]
+    fn send_again_plans_anew_keeps_the_pc_and_uses_a_new_submission_id() {
+        let (mut ai, d) = auto_fixture("replan", 1);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into())];
+        let mut a = ai.auto_pending.pop_front().unwrap();
+        let (p, st) = (a.project.clone(), a.st.clone());
+        a.row.placement = Placement::Target("network:n/a".into());
+        ai.submit_row(&p, &st, None, &a.row, a.plan.clone()).unwrap();
+        let first = ai.take_net_outbox().remove(0);
+        let why = "invalid: hint: unknown keys ['x']";
+        assert!(ai.refuse_sent(&first.submission_id, why));
+        // The user changes Key settings after the refusal.
+        let want = 0.123;
+        assert_ne!(first.spec.params.despill_strength, want);
+        ai.draft_mut(&p.clips[0], &p, &st).params.despill_strength = want;
+        ai.resend_refused(0, false);
+        replan_to_end(&mut ai, Some(&p), &st);
+        let again = ai.take_net_outbox();
+        assert_eq!(again.len(), 1, "{:?}", ai.notice);
+        assert_eq!(again[0].spec.params.despill_strength, want, "the new plan carries the new value");
+        assert_eq!(again[0].target.as_deref(), Some("n/a"), "same PC");
+        assert_ne!(again[0].submission_id, first.submission_id, "a new plan, a new id");
+        assert!(ai.refused.is_empty(), "the old record is replaced");
+        // An Automatic shot goes back to Automatic, planned anew too.
+        let sent2 = again[0].submission_id.clone();
+        assert!(ai.refuse_sent(&sent2, why));
+        ai.draft_mut(&p.clips[0], &p, &st).params.despill_strength = 0.321;
+        ai.resend_refused(0, true);
+        replan_to_end(&mut ai, Some(&p), &st);
+        assert!(ai.refused.is_empty() && ai.take_net_outbox().is_empty());
+        let w = ai.auto_pending.back().expect("waiting in Automatic");
+        assert!(matches!(w.row.placement, Placement::Auto));
+        assert_eq!(w.row.params.despill_strength, 0.321);
+        assert_eq!(w.plan.job.mode, JobMode::New);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_send_again_that_cannot_be_planned_shows_the_reason_and_keeps_the_record() {
+        let (mut ai, d) = auto_fixture("replan_fail", 1);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into())];
+        let mut a = ai.auto_pending.pop_front().unwrap();
+        let (p, st) = (a.project.clone(), a.st.clone());
+        a.row.placement = Placement::Target("network:n/a".into());
+        ai.submit_row(&p, &st, None, &a.row, a.plan.clone()).unwrap();
+        let first = ai.take_net_outbox().remove(0);
+        assert!(ai.refuse_sent(&first.submission_id, "invalid: x"));
+        ai.resend_refused(0, false);
+        replan_to_end(&mut ai, None, &st); // the project is not open
+        assert_eq!(ai.refused.len(), 1, "the old record stays");
+        assert!(ai.take_net_outbox().is_empty());
+        assert_eq!(ai.notice.as_deref(), Some(format!("{}: not sent, the project is not open", first.name).as_str()));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn auto_sends_one_shot_to_each_free_pc() {
         let (mut ai, d) = auto_fixture("two", 3);
@@ -4079,6 +4250,8 @@ mod tests {
         let sent = ai.take_net_outbox().remove(0);
         assert_eq!(ai.auto_pending.len(), 1);
         assert!(ai.requeue_sent(&sent.submission_id));
+        let (p, st) = (ai.auto_pending[0].project.clone(), ai.auto_pending[0].st.clone());
+        replan_to_end(&mut ai, Some(&p), &st);
         assert_eq!(ai.auto_pending.len(), 2, "back in the list");
         assert_eq!(ai.auto_pending.back().unwrap().row.clip.display_name, sent.name, "at the end");
         assert!(matches!(ai.auto_pending.back().unwrap().row.placement, Placement::Auto));
@@ -4116,13 +4289,16 @@ mod tests {
         ai.net_targets = vec![("n/a".into(), "A".into())];
         let mut a = ai.auto_pending.pop_front().unwrap();
         a.row.placement = Placement::Target("network:n/a".into());
-        ai.refused.push(Refused { shot: a, pc: "A".into(), why: why.into() });
+        let (p, st) = (a.project.clone(), a.st.clone());
+        ai.refused.push(Refused { sid: "old".into(), shot: a, pc: "A".into(), why: why.into() });
         ai.resend_refused(0, false);
+        replan_to_end(&mut ai, Some(&p), &st);
         let again = ai.take_net_outbox();
         assert_eq!((ai.refused.len(), again.len(), again[0].target.as_deref(), again[0].automatic), (0, 1, Some("n/a"), false), "back to the same PC");
         assert!(ai.sent_shots.contains_key(&again[0].submission_id), "followed again");
         ai.refuse_sent(&again[0].submission_id, why);
         ai.resend_refused(0, true);
+        replan_to_end(&mut ai, Some(&p), &st);
         assert_eq!((ai.refused.len(), ai.auto_pending.len()), (0, 1), "or into Automatic");
         let _ = std::fs::remove_dir_all(d);
         let _ = std::fs::remove_dir_all(d2);

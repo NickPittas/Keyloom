@@ -3482,6 +3482,7 @@ impl App {
             self.quit_request(&ctx);
         }
         self.ai_tick(&ctx);
+        self.ai.resend_tick(&ctx, self.project.as_ref(), self.settings.saved());
         self.last_ctx = Some(ctx.clone());
         self.persist_media();
         self.hint_pending_refresh();
