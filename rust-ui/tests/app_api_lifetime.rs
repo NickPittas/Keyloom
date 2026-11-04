@@ -92,19 +92,20 @@ fn listener_is_ours(port: u16) -> bool {
 
 #[cfg(windows)]
 fn listener_is_ours(port: u16) -> bool {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            // no listener on the port is a normal answer (closed), not an error
-            &format!("Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess"),
-        ])
-        .output()
-        .expect("query listening port owner");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .any(|pid| pid == std::process::id())
+    // netstat lists every TCP listener with its owning pid, IPv4 and IPv6, without CIM
+    let out = std::process::Command::new("netstat").args(["-ano", "-p", "TCP"]).output().expect("netstat");
+    let v6 = std::process::Command::new("netstat").args(["-ano", "-p", "TCPv6"]).output().expect("netstat v6");
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&v6.stdout));
+    let me = std::process::id().to_string();
+    let hit = text.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() == 5 && f[3] == "LISTENING" && f[1].rsplit(':').next() == Some(&port.to_string()) && f[4] == me
+    });
+    if !hit {
+        eprintln!("listener_is_ours({port}) pid {me}: no LISTENING row; rows for the port: {:?}",
+            text.lines().filter(|l| l.contains(&format!(":{port} "))).collect::<Vec<_>>());
+    }
+    hit
 }
 
 #[cfg(target_os = "linux")]
