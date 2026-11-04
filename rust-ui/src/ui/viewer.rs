@@ -347,6 +347,19 @@ impl Viewer {
         let keys = self.preview_keys(dir);
         Some((self.done_count(&keys), keys.len()))
     }
+    /// Why the frame under the playhead cannot be shown (decode failure), for the activity strip.
+    pub fn decode_error(&mut self) -> Option<String> {
+        let av = self.index.availability(self.view, self.playhead, self.range);
+        let Availability::Present(path) = &av else { return None };
+        let key = Key { interp: view_interp(self.view, path, self.linear, self.straight), path: path.clone() };
+        match self.store.lookup(&key) {
+            Lookup::Failed(e) => {
+                let left = self.store.retries_left(&key);
+                Some(format!("Decode failed: {e}{}", if left > 0 { format!(" · press R to retry ({left} left)") } else { " · retries exhausted; reopen the clip".into() }))
+            }
+            _ => None,
+        }
+    }
     pub fn fit(&mut self) {
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
@@ -996,19 +1009,9 @@ impl Viewer {
             None
         };
         // Decode failure is reported, never hidden behind a stale frame.
-        if let Lookup::Failed(e) = self.store.lookup(&key_a) {
-            let left = self.store.retries_left(&key_a);
-            return msg(
-                &format!(
-                    "Decode failed: {e}{}",
-                    if left > 0 {
-                        format!("  ·  press R to retry ({left} left)")
-                    } else {
-                        "  ·  retries exhausted; reopen the clip".into()
-                    }
-                ),
-                Color32::from_rgb(220, 100, 100),
-            );
+        if let Lookup::Failed(_) = self.store.lookup(&key_a) {
+            // The reason (and the retry hint) is in the activity strip.
+            return msg("Frame could not be decoded (see the activity strip)", Color32::from_rgb(220, 100, 100));
         }
         let a_ready = self.texture(ctx, &key_a).is_some();
         if a_ready {
@@ -1184,31 +1187,7 @@ impl Viewer {
                 WARN,
             );
         }
-        if let Some((done, total)) = self.buffering() {
-            let bar = Rect::from_center_size(
-                rect.center_bottom() - Vec2::new(0.0, 40.0),
-                Vec2::new(280.0, 22.0),
-            );
-            p.rect_filled(bar.expand(6.0), 4.0, Color32::from_black_alpha(190));
-            p.rect_filled(bar, 2.0, Color32::from_gray(50));
-            let f = if total > 0 {
-                done as f32 / total as f32
-            } else {
-                1.0
-            };
-            p.rect_filled(
-                Rect::from_min_size(bar.min, Vec2::new(bar.width() * f, bar.height())),
-                2.0,
-                Color32::from_rgb(60, 100, 140), // white text on it holds >= 4.5:1
-            );
-            p.text(
-                bar.center(),
-                Align2::CENTER_CENTER,
-                format!("Buffering RAM preview {done}/{total} · Space cancels"),
-                FontId::proportional(12.0),
-                Color32::WHITE,
-            );
-        }
+        // RAM-preview buffering progress is shown in the activity strip.
     }
 
     /// The current frame's name and how many marks are inside In/Out.

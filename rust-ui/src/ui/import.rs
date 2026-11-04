@@ -326,6 +326,11 @@ impl ImportUi {
         }
     }
 
+    /// Raw extraction/compression progress `(phase, done, total)` of a clip, for the activity strip.
+    pub fn progress_of(&self, c: &Clip) -> Option<(String, u64, u64)> {
+        self.progress.get(&c.folder).cloned()
+    }
+
     pub fn card_state(&self, c: &Clip) -> CardState {
         if let Some((phase, d, t)) = self.progress.get(&c.folder) {
             let f = if *t > 0 { *d as f32 / *t as f32 } else { 0.0 };

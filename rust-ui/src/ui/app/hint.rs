@@ -1996,59 +1996,18 @@ impl App {
         msg
     }
 
-    /// Status region (left of the action region): job progress, marks, overlay and notes. The generate buttons
-    /// live in the action region (`hint_actions`).
-    pub(super) fn hint_tools(&mut self, ui: &mut Ui, clip: &Clip) {
-        let guide = self.hint.cfg.guide;
-        // A job shows once: the Pre-matte route lists the guide's task plus SAM tracking, which is the same
-        // kind when the guide is SAM, and a job never appears under both headings.
-        let mut seen = vec![];
-        self.hint_progress(ui, clip, &[guide.task(), TaskKind::SamTrack], hints::GUIDE_DIR, &mut seen);
-        self.hint_progress(
-            ui,
-            clip,
-            &[
-                TaskKind::Gvm,
-                TaskKind::Birefnet,
-                TaskKind::Chroma,
-                TaskKind::SamTrack,
-                TaskKind::Matanyone2,
-                TaskKind::Videomama,
-                TaskKind::ImportHint,
-                TaskKind::PrepareSource,
-                TaskKind::PrematteHint,
-            ],
-            hints::HINT_DIR,
-            &mut seen,
-        );
+    /// Status region (left of the action region). Job progress, notes and the hint lock live in the activity
+    /// strip; the generate buttons live in the action region (`hint_actions`).
+    pub(super) fn hint_tools(&mut self, ui: &mut Ui) {
         ui.label(
             RichText::new("Pre-matte and hint generation run on this computer (the local worker). Key then runs on the client assigned to this clip.")
                 .color(theme::text_dim(ui))
                 .size(11.5),
         );
-        self.ai.hint_lock_ui(ui, clip);
-        if let Some(r) = self.ai.latest_task(&clip.folder, TaskKind::SamPreview) {
-            ui.label(RichText::new("Last preview:").color(theme::text_dim(ui)).size(12.0));
-            self.ai.task_status_row(ui, &r);
-        }
-        if let Some(n) = &self.hint.note {
-            ui.label(RichText::new(n).color(theme::warn(ui)).size(12.0));
-        }
     }
 
-    /// Latest task of each kind, beside the control that started it.
-    /// Progress of the jobs that actually publish into `dir`, whatever their kind: the Pre-matte column shows
-    /// `VideoMamaMaskHint` jobs and the Hint column `AlphaHint` jobs, so a SAM tracking run that published the
-    /// final hint never appears under the pre-matte heading (and the other way round).
-    fn hint_progress(&mut self, ui: &mut Ui, clip: &Clip, kinds: &[TaskKind], dir: &str, seen: &mut Vec<String>) {
-        for k in kinds {
-            if let Some(r) = self.ai.latest_task_in(&clip.folder, *k, dir) {
-                if !seen.contains(&r) {
-                    self.ai.task_status_row(ui, &r);
-                    seen.push(r);
-                }
-            }
-        }
+    pub(super) fn hint_note_text(&self) -> Option<&str> {
+        self.hint.note.as_deref()
     }
 
     // ------------------------------------------------------------------- properties
@@ -2585,18 +2544,6 @@ impl App {
         }
         if let Some(b) = self.ai.pipeline_block_reason() {
             ui.colored_label(theme::warn(ui), b);
-        }
-        // Real pipeline progress: the Key job, then whichever pre-matte/hint step and export is queued or running.
-        self.ai.job_status(ui, &clip.folder);
-        if busy {
-            for k in [TaskKind::Gvm, TaskKind::Birefnet, TaskKind::Chroma, TaskKind::SamTrack, TaskKind::Matanyone2, TaskKind::Videomama, TaskKind::PrematteHint] {
-                if let Some(r) = self.ai.latest_task(&clip.folder, k) {
-                    self.ai.task_status_row(ui, &r);
-                }
-            }
-        }
-        if let Some(r) = self.ai.latest_task(&clip.folder, TaskKind::ExportVideo) {
-            self.ai.task_status_row(ui, &r);
         }
     }
 }

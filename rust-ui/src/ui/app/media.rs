@@ -459,9 +459,7 @@ impl App {
             }
 
         }
-        if let Some(n) = &self.media.note {
-            ui.label(RichText::new(n).color(theme::warn(ui)).size(12.0));
-        }
+        // The note (relink/extraction/import result) is shown in the activity strip.
     }
 }
 

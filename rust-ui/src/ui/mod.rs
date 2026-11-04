@@ -1,4 +1,5 @@
 //! egui front end (provisional toolkit). Core modules never import this, so a toolkit swap stays here.
+pub mod activity;
 pub mod ai;
 pub mod annotate;
 pub mod clients;
