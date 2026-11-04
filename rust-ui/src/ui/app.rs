@@ -1589,7 +1589,7 @@ impl App {
                         (graph::Action::Open, "Open Pre-matte".into(), true),
                         (
                             graph::Action::GenerateRange,
-                            d_guide.label,
+                            d_guide.label.clone(),
                             d_guide.enabled,
                         ),
                     ],
@@ -1603,7 +1603,7 @@ impl App {
                         (graph::Action::Open, "Open Hint".into(), true),
                         (
                             graph::Action::GenerateRange,
-                            d_hint.label,
+                            d_hint.label.clone(),
                             d_hint.enabled,
                         ),
                     ],
