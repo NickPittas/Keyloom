@@ -262,7 +262,7 @@ impl App {
         let Some((parent, mut name)) = self.new_project_draft.take() else { return };
         let (mut create, mut cancel) = (false, false);
         egui::Window::new("New project").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.label(RichText::new(format!("An empty project folder is created in {}", parent.display())).color(DIM));
+            ui.label(RichText::new(format!("An empty project folder is created in {}", parent.display())).color(theme::text_dim(ui)));
             let r = ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
             create = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             ui.horizontal(|ui| {
@@ -271,7 +271,7 @@ impl App {
                 create |= c.clicked();
                 cancel = ui.button("Cancel").clicked();
             });
-            if let Some(e) = &self.new_project_error { ui.colored_label(super::theme::FOCUS, e); }
+            if let Some(e) = &self.new_project_error { ui.colored_label(theme::warn(ui), e); }
         });
         if cancel {
             self.new_project_error = None;
@@ -425,7 +425,7 @@ impl App {
                 Err(e) => format!("Not saved: {e}"),
             });
         }
-        if let Some(n) = self.loc_note.as_ref().filter(|n| n.starts_with("Not saved")) { ui.colored_label(super::theme::FOCUS, n); }
+        if let Some(n) = self.loc_note.as_ref().filter(|n| n.starts_with("Not saved")) { ui.colored_label(theme::warn(ui), n); }
     }
 
     /// Welcome page: Open, New (an empty project), a path entry and the Recent list.
@@ -439,14 +439,14 @@ impl App {
             ui.add_space(pad);
             ui.allocate_ui_with_layout(Vec2::new(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_width(width);
-                ui.label(RichText::new("YOUR WORKSPACE").size(12.0).color(DIM));
+                ui.label(RichText::new("YOUR WORKSPACE").size(12.0).color(theme::text_dim(ui)));
                 ui.add_space(12.0);
                 ui.label(RichText::new("Continue a project.").size(28.0).strong());
                 ui.add_space(8.0);
-                ui.label(RichText::new("Open your clips, refine the matte and deliver your enabled outputs.").color(DIM));
+                ui.label(RichText::new("Open your clips, refine the matte and deliver your enabled outputs.").color(theme::text_dim(ui)));
                 ui.add_space(24.0);
                 ui.horizontal(|ui| {
-                    let b = egui::Button::new(RichText::new("Open project…").color(Color32::from_rgb(21, 36, 26)).strong())
+                    let b = egui::Button::new(RichText::new("Open project…").color(ui.visuals().strong_text_color()).strong())
                         .fill(theme::ACCENT).min_size(Vec2::new(176.0, 42.0));
                     if ui.add_enabled(!busy, b).on_disabled_hover_text(why).clicked() { *want = Some(PickKind::Project); }
                     if ui.add_enabled(!busy, egui::Button::new("New project…")).on_disabled_hover_text(why).clicked() { *want = Some(PickKind::NewProject); }
@@ -455,7 +455,7 @@ impl App {
                 ui.columns(2, |cols| {
                     theme::section(&mut cols[0], "Recent projects", |ui| {
                         if self.recent.list().is_empty() {
-                            ui.label(RichText::new("Projects you open will appear here.").color(DIM));
+                            ui.label(RichText::new("Projects you open will appear here.").color(theme::text_dim(ui)));
                             ui.add_space(28.0);
                         }
                         for path in self.recent.list().to_vec() {
@@ -464,16 +464,16 @@ impl App {
                             ui.horizontal(|ui| {
                                 if ui.add_enabled(!busy && exists, egui::Button::new(RichText::new(&name).strong()).min_size(Vec2::new(160.0, 34.0)))
                                     .on_hover_text(path.display().to_string()).on_disabled_hover_text(if exists { why } else { "Project folder is missing" }).clicked() { open = Some(path.clone()); }
-                                ui.label(RichText::new(if exists { "Open →" } else { "Missing" }).size(11.0).color(DIM));
+                                ui.label(RichText::new(if exists { "Open →" } else { "Missing" }).size(11.0).color(theme::text_dim(ui)));
                             });
-                            ui.add(egui::Label::new(RichText::new(path.display().to_string()).size(11.0).color(DIM)).truncate());
+                            ui.add(egui::Label::new(RichText::new(path.display().to_string()).size(11.0).color(theme::text_dim(ui))).truncate());
                             ui.separator();
                         }
                     });
                     theme::section(&mut cols[1], "From clips to delivery", |ui| {
                         ui.label("Import  >  Pre-matte / Hint  >  Key  >  Deliver");
                         ui.add_space(12.0);
-                        ui.label(RichText::new("Workflow presets repeat the complete pipeline for your selected clips.").color(DIM));
+                        ui.label(RichText::new("Workflow presets repeat the complete pipeline for your selected clips.").color(theme::text_dim(ui)));
                         ui.add_space(20.0);
                         ui.horizontal(|ui| { self.clients_button(ui); self.settings_button(ui); });
                     });
@@ -488,7 +488,7 @@ impl App {
                         }
                     });
                 });
-                if let Some(e) = &self.load_error { ui.colored_label(WARN, e); }
+                if let Some(e) = &self.load_error { ui.colored_label(theme::error(ui), e); }
             });
         });
         if let Some(path) = open { self.open_project_path(&ctx, path); }
