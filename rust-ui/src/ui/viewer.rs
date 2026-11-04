@@ -297,6 +297,17 @@ impl Viewer {
         // A running preview re-buffers on its own when the range/view signature changed.
     }
 
+    /// Generated frames were deleted: forget their decoded pixels, failure records and textures (the paths are
+    /// gone from the rebuilt index, so `refresh` can no longer find them), and the annotation overlay textures.
+    pub fn forget_paths(&mut self, paths: &[std::path::PathBuf]) {
+        for p in paths {
+            self.store.forget_path(p);
+            self.tex.retain(|k, _| k.path != *p);
+            self.tex_order.retain(|k| k.path != *p);
+        }
+        self.ann.forget_masks();
+    }
+
     pub fn range_dirty(&self) -> bool {
         self.range != self.range_stored
     }

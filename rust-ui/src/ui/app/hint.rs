@@ -68,6 +68,74 @@ pub struct State {
     /// The route was saved while the pointer was down: the project's copy of the clip is refreshed once it settles.
     route_refresh: Option<String>,
     ann_saved: u64,
+    /// The open "Delete generated frames" dialog.
+    dele: Option<Del>,
+    /// Jobs known when generated frames were deleted: a SAM preview that finishes later is never shown.
+    dead_previews: std::collections::HashSet<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DelScope {
+    Current,
+    Marked,
+    All,
+}
+
+/// What the helper says it would delete (exact file names, movies only when asked).
+#[derive(Default)]
+struct DelPlan {
+    files: Vec<String>,
+    movies: Vec<String>,
+    blocked: usize,
+}
+
+struct Del {
+    folder: String,
+    prematte: bool,
+    scope: DelScope,
+    movies: bool,
+    /// What `plan` was asked for (asset|scope|movies|stems); a different choice asks again.
+    plan_key: String,
+    plan: Option<Result<DelPlan, String>>,
+    /// The helper request in flight: (is the delete itself, answer).
+    rx: Option<(bool, std::sync::mpsc::Receiver<Result<serde_json::Value, String>>)>,
+    done: Option<String>,
+}
+
+/// Why generated frames of this clip cannot be deleted right now (None = they can). The helper checks the
+/// publication lock and interrupted publishes again under the lock.
+fn delete_refusal(active: bool, external: bool) -> Option<&'static str> {
+    if active {
+        Some("This clip has queued or running jobs that read or write its hint folders. Wait for them or cancel them.")
+    } else if external {
+        Some("Another computer is importing into this clip. Wait for it to finish.")
+    } else {
+        None
+    }
+}
+
+/// The frames a scope names: `None` = every frame of the asset.
+fn scope_stems(scope: DelScope, current: Option<&str>, marked: &[String]) -> Option<Vec<String>> {
+    match scope {
+        DelScope::All => None,
+        DelScope::Current => Some(current.map(str::to_owned).into_iter().collect()),
+        DelScope::Marked => Some(marked.to_vec()),
+    }
+}
+
+fn delete_request(cmd: &str, rid: &str, root: &Path, prematte: bool, stems: &Option<Vec<String>>, movies: bool) -> String {
+    serde_json::json!({"cmd": cmd, "request_id": rid, "clip_root": root, "asset": if prematte { "prematte" } else { "hint" },
+        "scope": if stems.is_some() { "frames" } else { "all" }, "stems": stems.clone().unwrap_or_default(), "movies": movies})
+    .to_string()
+}
+
+fn strings(v: &serde_json::Value, k: &str) -> Vec<String> {
+    v.get(k).and_then(|a| a.as_array()).into_iter().flatten().filter_map(|x| x.as_str()).map(str::to_owned).collect()
+}
+
+/// A SAM preview of a job that existed when frames were deleted must not come back.
+fn preview_is_live(job_id: &str, dead: &std::collections::HashSet<String>) -> bool {
+    !dead.contains(job_id)
 }
 
 
@@ -824,6 +892,7 @@ impl App {
             let sig = psig(&self.hint, s, v.linear);
             self.ai
                 .current_preview(&clip.folder, s, sig)
+                .filter(|r| preview_is_live(&r.job_id, &self.hint.dead_previews))
                 .map(|r| r.mask_png.clone())
         });
     }
@@ -1641,6 +1710,7 @@ impl App {
         let import_ok = ready(TaskKind::ImportHint) && src.is_some();
         let ctx = ui.ctx().clone();
         let (mut run, mut preview, mut extract, mut import, mut cancel_import) = (None, false, false, false, false);
+        let mut del_open: Option<bool> = None;
         let marks_in: Vec<usize> = match self.ai_open_range() {
             Ok(r) => clip.keyframes.iter().copied().filter(|k| (r.0..=r.1).contains(k)).collect(),
             Err(_) => vec![],
@@ -1675,6 +1745,9 @@ impl App {
                         }
                     });
                     ui.label(RichText::new(format!("{} frames on disk", clip.mask_frames)).color(theme::text_dim(ui)).size(12.0));
+                    if ui.small_button("Delete frames…").on_hover_text("Delete generated pre-matte or hint frames from disk").clicked() {
+                        del_open = Some(true);
+                    }
                 });
             });
             if tool_on {
@@ -1691,8 +1764,15 @@ impl App {
                     }
                 });
                 ui.label(RichText::new(format!("{} frames on disk", clip.alpha_frames)).color(theme::text_dim(ui)).size(12.0));
+                if ui.small_button("Delete frames…").on_hover_text("Delete generated pre-matte or hint frames from disk").clicked() {
+                    del_open = Some(false);
+                }
             });
         });
+        if let Some(prematte) = del_open {
+            self.hint.dele = Some(Del { folder: clip.folder.clone(), prematte, scope: DelScope::All, movies: false, plan_key: String::new(), plan: None, rx: None, done: None });
+        }
+        self.hint_delete_ui(ui, clip);
         let mut marked = None;
         if fin != Final::Import {
             let (mut p, mut h) = (self.hint.cfg.marks_pre, self.hint.cfg.marks_hint);
@@ -1767,6 +1847,133 @@ impl App {
         if let Some(r) = run {
             self.hint_run(r);
         }
+    }
+
+    /// "Delete generated frames": Pre-matte or Hint, current / marked / all frames, the exact files and count,
+    /// companion movies as a separate unticked choice. The deletion runs in the app-side helper, never the worker.
+    fn hint_delete_ui(&mut self, ui: &mut Ui, clip: &Clip) {
+        let Some(mut d) = self.hint.dele.take() else { return };
+        if d.folder != clip.folder {
+            return;
+        }
+        let refusal = delete_refusal(self.ai.clip_active(&clip.root) || self.ai.task_busy(&clip.folder), self.ai.external_writer(&clip.root));
+        let (current, marked): (Option<String>, Vec<String>) = match &self.viewer {
+            Some(v) => (v.index.stems.get(v.playhead).cloned(), clip.keyframes.iter().filter_map(|k| v.index.stems.get(*k).cloned()).collect()),
+            None => (None, vec![]),
+        };
+        let stems = scope_stems(d.scope, current.as_deref(), &marked);
+        let key = format!("{}|{:?}|{}|{:?}", d.prematte, d.scope, d.movies, stems);
+        if let Some((is_delete, rx)) = &d.rx {
+            match rx.try_recv() {
+                Ok(r) => {
+                    let is_delete = *is_delete;
+                    d.rx = None;
+                    if is_delete {
+                        d.done = Some(self.mask_delete_done(ui.ctx(), clip, r));
+                        d.plan_key.clear();
+                        d.plan = None;
+                    } else {
+                        d.plan = Some(r.map(|v| DelPlan { files: strings(&v, "files"), movies: strings(&v, "movies"), blocked: v.get("blocked").and_then(|b| b.as_array()).map_or(0, Vec::len) }));
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)),
+                Err(_) => {
+                    d.rx = None;
+                    d.plan = Some(Err("the delete helper ended without an answer; nothing was changed".into()));
+                }
+            }
+        }
+        let empty_scope = stems.as_ref().is_some_and(|s| s.is_empty());
+        if d.rx.is_none() && d.done.is_none() && refusal.is_none() && !empty_scope && d.plan_key != key {
+            d.plan_key = key.clone();
+            d.plan = None;
+            match self.ai.scheduler().local_target() {
+                Some(t) => d.rx = Some((false, crate::scheduler::spawn_mask_helper(t, delete_request("plan", &new_id(), &clip.root, d.prematte, &stems, d.movies)))),
+                None => d.plan = Some(Err("no enabled local worker to run the helper".into())),
+            }
+        }
+        let (mut close, mut go) = (false, false);
+        egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Delete generated frames").strong());
+            if let Some(msg) = &d.done {
+                ui.label(msg.as_str());
+                close = ui.button("Close").clicked();
+                return;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut d.prematte, true, "Pre-matte (VideoMamaMaskHint)");
+                ui.radio_value(&mut d.prematte, false, "Hint (AlphaHint)");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut d.scope, DelScope::Current, "Current frame");
+                ui.radio_value(&mut d.scope, DelScope::Marked, "Marked frames");
+                ui.radio_value(&mut d.scope, DelScope::All, "All frames");
+            });
+            theme::checkbox(ui, &mut d.movies, "Also delete the companion movie(s) of this asset");
+            ui.label(RichText::new("Prompts, marks, the other asset, renders, models and the prepared source frames are kept.").color(theme::text_dim(ui)).size(12.0));
+            if let Some(r) = refusal {
+                ui.colored_label(theme::warn(ui), r);
+            } else if empty_scope {
+                ui.colored_label(theme::warn(ui), if d.scope == DelScope::Current { "No frame is selected." } else { "No frames are marked." });
+            }
+            let mut can = false;
+            match &d.plan {
+                _ if refusal.is_some() || empty_scope => {}
+                Some(Ok(p)) => {
+                    ui.label(format!("{} frame file(s){}", p.files.len(), if p.movies.is_empty() { String::new() } else { format!(" and {} movie(s)", p.movies.len()) }));
+                    egui::ScrollArea::vertical().max_height(110.0).id_salt("del_files").show(ui, |ui| {
+                        for f in p.files.iter().chain(p.movies.iter()) {
+                            ui.label(RichText::new(f.as_str()).monospace().size(11.0));
+                        }
+                    });
+                    if p.blocked > 0 {
+                        ui.colored_label(theme::warn(ui), format!("{} file(s) are links that leave the clip folder and will not be deleted.", p.blocked));
+                    }
+                    can = !p.files.is_empty() || !p.movies.is_empty();
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(theme::warn(ui), e.as_str());
+                }
+                None => {
+                    ui.label("Checking the files…");
+                }
+            }
+            ui.horizontal_wrapped(|ui| {
+                go = ui.add_enabled(can && d.rx.is_none(), egui::Button::new("Delete")).clicked();
+                close = ui.button("Cancel").clicked();
+            });
+        });
+        if go {
+            match self.ai.scheduler().local_target() {
+                Some(t) => d.rx = Some((true, crate::scheduler::spawn_mask_helper(t, delete_request("delete", &new_id(), &clip.root, d.prematte, &stems, d.movies)))),
+                None => d.done = Some("Nothing was deleted: no enabled local worker to run the helper.".into()),
+            }
+        }
+        if !close {
+            self.hint.dele = Some(d);
+        }
+    }
+
+    /// The helper answered the delete: forget everything built from the deleted files, rescan the clip (also after
+    /// a partial failure) and say what happened.
+    fn mask_delete_done(&mut self, ctx: &egui::Context, clip: &Clip, r: Result<serde_json::Value, String>) -> String {
+        let (deleted, errors) = match &r {
+            Ok(v) => (strings(v, "deleted"), v.get("errors").and_then(|e| e.as_array()).cloned().unwrap_or_default()),
+            Err(e) => return format!("Nothing was deleted: {e}"),
+        };
+        let paths: Vec<PathBuf> = deleted.iter().map(PathBuf::from).collect();
+        if let Some(v) = &mut self.viewer {
+            v.forget_paths(&paths);
+        }
+        let ids = self.ai.forget_masks(&clip.folder);
+        self.hint.dead_previews.extend(ids);
+        self.refresh_clip(ctx, &clip.folder);
+        let mut msg = format!("Deleted {} file(s).", deleted.len());
+        for e in errors.iter().take(5) {
+            msg.push_str(&format!("\nNot deleted: {} — {}", e["path"].as_str().unwrap_or("?"), e["message"].as_str().unwrap_or("?")));
+        }
+        msg
     }
 
     /// Status region (left of the action region): job progress, marks, overlay and notes. The generate buttons
@@ -2802,5 +3009,37 @@ fn paint_icon(p: &egui::Painter, r: egui::Rect, icon: Icon, col: Color32) {
                 );
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod delete_masks_tests {
+    use super::*;
+
+    #[test]
+    fn queued_or_external_work_refuses_deletion() {
+        assert!(delete_refusal(true, false).is_some_and(|m| m.contains("queued")));
+        assert!(delete_refusal(false, true).is_some());
+        assert!(delete_refusal(false, false).is_none());
+    }
+
+    #[test]
+    fn scopes_name_exact_frames_and_all_means_the_whole_asset() {
+        let marks = vec!["s_2".to_string(), "s_5".to_string()];
+        assert_eq!(scope_stems(DelScope::Current, Some("s_3"), &marks), Some(vec!["s_3".into()]));
+        assert_eq!(scope_stems(DelScope::Marked, Some("s_3"), &marks), Some(marks.clone()));
+        assert_eq!(scope_stems(DelScope::All, Some("s_3"), &marks), None);
+        let v: serde_json::Value = serde_json::from_str(&delete_request("delete", "r", Path::new("/c"), true, &None, false)).unwrap();
+        assert_eq!((v["scope"].as_str(), v["asset"].as_str(), v["movies"].as_bool()), (Some("all"), Some("prematte"), Some(false)));
+    }
+
+    #[test]
+    fn a_late_preview_of_a_job_known_at_deletion_is_not_shown() {
+        let mut dead = std::collections::HashSet::new();
+        assert!(preview_is_live("job-1", &dead));
+        dead.insert("job-1".to_string());
+        assert!(!preview_is_live("job-1", &dead));
+        assert!(preview_is_live("job-2", &dead));
     }
 }

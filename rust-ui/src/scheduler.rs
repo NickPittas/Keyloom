@@ -506,6 +506,10 @@ impl Scheduler {
     pub fn lock_pending(&self) -> bool {
         !self.locks.is_empty()
     }
+    /// The first enabled local worker's target: where the app-side helpers run (mask deletion).
+    pub fn local_target(&self) -> Option<Target> {
+        self.order.iter().map(|c| &self.slots[*c].target).find(|t| t.enabled).cloned()
+    }
 
     fn pump_locks(&mut self, ev: &mut Vec<SchedEvent>) {
         // Collect finished helpers.
@@ -1850,6 +1854,31 @@ fn run_lock_helper(target: &Target, request: &str) -> LockOutcome {
     }
 }
 
+/// Run one generated-mask plan/delete request (`backend/mask_delete_cli.py`, 10 s limit) on a background thread.
+/// `Ok` = the helper's `mask_plan` / `masks_deleted` event; `Err` = why nothing was changed.
+pub fn spawn_mask_helper(target: Target, request: String) -> Receiver<Result<Value, String>> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_mask_helper(&target, &request));
+    });
+    rx
+}
+
+fn run_mask_helper(target: &Target, request: &str) -> Result<Value, String> {
+    let mut cmd = target.one_shot("backend.mask_delete_cli", request)?;
+    let out = output_within(&mut cmd, LOCK_HELPER_LIMIT)?;
+    let text = String::from_utf8_lossy(&out);
+    let v = text
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<Value>(l).ok())
+        .ok_or("the delete helper gave no answer; nothing was changed")?;
+    match v.get("event").and_then(Value::as_str) {
+        Some("mask_plan" | "masks_deleted") => Ok(v),
+        Some("rejected") => Err(v.get("message").and_then(Value::as_str).unwrap_or("refused").to_owned()),
+        _ => Err("the delete helper gave an unknown answer; nothing was changed".into()),
+    }
+}
 
 #[cfg(test)]
 mod tests {
