@@ -157,6 +157,14 @@ pub struct AppOptions {
     pub endpoint: bool,
 }
 
+/// A shot the user asked to remove: the confirmation's state. `blocked` = why it cannot be removed now.
+struct ShotRemove {
+    folder: String,
+    name: String,
+    delete_files: bool,
+    blocked: Option<String>,
+}
+
 pub struct App {
     opts: AppOptions,
     project: Option<Project>,
@@ -212,6 +220,13 @@ pub struct App {
     new_project_create_rect: Option<egui::Rect>,
     /// "Open clip settings" button rectangles from the last Board frame: per-card (layout tests).
     open_rects: Vec<(Option<usize>, egui::Rect)>,
+    /// Queue panel rectangle and each card's (index, card, thumbnail) rectangles from the last Board frame (layout tests).
+    queue_rect: Option<egui::Rect>,
+    card_rects: Vec<(usize, egui::Rect, egui::Rect)>,
+    /// The Board card being dragged to a new place.
+    board_drag: Option<usize>,
+    /// "Remove shot…" waiting for its confirmation.
+    shot_remove: Option<ShotRemove>,
     /// Settings and Models pages replace the Board/workspace while open, which stay untouched underneath.
     settings: SettingsPage,
     settings_open: bool,
@@ -431,6 +446,10 @@ impl App {
             new_project_error: None,
             new_project_create_rect: None,
             open_rects: vec![],
+            queue_rect: None,
+            card_rects: vec![],
+            board_drag: None,
+            shot_remove: None,
             settings,
             settings_open: false,
             models,
@@ -792,6 +811,7 @@ impl App {
         };
         let mut want: Option<PickKind> = None;
         self.open_rects.clear();
+        self.card_rects.clear();
         let has_project = self.project.is_some();
         if !has_project {
             self.welcome(ui, busy, why, &mut want);
@@ -878,7 +898,7 @@ impl App {
         let active = self.active_gpus();
         let mut queue_actions = vec![];
         if ui.available_width() > 760.0 {
-            Panel::right("board_queue")
+            let panel = Panel::right("board_queue")
                 .resizable(true)
                 .default_size(540.0)
                 .min_size(340.0)
@@ -887,9 +907,13 @@ impl App {
                 .show(ui, |ui| {
                     queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active);
                 });
+            self.queue_rect = Some(panel.response.rect);
         } else {
-            Panel::bottom("board_queue_bottom").resizable(true).default_size(280.0).min_size(150.0).show(ui, |ui| { queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active); });
+            let panel = Panel::bottom("board_queue_bottom").resizable(true).default_size(280.0).min_size(150.0).show(ui, |ui| { queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active); });
+            self.queue_rect = Some(panel.response.rect);
         }
+        let (mut drag, mut remove_idx): (Option<(usize, bool)>, Option<usize>) = (None, None);
+        let dragging = self.board_drag;
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
@@ -912,11 +936,15 @@ impl App {
                             let st = self.imp.card_state(c);
                             // A cell is its own top-down layout: a group frame inside a horizontal row would
                             // otherwise lay the card's lines out side by side.
+                            let sc = theme::stage(ui, c.state);
                             ui.allocate_ui_with_layout(
                                 Vec2::new(w, 0.0),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    egui::Frame::group(ui.style()).inner_margin(8.0).show(
+                                    if dragging == Some(i) {
+                                        ui.set_opacity(0.45);
+                                    }
+                                    let f = egui::Frame::group(ui.style()).stroke(egui::Stroke::new(2.0, sc.edge)).inner_margin(8.0).show(
                                         ui,
                                         |ui| {
                                             ui.set_width(w - 18.0);
@@ -931,16 +959,52 @@ impl App {
                                                 self.thumbs.as_mut(),
                                                 &mut self.ai,
                                                 &mut self.open_rects,
+                                                &mut self.card_rects,
+                                                &mut drag,
+                                                &mut remove_idx,
                                             );
                                         },
                                     );
+                                    if let Some(r) = self.card_rects.last_mut() {
+                                        r.1 = f.response.rect;
+                                    }
                                 },
                             );
                         }
                     });
                 }
+                // Drop slot under the pointer while a card is dragged: a line between cards, the name beside the pointer.
+                if let (Some((src, _)), Some(pos)) = (drag, ui.ctx().pointer_latest_pos()) {
+                    let rects: Vec<egui::Rect> = self.card_rects.iter().map(|c| c.1).collect();
+                    let (slot, near) = drop_slot(&rects, pos);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                    if slot != src && slot != src + 1 {
+                        let r = rects[near];
+                        let x = if slot == near { r.min.x - gap / 2.0 } else { r.max.x + gap / 2.0 };
+                        let ink = ui.visuals().widgets.noninteractive.fg_stroke.color;
+                        ui.painter().line_segment([egui::pos2(x, r.min.y), egui::pos2(x, r.max.y)], egui::Stroke::new(3.0, ink));
+                    }
+                    if let Some(c) = p.clips.get(src) {
+                        let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, ui.make_persistent_id("board_drag_ghost")));
+                        let ink = ui.visuals().text_color();
+                        let g = lp.layout_no_wrap(c.display_name.clone(), egui::FontId::proportional(12.0), ink);
+                        let r = egui::Rect::from_min_size(pos + Vec2::new(14.0, 14.0), g.size()).expand(5.0);
+                        lp.rect_filled(r, 4.0, theme::card_fill(ui));
+                        lp.rect_stroke(r, 4.0, theme::card_stroke(ui), egui::StrokeKind::Inside);
+                        lp.galley(r.min + Vec2::splat(5.0), g, ink);
+                    }
+                }
             });
         self.selected = sel;
+        self.board_drag = drag.and_then(|(i, stopped)| (!stopped).then_some(i));
+        let reorder = match (drag, ctx.pointer_latest_pos()) {
+            (Some((from, true)), Some(pos)) => {
+                let rects: Vec<egui::Rect> = self.card_rects.iter().map(|c| c.1).collect();
+                let (slot, _) = drop_slot(&rects, pos);
+                Some((from, if slot > from { slot - 1 } else { slot }))
+            }
+            _ => None,
+        };
         if let Some(i) = resume_idx {
             if let Some(c) = p.clips.get(i) {
                 let root = p.root.clone();
@@ -950,14 +1014,137 @@ impl App {
         if let Some(i) = open_idx {
             self.open_clip(&ctx, i);
         }
+        if let Some((from, to)) = reorder {
+            self.move_clip(from, to);
+        }
+        if let Some(i) = remove_idx {
+            self.ask_remove_shot(i);
+        }
         for action in queue_actions { self.net_action(action); }
     }
 
+    /// Drag and drop: clip `from` takes place `to` in the Board. The order is saved in the project and work that
+    /// has not started follows it; running work never moves.
+    pub fn move_clip(&mut self, from: usize, to: usize) {
+        let keep = self.selected_folders();
+        let Some(p) = self.project.as_mut() else { return };
+        if from == to || from >= p.clips.len() || to >= p.clips.len() || self.open.is_some() {
+            return;
+        }
+        let c = p.clips.remove(from);
+        p.clips.insert(to, c);
+        if from < self.summaries.len() && to < self.summaries.len() {
+            let s = self.summaries.remove(from);
+            self.summaries.insert(to, s);
+        }
+        let folders: Vec<String> = p.clips.iter().map(|c| c.folder.clone()).collect();
+        let roots: Vec<PathBuf> = p.clips.iter().map(|c| c.root.clone()).collect();
+        let saved = crate::persist::save_clip_order(&p.root, &folders);
+        self.selected = p.clips.iter().enumerate().filter(|(_, c)| keep.contains(&c.folder)).map(|(i, _)| i).collect();
+        self.ai.apply_board_order(&roots);
+        if let Err(e) = saved {
+            self.ai.notice = Some(format!("The new order could not be saved: {e}"));
+        }
+    }
+
+    /// Why shot `i` cannot be removed right now (extracting, queued, waiting for a PC or rendering).
+    fn shot_block(&self, c: &Clip) -> Option<String> {
+        if matches!(self.imp.card_state(c), CardState::Busy(..) | CardState::Waiting) {
+            return Some(format!("{} is being extracted. Wait for it to finish, then remove it.", c.display_name));
+        }
+        self.ai
+            .clip_busy(&c.root)
+            .then(|| format!("{} is rendering or queued. Cancel its work in the Queue first, then remove it.", c.display_name))
+    }
+
+    /// The Remove shot… button: opens the confirmation (or the reason it is refused).
+    pub fn ask_remove_shot(&mut self, i: usize) {
+        let Some(c) = self.project.as_ref().and_then(|p| p.clips.get(i)) else { return };
+        self.shot_remove = Some(ShotRemove { folder: c.folder.clone(), name: c.display_name.clone(), delete_files: false, blocked: self.shot_block(c) });
+    }
+
+    /// The confirmation window. Remove keeps every file unless the unticked option is ticked.
+    fn shot_remove_ui(&mut self, ctx: &egui::Context) {
+        let Some(r) = self.shot_remove.as_mut() else { return };
+        let (mut yes, mut no) = (false, false);
+        egui::Window::new("Remove shot").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.set_max_width(380.0);
+            if let Some(why) = &r.blocked {
+                ui.add(egui::Label::new(why.as_str()).wrap());
+                no = ui.button("OK").clicked();
+                return;
+            }
+            ui.add(egui::Label::new(format!("Remove {} from this project? Its files stay on disk.", r.name)).wrap());
+            theme::checkbox(ui, &mut r.delete_files, "also delete this shot's extracted frames, masks and renders");
+            if r.delete_files {
+                ui.add(egui::Label::new(RichText::new("Only inside this shot's folder in the project. The original source is never deleted.").color(theme::text_dim(ui)).size(11.0)).wrap());
+            }
+            ui.horizontal(|ui| {
+                yes = ui.button("Remove").clicked();
+                no = ui.button("Cancel").clicked();
+            });
+        });
+        if !(yes || no) {
+            return;
+        }
+        let Some(r) = self.shot_remove.take() else { return };
+        if !yes || r.blocked.is_some() {
+            return;
+        }
+        let Some(p) = self.project.as_ref() else { return };
+        let Some(c) = p.clips.iter().find(|c| c.folder == r.folder).cloned() else { return };
+        // The shot may have started since the window opened.
+        if let Some(why) = self.shot_block(&c) {
+            self.ai.notice = Some(why);
+            return;
+        }
+        let root = p.root.clone();
+        match crate::persist::remove_shot(&root, &c, r.delete_files) {
+            Ok(done) => {
+                self.reload_keep_selection(ctx);
+                self.ai.notice = done.problem.or_else(|| {
+                    (!done.deleted.is_empty()).then(|| format!("Removed {}. Deleted {} inside its folder.", r.name, done.deleted.join(", ")))
+                });
+            }
+            Err(e) => self.ai.notice = Some(format!("Could not remove {}: {e}", r.name)),
+        }
+    }
+
+    /// Queue panel rectangle from the last Board frame (tests).
+    pub fn queue_panel_rect(&self) -> Option<egui::Rect> {
+        self.queue_rect
+    }
+    /// (index, card, thumbnail) rectangles from the last Board frame (tests).
+    pub fn board_cards(&self) -> &[(usize, egui::Rect, egui::Rect)] {
+        &self.card_rects
+    }
+    /// Clip folders in Board order (tests).
+    pub fn board_folders(&self) -> Vec<String> {
+        self.project.as_ref().map(|p| p.clips.iter().map(|c| c.folder.clone()).collect()).unwrap_or_default()
+    }
+    /// A Remove shot confirmation (or refusal) is showing (tests).
+    pub fn remove_shot_open(&self) -> bool {
+        self.shot_remove.is_some()
+    }
+
+    /// The Queue panel's content. It gets exactly the panel's inner area in a child that reports nothing back, so
+    /// no card, bar or long name can widen the panel (egui stores the content's width as the panel's width: a
+    /// too-wide row made the panel snap back and spill past the window edge); what does not fit is clipped.
     fn batch_queue(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote_set::RemoteSet, local: &crate::metrics::View, active: &[u32]) -> Vec<crate::remote::Action> {
+        let area = ui.available_rect_before_wrap();
+        let mut inner = ui.new_child(egui::UiBuilder::new().id_salt("board_queue_body").max_rect(area).layout(egui::Layout::top_down(egui::Align::Min)));
+        inner.set_clip_rect(area.intersect(ui.clip_rect()));
+        let actions = Self::batch_queue_body(&mut inner, ai, remote, local, active);
+        ui.allocate_rect(area, Sense::hover());
+        actions
+    }
+
+    fn batch_queue_body(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote_set::RemoteSet, local: &crate::metrics::View, active: &[u32]) -> Vec<crate::remote::Action> {
         // Two tabs: the machines and what they run, and the shots still waiting for a PC.
         let tab_id = ui.make_persistent_id("queue_tab_waiting");
         let mut waiting = ui.data(|d| d.get_temp::<bool>(tab_id)).unwrap_or(false);
-        ui.horizontal(|ui| {
+        // Wrapped: at the narrowest panel the buttons drop to a second line instead of widening the panel.
+        ui.horizontal_wrapped(|ui| {
             ui.heading("Queue");
             ui.add_space(8.0);
             if ui.selectable_label(!waiting, "Machines").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() { waiting = false; }
@@ -2128,6 +2315,9 @@ fn board_card(
     mut thumbs: Option<&mut super::thumbs::Thumbs>,
     ai: &mut AiUi,
     open_rects: &mut Vec<(Option<usize>, egui::Rect)>,
+    card_rects: &mut Vec<(usize, egui::Rect, egui::Rect)>,
+    drag: &mut Option<(usize, bool)>,
+    remove: &mut Option<usize>,
 ) {
     let idle = matches!(st, CardState::Idle);
     let mut on = sel.contains(&i);
@@ -2136,10 +2326,18 @@ fn board_card(
         .fill(ui.visuals().extreme_bg_color)
         .corner_radius(4.0)
         .show(ui, |ui| {
+            // Double-click opens; dragging the thumbnail moves the card to another place in the Board.
             let (rect, resp) = ui.allocate_exact_size(
                 Vec2::new(ui.available_width(), thumb_h),
-                Sense::click(),
+                Sense::click_and_drag(),
             );
+            card_rects.push((i, egui::Rect::NOTHING, rect));
+            if resp.dragged() {
+                *drag = Some((i, false));
+            } else if resp.drag_stopped() {
+                *drag = Some((i, true));
+            }
+            resp.clone().on_hover_text("Drag to change this shot's place in the batch");
             let tex = match thumbs.as_mut() {
                 Some(t) => t.texture(ui.ctx(), c),
                 None => None,
@@ -2196,11 +2394,11 @@ fn board_card(
         }
         ui.add(egui::Label::new(RichText::new(&c.display_name).strong().size(13.0)).truncate())
             .on_hover_text(&c.display_name);
-        ui.label(
-            RichText::new(c.state.label())
-                .color(theme::ok(ui))
-                .size(11.0),
-        );
+        // The stage chip: its own colour per stage (Raw, Masked, Ready, Complete), readable in both themes.
+        let sc = theme::stage(ui, c.state);
+        egui::Frame::new().fill(sc.chip).corner_radius(8.0).inner_margin(egui::Margin::symmetric(6, 1)).show(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(c.state.label()).color(sc.text).size(11.0)).wrap());
+        });
     });
     match &st {
         CardState::Busy(t, f) => {
@@ -2249,7 +2447,17 @@ fn board_card(
         if idle {
             ai.client_combo(ui, c);
         }
+        if ui.small_button("Remove shot…").on_hover_text("Take this shot off the project (its files stay unless you choose to delete them)").clicked() {
+            *remove = Some(i);
+        }
     });
+}
+
+/// Where a card dropped at `pos` lands: (slot, nearest card). Slot `s` is the place before card `s`, `cards.len()`
+/// after the last; the pointer's half of the nearest card decides.
+fn drop_slot(cards: &[egui::Rect], pos: egui::Pos2) -> (usize, usize) {
+    let near = (0..cards.len()).min_by(|a, b| cards[*a].distance_to_pos(pos).total_cmp(&cards[*b].distance_to_pos(pos))).unwrap_or(0);
+    (near + usize::from(cards.get(near).is_some_and(|r| pos.x > r.center().x)), near)
 }
 
 /// One short line per clip, from what the load already read (no directory listings per frame): the generated
@@ -3274,6 +3482,7 @@ impl App {
         }
         self.close_ui(&ctx);
         self.remove_ui(&ctx);
+        self.shot_remove_ui(&ctx);
         // Dev-only evidence capture: wait for the first frame, then write a PNG and quit.
         if let (Some(path), false) = (self.opts.screenshot.clone(), self.shot_requested) {
             let ready = self.viewer.as_ref().is_none_or(|v| {

@@ -1,21 +1,40 @@
 //! Every primary screen (Board with its Queue, and the clip view's Media/Hint/Key/Deliver tabs with the node
 //! graph) is drawn headless in Dark and Light; no painted text may fall under 4.5:1 against the fill behind it.
+use ck::project::ClipState;
 use ck::ui::{theme, App, AppOptions, Tab};
 use eframe::egui::{self, Color32, RawInput, Rect, Vec2};
 use std::{fs, sync::Arc};
 
+fn png(p: &std::path::Path, v: u8) {
+    let f = fs::File::create(p).unwrap();
+    let mut e = png::Encoder::new(f, 4, 4);
+    e.set_color(png::ColorType::Rgb);
+    e.set_depth(png::BitDepth::Eight);
+    e.write_header().unwrap().write_image_data(&[v; 48]).unwrap();
+}
+
+/// Four clips, one per Board stage: c Raw, m Masked, r Ready, d Complete.
 fn project(tag: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("ck-theme-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("clips/c/Frames")).unwrap();
+    for c in ["c", "m", "r", "d"] {
+        fs::create_dir_all(root.join(format!("clips/{c}/Frames"))).unwrap();
+        fs::write(root.join(format!("clips/{c}/.video_metadata.json")), r#"{"fps":24.0}"#).unwrap();
+        for i in 0..3u8 {
+            png(&root.join(format!("clips/{c}/Frames/f_{i}.png")), i * 80);
+        }
+    }
     fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
-    fs::write(root.join("clips/c/.video_metadata.json"), r#"{"fps":24.0}"#).unwrap();
+    fs::create_dir_all(root.join("clips/m/VideoMamaMaskHint")).unwrap();
+    png(&root.join("clips/m/VideoMamaMaskHint/m_0.png"), 9);
+    fs::create_dir_all(root.join("clips/r/AlphaHint")).unwrap();
     for i in 0..3u8 {
-        let f = fs::File::create(root.join(format!("clips/c/Frames/f_{i}.png"))).unwrap();
-        let mut e = png::Encoder::new(f, 4, 4);
-        e.set_color(png::ColorType::Rgb);
-        e.set_depth(png::BitDepth::Eight);
-        e.write_header().unwrap().write_image_data(&[i * 80; 48]).unwrap();
+        png(&root.join(format!("clips/r/AlphaHint/a_{i}.png")), i);
+    }
+    fs::create_dir_all(root.join("clips/d/Output/Matte")).unwrap();
+    fs::write(root.join("clips/d/Output/.corridorkey_manifest.json"), r#"{"version":2,"engine":"corridorkey-v2","enabled_outputs":["matte"],"formats":{"matte":"png"},"complete":true}"#).unwrap();
+    for i in 0..3u8 {
+        png(&root.join(format!("clips/d/Output/Matte/f_{i}.png")), i);
     }
     root
 }
@@ -50,7 +69,9 @@ fn board_queue_and_every_clip_tab_have_readable_text_in_dark_and_light() {
         for _ in 0..3 { frame(&ctx, &mut app, size); }
         let base = ctx.global_style().visuals.panel_fill;
         assert_eq!(base == theme::PANEL, pref == "Dark", "{pref} palette not installed");
-        check(pref, "Board+Queue", &frame(&ctx, &mut app, size), base);
+        let board = frame(&ctx, &mut app, size);
+        check(pref, "Board+Queue", &board, base);
+        stage_chips_are_painted(pref, &ctx, &board);
         app.open_clip(&ctx, 0);
         for tab in Tab::ALL {
             app.switch_tab(tab);
@@ -210,5 +231,53 @@ fn missing_original_movie_text_shows_on_board_card_and_in_media() {
         for cs in &shapes { texts(&cs.shape, &mut t); }
         assert!(t.iter().any(|s| s == want), "{pref} Media lacks the full text: {t:?}");
         check(pref, "Media missing movie", &shapes, base);
+    }
+}
+
+fn stage_colours(ctx: &egui::Context) -> Vec<(ClipState, theme::StageColors, Color32, Color32)> {
+    let mut out = vec![];
+    let mut o = ctx.run_ui(RawInput::default(), |ui| {
+        for st in [ClipState::Raw, ClipState::Masked, ClipState::Ready, ClipState::Complete, ClipState::Extracting, ClipState::Error] {
+            out.push((st, theme::stage(ui, st), theme::card_fill(ui), ui.visuals().panel_fill));
+        }
+    });
+    o.textures_delta.clear();
+    out
+}
+
+/// The Board draws every stage's chip fill and 2 px card edge in its own colour, and names it.
+fn stage_chips_are_painted(pref: &str, ctx: &egui::Context, shapes: &[egui::epaint::ClippedShape]) {
+    use egui::Shape;
+    fn rects(s: &Shape, out: &mut Vec<egui::epaint::RectShape>) {
+        match s {
+            Shape::Vec(v) => v.iter().for_each(|x| rects(x, out)),
+            Shape::Rect(r) => out.push(r.clone()),
+            _ => {}
+        }
+    }
+    let mut all = vec![];
+    shapes.iter().for_each(|c| rects(&c.shape, &mut all));
+    for (st, c, _, _) in stage_colours(ctx).into_iter().take(4) {
+        assert!(all.iter().any(|r| r.fill == c.chip), "{pref}: no {st:?} chip painted");
+        assert!(all.iter().any(|r| r.stroke.color == c.edge && r.stroke.width >= 2.0), "{pref}: no {st:?} card edge painted");
+    }
+}
+
+#[test]
+fn stage_colours_are_distinct_and_readable_in_dark_and_light() {
+    for pref in ["Dark", "Light"] {
+        let ctx = egui::Context::default();
+        theme::apply_preference(&ctx, pref);
+        let cols = stage_colours(&ctx);
+        for (st, c, card, panel) in &cols {
+            assert!(theme::contrast(c.text, c.chip) >= 4.5, "{pref} {st:?}: chip text {:.2}:1", theme::contrast(c.text, c.chip));
+            assert!(theme::contrast(c.edge, *card) >= 3.0, "{pref} {st:?}: edge on the card {:.2}:1", theme::contrast(c.edge, *card));
+            assert!(theme::contrast(c.edge, *panel) >= 3.0, "{pref} {st:?}: edge on the panel {:.2}:1", theme::contrast(c.edge, *panel));
+        }
+        for (i, a) in cols.iter().enumerate() {
+            for b in &cols[i + 1..] {
+                assert!(a.1.edge != b.1.edge && a.1.chip != b.1.chip, "{pref}: {:?} and {:?} share a colour", a.0, b.0);
+            }
+        }
     }
 }

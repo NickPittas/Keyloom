@@ -247,7 +247,7 @@ fn source_movie_missing(p: &Path) -> String {
     format!("Source movie not found at {}: reconnect or relink it", p.display())
 }
 
-fn first_video(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn first_video(dir: &Path) -> Option<PathBuf> {
     let mut v: Vec<PathBuf> = fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -407,6 +407,13 @@ pub fn load_project(root: &Path, opts: &LoadOptions) -> Result<Project, String> 
             }
         })
         .collect();
+    // Board order the user set by dragging (`project.json["clip_order"]`, folder names). Folders not listed
+    // (new imports) keep their name order after the listed ones.
+    let mut clips: Vec<Clip> = clips;
+    if let Some(order) = pj.as_ref().and_then(|j| j.get("clip_order")).and_then(Value::as_array) {
+        let at = |c: &Clip| order.iter().position(|v| v.as_str() == Some(c.folder.as_str())).unwrap_or(usize::MAX);
+        clips.sort_by_key(at); // stable
+    }
     Ok(Project {
         root: root.to_path_buf(),
         display_name,

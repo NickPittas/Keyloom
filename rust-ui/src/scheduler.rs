@@ -481,6 +481,29 @@ impl Scheduler {
         self.jobs.clone()
     }
 
+    /// Board order for work that has not started: the Queued jobs and tasks of clips with nothing dispatched or
+    /// running swap places among themselves so the clips in `roots` come first-to-last (stable: one clip's own steps
+    /// keep their order; clips not listed go last). A clip that already started keeps its queued steps where they
+    /// are, and dispatched, running and finished entries never move.
+    pub fn reorder_queued(&mut self, roots: &[std::path::PathBuf]) {
+        let rank = |r: &std::path::Path| roots.iter().position(|x| x == r).unwrap_or(usize::MAX);
+        let live = |s: &JobState| !s.is_terminal() && *s != JobState::Queued;
+        let started: Vec<std::path::PathBuf> = self.jobs.iter().filter(|e| live(&e.state)).map(|e| e.job.clip_root.clone())
+            .chain(self.tasks.iter().filter(|e| live(&e.state)).map(|e| e.job.clip_root.clone())).collect();
+        let at: Vec<usize> = (0..self.jobs.len()).filter(|i| self.jobs[*i].state == JobState::Queued && !started.contains(&self.jobs[*i].job.clip_root)).collect();
+        let mut q: Vec<JobEntry> = at.iter().map(|i| self.jobs[*i].clone()).collect();
+        q.sort_by_key(|e| rank(&e.job.clip_root));
+        for (i, e) in at.into_iter().zip(q) {
+            self.jobs[i] = e;
+        }
+        let at: Vec<usize> = (0..self.tasks.len()).filter(|i| self.tasks[*i].state == JobState::Queued && !started.contains(&self.tasks[*i].job.clip_root)).collect();
+        let mut q: Vec<TaskEntry> = at.iter().map(|i| self.tasks[*i].clone()).collect();
+        q.sort_by_key(|e| rank(&e.job.clip_root));
+        for (i, e) in at.into_iter().zip(q) {
+            self.tasks[i] = e;
+        }
+    }
+
     /// Inspect/clear a clip's hint lock through the app-side helper (`backend/hint_lock_cli.py`, which keeps the
     /// exact writer checks). The answer arrives as `SchedEvent::HintLock`. The request waits until no job runs on
     /// any worker (a running job may be the lock's owner: never race it) and no job starts while it runs.

@@ -45,6 +45,34 @@ pub fn error(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::fr
 pub fn ok(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::from_rgb(150, 190, 150) } else { Color32::from_rgb(25, 100, 45) } }
 /// Green status dot / accent mark that holds >= 3:1 on the panel and canvas of the current palette.
 pub fn accent_mark(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { ACCENT } else { Color32::from_rgb(45, 103, 61) } }
+/// Board stage identity: the card's edge colour, and the stage chip's fill and text (chip text >= 4.5:1 on its
+/// fill, edge >= 3:1 on the card, in both palettes; tested). One hue per stage: Raw blue, Masked violet,
+/// Ready amber, Complete green; extracting grey and error red.
+pub struct StageColors { pub edge: Color32, pub chip: Color32, pub text: Color32 }
+pub fn stage(ui: &egui::Ui, s: crate::project::ClipState) -> StageColors {
+    use crate::project::ClipState::*;
+    let c = |r, g, b| Color32::from_rgb(r, g, b);
+    let (chip, text, edge) = if ui.visuals().dark_mode {
+        match s {
+            Raw => (c(46, 84, 140), c(240, 244, 250), c(110, 160, 230)),
+            Masked => (c(96, 64, 140), c(244, 238, 252), c(176, 140, 230)),
+            Ready => (c(128, 84, 10), c(255, 244, 224), c(230, 170, 60)),
+            Complete => (c(30, 106, 60), c(236, 250, 240), c(110, 200, 140)),
+            Extracting => (c(70, 80, 92), c(236, 240, 244), c(150, 165, 180)),
+            Error => (c(140, 40, 40), c(255, 240, 238), c(240, 120, 110)),
+        }
+    } else {
+        match s {
+            Raw => (c(205, 222, 248), c(20, 40, 80), c(40, 100, 190)),
+            Masked => (c(226, 212, 246), c(60, 30, 100), c(120, 70, 190)),
+            Ready => (c(250, 226, 170), c(80, 50, 0), c(180, 110, 0)),
+            Complete => (c(190, 232, 200), c(10, 70, 30), c(30, 130, 60)),
+            Extracting => (c(215, 222, 230), c(40, 50, 62), c(100, 115, 130)),
+            Error => (c(248, 208, 204), c(120, 20, 15), c(190, 40, 35)),
+        }
+    };
+    StageColors { edge, chip, text }
+}
 /// Outline of big panel frames (>= 3:1 on the panel of the current palette).
 pub fn panel_edge(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::from_rgb(110, 134, 118) } else { Color32::from_rgb(120, 140, 125) } }
 
