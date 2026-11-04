@@ -205,7 +205,10 @@ fn missing_original_movie_text_shows_on_board_card_and_in_media() {
     }
     let want = "Source movie not found at /gone/movie.mp4: reconnect or relink it";
     for pref in ["Dark", "Light"] {
-        let root = project(&format!("gone{pref}"));
+        let root = std::env::temp_dir().join(format!("ck-theme-gone{pref}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
         fs::create_dir_all(root.join("clips/m/Source")).unwrap();
         fs::write(root.join("clips/m/clip.json"), r#"{"source":{"type":"video","filename":"movie.mp4","original_path":"/gone/movie.mp4"}}"#).unwrap();
         let ctx = egui::Context::default();
@@ -222,7 +225,7 @@ fn missing_original_movie_text_shows_on_board_card_and_in_media() {
         for cs in &shapes { texts(&cs.shape, &mut t); }
         assert!(t.iter().any(|s| s.contains("Source movie not found at /gone/movie.mp4")), "{pref} Board card lacks the text: {t:?}");
         check(pref, "Board missing movie", &shapes, base);
-        app.open_clip(&ctx, 1); // clips are listed by folder name: c, m
+        app.open_clip(&ctx, 0);
         assert!(app.in_workspace());
         app.switch_tab(Tab::Media);
         for _ in 0..3 { frame(&ctx, &mut app, size); }
