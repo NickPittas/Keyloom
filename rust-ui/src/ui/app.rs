@@ -1556,16 +1556,13 @@ impl App {
                 .as_ref()
                 .is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false))
         };
-        let busy = self.ai.task_busy(&clip.folder);
         // Same missing-model check as the producer buttons: the selected BiRefNet/SAM variant must be installed.
         let miss_guide = hint::missing_guide(&local, lazy, cfg);
-        let guide_ok = !cfg.bypass && !busy && ready(cfg.guide.task()) && miss_guide.is_none();
-        let fin_ok = !cfg.bypass
-            && !busy
-            && cfg
-                .finish
-                .task()
-                .map_or(cfg.finish == Final::Direct && guide_ok, ready);
+        let external = self.ai.external_writer(&clip.root);
+        let guide_ready = !cfg.bypass && ready(cfg.guide.task()) && miss_guide.is_none();
+        let fin_ready = !cfg.bypass && cfg.finish.task().map_or(cfg.finish == Final::Direct && guide_ready, ready);
+        let d_guide = crate::actions::decide(self.ai.scheduler(), &clip.root, if cfg.guide == crate::hints::Producer::Sam { crate::actions::Action::Track } else { crate::actions::Action::PreMatte }, "Generate pre-matte", if cfg.bypass { Some("Bypass is on".into()) } else if !guide_ready { Some(miss_guide.clone().unwrap_or_else(|| "The selected model is unavailable".into())) } else if external { Some("Another computer is importing into this clip. Wait for it to finish.".into()) } else { None });
+        let d_hint = crate::actions::decide(self.ai.scheduler(), &clip.root, crate::actions::Action::Hint, "Generate hint", if cfg.bypass { Some("Bypass is on".into()) } else if !fin_ready { Some("The selected model is unavailable".into()) } else if external { Some("Another computer is importing into this clip. Wait for it to finish.".into()) } else { None });
         let mut out = vec![];
         for node in [Node::Media, Node::PreMatte, Node::Hint, Node::Key] {
             let (note, actions): (Option<String>, Vec<(graph::Action, String, bool)>) = match node {
@@ -1592,8 +1589,8 @@ impl App {
                         (graph::Action::Open, "Open Pre-matte".into(), true),
                         (
                             graph::Action::GenerateRange,
-                            format!("Generate {} {}", cfg.guide.label(), if cfg.pre_on_marks() { "on marked frames" } else { "over In/Out" }),
-                            guide_ok,
+                            d_guide.label,
+                            d_guide.enabled,
                         ),
                     ],
                 ),
@@ -1606,8 +1603,8 @@ impl App {
                         (graph::Action::Open, "Open Hint".into(), true),
                         (
                             graph::Action::GenerateRange,
-                            format!("Generate {} hint {}", cfg.finish.label(), if cfg.hint_on_marks() { "on marked frames" } else { "over In/Out" }),
-                            fin_ok,
+                            d_hint.label,
+                            d_hint.enabled,
                         ),
                     ],
                 ),

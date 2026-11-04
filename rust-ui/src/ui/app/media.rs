@@ -234,7 +234,8 @@ impl App {
                 staging: PathBuf::new(),
             }
             .prepare_source(&crate::project::clean_abs(&path));
-            self.ai.submit_task(&clip, job, vec![], 0).map(|_| ())
+            let after = crate::actions::waits_for(self.ai.scheduler(), &clip.root, crate::actions::Action::Extract);
+            self.ai.submit_task(&clip, job, after, 0).map(|_| ())
         });
         self.media.note = Some(match &res {
             Ok(()) => {
