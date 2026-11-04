@@ -256,8 +256,12 @@ impl App {
             return;
         }
         let root = s.clip_root.clone();
-        if self.ai.external_writer(&root) {
-            self.media.note = Some("Another computer is importing into this clip. Wait for it to finish.".into());
+        // The import writes the hint folders outside the queue, so it can't wait behind a same-clip job: refuse instead.
+        if self.ai.clip_active(&root) || self.ai.external_writer(&root) {
+            self.media.note = Some(
+                "A hint job or another import is running for this clip; wait for it to finish."
+                    .into(),
+            );
             return;
         }
         // Exclusive on-disk ownership for the whole copy: worker hint jobs are refused, and so is a second
