@@ -1162,7 +1162,9 @@ impl AiUi {
             let w = &self.gate.want.as_ref().unwrap().1;
             (w.params.clone(), w.out.clone())
         };
-        self.submit_plan(clip, plan.clone(), &params, &out)
+        // Key waits for the hint (or earlier Key) of this clip that is queued or running; settings are the frozen gate result.
+        let after = crate::actions::waits_for(&self.sched, &clip.root, crate::actions::Action::Key);
+        self.submit_plan_after(clip, plan.clone(), &params, &out, after)
     }
 
     pub fn set_presets_file(&mut self, f: Option<PathBuf>) {
@@ -2304,7 +2306,9 @@ impl AiUi {
             ui.label("Processing this clip…");
             self.job_row(ui, &id, false);
             let go = ui.add_enabled(false, egui::Button::new(action)
-                .min_size(egui::Vec2::new(ui.available_width(), 30.0)));
+                .min_size(egui::Vec2::new(ui.available_width(), 30.0)))
+                .on_disabled_hover_text("Key is running for this clip");
+            ui.label(RichText::new("Key is running for this clip").color(theme::text_dim(ui)).size(12.0));
             self.key_rect = Some(go.rect);
             return;
         }
@@ -2352,8 +2356,12 @@ impl AiUi {
             .filter(|_| g.as_ref().is_some_and(|g| g.newver.is_some()) && setup.is_empty());
         if new_version.is_some() && !network { can = true; why = "Keeps the existing result in place".into(); }
         let primary_label = new_version.map_or_else(|| action.to_string(), |v| format!("Key as v{v:03}"));
+        // Busy clip/PC -> "Queue Key"; the same Key already waiting -> disabled "Already queued".
+        let decision = crate::actions::decide(&self.sched, &clip.root, crate::actions::Action::Key, &primary_label, (!can).then(|| why.clone()));
+        let (can, primary_label) = (decision.enabled, decision.label.clone());
+        let why = if decision.reason.is_empty() { why } else { decision.reason.clone() };
         ui.label(
-            RichText::new(why)
+            RichText::new(&why)
                 .color(if can { theme::text_dim(ui) } else { theme::error(ui) })
                 .size(12.0),
         );
@@ -2362,7 +2370,9 @@ impl AiUi {
             .vertical_centered(|ui| {
                 theme::accent(ui, can, |ui| ui.add(egui::Button::new(primary_label).min_size(egui::Vec2::new(180.0, 34.0))))
             })
-            .inner;
+            .inner
+            .on_hover_text(&why)
+            .on_disabled_hover_text(&why);
         self.key_rect = Some(go.rect);
         if let Some(pulse) = self.stale_key {
             ui.painter().rect_stroke(go.rect.expand(1.0), 4.0, egui::Stroke::new(2.0 + pulse * 1.5, theme::warn(ui)), egui::StrokeKind::Outside);
@@ -3414,8 +3424,9 @@ impl AiUi {
         let products: Vec<String> = m.enabled.iter().map(|e| e.to_lowercase()).collect();
         let jobs = crate::pipeline::export_jobs(clip, &clip_id, range, cfg, dir, &products, &dests, new_id)?;
         let mut ids: Vec<String> = vec![];
+        let first = crate::actions::waits_for(&self.sched, &clip.root, crate::actions::Action::Export);
         for j in jobs {
-            let after = ids.last().cloned().into_iter().collect();
+            let after = if ids.is_empty() { first.clone() } else { ids.last().cloned().into_iter().collect() };
             match self.submit_task(clip, j, after, 0) {
                 Ok(id) => ids.push(id),
                 Err(e) => {
