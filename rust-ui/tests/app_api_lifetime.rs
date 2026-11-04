@@ -96,11 +96,11 @@ fn listener_is_ours(port: u16) -> bool {
         .args([
             "-NoProfile",
             "-Command",
-            &format!("Get-NetTCPConnection -LocalPort {port} -State Listen | Select-Object -ExpandProperty OwningProcess"),
+            // no listener on the port is a normal answer (closed), not an error
+            &format!("Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess"),
         ])
         .output()
         .expect("query listening port owner");
-    assert!(output.status.success(), "Get-NetTCPConnection failed");
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.trim().parse::<u32>().ok())
@@ -125,7 +125,7 @@ fn child_processes() -> Vec<String> {
             "-NoProfile",
             "-Command",
             &format!(
-                "Get-CimInstance Win32_Process -Filter 'ParentProcessId={}' | Select-Object -ExpandProperty ProcessId",
+                "Get-CimInstance Win32_Process -Filter 'ParentProcessId={}' | Where-Object ProcessId -ne $PID | Select-Object -ExpandProperty ProcessId",
                 std::process::id()
             ),
         ])
