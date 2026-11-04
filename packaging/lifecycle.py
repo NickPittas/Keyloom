@@ -356,9 +356,13 @@ def _attach(prefix: Path, vdir: Path, final: Path | None = None) -> dict:
                 out.update(ok=True, source=av["source"])
             else:
                 out["reason"] = "version already references a different runtime"
-        elif link.exists():
+        elif link.is_dir() and any(link.iterdir()):
+            out["reason"] = "version already has its own runtime"
+        elif link.exists() and not link.is_dir():
             out["reason"] = "version already has its own runtime"
         else:
+            if link.is_dir():
+                os.rmdir(link)  # Inno leaves an empty runtime\ behind; non-recursive, plain dir only (links handled above)
             if IS_WIN:
                 import _winapi
                 _winapi.CreateJunction(str(target), str(link))

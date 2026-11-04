@@ -182,6 +182,8 @@ def extract_runtime(meta_path, meta_sha256: str, runtime_id: str, dest, label: s
     holder, final = os.path.join(dest, ".runtime-extract"), os.path.join(dest, "runtime")
     if _is_link(dest) or not os.path.isdir(dest):
         raise ValueError(f"{dest} is not a plain directory")
+    if os.path.isdir(final) and not _is_link(final) and not os.listdir(final):
+        os.rmdir(final)  # Inno leaves an empty runtime\ behind; non-recursive, plain dir only
     if os.path.lexists(holder) or (os.path.lexists(final) and not _is_link(final)):
         raise FileExistsError(f"{final} (or its holder) already exists; refusing to overwrite it")
     if _is_link(final):

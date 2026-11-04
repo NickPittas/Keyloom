@@ -140,3 +140,33 @@ def test_discard_new_keeps_referenced_runtime(tmp_path):
                                                                "current": "2-y", "versions": ["2-y"]})
     lifecycle.discard_new(tmp_path, "1-x", None)
     assert (owner / PY).is_file()
+
+
+def test_attach_empty_runtime_dir_counts_as_absent(tmp_path, no_runtime_io):
+    m = manifest()
+    owner = legacy(tmp_path, m)
+    v = new_version(tmp_path, m)
+    (v / "runtime").mkdir()  # Inno's empty leftover
+    r = lifecycle.attach_runtime(tmp_path, "2-y")
+    assert r["ok"] and os.path.islink(v / "runtime") and (v / "runtime").resolve() == (owner / "runtime").resolve()
+
+
+def test_attach_nonempty_runtime_dir_still_refused(tmp_path):
+    m = manifest()
+    legacy(tmp_path, m)
+    v = new_version(tmp_path, m)
+    (v / "runtime").mkdir()
+    (v / "runtime" / "f").write_text("x")
+    r = lifecycle.attach_runtime(tmp_path, "2-y")
+    assert not r["ok"] and "own runtime" in r["reason"] and (v / "runtime" / "f").exists()
+
+
+def test_attach_link_to_other_runtime_still_refused(tmp_path):
+    m = manifest()
+    legacy(tmp_path, m)
+    v = new_version(tmp_path, m)
+    other = tmp_path / "other"
+    other.mkdir()
+    os.symlink(other, v / "runtime", target_is_directory=True)
+    r = lifecycle.attach_runtime(tmp_path, "2-y")
+    assert not r["ok"] and "different runtime" in r["reason"] and other.exists() and os.path.islink(v / "runtime")

@@ -279,3 +279,25 @@ exit 0
 
 def c_consts(stub):
     return [l for l in stub.splitlines() if re.match(r"(STUB_BYTES|BOOT_|APP_|RUNTIME_|TITLE=)", l)]
+
+
+def test_extract_runtime_empty_dir_is_removed_nonempty_and_link_refused(tmp_path):
+    kw = dict(meta_path=tmp_path / "none", meta_sha256="0" * 64, runtime_id="r" * 64, out=io.StringIO())
+    d = tmp_path / "e"
+    (d / "runtime").mkdir(parents=True)  # Inno's empty leftover: removed, then extraction proceeds (fails later on the bogus metadata)
+    with pytest.raises(Exception) as ei:
+        ip.extract_runtime(dest=d, **kw)
+    assert not isinstance(ei.value, FileExistsError) and not (d / "runtime").exists()
+    n = tmp_path / "n"
+    (n / "runtime").mkdir(parents=True)
+    (n / "runtime" / "f").write_text("x")
+    with pytest.raises(FileExistsError):
+        ip.extract_runtime(dest=n, **kw)
+    assert (n / "runtime" / "f").exists()
+    lk, tgt = tmp_path / "l", tmp_path / "tgt"
+    lk.mkdir()
+    tgt.mkdir()
+    os.symlink(tgt, lk / "runtime", target_is_directory=True)
+    with pytest.raises(FileExistsError, match="link"):
+        ip.extract_runtime(dest=lk, **kw)
+    assert tgt.exists() and os.path.islink(lk / "runtime")
