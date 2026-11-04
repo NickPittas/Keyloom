@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 # Re-export all public symbols from submodules
-from .color import build_exr_vf
+from .color import build_exr_vf, build_sam_jpeg_vf
 from .discovery import (
     FFmpegValidationResult,
     FFmpegVersionInfo,
@@ -52,6 +52,7 @@ __all__ = [
     "probe_video",
     # color
     "build_exr_vf",
+    "build_sam_jpeg_vf",
     # extraction
     "detect_hwaccel",
     "_recompress_to_dwab",

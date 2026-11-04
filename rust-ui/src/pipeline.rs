@@ -1,8 +1,10 @@
 //! Full-pipeline batch planning (pre-matte -> Key -> video export), pure and UI-free. Every clip gets the preset's
-//! settings but its own media, range, prompts, masks and hints: automatic producers/refiners are re-run (a stale
-//! hint is never reused), manual SAM guides and imported alphas must already exist on that clip.
+//! settings but its own media, range, prompts, masks and hints: automatic producers/refiners are planned to re-run,
+//! and `hint_offer` tells the review when a hint render already exists so the user can reuse it (a hint that is
+//! known to differ is never reused silently); manual SAM guides and imported alphas must already exist on that clip.
 use crate::hints::{
-    covers, staging_root, Annotations, Ctx, ExportCfg, Final, HintCfg, Producer, CONTAINERS, GUIDE_DIR, HINT_DIR,
+    check_hint, covers, identity, staging_root, stamp_value, Annotations, Compat, Ctx, ExportCfg, Final, HintCfg,
+    HintWant, Producer, CONTAINERS, GUIDE_DIR, HINT_DIR,
 };
 use crate::jobs::KeyJob;
 use crate::presets::PipelineExport;
@@ -16,6 +18,67 @@ pub struct HintPlan {
     pub steps: Vec<TaskJob>,
     /// Shown in the review when the configured producer is NOT run ("Key only: ...").
     pub note: Option<String>,
+}
+
+/// An existing hint render the queue could reuse instead of the planned hint steps.
+#[derive(Debug, Clone)]
+pub struct HintOffer {
+    pub compat: Compat,
+    /// `stem -> size:mtime_ns` of exactly the hint frames Key will read, frozen when the review was built.
+    pub identity: BTreeMap<String, String>,
+    /// Why the offer cannot be proven compatible even though a hint exists (e.g. the pre-matte is gone).
+    pub note: Option<String>,
+}
+
+/// Compares the hint frames (and, when the plan regenerates it, the pre-matte) already on disk with the render
+/// `steps` would make. `None` = nothing to reuse (no steps into `AlphaHint`, or a requested frame is missing).
+/// Reads frames: call off the UI thread.
+pub fn hint_offer(clip: &Clip, steps: &[TaskJob]) -> Option<HintOffer> {
+    let (hint_dir, guide_dir) = (clip.root.join(HINT_DIR), clip.root.join(GUIDE_DIR));
+    let sha = |p: &Path| crate::sha256::file(p, &std::sync::atomic::AtomicBool::new(false), |_, _| {}).ok().flatten();
+    let guide = crate::hints::hint_files(&guide_dir);
+    let (mut compat, mut read, mut note) = (Compat::Compatible, vec![], None);
+    for t in steps {
+        let (dir, r) = (t.publish_dir.as_deref()?, t.range.as_ref()?);
+        let files = clip.input_files.get(r.in_point..=r.out_point)?;
+        let stems: Vec<String> = files.iter().map(|f| f.0.clone()).collect();
+        let into_hint = dir == hint_dir;
+        let mut want = HintWant {
+            kind: t.kind.wire().into(),
+            params: t.params.clone(),
+            source: files.iter().map(|f| (f.0.clone(), stamp_value(&f.1))).collect(),
+            upstream: Default::default(),
+            // ponytail: the planner never makes a SAM hint itself, so there is no prompt fingerprint to compare
+            prompt_fp: None,
+        };
+        if into_hint {
+            // The pre-matte this hint is refined from. MatAnyone2 is conditioned only on the In frame (the worker
+            // records just that one), so only that frame is compared; the other kinds read every frame.
+            let seeded = if t.kind == crate::tasks::TaskKind::Matanyone2 { 1 } else { stems.len() };
+            want.upstream = if seeded == 1 {
+                // The seed must be the very In frame: no guide file there compares as "" and never matches the
+                // record, so a hint seeded from an earlier In frame is a Mismatch, not Compatible.
+                stems.iter().take(1).map(|s| (s.clone(), guide.get(s).and_then(|p| sha(p)).unwrap_or_default())).collect()
+            } else {
+                stems.iter().filter_map(|s| Some((s.clone(), sha(guide.get(s)?)?))).collect()
+            };
+            read.extend(stems.iter().cloned());
+        } else if dir != guide_dir {
+            return None;
+        }
+        let c = check_hint(dir, &stems, &want);
+        if c == Compat::Missing && dir == guide_dir {
+            // pre-matte gone but the hint kept: still ask, saying why it cannot be verified (never a silent re-render)
+            note = Some("the pre-matte it was made from is missing, so it cannot be verified".to_string());
+            compat = compat.worst(Compat::Unrecorded);
+            continue;
+        }
+        compat = compat.worst(c);
+        if compat == Compat::Missing {
+            return None;
+        }
+    }
+    Some(HintOffer { compat, identity: identity(&hint_dir, &read).filter(|_| !read.is_empty())?, note })
 }
 
 fn frames(stems: &[String], r: (usize, usize)) -> String {
@@ -268,5 +331,237 @@ mod tests {
         let jobs = jobs.unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].clip_id, "key-clip-id");
+    }
+
+    /// A clip with 4 source frames, a pre-matte and a hint made by the very steps `hint_steps` plans, with the
+    /// provenance record the worker writes for them.
+    fn rendered(tag: &str) -> (PathBuf, Clip, Vec<TaskJob>) {
+        use crate::hints::{Final, HintCfg, Producer};
+        let root = std::env::temp_dir().join(format!("ck-offer-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let d = root.join("clips/c1");
+        for sub in ["Frames", "VideoMamaMaskHint", "AlphaHint"] {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+        }
+        for i in 1..=4 {
+            std::fs::write(d.join(format!("Frames/f{i}.png")), format!("src{i}")).unwrap();
+            std::fs::write(d.join(format!("VideoMamaMaskHint/f{i}.png")), format!("guide{i}")).unwrap();
+            std::fs::write(d.join(format!("AlphaHint/f{i}.png")), format!("hint{i}")).unwrap();
+        }
+        std::fs::write(d.join("clip.json"), "{}").unwrap();
+        std::fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
+        let clip = crate::project::load_project(&root, &crate::project::LoadOptions::default()).unwrap().clips.remove(0);
+        let mut cfg = HintCfg::default();
+        (cfg.guide, cfg.finish) = (Producer::Chroma, Final::Direct);
+        let mut n = 0;
+        let steps = hint_steps(&clip, &root, &cfg, "full", (0, 3), false, || {
+            n += 1;
+            format!("job{n}")
+        })
+        .unwrap()
+        .steps;
+        assert_eq!(steps.len(), 1, "a manual pre-matte plans only the hint step");
+        let st = &steps[0];
+        let hex = |f: &str| crate::sha256::hex(&std::fs::read(d.join(f)).unwrap());
+        let stems: Vec<String> = (1..=4).map(|i| format!("f{i}")).collect();
+        let rec = serde_json::json!({
+            "kind": st.kind.wire(), "job_id": "old", "params": st.params, "stems": stems,
+            "digests": stems.iter().map(|s| (s.clone(), hex(&format!("AlphaHint/{s}.png")))).collect::<BTreeMap<_, _>>(),
+            "stats": stems.iter().map(|s| (s.clone(), crate::hints::stamp_value(&d.join(format!("AlphaHint/{s}.png"))))).collect::<BTreeMap<_, _>>(),
+            "source": stems.iter().map(|s| (s.clone(), crate::hints::stamp_value(&d.join(format!("Frames/{s}.png"))))).collect::<BTreeMap<_, _>>(),
+            "upstream": stems.iter().map(|s| (s.clone(), hex(&format!("VideoMamaMaskHint/{s}.png")))).collect::<BTreeMap<_, _>>(),
+        });
+        std::fs::write(d.join("AlphaHint/.corridorkey_hint.json"), json!({"kind": "prematte_hint", "ranges": [rec]}).to_string()).unwrap();
+        (root, clip, steps)
+    }
+    use serde_json::json;
+
+    #[test]
+    fn a_hint_made_from_these_frames_with_these_settings_is_offered_as_compatible() {
+        let (root, clip, steps) = rendered("ok");
+        let o = hint_offer(&clip, &steps).unwrap();
+        assert_eq!(o.compat, Compat::Compatible);
+        assert_eq!(o.identity.len(), 4);
+        // a wider recorded render serves the narrower range the queue asks for
+        let sub: Vec<TaskJob> = vec![TaskJob { range: crate::contracts::RangeIdentity::from_inclusive(&["f1".into(), "f2".into(), "f3".into(), "f4".into()], 1, 2).ok(), ..steps[0].clone() }];
+        assert_eq!(hint_offer(&clip, &sub).unwrap().compat, Compat::Compatible);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn known_differences_are_mismatches_old_hints_are_unrecorded_missing_frames_offer_nothing() {
+        let (root, clip, steps) = rendered("diff");
+        let d = root.join("clips/c1");
+        let compat = |clip: &Clip| hint_offer(clip, &steps).map(|o| o.compat);
+        let mut other = steps.clone();
+        other[0].params["mask_cleanup"]["feather"] = json!(3.0);
+        assert!(matches!(hint_offer(&clip, &other).unwrap().compat, Compat::Mismatch(w) if w.contains("settings")));
+        std::fs::write(d.join("Frames/f2.png"), "replaced source!").unwrap();
+        assert!(matches!(compat(&clip), Some(Compat::Mismatch(w)) if w.contains("source frame f2")));
+        std::fs::write(d.join("Frames/f2.png"), "src2").unwrap(); // size equal again; mtime moved, so it still differs
+        std::fs::write(d.join("VideoMamaMaskHint/f3.png"), "a new guide").unwrap();
+        assert!(matches!(compat(&clip), Some(Compat::Mismatch(w)) if w.contains("pre-matte") || w.contains("source frame")));
+        std::fs::write(d.join("AlphaHint/f1.png"), "edited by hand").unwrap();
+        assert!(matches!(compat(&clip), Some(Compat::Mismatch(_))));
+        std::fs::remove_file(d.join("AlphaHint/.corridorkey_hint.json")).unwrap();
+        assert_eq!(compat(&clip), Some(Compat::Unrecorded)); // legacy / imported: the user decides
+        std::fs::remove_file(d.join("AlphaHint/f4.png")).unwrap();
+        assert!(compat(&clip).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn matanyone2_compares_only_the_in_frame_pre_matte() {
+        let (root, clip, steps) = rendered("mat");
+        let d = root.join("clips/c1");
+        let mut mat = steps.clone();
+        mat[0].kind = crate::tasks::TaskKind::Matanyone2;
+        let path = d.join("AlphaHint/.corridorkey_hint.json");
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["ranges"][0]["kind"] = json!("matanyone2");
+        v["ranges"][0]["params"] = mat[0].params.clone();
+        let up = v["ranges"][0]["upstream"].as_object_mut().unwrap();
+        up.retain(|k, _| k == "f1"); // what the worker records: the In frame only
+        std::fs::write(&path, v.to_string()).unwrap();
+        assert_eq!(hint_offer(&clip, &mat).unwrap().compat, Compat::Compatible, "a dense pre-matte is not an input");
+        std::fs::write(d.join("VideoMamaMaskHint/f3.png"), "later frame edited").unwrap();
+        assert_eq!(hint_offer(&clip, &mat).unwrap().compat, Compat::Compatible);
+        std::fs::write(d.join("VideoMamaMaskHint/f1.png"), "the seed changed").unwrap();
+        assert!(matches!(hint_offer(&clip, &mat).unwrap().compat, Compat::Mismatch(w) if w.contains("pre-matte f1")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matanyone2_seeded_from_an_earlier_in_frame_is_not_compatible() {
+        let (root, clip, steps) = rendered("seed");
+        let d = root.join("clips/c1");
+        let mut mat = steps.clone();
+        mat[0].kind = crate::tasks::TaskKind::Matanyone2;
+        let path = d.join("AlphaHint/.corridorkey_hint.json");
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["ranges"][0]["kind"] = json!("matanyone2");
+        v["ranges"][0]["params"] = mat[0].params.clone();
+        v["ranges"][0]["upstream"].as_object_mut().unwrap().retain(|k, _| k == "f1"); // seeded from f1
+        std::fs::write(&path, v.to_string()).unwrap();
+        // the queue now starts at f2 and the sparse guide has no file there
+        std::fs::remove_file(d.join("VideoMamaMaskHint/f2.png")).unwrap();
+        mat[0].range = crate::contracts::RangeIdentity::from_inclusive(&["f1".into(), "f2".into(), "f3".into(), "f4".into()], 1, 3).ok();
+        assert!(matches!(hint_offer(&clip, &mat).unwrap().compat, Compat::Mismatch(w) if w.contains("pre-matte f2")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The same record, checked by Rust here and by Python's `hint_compat.check` (the repo venv), must give the
+    /// same verdict for each change to the render being asked for.
+    #[test]
+    fn rust_and_python_give_the_same_verdict_for_the_same_hint_record() {
+        let root_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let Some(py) = [".venv/bin/python", ".venv/Scripts/python.exe"].iter().map(|p| root_dir.join(p)).find(|p| p.is_file()) else {
+            eprintln!("SKIPPED parity test: no repo python at <repo>/.venv/bin/python or .venv/Scripts/python.exe");
+            return;
+        };
+        let (root, _clip, steps) = rendered("parity");
+        let d = root.join("clips/c1");
+        let rec_path = d.join("AlphaHint/.corridorkey_hint.json");
+        let rec_text = std::fs::read_to_string(&rec_path).unwrap();
+        let stems: Vec<String> = (1..=4).map(|i| format!("f{i}")).collect();
+        let hex = |f: &str| crate::sha256::hex(&std::fs::read(d.join(f)).unwrap());
+        let want_json = |kind: &str, params: serde_json::Value, src: &str| {
+            json!({
+                "kind": kind, "params": params,
+                "source": stems.iter().map(|s| (s.clone(), if s == "f1" { json!(src) } else { crate::hints::stamp_value(&d.join(format!("Frames/{s}.png"))) })).collect::<BTreeMap<_, _>>(),
+                "upstream": stems.iter().map(|s| (s.clone(), hex(&format!("VideoMamaMaskHint/{s}.png")))).collect::<BTreeMap<_, _>>(),
+            })
+        };
+        let kind = steps[0].kind.wire();
+        let mut other = steps[0].params.clone();
+        other.as_object_mut().unwrap().insert("zz_other".into(), json!(1));
+        let src1 = crate::hints::stamp_value(&d.join("Frames/f1.png"));
+        // each case: name, the wanted render, how the stored record is edited first, the verdict both must give
+        type Edit = fn(&mut serde_json::Value);
+        let mat_seed: Edit = |r| {
+            r["ranges"][0]["kind"] = json!("matanyone2");
+            r["ranges"][0]["upstream"].as_object_mut().unwrap().retain(|k, _| k == "f1"); // the In frame only
+        };
+        let mat_want = |hash: Option<&str>| {
+            let mut w = want_json("matanyone2", steps[0].params.clone(), "");
+            w["upstream"].as_object_mut().unwrap().retain(|k, _| k == "f1");
+            if let Some(h) = hash {
+                w["upstream"]["f1"] = json!(h);
+            }
+            w
+        };
+        let cases: Vec<(&str, serde_json::Value, Option<Edit>, &str)> = vec![
+            ("same", want_json(kind, steps[0].params.clone(), src1.as_str().unwrap_or("")), None, "compatible"),
+            ("kind", want_json("matanyone2", steps[0].params.clone(), ""), None, "mismatch"),
+            ("settings", want_json(kind, other, ""), None, "mismatch"),
+            ("source", want_json(kind, steps[0].params.clone(), "changed"), None, "mismatch"),
+            ("settings not recorded", want_json(kind, steps[0].params.clone(), src1.as_str().unwrap_or("")),
+                Some(|r| { r["ranges"][0].as_object_mut().unwrap().remove("params"); }), "mismatch"),
+            ("missing pre-matte", want_json(kind, steps[0].params.clone(), src1.as_str().unwrap_or("")),
+                Some(|r| { r["ranges"][0]["upstream"].as_object_mut().unwrap().remove("f2"); }), "mismatch"),
+            ("matanyone2 seed unchanged", mat_want(None), Some(mat_seed), "compatible"),
+            ("matanyone2 seed changed", mat_want(Some("0000")), Some(mat_seed), "mismatch"),
+        ];
+        for (name, mut w, edit, expect) in cases {
+            if name == "same" || edit.is_some() {
+                w["source"]["f1"] = src1.clone(); // the real stamp (an array, not a string)
+            }
+            let mut rec: serde_json::Value = serde_json::from_str(&rec_text).unwrap();
+            if let Some(e) = edit {
+                e(&mut rec);
+            }
+            std::fs::write(&rec_path, rec.to_string()).unwrap();
+            let want = HintWant {
+                kind: w["kind"].as_str().unwrap().into(),
+                params: w["params"].clone(),
+                source: w["source"].as_object().unwrap().clone().into_iter().collect(),
+                upstream: w["upstream"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().into())).collect(),
+                prompt_fp: None,
+            };
+            let rust = match check_hint(&d.join("AlphaHint"), &stems, &want) {
+                Compat::Compatible => "compatible",
+                Compat::Unrecorded => "unrecorded",
+                Compat::Mismatch(_) => "mismatch",
+                Compat::Missing => "missing",
+            };
+            let out = std::process::Command::new(&py)
+                .args(["-I", "-c", "import json,sys\nsys.path.insert(0,sys.argv[1])\nfrom backend import hint_compat as h\nprint(h.check(sys.argv[2],sys.argv[3].split(','),json.loads(sys.argv[4]))[0])"])
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+                .arg(d.join("AlphaHint"))
+                .arg(stems.join(","))
+                .arg(w.to_string())
+                .output()
+                .expect("run the repo python");
+            let python = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            assert_eq!(python, rust, "case {name}: python said {python:?}, rust {rust:?}; stderr {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(rust, expect, "case {name}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_missing_pre_matte_is_offered_with_its_reason_not_silently_dropped() {
+        let (root, clip, steps) = rendered("gone");
+        let d = root.join("clips/c1");
+        let mut guide = steps[0].clone();
+        guide.publish_dir = Some(d.join(GUIDE_DIR));
+        std::fs::remove_file(d.join("VideoMamaMaskHint/f2.png")).unwrap();
+        let o = hint_offer(&clip, &[guide, steps[0].clone()]).unwrap();
+        assert_eq!(o.compat, Compat::Unrecorded);
+        assert!(o.note.unwrap().contains("pre-matte"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stems_with_a_tilde_and_dot_files_do_not_confuse_the_record_lookups() {
+        let (root, _clip, _steps) = rendered("tilde");
+        let d = root.join("clips/c1/AlphaHint");
+        std::fs::write(d.join("sh~v2.0001.png"), "x").unwrap();
+        std::fs::write(d.join(".hidden.png"), "x").unwrap();
+        std::fs::write(d.join("f1.exr"), "x").unwrap();
+        std::fs::write(d.join("f1.dpx"), "x").unwrap();
+        let files = crate::hints::hint_files(&d);
+        assert!(files.contains_key("sh~v2.0001") && !files.contains_key(".hidden"));
+        assert_eq!(files["f1"].extension().unwrap(), "png", "dpx is ignored and the last sorted name wins, as in Python");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -199,8 +199,8 @@ struct Slot {
     lost_job: Option<String>,
     /// Stop was requested (`stop_*`/`force_stop`): the final status is `Stopped` once the process exits.
     stopping: bool,
-    /// The stop is a refresh (model change): a task submitted meanwhile waits for the restart instead of failing.
-    rearm: bool,
+    /// A `refresh` was sent to this idle worker: its next `hello` replaces the old one (models re-read).
+    refreshing: bool,
     /// When this slot's worker died on its own (not stopped by the user): a crash restarts it, at most
     /// `CRASH_RESTARTS` times in `CRASH_WINDOW`, so queued work waits for it instead of failing.
     crashes: Vec<Instant>,
@@ -407,7 +407,7 @@ impl Scheduler {
                 lost_job: None,
                 crashes: vec![],
                 stopping: false,
-                rearm: false,
+                refreshing: false,
             })
             .collect();
         Ok(Self {
@@ -979,12 +979,15 @@ impl Scheduler {
         }
     }
 
-    /// Make every exited, jobless `Stopped` target startable again (after a model change or a capability
-    /// refresh stopped it); the next action or probe starts it.
-    pub fn rearm_stopped(&mut self) {
-        self.slots.iter_mut().for_each(|s| s.rearm = false);
-        let ids: Vec<String> = self.slots.iter().filter(|s| s.status == TargetStatus::Stopped && s.conn.is_none() && s.job.is_none()).map(|s| s.target.id.clone()).collect();
-        ids.iter().for_each(|i| self.reset_target(i));
+    /// Ask every idle, ready worker to re-read what is installed (no restart); its answer replaces its hello.
+    /// `true` once no worker is still starting (a starting one reads the models fresh anyway).
+    pub fn refresh_idle_workers(&mut self) -> bool {
+        for s in self.slots.iter_mut().filter(|s| s.status == TargetStatus::Ready && s.hello.is_some() && s.job.is_none() && !s.refreshing) {
+            if s.conn.as_mut().is_some_and(|c| c.send(&Cmd::Refresh).is_ok()) {
+                s.refreshing = true;
+            }
+        }
+        !self.slots.iter().any(|s| s.target.enabled && matches!(s.status, TargetStatus::Fresh | TargetStatus::Starting) && s.conn.is_some())
     }
 
     /// A job still in its preflight was never sent: drop it as `Cancelled` (nothing was written, no worker saw
@@ -1015,11 +1018,6 @@ impl Scheduler {
                 s.status = TargetStatus::Stopped;
             }
         }
-    }
-
-    /// Mark every target's stop as a refresh: tasks submitted until `rearm_stopped` wait instead of failing.
-    pub fn mark_rearm(&mut self) {
-        self.slots.iter_mut().for_each(|s| s.rearm = true);
     }
 
     /// Graceful stop of everything; queued jobs are cancelled. Poll `tick` until `all_stopped`.
@@ -1469,7 +1467,17 @@ impl Scheduler {
             return; // a dying/refused/stopped worker's hello means nothing
         }
         if self.slots[i].hello.is_some() {
-            self.lose(i, "duplicate hello".into(), ev);
+            let s = &mut self.slots[i];
+            if s.refreshing && s.status == TargetStatus::Ready && h.protocol == PROTOCOL {
+                // The answer to our `refresh`: same process, models re-read. A moved reference follows.
+                s.refreshing = false;
+                if self.reference_from.as_deref() == Some(s.target.id.as_str()) {
+                    self.reference = Some(digests(&h));
+                }
+                s.hello = Some(h);
+            } else {
+                self.lose(i, "duplicate hello".into(), ev);
+            }
             return;
         }
         let s = &mut self.slots[i];
@@ -1715,7 +1723,6 @@ impl Scheduler {
             match &s.status {
                 TargetStatus::Down(_) if s.conn.is_some() => pending = Some(c),
                 TargetStatus::Refused(r) | TargetStatus::Down(r) => reasons.push(r.clone()),
-                TargetStatus::Stopping | TargetStatus::Stopped if s.rearm => pending = Some(c),
                 TargetStatus::Stopping | TargetStatus::Stopped => reasons.push("stopped".into()),
                 TargetStatus::Fresh | TargetStatus::Starting => pending = Some(c),
                 TargetStatus::Ready => {

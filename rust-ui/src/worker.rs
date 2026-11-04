@@ -249,6 +249,8 @@ pub enum Cmd<'a> {
     Key(&'a KeyJob),
     Task(&'a crate::tasks::TaskJob),
     Cancel(&'a str),
+    /// Idle worker: re-read what is installed and say `hello` again (no restart).
+    Refresh,
     Shutdown,
 }
 impl Cmd<'_> {
@@ -262,6 +264,7 @@ impl Cmd<'_> {
             },
             Cmd::Task(j) => json!({"v":1,"cmd":"task","job":j}),
             Cmd::Cancel(id) => json!({"v":1,"cmd":"cancel","job_id":id}),
+            Cmd::Refresh => json!({"v":1,"cmd":"refresh"}),
             Cmd::Shutdown => json!({"v":1,"cmd":"shutdown"}),
         }
         .to_string()

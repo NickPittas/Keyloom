@@ -101,6 +101,7 @@ pub fn job(base: &Path, id: &str, n: usize, fake: &str) -> KeyJob {
         path_map: vec![],
         source_map: vec![],
         enforce_fixed_window: false,
+        hint_identity: None,
         require: Require {
             protocol: 1,
             models: [("corridorkey_v2".to_string(), Some("aa".to_string()))].into(),

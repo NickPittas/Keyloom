@@ -40,7 +40,10 @@ def reader():
 
 threading.Thread(target=reader, daemon=True).start()
 time.sleep(cfg.get("hello_delay", 0))
-emit({
+
+
+def hello_msg(refreshed=False):
+    return ({
     "event": "hello", "protocol": cfg.get("protocol", 1), "worker_rev": "fake", "engine": "corridorkey-v2",
     "host": cfg.get("host", "fakehost"),
     "gpu": None if cfg.get("no_gpu") else {"index": cfg.get("gpu", gpu), "name": "Fake GPU", "vram_gb": cfg.get("vram", 24.0),
@@ -48,8 +51,11 @@ emit({
     "models": {"corridorkey_v2": {"path": "/m/ck.safetensors", "bytes": 1, "sha256": cfg.get("sha")}},
     "capabilities": {"key": True, "generate_hint": True, "publish_modes": ["final"], "key_modes": cfg.get("key_modes", ["new", "resume", "replace"]),
                      "birefnet_variants": cfg.get("variants", ["Matting"]), "sam_models": cfg.get("sam", ["small", "base_plus", "large"]),
-                     "tasks": cfg.get("tasks", {k: True for k in ("gvm", "birefnet", "chroma", "sam_preview", "sam_track", "matanyone2", "videomama", "prematte_hint", "export_video", "prepare_source", "import_hint")})},
+                     "tasks": cfg.get("tasks_after_refresh" if refreshed and "tasks_after_refresh" in cfg else "tasks", {k: True for k in ("gvm", "birefnet", "chroma", "sam_preview", "sam_track", "matanyone2", "videomama", "prematte_hint", "export_video", "prepare_source", "import_hint")})},
 })
+
+
+emit(hello_msg())
 
 
 def cancelled(job_id, wait=0.0):
@@ -215,6 +221,9 @@ while True:
         run(c["job"])
         if eof:
             break
+    if c.get("cmd") == "refresh":  # the app asks an idle worker to re-read the installed models
+        log({"event": "refresh"})
+        emit(hello_msg(True))
     if c.get("cmd") in ("inspect_hint_lock", "clear_hint_lock"):
         lock_cmd(c)
     if c.get("cmd") == "task":

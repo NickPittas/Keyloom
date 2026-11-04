@@ -7,7 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -48,6 +48,47 @@ def _disable_external_progress_bars() -> None:
 
     sam2_misc.tqdm = _silent_tqdm
     sam2_video_predictor.tqdm = _silent_tqdm
+
+
+@contextmanager
+def _listed_frame_loader():
+    """Let ``init_state(video_path=[jpg paths])`` read the listed JPEGs where they are.
+
+    SAM2's own loader only takes a folder of ``<n>.jpg``. A list is loaded the same way
+    (eager, same resize/normalise); a folder still goes to the original loader. Callers hold
+    the tracker's GPU lock, so the temporary module patch is never seen by another track.
+    """
+    try:
+        import sam2.sam2_video_predictor as predictor_module
+        from sam2.utils.misc import _load_img_as_tensor
+        import torch
+    except Exception:
+        yield
+        return
+    original = predictor_module.load_video_frames
+
+    def load(video_path, image_size, offload_video_to_cpu, img_mean=(0.485, 0.456, 0.406),
+             img_std=(0.229, 0.224, 0.225), async_loading_frames=False,
+             compute_device=torch.device("cuda")):
+        if isinstance(video_path, str):
+            return original(video_path, image_size, offload_video_to_cpu, img_mean, img_std,
+                            async_loading_frames, compute_device)
+        mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
+        std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
+        images = torch.zeros(len(video_path), 3, image_size, image_size, dtype=torch.float32)
+        for n, path in enumerate(video_path):
+            images[n], height, width = _load_img_as_tensor(path, image_size)
+        if not offload_video_to_cpu:
+            images, mean, std = images.to(compute_device), mean.to(compute_device), std.to(compute_device)
+        images -= mean
+        images /= std
+        return images, height, width
+
+    predictor_module.load_video_frames = load
+    try:
+        yield
+    finally:
+        predictor_module.load_video_frames = original
 
 
 @dataclass(frozen=True)
@@ -236,14 +277,22 @@ class SAM2Tracker:
         on_progress: Callable[[int, int], None] | None = None,
         on_status: Callable[[str], None] | None = None,
         check_cancel: Callable[[], None] | None = None,
+        prepared: tuple[list[str], int, tuple[int, int]] | None = None,
     ) -> list[np.ndarray]:
-        """Track a single object through a clip from sparse prompt frames."""
-        if not frames:
+        """Track a single object through a clip from sparse prompt frames.
+
+        ``prepared`` = (JPEG paths in frame order, frame count, (h, w)): SAM reads those files
+        where they are (nothing is copied, linked, decoded or encoded here); ``frames`` is ignored.
+        """
+        if prepared is not None:
+            listed, total, frame_shape = list(prepared[0]), prepared[1], tuple(prepared[2])
+        elif frames:
+            listed, total, frame_shape = None, len(frames), frames[0].shape[:2]
+        else:
             return []
         if not prompt_frames:
             raise ValueError("SAM2 tracking requires at least one prompt frame")
 
-        frame_shape = frames[0].shape[:2]
         sanitized_prompts = [
             self._sanitize_prompt_frame(prompt, frame_shape)
             for prompt in prompt_frames
@@ -290,25 +339,26 @@ class SAM2Tracker:
                 f"Import error: {exc}"
             ) from exc
 
-        temp_root = Path(tempfile.mkdtemp(prefix="keyloom_sam2_"))
-        frames_dir = temp_root / "frames"
-        frames_dir.mkdir(parents=True, exist_ok=True)
+        temp_root = None if listed else Path(tempfile.mkdtemp(prefix="keyloom_sam2_"))
+        frames_dir = None if listed else temp_root / "frames"
+        if frames_dir is not None:
+            frames_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            if on_status:
-                on_status("Preparing JPEG frames for SAM2")
-            for idx, frame in enumerate(frames):
-                if check_cancel:
-                    check_cancel()
-                frame_path = frames_dir / f"{idx:05d}.jpg"
-                Image.fromarray(frame).save(frame_path, quality=95)
+            if temp_root is not None:
+                if on_status:
+                    on_status("Preparing JPEG frames for SAM2")
+                for idx, frame in enumerate(frames):
+                    if check_cancel:
+                        check_cancel()
+                    frame_path = frames_dir / f"{idx:05d}.jpg"
+                    Image.fromarray(frame).save(frame_path, quality=95)
 
             autocast_ctx = nullcontext()
             if self.device.startswith("cuda") and torch.cuda.is_available():
                 autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
 
             masks_by_frame: dict[int, np.ndarray] = {}
-            total = len(frames)
             sorted_prompts = sorted(sanitized_prompts, key=lambda item: item.frame_index)
             earliest_prompt = sorted_prompts[0].frame_index
             latest_prompt = sorted_prompts[-1].frame_index
@@ -316,11 +366,12 @@ class SAM2Tracker:
             with torch.inference_mode(), autocast_ctx:
                 if on_status:
                     on_status("Initializing SAM2")
-                inference_state = predictor.init_state(
-                    video_path=str(frames_dir),
-                    offload_video_to_cpu=self.offload_video_to_cpu,
-                    offload_state_to_cpu=self.offload_state_to_cpu,
-                )
+                with _listed_frame_loader():
+                    inference_state = predictor.init_state(
+                        video_path=listed if listed else str(frames_dir),
+                        offload_video_to_cpu=self.offload_video_to_cpu,
+                        offload_state_to_cpu=self.offload_state_to_cpu,
+                    )
 
                 def _apply_prompts():
                     """Add every sorted prompt into the predictor's state.
@@ -365,7 +416,7 @@ class SAM2Tracker:
                     masks_by_frame[frame_idx] = self._extract_object_mask(
                         obj_ids=obj_ids,
                         mask_logits=mask_logits,
-                        fallback_shape=frames[0].shape[:2],
+                        fallback_shape=frame_shape,
                     )
                     if on_progress:
                         on_progress(len(masks_by_frame), total)
@@ -405,15 +456,16 @@ class SAM2Tracker:
                         masks_by_frame[frame_idx] = self._extract_object_mask(
                             obj_ids=obj_ids,
                             mask_logits=mask_logits,
-                            fallback_shape=frames[0].shape[:2],
+                            fallback_shape=frame_shape,
                         )
                         if on_progress:
                             on_progress(len(masks_by_frame), total)
 
-            empty = np.zeros(frames[0].shape[:2], dtype=np.uint8)
+            empty = np.zeros(frame_shape, dtype=np.uint8)
             return [masks_by_frame.get(i, empty.copy()) for i in range(total)]
         finally:
-            shutil.rmtree(temp_root, ignore_errors=True)
+            if temp_root is not None:
+                shutil.rmtree(temp_root, ignore_errors=True)
 
     @staticmethod
     def _points_and_labels(prompt: PromptFrame) -> tuple[np.ndarray, np.ndarray]:

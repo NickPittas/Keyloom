@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -279,9 +280,10 @@ class FakeTracker:
     def __init__(self):
         self.calls = []
 
-    def track_video(self, frames, prompts, *, on_progress=None, on_status=None, check_cancel=None):
-        self.calls.append((len(frames), prompts))
-        return [np.full(f.shape[:2], 255 if i % 2 else 0, np.uint8) for i, f in enumerate(frames)]
+    def track_video(self, frames, prompts, *, on_progress=None, on_status=None, check_cancel=None, prepared=None):
+        n, shape = (prepared[1], prepared[2]) if prepared else (len(frames), frames[0].shape[:2])
+        self.calls.append((n, prompts))
+        return [np.full(shape, 255 if i % 2 else 0, np.uint8) for i in range(n)]
 
 
 def sam_svc(svc, monkeypatch):
@@ -289,6 +291,40 @@ def sam_svc(svc, monkeypatch):
     monkeypatch.setattr(svc, "_get_sam2_tracker", lambda **k: tr)
     monkeypatch.setattr(svc, "set_sam2_model", lambda m: tr.__dict__.setdefault("model", m))
     return tr
+
+
+def test_sam_retrack_with_a_new_job_id_reuses_the_clip_cache(env, svc, monkeypatch):
+    from backend.ffmpeg_tools import find_ffmpeg
+    from backend.service import prepared_frames as pf
+    if find_ffmpeg() is None:
+        pytest.skip("needs FFmpeg")
+    sam_svc(svc, monkeypatch)
+    batches, real = [], pf._ffmpeg_batch
+    monkeypatch.setattr(pf, "_ffmpeg_batch", lambda srcs, *a: (batches.append(len(srcs)), real(srcs, *a))[1])
+    p = {"tracker_model": "small", "frames": {STEMS[A]: {"points": [{"x": 2, "y": 2, "label": 1}]}}}
+    stg = lambda n: str(env.tmp / "staging" / n)  # noqa: E731  (<clip staging>/<job id>, like the app)
+    for jid in ("job-a", "job-b"):
+        _, done = run(svc, env.job("sam_track", p, job_id=jid, staging_dir=stg(jid)))
+        assert done["outcome"] == "complete", done
+    assert batches == [3]  # the second job (other id, other job folder) converted zero frames
+    assert sorted(os.listdir(env.tmp / "staging" / "sam-frames")) and not list((env.tmp / "staging" / "job-a").rglob("*.jpg"))
+
+
+def test_stale_work_folders_of_killed_jobs_are_swept_but_not_live_ones(env, svc, monkeypatch):
+    from backend.service import prepared_frames as pf
+    sam_svc(svc, monkeypatch)
+    old, fresh, cache = (env.tmp / "staging" / n for n in ("dead", "live", "sam-frames"))
+    for d in (old / "work-dead" / "clip", fresh / "work-live" / "clip", cache):
+        d.mkdir(parents=True)
+        (d / "x").write_text("x")
+    (old / "keep.txt").write_text("not ours")
+    long_ago = time.time() - pf.WORK_STALE_S - 100
+    for q in (old / "work-dead", old / "work-dead" / "clip", old / "work-dead" / "clip" / "x"):
+        os.utime(q, (long_ago, long_ago))
+    p = {"tracker_model": "small", "frames": {STEMS[A]: {"points": [{"x": 2, "y": 2, "label": 1}]}}}
+    run(svc, env.job("sam_track", p, staging_dir=str(env.tmp / "staging" / "now")))
+    assert not (old / "work-dead").exists() and (old / "keep.txt").exists()  # only work-*, job folder kept
+    assert (fresh / "work-live" / "clip" / "x").exists() and (cache / "x").exists()
 
 
 def test_sam_preview_writes_only_owned_preview(env, svc, monkeypatch):

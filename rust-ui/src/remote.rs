@@ -1175,7 +1175,7 @@ impl Remote {
         let hello_gpu = local.as_ref().and_then(|t| t.hello.as_ref()).and_then(|h| h.gpu.clone());
         let sample = if let View::Live(s) = env.metrics { Some(s.clone()) } else { None };
         // Only "Receive jobs" starts the worker ahead of work ("Ready receive jobs"): it must report its GPU to accept
-        // offers. An idle worker never blocks local actions or model repair (Models stops it).
+        // offers. An idle worker holds no model file, so it never blocks local actions or model repair.
         if env.cfg.local_host && env.cfg.receive && hello_gpu.is_none() && due(self.last_probe, Duration::from_secs(60)) {
             self.last_probe = Some(now);
             env.ai.probe_workers();
@@ -2245,6 +2245,21 @@ mod discovery_tests {
         assert_eq!(r.jobs[0].job_id.as_deref(), Some("job_1"));
         assert_eq!(r.jobs[0].state, "queued");
         assert!(r.jobs[0].submission.is_none());
+    }
+
+    #[test]
+    fn an_empty_claim_answer_starts_nothing_and_blocks_nothing() {
+        let mut r = free_remote(1.0, true);
+        let settings = Settings::default();
+        let mut ai = AiUi::new(&settings, None);
+        let view = View::Unavailable(String::new());
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let mut env = Env { settings: &settings, settings_path: None, ai: &mut ai, metrics: &view, repo: None, python: None, wake: &wake, cfg: Conn::default() };
+        r.claim_inflight = true;
+        r.on_claim(json!({"offer": null}), &mut env);
+        assert!(matches!(r.rx, Rx::Idle) && r.held.is_empty(), "nothing was taken");
+        assert!(!env.ai.scheduler().running() && env.ai.scheduler().all_stopped(), "no job, no worker started by the poll");
+        assert!(env.ai.model_asset_mutation_safe(), "the poll never gates a model change");
     }
 
     #[test]

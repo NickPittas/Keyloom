@@ -365,6 +365,11 @@ struct BatchRow {
     base: Option<RowBase>,
     /// The output location this row was planned with (`None` = the clip's default), for a network submission.
     location: Option<Value>,
+    /// A hint render already exists for this shot: what it is compatible with, and its frozen frame identity.
+    offer: Option<crate::pipeline::HintOffer>,
+    /// The hint steps a re-render queues (`steps` is empty while the user keeps "Reuse").
+    rerender: Vec<crate::tasks::TaskJob>,
+    reuse: bool,
 }
 
 /// The selected preset's resolved values for one shot: what "Use preset values" returns to.
@@ -460,6 +465,43 @@ fn row_problem(r: &BatchRow, net: &[(String, String)]) -> Option<(String, bool)>
 }
 
 impl BatchRow {
+    /// The user's "Reuse" / "Re-render" pick: Reuse queues zero hint steps (Key reads the existing frames, frozen
+    /// by identity); Re-render queues the steps again.
+    fn set_reuse(&mut self, reuse: bool) {
+        if self.offer.is_none() || self.reuse == reuse {
+            return;
+        }
+        self.reuse = reuse;
+        self.steps = if reuse { vec![] } else { self.rerender.clone() };
+        if !reuse && self.choice == Choice::Resume {
+            // an interrupted Key must not mix old and new hints
+            self.choice = match &self.state {
+                RowState::Existing { newver: Some(_), .. } => Choice::NewVersion,
+                _ => Choice::Skip,
+            };
+        }
+    }
+    /// The question shown for an existing hint render. A compatible one is reused without asking (see
+    /// `reuse_note`); only an unknown or known-different one stops the batch.
+    fn offer_text(&self) -> Option<String> {
+        use crate::hints::Compat;
+        let o = self.offer.as_ref()?;
+        let remote = if network_target(&self.placement).is_some() { " The other PC rechecks the hint only from when it accepts the job." } else { "" };
+        Some(match &o.compat {
+            Compat::Compatible | Compat::Missing => return None,
+            Compat::Unrecorded => format!(
+                "A hint render exists. {}: reuse or re-render?{remote}",
+                o.note.as_deref().unwrap_or("Settings not recorded")
+            ),
+            Compat::Mismatch(why) => format!("A hint render exists but {why}: re-render, or reuse it anyway?{remote}"),
+        })
+    }
+    /// The visible note for a shot whose existing, compatible hint is reused automatically.
+    fn reuse_note(&self) -> Option<String> {
+        let o = self.offer.as_ref().filter(|o| o.compat == crate::hints::Compat::Compatible && self.reuse)?;
+        let remote = if network_target(&self.placement).is_some() { ", the other PC rechecks it from when it accepts the job" } else { "" };
+        Some(format!("{}: reusing the existing hint ({} frame(s), made with these settings from these frames{remote})", self.clip.display_name, o.identity.len()))
+    }
     /// Hints are regenerated ahead of Key: frames of an interrupted run were keyed with the OLD hint, so
     /// continuing it would mix old and new hints in one result.
     fn regenerates(&self) -> bool {
@@ -547,9 +589,8 @@ pub struct AiUi {
     pending_targets: Option<Vec<Target>>,
     /// Model assets are being installed or repaired; do not start workers against a changing tree.
     model_mutation_active: bool,
-    /// A stop was asked for a model change or capability refresh: once the worker has exited it is made
-    /// startable again (never left "Stopped" for the next action to fail on).
-    pub(crate) rearm_after_stop: bool,
+    /// A model operation ended: the idle local worker is asked once to re-read what is installed.
+    caps_stale: bool,
     /// Screen rectangles from the last frame (click tests).
     pub key_rect: Option<egui::Rect>,
     pub batch_confirm_rect: Option<egui::Rect>,
@@ -704,7 +745,7 @@ impl AiUi {
             lock_remove_temps: false,
             pending_targets: None,
             model_mutation_active: false,
-            rearm_after_stop: false,
+            caps_stale: false,
             key_rect: None,
             batch_confirm_rect: None,
             batch_preset_rect: None,
@@ -846,6 +887,10 @@ impl AiUi {
                     return;
                 }
             }
+        }
+        if b.rows.iter().any(|r| r.offer_text().is_some()) {
+            b.auto = false; // the review stays open: "A hint render exists: reuse or re-render?"
+            return;
         }
         let why = b.rows.iter().find_map(|r| match &r.state {
             _ if r.plan().is_some() => export_block(r),
@@ -1355,9 +1400,23 @@ impl AiUi {
                         overrides,
                         base,
                         location,
+                        offer: None,
+                        rerender: vec![],
+                        reuse: false,
                     }
                 })
                 .collect();
+            // A hint that is already on disk is offered for reuse (decided here, off the UI thread: it reads frames).
+            for r in rows.iter_mut().filter(|r| r.hint.is_some() && !r.steps.is_empty()) {
+                if let Some(o) = crate::pipeline::hint_offer(&r.clip, &r.steps) {
+                    let reuse = o.compat != crate::hints::Compat::Missing && !matches!(o.compat, crate::hints::Compat::Mismatch(_));
+                    if o.compat != crate::hints::Compat::Missing {
+                        r.rerender = r.steps.clone();
+                        r.offer = Some(o);
+                        r.set_reuse(reuse);
+                    }
+                }
+            }
             // Two clips writing the same files/folder: the later one is held back, named.
             let hits = crate::pipeline::collisions(
                 rows.iter()
@@ -2741,7 +2800,7 @@ impl AiUi {
             }
         }
         let Some(b) = &self.batch else { return };
-        if b.quick && !b.rows.is_empty() && b.rows.iter().all(|r| row_problem(r, &self.net_targets).is_none()) {
+        if b.quick && !b.rows.is_empty() && b.rows.iter().all(|r| row_problem(r, &self.net_targets).is_none() && r.offer_text().is_none()) {
             self.confirm_batch();
             return;
         }
@@ -2754,22 +2813,40 @@ impl AiUi {
             let net = self.net_targets.clone();
             let Some(b) = self.batch.as_mut() else { return };
             let total = b.rows.len();
-            let need = b.rows.iter().filter(|r| row_problem(r, &net).is_some()).count();
+            let need = b.rows.iter().filter(|r| row_problem(r, &net).is_some() || r.offer_text().is_some()).count();
             ui.label(RichText::new(format!("{} clip(s) ready; {need} need a decision.", total - need)).color(DIM));
+            for n in b.rows.iter().filter(|r| r.plan().is_some()).filter_map(|r| r.reuse_note()) {
+                ui.label(RichText::new(n).color(DIM).size(12.0));
+            }
             // The rows scroll; the verdict and the Queue/Cancel buttons stay reachable below them.
             let max_h = (ui.available_height() * 0.5).max(140.0);
             egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
             for r in &mut b.rows {
-                let Some((text, ok_allowed)) = row_problem(r, &net) else { continue };
-                if !ok_allowed && r.choice != Choice::Skip {
+                let offer = if matches!(r.state, RowState::Blocked(_)) { None } else { r.offer_text() };
+                let problem = row_problem(r, &net);
+                if problem.is_none() && offer.is_none() {
+                    continue;
+                }
+                let (text, ok_allowed) = problem.clone().unwrap_or_default();
+                if problem.as_ref().is_some_and(|p| !p.1) && r.choice != Choice::Skip {
                     r.choice = Choice::Skip; // a problem the user cannot accept never queues
                 }
                 let ok = if matches!(r.state, RowState::Existing { .. }) { Choice::NewVersion } else { Choice::Queue };
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(&r.clip.display_name).strong());
-                    ui.colored_label(if ok_allowed { WARN } else { BAD }, trunc(&text));
-                    if ok_allowed {
+                    if problem.is_some() {
+                        ui.colored_label(if ok_allowed { WARN } else { BAD }, trunc(&text));
+                    }
+                    if problem.is_some() && ok_allowed {
                         ui.selectable_value(&mut r.choice, ok, "OK");
+                    }
+                    if let Some(q) = &offer {
+                        ui.colored_label(WARN, trunc(q));
+                        let mut reuse = r.reuse;
+                        let mismatch = matches!(r.offer.as_ref().map(|o| &o.compat), Some(crate::hints::Compat::Mismatch(_)));
+                        ui.selectable_value(&mut reuse, true, if mismatch { "Reuse anyway" } else { "Reuse" });
+                        ui.selectable_value(&mut reuse, false, "Re-render");
+                        r.set_reuse(reuse);
                     }
                     ui.selectable_value(&mut r.choice, Choice::Skip, "Skip");
                     if !r.overrides.is_empty() {
@@ -2863,6 +2940,7 @@ impl AiUi {
         }
         let Some(b) = self.batch.take() else { return };
         let rows = b.rows;
+        let reused: Vec<String> = rows.iter().filter(|r| r.plan().is_some()).filter_map(|r| r.reuse_note()).collect();
         let (mut queued, mut waiting, mut errs) = (0, 0, vec![]);
         let mut per_client: BTreeMap<String, usize> = BTreeMap::new();
         for r in rows {
@@ -2892,6 +2970,9 @@ impl AiUi {
         );
         if waiting > 0 {
             m += &format!(" {waiting} waiting for a free PC.");
+        }
+        if !reused.is_empty() {
+            m += &format!(" {}.", reused.join("; "));
         }
         if !errs.is_empty() {
             m += &format!(" Not queued: {}", errs.join(" "));
@@ -3237,7 +3318,9 @@ impl AiUi {
 
     /// One pipeline row: hint steps > Key > export, all-or-nothing (an earlier job is cancelled again if a later
     /// one is refused). The clip's hint settings are saved only once everything is queued.
-    fn submit_pipeline_row(&mut self, r: &BatchRow, plan: Plan) -> Result<String, String> {
+    fn submit_pipeline_row(&mut self, r: &BatchRow, mut plan: Plan) -> Result<String, String> {
+        // Reusing an existing hint: Key refuses to start (or resume) if those frames changed after this review.
+        plan.job.hint_identity = r.offer.as_ref().filter(|_| r.reuse && r.steps.is_empty()).map(|o| o.identity.clone());
         let exports = match &r.export {
             Some(x) => crate::pipeline::export_jobs(
                 &r.clip,
@@ -3349,22 +3432,23 @@ impl AiUi {
     }
     pub fn set_model_mutation_active(&mut self, active: bool) {
         self.model_mutation_active = active;
-        if self.rearm_after_stop && !active && self.sched.all_stopped() {
-            self.sched.rearm_stopped();
-            self.rearm_after_stop = false;
-        }
     }
-    /// Model assets are safe to change only after observed worker exits and resolved job fences. A live idle
-    /// worker reads as "not yet safe"; the Models page (given `worker_activity()`) stops it itself and waits for
-    /// the exit, so only a job that really runs or an unresolved fence refuses the change.
+    /// The one rule for Install/Repair/Delete: no job is queued or running on this PC's worker and no fence is
+    /// unresolved. An idle worker holds no model file (every job unloads its models), so it never matters.
     pub fn model_asset_mutation_safe(&self) -> bool {
-        self.sched.all_stopped()
-            && self.sched.needs_attention().is_empty()
+        self.sched.needs_attention().is_empty()
             && self.sched.task_attention().is_empty()
             && !self.sched.running()
     }
-    pub fn workers_need_stop_for_model_change(&self) -> bool {
-        self.running_jobs() || !self.sched.all_stopped()
+    /// The models changed: ask every idle local worker (once it is up) to re-read what is installed, so the
+    /// next job and the buttons see it without a restart.
+    pub fn refresh_capabilities(&mut self) {
+        self.caps_stale = true;
+    }
+    pub fn refresh_tick(&mut self) {
+        if self.caps_stale && !self.model_mutation_active && self.sched.refresh_idle_workers() {
+            self.caps_stale = false;
+        }
     }
     pub fn unresolved_model_fences(&self) -> bool {
         !self.unresolved().is_empty()
@@ -3373,11 +3457,10 @@ impl AiUi {
     pub fn workers_alive(&self) -> bool {
         !self.sched.all_stopped()
     }
-    /// Graceful stop of everything: queued jobs are cancelled, workers get EOF and finish their `done`.
+    /// Graceful stop of everything (the app is closing): queued jobs are cancelled, workers get EOF and finish
+    /// their `done`.
     pub fn begin_stop(&mut self) {
-        self.rearm_after_stop = true;
         self.sched.stop_all();
-        self.sched.mark_rearm();
         self.disk_gen += 1;
     }
     pub fn all_stopped(&self) -> bool {
@@ -3644,34 +3727,27 @@ mod tests {
     fn model_changes_are_safe_with_no_worker_alive() {
         let ai = AiUi::new(&Settings::default(), None);
         assert!(ai.model_asset_mutation_safe());
-        assert!(!ai.workers_need_stop_for_model_change());
         assert!(!ai.unresolved_model_fences());
     }
 
     #[test]
-    fn an_idle_worker_never_blocks_actions_and_is_restartable_after_a_model_change() {
+    fn an_idle_worker_never_blocks_a_model_change_and_is_never_restarted_for_one() {
         let mut ai = fake_ai("idle");
         assert!(ai.local_worker_unstarted(), "a fresh worker counts as available");
         ai.sched.probe(None);
         assert!(ai.local_worker_unstarted(), "a starting (probing) worker counts as available");
         until(&mut ai, "worker ready", |a| a.local_caps().is_some());
-        // Live and idle: no job, so it is Idle (never "working") and a model change may stop it.
+        // Live and idle: no job, so it is Idle (never "working") and the change is allowed as it stands.
         assert_eq!(ai.worker_activity(), crate::ui::models::WorkerActivity::Idle);
-        assert!(ai.workers_alive() && !ai.model_asset_mutation_safe() && ai.workers_need_stop_for_model_change());
+        assert!(ai.workers_alive() && ai.model_asset_mutation_safe());
         assert!(!ai.unresolved_model_fences());
-        // The Models page stops it for a model change; the change is active while it runs.
-        ai.begin_stop();
+        // The change runs and ends with the worker untouched: same process, still Ready.
         ai.set_model_mutation_active(true);
-        until(&mut ai, "worker exited", |a| a.all_stopped());
-        ai.set_model_mutation_active(true);
-        assert!(ai.sched.targets()[0].status == TargetStatus::Stopped, "stays stopped while the change runs");
-        assert!(ai.model_asset_mutation_safe());
-        // The change ended: the target is startable again, so the next action (or Receive jobs) starts it.
+        ai.sched.tick();
+        assert_eq!(ai.sched.targets()[0].status, TargetStatus::Ready);
         ai.set_model_mutation_active(false);
-        assert_eq!(ai.sched.targets()[0].status, TargetStatus::Fresh);
-        assert!(ai.local_worker_unstarted() && !ai.rearm_after_stop);
-        ai.sched.probe(None);
-        until(&mut ai, "worker restarted", |a| a.local_caps().is_some());
+        assert_eq!(ai.sched.targets()[0].status, TargetStatus::Ready);
+        assert!(ai.local_caps().is_some() && ai.model_asset_mutation_safe());
         let _ = ai.begin_stop();
         until(&mut ai, "worker exited", |a| a.all_stopped());
     }
@@ -3717,6 +3793,9 @@ mod tests {
             overrides: vec![],
             base: None,
             location: None,
+            offer: None,
+            rerender: vec![],
+            reuse: false,
         };
         let step = crate::tasks::TaskJob {
             job_id: "t".into(),
@@ -3732,6 +3811,64 @@ mod tests {
         assert!(row(Some(HintCfg::default()), vec![]).plan().is_some(), "no regeneration: resume is fine");
         assert!(row(None, vec![step.clone()]).plan().is_some(), "non-pipeline rows keep their behaviour");
         assert!(row(Some(HintCfg::default()), vec![step]).plan().is_none(), "regenerated hint: never resume");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn reusing_an_existing_hint_queues_zero_steps_and_keeps_resume() {
+        use crate::hints::Compat;
+        let d = std::env::temp_dir().join(format!("ck-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("clips/a/Frames")).unwrap();
+        std::fs::write(d.join("clips/a/Frames/f_1101.png"), b"x").unwrap();
+        std::fs::write(d.join("project.json"), r#"{"version":2}"#).unwrap();
+        let clip = load_project(&d, &LoadOptions::default()).unwrap().clips[0].clone();
+        let step = crate::tasks::TaskJob {
+            job_id: "t".into(),
+            kind: crate::tasks::TaskKind::Gvm,
+            clip_id: "c".into(),
+            clip_root: clip.root.clone(),
+            range: None,
+            params: serde_json::json!({}),
+            staging_dir: None,
+            publish_dir: None,
+            require: crate::jobs::Require { protocol: 1, models: BTreeMap::new() },
+        };
+        let row = |compat: Compat| {
+            let mut r = BatchRow {
+                steps: vec![step.clone()],
+                clip: clip.clone(),
+                params: Params::default(),
+                out: OutputCfg::default(),
+                range: (0, 0),
+                state: RowState::Existing { reason: "x".into(), newver: Some(plan_for(&clip)), resume: Some(plan_for(&clip)), replace: None },
+                choice: Choice::Resume,
+                placement: Placement::Auto,
+                hint: Some(HintCfg::default()),
+                note: None,
+                export: None,
+                overrides: vec![],
+                base: None,
+                location: None,
+                rerender: vec![step.clone()],
+                offer: Some(crate::pipeline::HintOffer { compat, identity: BTreeMap::from([("f_1101".to_string(), "1:2".to_string())]), note: None }),
+                reuse: false,
+            };
+            r.set_reuse(true);
+            r
+        };
+        let mut r = row(Compat::Compatible);
+        assert!(r.steps.is_empty() && r.reuse, "Reuse queues zero hint steps");
+        assert!(r.plan().is_some(), "and an interrupted Key can still resume (the worker refuses a changed hint)");
+        assert!(r.offer_text().is_none(), "a compatible hint is reused without stopping");
+        assert!(r.reuse_note().unwrap().contains("reusing the existing hint"));
+        r.set_reuse(false);
+        assert!(r.reuse_note().is_none());
+        assert_eq!(r.steps.len(), 1, "Re-render brings the hint steps back");
+        assert_eq!(r.choice, Choice::NewVersion, "and a mixed old/new Resume is dropped");
+        assert!(row(Compat::Unrecorded).offer_text().unwrap().contains("Settings not recorded"));
+        assert!(row(Compat::Mismatch("generation settings differ".into())).offer_text().unwrap().contains("generation settings differ"));
+        assert!(row(Compat::Missing).offer_text().is_none(), "nothing to reuse, nothing to ask");
         let _ = std::fs::remove_dir_all(d);
     }
     fn auto_fixture(tag: &str, n: usize) -> (AiUi, std::path::PathBuf) {
@@ -3766,6 +3903,9 @@ mod tests {
                 overrides: vec![],
                 base: None,
                 location: None,
+                offer: None,
+                rerender: vec![],
+                reuse: false,
             };
             ai.auto_pending.push_back(AutoShot { row, plan, project: p.clone(), st: st.clone(), preset_name: None, failed_on: vec![], paused: false, on: None });
         }

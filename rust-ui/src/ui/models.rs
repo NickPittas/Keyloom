@@ -148,7 +148,6 @@ pub struct Page {
     initialized: bool,
     stop_after_active: bool,
     pending_check: bool,
-    stop_workers_available: bool,
     unresolved_worker_fences: bool,
     check_expected: BTreeSet<String>,
     check_seen: BTreeSet<String>,
@@ -157,9 +156,8 @@ pub struct Page {
     confirm_delete: Option<String>,
     /// `None` until the app reports it: then the old rule (any live worker blocks) applies.
     worker: Option<WorkerActivity>,
-    /// A model change waiting for the idle worker to exit.
-    pending_mutation: Option<Action>,
-    stop_requested: bool,
+    /// A verify/install/repair/delete finished: what the worker reports as ready may have changed.
+    readiness_changed: bool,
 }
 
 impl Page {
@@ -190,7 +188,6 @@ impl Page {
             initialized: false,
             stop_after_active: false,
             pending_check: false,
-            stop_workers_available: false,
             unresolved_worker_fences: false,
             check_expected: BTreeSet::new(),
             check_seen: BTreeSet::new(),
@@ -198,8 +195,7 @@ impl Page {
             search: String::new(),
             confirm_delete: None,
             worker: None,
-            pending_mutation: None,
-            stop_requested: false,
+            readiness_changed: false,
         }
     }
 
@@ -289,14 +285,10 @@ impl Page {
         }))
     }
 
-    pub fn set_asset_safety(
-        &mut self,
-        blocked: bool,
-        can_stop_workers: bool,
-        unresolved_fences: bool,
-    ) {
+    /// `blocked`: a job is queued or running (or a fence is unresolved) on this PC's worker. Nothing else blocks
+    /// a model change: an idle worker holds no model file.
+    pub fn set_asset_safety(&mut self, blocked: bool, unresolved_fences: bool) {
         self.assets_in_use = blocked;
-        self.stop_workers_available = can_stop_workers;
         self.unresolved_worker_fences = unresolved_fences;
     }
 
@@ -304,25 +296,9 @@ impl Page {
         self.worker = a;
     }
 
-    /// Install/Repair/Delete may go ahead: nothing uses the models, or only an idle worker does (stopped first).
-    fn mutation_allowed(&self) -> bool {
-        !self.assets_in_use || (self.worker == Some(WorkerActivity::Idle) && !self.unresolved_worker_fences)
-    }
-
-    /// Start a model change; an idle worker is stopped first and the change starts once it has exited.
-    fn request_mutation(&mut self, action: Action, ctx: &egui::Context) {
-        if self.assets_in_use && self.mutation_allowed() {
-            self.pending_mutation = Some(action);
-            self.stop_requested = true;
-            self.last_outcome = Some(("Stopping the idle worker first; the change starts when it has exited.".into(), true));
-        } else {
-            self.start(action, ctx);
-        }
-    }
-
+    /// A model operation is running, so the app must not start a worker (it would read files mid-change).
     pub fn blocks_worker_launch(&self) -> bool {
-        // A waiting change must not see its stopped worker started again before it can begin.
-        self.pending_mutation.is_some() || self.active.as_ref().is_some_and(|r| {
+        self.active.as_ref().is_some_and(|r| {
             matches!(
                 r.action,
                 Action::Download(_) | Action::DownloadProfile(_) | Action::Repair(_) | Action::Delete(_)
@@ -467,16 +443,6 @@ impl Page {
     }
 
     pub fn tick(&mut self, ctx: &egui::Context) {
-        if self.pending_mutation.is_some() {
-            if !self.assets_in_use {
-                if let Some(a) = self.pending_mutation.take() {
-                    self.start(a, ctx);
-                }
-            } else if !self.mutation_allowed() && self.worker != Some(WorkerActivity::Queued) {
-                self.pending_mutation = None;
-                self.last_outcome = Some(("A job is running on the worker, so the model change was not made. Try again when it ends.".into(), false));
-            }
-        }
         let active_events: Vec<_> = self
             .active
             .as_ref()
@@ -830,9 +796,9 @@ impl Page {
         if self.cancel_requested && !cancelled {
             outcome = format!("Operation ended before cancellation was confirmed: {outcome}");
         }
-        // Readiness changed under an idle worker: stop it so the next action starts it with fresh capabilities.
-        if looks_successful && !cancelled && self.worker == Some(WorkerActivity::Idle) && may_change_readiness(&r.action) {
-            self.stop_requested = true;
+        // The running worker re-reads what is installed (no restart): the app asks it to once, when this ends.
+        if looks_successful && !cancelled && may_change_readiness(&r.action) {
+            self.readiness_changed = true;
         }
         if r.action.name() != "catalog" && r.action.name() != "check" {
             self.last_outcome = Some((outcome.clone(), looks_successful && !cancelled));
@@ -928,22 +894,21 @@ impl Page {
         open
     }
 
-    pub fn ui(&mut self, ui: &mut Ui) -> bool {
+    pub fn ui(&mut self, ui: &mut Ui) {
         if !self.initialized {
             self.start_background(ui.ctx());
         }
         self.tick(ui.ctx());
-        let mut stop_workers = false;
         egui::Panel::bottom("models_actions").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 let idle = !self.busy();
-                let can_change = idle && self.mutation_allowed() && self.pending_mutation.is_none();
+                let can_change = idle && !self.assets_in_use;
                 if ui.add_enabled_ui(can_change, |ui| theme::primary_button(ui, "Install required models")).inner.on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
-                    self.request_mutation(Action::DownloadProfile(Profile::Required), ui.ctx());
+                    self.start(Action::DownloadProfile(Profile::Required), ui.ctx());
                 }
                 if ui.add_enabled(can_change, egui::Button::new("Install full profile")).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
-                    self.request_mutation(Action::DownloadProfile(Profile::Full), ui.ctx());
+                    self.start(Action::DownloadProfile(Profile::Full), ui.ctx());
                 }
                 if ui.add_enabled(idle, egui::Button::new("Verify all")).clicked() {
                     self.start(Action::VerifyAll, ui.ctx());
@@ -957,22 +922,15 @@ impl Page {
                 }
             });
             if let Some(w) = &self.worker {
-                ui.label(RichText::new(w.label()).color(theme::text_dim(ui))).on_hover_text("With Receive jobs on, this computer starts its worker ahead of work so it can report its GPU and accept jobs. An idle worker never blocks anything: Install, Repair and Delete stop it for you.");
+                ui.label(RichText::new(w.label()).color(theme::text_dim(ui))).on_hover_text("With Receive jobs on, this computer starts its worker ahead of work so it can report its GPU and accept jobs. An idle worker holds no model files and never blocks anything; Install, Repair and Delete only wait for a running job.");
             }
-            if self.assets_in_use && !self.mutation_allowed() {
-                ui.colored_label(BAD, "Install, Repair and Delete are disabled until workers have exited and job fences are resolved.");
-                if self.stop_workers_available && ui.button("Stop workers").clicked() {
-                    stop_workers = true;
-                }
+            if self.assets_in_use {
+                ui.colored_label(BAD, "Install, Repair and Delete are disabled while a job is queued or running on this PC's worker.");
                 if self.unresolved_worker_fences {
                     ui.colored_label(BAD, "Unresolved Key job fences still block model changes. Return to Key to resolve them.");
                 }
             } else if self.busy() {
                 ui.colored_label(BAD, "One model operation at a time; wait for it to finish before starting another.");
-            }
-            if self.pending_mutation.is_some() && ui.button("Cancel pending change").clicked() {
-                self.pending_mutation = None;
-                self.last_outcome = Some(("The pending model change was cancelled.".into(), true));
             }
             if let Some(r) = &self.active {
                 ui.label(RichText::new(format!("{} running…", r.action.name())).strong());
@@ -1024,18 +982,11 @@ impl Page {
             }
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| self.detail(ui));
         });
-        // Read after the buttons above had their say: a stop they asked for happens in this very frame.
-        self.take_stop_request() || stop_workers
     }
 
-    /// A model change or a model check wants the idle worker stopped (it restarts with fresh capabilities).
-    pub fn take_stop_request(&mut self) -> bool {
-        std::mem::take(&mut self.stop_requested)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn raise_stop_request_for_test(&mut self) {
-        self.stop_requested = true;
+    /// An operation that can change what is installed and verified just ended well (taken once).
+    pub fn take_readiness_changed(&mut self) -> bool {
+        std::mem::take(&mut self.readiness_changed)
     }
 
     fn nav(&mut self, ui: &mut Ui) {
@@ -1112,16 +1063,16 @@ impl Page {
                 ui.label(RichText::new("Local runtime code/packages cannot be installed or deleted here; update or repair the app runtime.").color(theme::TEXT_DIM));
             } else {
                 ui.add_space(4.0);
-                let can_change = actions_enabled && self.mutation_allowed() && self.pending_mutation.is_none();
+                let can_change = actions_enabled && !self.assets_in_use;
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_enabled(can_change, egui::Button::new(RichText::new("Download").color(if item.present != Some(true) { Color32::from_rgb(21, 36, 26) } else { theme::TEXT })).fill(if item.present != Some(true) { theme::ACCENT } else { theme::BUTTON })).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
-                        self.request_mutation(Action::Download(item.id.clone()), ui.ctx());
+                        self.start(Action::Download(item.id.clone()), ui.ctx());
                     }
                     if ui.add_enabled(actions_enabled, egui::Button::new(RichText::new("Verify").color(if item.present == Some(true) { Color32::from_rgb(21, 36, 26) } else { theme::TEXT })).fill(if item.present == Some(true) { theme::ACCENT } else { theme::BUTTON })).clicked() {
                         self.start(Action::Verify(item.id.clone()), ui.ctx());
                     }
                     if ui.add_enabled(can_change, egui::Button::new("Repair")).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
-                        self.request_mutation(Action::Repair(item.id.clone()), ui.ctx());
+                        self.start(Action::Repair(item.id.clone()), ui.ctx());
                     }
                     let deletable = can_change && matches!(item.state.as_deref(), Some("installed" | "partial"));
                     if ui.add_enabled(deletable, egui::Button::new(RichText::new("Delete…").color(BAD))).on_disabled_hover_text("Only installed or partial assets can be deleted, and not while a job runs on the worker.").clicked() {
@@ -1138,7 +1089,7 @@ impl Page {
                             ui.horizontal_wrapped(|ui| {
                                 if ui.button(RichText::new("Delete files").color(BAD)).clicked() {
                                     self.confirm_delete = None;
-                                    self.request_mutation(Action::Delete(item.id.clone()), ui.ctx());
+                                    self.start(Action::Delete(item.id.clone()), ui.ctx());
                                 }
                                 if ui.button("Keep").clicked() {
                                     self.confirm_delete = None;
@@ -1229,7 +1180,7 @@ fn is_asset_mutation(action: &Action) -> bool {
     )
 }
 
-/// Operations that can change what a worker would report; a Check only looks, so it never stops the worker.
+/// Operations that can change what a worker would report; a Check only looks.
 fn may_change_readiness(action: &Action) -> bool {
     is_asset_mutation(action) || matches!(action, Action::Verify(_) | Action::VerifyAll)
 }
@@ -1817,64 +1768,24 @@ mod tests {
     }
 
     #[test]
-    fn asset_mutation_is_blocked_until_worker_and_fence_safety_is_confirmed() {
+    fn asset_mutation_is_blocked_only_by_a_job_or_an_unresolved_fence() {
         let mut page = Page::from_runtime(Err("unused".into()));
-        page.set_asset_safety(true, true, false);
-        assert!(page.assets_in_use);
-        assert!(page.stop_workers_available);
-        assert!(!page.unresolved_worker_fences);
-        page.set_asset_safety(true, false, true);
+        page.set_asset_safety(true, false);
+        assert!(page.assets_in_use && !page.unresolved_worker_fences);
+        page.set_asset_safety(true, true);
         assert!(page.unresolved_worker_fences);
-        page.set_asset_safety(false, false, false);
+        page.set_asset_safety(false, false);
         assert!(!page.assets_in_use);
     }
 
     #[test]
-    fn idle_worker_never_blocks_model_changes_but_a_running_job_does() {
-        let mut page = Page::from_runtime(Err("unused".into()));
-        let ctx = egui::Context::default();
-        // Unknown worker state keeps the old, strict rule.
-        page.set_asset_safety(true, true, false);
-        assert!(!page.mutation_allowed());
-        // Idle worker: Repair is accepted, the worker is stopped, and it starts once the exit is seen.
-        page.set_worker_activity(Some(WorkerActivity::Idle));
-        assert!(page.mutation_allowed());
-        page.request_mutation(Action::Repair("key".into()), &ctx);
-        assert_eq!(page.pending_mutation, Some(Action::Repair("key".into())));
-        assert!(page.stop_requested);
-        page.tick(&ctx);
-        assert!(page.pending_mutation.is_some(), "still waiting for the worker to exit");
-        page.set_asset_safety(false, false, false);
-        page.set_worker_activity(Some(WorkerActivity::Stopped));
-        page.tick(&ctx);
-        assert!(page.pending_mutation.is_none());
-        // A job that really runs refuses the change, and cancels one that was waiting.
-        page.set_asset_safety(true, true, false);
-        page.set_worker_activity(Some(WorkerActivity::Working("Track prompts".into())));
-        assert!(!page.mutation_allowed());
-        page.pending_mutation = Some(Action::Delete("key".into()));
-        page.tick(&ctx);
-        assert!(page.pending_mutation.is_none());
-        assert_eq!(page.last_outcome.as_ref().map(|o| o.1), Some(false));
-        // Work that is only queued (clicked while the worker stops) leaves a waiting change pending.
-        page.pending_mutation = Some(Action::Repair("key".into()));
-        page.set_worker_activity(Some(WorkerActivity::Queued));
-        page.tick(&ctx);
-        assert_eq!(page.pending_mutation, Some(Action::Repair("key".into())));
-        page.set_worker_activity(Some(WorkerActivity::Working("Key".into())));
-        page.tick(&ctx);
-        assert!(page.pending_mutation.is_none());
-        // Unresolved fences refuse even with an idle worker.
-        page.set_asset_safety(true, true, true);
-        page.set_worker_activity(Some(WorkerActivity::Idle));
-        assert!(!page.mutation_allowed());
-    }
-
-    #[test]
-    fn only_readiness_changing_operations_stop_an_idle_worker() {
+    fn only_readiness_changing_operations_ask_the_worker_to_re_read() {
         assert!(!may_change_readiness(&Action::Check) && !may_change_readiness(&Action::Catalog));
         assert!(may_change_readiness(&Action::Verify("k".into())) && may_change_readiness(&Action::VerifyAll));
         assert!(may_change_readiness(&Action::Repair("k".into())) && may_change_readiness(&Action::Delete("k".into())));
+        let mut page = Page::from_runtime(Err("unused".into()));
+        page.readiness_changed = true;
+        assert!(page.take_readiness_changed() && !page.take_readiness_changed(), "taken once");
     }
 
     #[test]
@@ -1885,28 +1796,16 @@ mod tests {
     }
 
     #[test]
-    fn verify_is_not_gated_by_the_worker() {
+    fn an_idle_worker_never_gates_a_model_change() {
+        // The page only sees "a job runs or is queued"; the worker's own state (idle, starting, stopped) is a label.
         let mut page = Page::from_runtime(Err("unused".into()));
-        // Verify/Refresh only wait for model operations: an idle worker and a running job both leave them enabled,
-        // while only the running job (or an unresolved fence) stops Install/Repair/Delete.
-        for (activity, change_ok) in [(WorkerActivity::Idle, true), (WorkerActivity::Working("Key".into()), false)] {
-            page.set_asset_safety(true, true, false);
+        for activity in [WorkerActivity::Idle, WorkerActivity::Stopped] {
+            page.set_asset_safety(false, false);
             page.set_worker_activity(Some(activity));
-            assert!(!page.busy());
-            assert_eq!(page.mutation_allowed(), change_ok);
+            assert!(!page.assets_in_use && !page.blocks_worker_launch());
         }
-    }
-
-    #[test]
-    fn a_pending_change_can_be_cancelled_and_its_stop_request_is_taken_once() {
-        let mut page = Page::from_runtime(Err("unused".into()));
-        let ctx = egui::Context::default();
-        page.set_asset_safety(true, true, false);
-        page.set_worker_activity(Some(WorkerActivity::Idle));
-        page.request_mutation(Action::Repair("key".into()), &ctx);
-        assert!(page.blocks_worker_launch(), "a waiting change keeps its stopped worker from restarting");
-        assert!(page.take_stop_request() && !page.take_stop_request());
-        page.pending_mutation = None; // what "Cancel pending change" does
-        assert!(!page.blocks_worker_launch());
+        page.set_asset_safety(true, false);
+        page.set_worker_activity(Some(WorkerActivity::Working("Key".into())));
+        assert!(page.assets_in_use);
     }
 }

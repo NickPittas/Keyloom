@@ -1015,6 +1015,7 @@ fn build(
         },
         source_map: vec![],
         enforce_fixed_window: false,
+        hint_identity: None,
     }
 }
 

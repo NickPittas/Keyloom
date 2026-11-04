@@ -268,6 +268,19 @@ fn the_range_must_name_this_pcs_own_frames_by_stem() {
 }
 
 #[test]
+fn the_receiver_freezes_the_hint_it_accepted_so_key_can_recheck_it() {
+    let p = pcs("sub-freeze");
+    let frozen = spec(&p, "full", None).preflight(&roots(&p.b), "j").unwrap().job.hint_identity.expect("frozen on accept");
+    assert_eq!(frozen.keys().cloned().collect::<Vec<_>>(), ["f_1101", "f_1102", "f_1103"]);
+    assert!(spec(&p, "none", None).preflight(&roots(&p.b), "j").unwrap().job.hint_identity.is_none());
+    let marked = ck::persist::save_keyframes(&p.b.join("projects/Show/clips/shot_01"), &[0, 2], &["f_1101".into(), "f_1102".into(), "f_1103".into()]);
+    assert!(marked.is_ok());
+    let job = spec(&p, "keyframes", Some(vec![0, 2])).preflight(&roots(&p.b), "j").unwrap().job;
+    assert_eq!(job.hint_identity.unwrap().keys().cloned().collect::<Vec<_>>(), ["f_1101", "f_1103"]);
+    let _ = fs::remove_dir_all(p.base);
+}
+
+#[test]
 fn hint_coverage_is_checked_by_stem_not_by_count() {
     let p = pcs("sub-hints");
     let hints = p.b.join("projects/Show/clips/shot_01/AlphaHint");

@@ -307,23 +307,27 @@ fn key_after_two_chained_writers_is_accepted_but_a_stranger_still_collides() {
 }
 
 #[test]
-fn a_task_submitted_while_a_refresh_stop_runs_waits_and_dispatches_after_the_restart() {
-    let (base, mut s) = sched("rearm_wait", json!({}));
+fn an_idle_worker_re_reads_the_models_without_a_restart_and_then_runs_the_job() {
+    // The worker started when GVM was not installed; the models changed; the same process answers `refresh`.
+    let (base, mut s) = sched(
+        "refresh",
+        json!({"tasks": {"gvm": false}, "tasks_after_refresh": {"gvm": true}}),
+    );
     s.probe(None);
     wait_until("worker ready", || {
         s.tick();
         s.targets().iter().any(|t| t.hello.is_some())
     });
-    s.stop_all();
-    s.mark_rearm();
-    s.submit_task(task(&base, "r1", TaskKind::Gvm, "ok"), vec![]).unwrap();
-    wait_until("worker exited", || {
+    let caps = |s: &Scheduler| s.targets()[0].hello.as_ref().unwrap().capabilities.tasks.get("gvm").copied();
+    assert_eq!(caps(&s), Some(false));
+    assert!(s.refresh_idle_workers());
+    wait_until("fresh hello", || {
         s.tick();
-        s.all_stopped()
+        caps(&s) == Some(true)
     });
-    s.tick();
-    assert_eq!(st(&s, "r1"), JobState::Queued, "waits while the target is stopped for a refresh");
-    s.rearm_stopped();
+    s.submit_task(task(&base, "r1", TaskKind::Gvm, "ok"), vec![]).unwrap();
     settle(&mut s, &["r1"]);
     assert!(ok(&st(&s, "r1")));
+    let starts = log_lines(&base, "w0").iter().filter(|l| l["event"] == "start").count();
+    assert_eq!(starts, 1, "the same worker process served both: no restart");
 }

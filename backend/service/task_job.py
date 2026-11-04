@@ -360,7 +360,8 @@ def _images(directory: str) -> dict:
     """stem -> filename for image files directly inside ``directory`` (dotfiles ignored)."""
     if not os.path.isdir(directory):
         return {}
-    return {os.path.splitext(f)[0]: f for f in os.listdir(directory)
+    # sorted: when a stem exists twice (f1.png, f1.exr) the last name wins, as in hint_compat._files / Rust hints::hint_files
+    return {os.path.splitext(f)[0]: f for f in sorted(os.listdir(directory))
             if not f.startswith(".") and f.lower().endswith(_IMG)}
 
 
@@ -852,6 +853,8 @@ def _check_staging(job: TaskJob, ctx: _Ctx) -> None:
         ctx.work = None
         _rej("paths", f"{stg}/work-{job.job_id} already exists; use a fresh job_id")
     os.mkdir(ctx.work)
+    from .prepared_frames import sweep_stale_work
+    sweep_stale_work(os.path.dirname(stg), stg)  # work-* folders of killed jobs, long untouched
 
 
 def _load_prompt_mask(job: TaskJob, rel: str, size: tuple) -> np.ndarray:
@@ -1193,7 +1196,7 @@ def _promote_guide(job: TaskJob, ctx: _Ctx, view, staged: str, cancel) -> None:
 def _sam(svc, job: TaskJob, ctx: _Ctx, view, ev, cancel, prog, status, warn):
     """Run the SAM2 tracker on ``view`` frames with the job's explicit prompts; returns masks."""
     from sam2_tracker import PromptFrame, SAM2NotInstalledError
-    p, cj = job.params, _Cancel(cancel)
+    p = job.params
 
     def chk():
         if cancel.is_set():
@@ -1210,15 +1213,18 @@ def _sam(svc, job: TaskJob, ctx: _Ctx, view, ev, cancel, prog, status, warn):
     with svc._gpu_lock:
         tracker = svc._get_sam2_tracker(on_progress=lambda c, t: prog(view.name, c, t), on_status=status)
         chk()
-        names = view.input_asset.get_frame_files()
-        frames = svc._load_named_sequence_frames(
-            view.input_asset, names, view.name,
-            gamma_correct_exr=svc._resolve_sequence_input_is_linear(view, p["input_is_linear"]),
-            job=cj, on_status=status)
+        from .prepared_frames import prepare
+        # Prepared JPEGs live in the CLIP's staging folder (the parent of this job's folder, so a
+        # re-track reuses them; never copied), keyed on the ORIGINAL frames, not the per-job view.
+        prepared = prepare(
+            ctx.clip.input_asset, view.input_asset.get_frame_files(), view.name,
+            os.path.join(os.path.dirname(job.staging_dir), "sam-frames"),
+            input_is_linear=svc._resolve_sequence_input_is_linear(view, p["input_is_linear"]),
+            on_status=status, check_cancel=chk, rel_base=job.clip_root)
         chk()
         try:
-            masks = tracker.track_video([f for _, f in frames], local, on_progress=lambda c, t: prog(view.name, c, t),
-                                        on_status=status, check_cancel=chk)
+            masks = tracker.track_video([], local, on_progress=lambda c, t: prog(view.name, c, t),
+                                        on_status=status, check_cancel=chk, prepared=prepared)
         except SAM2NotInstalledError as exc:
             raise CorridorKeyError(str(exc)) from exc
         except ValueError as exc:

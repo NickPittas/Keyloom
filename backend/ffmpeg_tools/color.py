@@ -218,3 +218,18 @@ def build_exr_vf(video_info: dict) -> str:
     return (
         f"{prefix}scale=in_color_matrix={cs}:in_range={cr},format=gbrpf32le"
     )
+
+
+def build_sam_jpeg_vf(srgb_encode: bool) -> str:
+    """-vf string that turns image-sequence frames into the JPEG pixels SAM2 reads.
+
+    Mirrors ``read_image_frame`` + 8-bit quantising: negatives and highlights clip, alpha is
+    dropped, ``srgb_encode`` applies the standard sRGB curve to linear EXR (display-coded
+    frames are used as they are). Output is full-range BT.601 YUV 4:2:0 like any JPEG.
+    Image sequences are already RGB, so no YUV/Rec.709 tags are involved.
+    """
+    if not srgb_encode:
+        return "format=rgb24,format=yuvj420p"
+    v = "val/maxval"
+    curve = f"maxval*if(lte({v},0.0031308),12.92*{v},1.055*pow({v},1/2.4)-0.055)"
+    return f"format=rgb48le,lutrgb=r='{curve}':g='{curve}':b='{curve}',format=rgb24,format=yuvj420p"

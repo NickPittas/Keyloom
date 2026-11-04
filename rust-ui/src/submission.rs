@@ -652,6 +652,11 @@ impl JobSpec {
         if !problems.is_empty() {
             return Err(problems);
         }
+        // Frozen when this PC accepts the job: Key rechecks it on its own start and holds with a reason if the hint
+        // changed while the job waited. A chain that makes the hint here (steps) records what Key read instead.
+        let hint_identity = Some(needed.iter().map(|s| (*s).clone()).collect::<Vec<_>>())
+            .filter(|n| steps.is_empty() && !n.is_empty())
+            .and_then(|n| crate::hints::identity(&clip_root.join(crate::hints::HINT_DIR), &n));
         let job = KeyJob {
             job_id: job_id.into(),
             clip_id: self.clip_id.clone(),
@@ -667,6 +672,7 @@ impl JobSpec {
             path_map: vec![],
             require: self.require.clone(),
             source_map: scan.source_map.clone(),
+            hint_identity,
             enforce_fixed_window: true, // a pinned window that cannot fit fails with its reason, never a silent downgrade
         };
         job.validate().map_err(|e| vec![format!("the job is not valid on this PC: {e}")])?;

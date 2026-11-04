@@ -59,6 +59,10 @@ pub struct KeyJob {
     /// Network receiver only: a pinned temporal window that does not fit the free GPU memory fails instead of warning.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enforce_fixed_window: bool,
+    /// Queue-time reuse of an existing hint: `stem -> "size:mtime_ns"` of exactly the hint frames Key reads, taken
+    /// when the user chose "Reuse". The worker refuses to start (and to Resume) if any of them changed since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_identity: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +234,12 @@ impl KeyJob {
                 )
             }
             (None, _) => {}
+        }
+        if let Some(h) = &self.hint_identity {
+            let want = if hint == "keyframes" { self.hint_keyframes_abs.as_ref().map_or(0, Vec::len) } else { n };
+            if hint == "none" || h.len() != want {
+                return err("hint_identity", "must name exactly the hint frames Key reads");
+            }
         }
         if self.publish != "final" {
             return err("publish", "only \"final\" is supported");

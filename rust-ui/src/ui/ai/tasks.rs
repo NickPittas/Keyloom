@@ -164,18 +164,16 @@ impl AiUi {
             .find(|t| t.local && t.enabled && t.hello.is_some())
             .and_then(|t| t.hello.map(|h| h.capabilities))
     }
-    /// The local worker has not been started, is starting, or is being refreshed after a model change, and told
-    /// us nothing yet. Actions then queue normally (the scheduler starts or waits for it): only Down/Refused
-    /// (and a worker the user stopped) make an action unavailable.
+    /// The local worker has not been started or is starting, and told us nothing yet. Actions then queue
+    /// normally (the scheduler starts or waits for it): only Down/Refused (and a worker the user stopped) make
+    /// an action unavailable.
     pub fn local_worker_unstarted(&self) -> bool {
-        let refreshing = self.rearm_after_stop;
         self.sched.targets().iter().any(|t| {
             t.local
                 && t.enabled
                 && t.hello.is_none()
                 && match t.status {
                     TargetStatus::Fresh | TargetStatus::Starting | TargetStatus::Ready => true,
-                    TargetStatus::Stopping | TargetStatus::Stopped => refreshing,
                     _ => false,
                 }
         })

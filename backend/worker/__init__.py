@@ -141,8 +141,9 @@ def probe_task_capabilities(gpu_ok: bool) -> dict:
 
 
 class Worker:
-    def __init__(self, service, out, hello: dict):
+    def __init__(self, service, out, hello: dict, reprobe=None):
         self.service, self.out, self.hello = service, out, hello
+        self._reprobe = reprobe  # () -> fresh hello facts; None = the facts are fixed (tests)
         self._out_lock = threading.Lock()
         self._state = threading.Lock()  # guards _thread/_cancel/_current/_seen
         self._thread: threading.Thread | None = None
@@ -176,14 +177,16 @@ class Worker:
             job = KeyJob.from_dict(raw)
         except KeyJobRejected as exc:
             return self._reject(jid, exc.code, exc.message)
-        if not self.hello["capabilities"]["key"]:
-            return self._reject(jid, "invalid", "Key is unavailable on this worker: Keyloom Key "
-                                                "model files are missing or incomplete")
-        known = self.hello["models"].get("corridorkey_v2") or {}
-        for name, want in job.require["models"].items():
-            if want is not None and (name != "corridorkey_v2" or known.get("sha256") != want):
-                return self._reject(jid, "invalid", f"Cannot verify model '{name}' hash on this "
-                                                    "worker; refusing to assume it is identical")
+        def problem():
+            if not self.hello["capabilities"]["key"]:
+                return "Key is unavailable on this worker: Keyloom Key model files are missing or incomplete"
+            known = self.hello["models"].get("corridorkey_v2") or {}
+            for name, want in job.require["models"].items():
+                if want is not None and (name != "corridorkey_v2" or known.get("sha256") != want):
+                    return f"Cannot verify model '{name}' hash on this worker; refusing to assume it is identical"
+        why = self._recheck(problem)
+        if why:
+            return self._reject(jid, "invalid", why)
         with self._state:
             if self._thread is not None or job.job_id in self._seen:
                 return self._reject(jid, "busy", "Worker is running a job or already ran this job_id")
@@ -216,6 +219,26 @@ class Worker:
             self._thread = threading.Thread(target=run, name=f"key-{job.job_id}", daemon=True)
             self._thread.start()
 
+    def _recheck(self, problem):
+        """``problem()`` against the worker's facts; if it complains, re-read what is installed first (models
+        installed or repaired after this worker started are picked up without a restart) and ask again."""
+        found = problem()
+        if found and self._reprobe is not None:
+            self._refresh()
+            found = problem()
+        return found
+
+    def _refresh(self) -> None:
+        """Re-read the installed models and capabilities (the GPU facts stay) and say ``hello`` again."""
+        if self._reprobe is None:
+            return
+        try:
+            fresh = self._reprobe()
+        except Exception as exc:  # noqa: BLE001 - keep the old facts rather than die
+            sys.stderr.write(f"model refresh failed: {exc!r}\n")
+            return
+        self.hello.update(models=fresh["models"], capabilities=fresh["capabilities"])
+
     def _release_gpu(self) -> None:
         """Every job starts on an empty GPU: drop all models and PyTorch's cached memory before the result is
         reported (so the next job, sent on that result, never finds this worker still busy unloading)."""
@@ -233,18 +256,22 @@ class Worker:
             job = TaskJob.from_dict(raw)
         except KeyJobRejected as exc:
             return self._reject(jid, exc.code, exc.message, **getattr(exc, "extra", {}))
-        caps = self.hello["capabilities"].get("tasks") or {}
-        if not caps.get(job.kind):
-            why = "; ".join((self.hello["capabilities"].get("task_unavailable") or {}).values())
-            return self._reject(jid, "model_missing", f"'{job.kind}' is unavailable on this worker: its "
-                                f"models or tools are not installed and verified{': ' + why if why else ''}")
-        if job.kind == "birefnet" and job.params["variant"] not in self.hello["capabilities"].get("birefnet_variants", ()):
-            return self._reject(jid, "model_missing", f"BiRefNet variant {job.params['variant']!r} is not installed")
-        if job.kind in ("sam_preview", "sam_track") and job.params["tracker_model"] not in self.hello["capabilities"].get("sam_models", ()):
-            return self._reject(jid, "model_missing", f"SAM2 model {job.params['tracker_model']!r} is not installed")
-        for name, want in job.require["models"].items():
-            if want is not None and (self.hello["models"].get(name) or {}).get("sha256") != want:
-                return self._reject(jid, "invalid", f"Cannot verify model '{name}' hash on this worker")
+        def problem():
+            caps = self.hello["capabilities"].get("tasks") or {}
+            if not caps.get(job.kind):
+                why = "; ".join((self.hello["capabilities"].get("task_unavailable") or {}).values())
+                return ("model_missing", f"'{job.kind}' is unavailable on this worker: its models or tools are "
+                                         f"not installed and verified{': ' + why if why else ''}")
+            if job.kind == "birefnet" and job.params["variant"] not in self.hello["capabilities"].get("birefnet_variants", ()):
+                return "model_missing", f"BiRefNet variant {job.params['variant']!r} is not installed"
+            if job.kind in ("sam_preview", "sam_track") and job.params["tracker_model"] not in self.hello["capabilities"].get("sam_models", ()):
+                return "model_missing", f"SAM2 model {job.params['tracker_model']!r} is not installed"
+            for name, want in job.require["models"].items():
+                if want is not None and (self.hello["models"].get(name) or {}).get("sha256") != want:
+                    return "invalid", f"Cannot verify model '{name}' hash on this worker"
+        bad = self._recheck(problem)
+        if bad:
+            return self._reject(jid, *bad)
         with self._state:
             if self._thread is not None or job.job_id in self._seen:
                 return self._reject(jid, "busy", "Worker is running a job or already ran this job_id")
@@ -336,6 +363,9 @@ class Worker:
                 self._handle_lock_cmd(msg)
             elif cmd == "task":
                 self._handle_task(msg)
+            elif cmd == "refresh":  # the app changed the installed models: answer with a fresh hello
+                self._refresh()
+                self.emit({"event": "hello", "protocol": PROTOCOL, **self.hello})
             elif cmd == "cancel":
                 with self._state:
                     if msg.get("job_id") == self._current:
@@ -467,5 +497,6 @@ def main(argv=None, stdin=None, out=None, service=None, hello=None) -> int:
         service.detect_device()  # after CUDA_VISIBLE_DEVICES; the default device is 'cpu' until detected
     if hasattr(out, "reconfigure"):  # Windows text mode would turn "\n" into "\r\n"
         out.reconfigure(newline="\n")
-    worker = Worker(service, out, hello if hello is not None else probe_hello(args.gpu))
+    worker = Worker(service, out, hello if hello is not None else probe_hello(args.gpu),
+                    reprobe=None if hello is not None else lambda: probe_hello(args.gpu))
     return worker.serve(stdin or (PolledStdin(0) if sys.platform == "win32" else sys.stdin.buffer))

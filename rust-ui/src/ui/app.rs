@@ -2199,14 +2199,6 @@ fn board_status(c: &Clip) -> String {
     parts.join(" · ")
 }
 
-impl App {
-    fn stop_worker_for_models(&mut self) {
-        if self.models.take_stop_request() {
-            self.ai.begin_stop();
-        }
-    }
-}
-
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.net_logic(ctx);
@@ -3022,14 +3014,14 @@ impl App {
                 self.key_selected(&ctx);
             }
         }
-        self.models.set_asset_safety(
-            !self.ai.model_asset_mutation_safe(),
-            self.ai.workers_need_stop_for_model_change(),
-            self.ai.unresolved_model_fences(),
-        );
+        self.models
+            .set_asset_safety(!self.ai.model_asset_mutation_safe(), self.ai.unresolved_model_fences());
         self.models.set_worker_activity(Some(self.ai.worker_activity()));
         self.models.tick(&ctx);
-        self.stop_worker_for_models(); // also when the Models page is closed: its ui() is the other consumer
+        if self.models.take_readiness_changed() {
+            self.ai.refresh_capabilities(); // also when the Models page is closed
+        }
+        self.ai.refresh_tick();
         self.ai
             .set_model_mutation_active(self.models.blocks_worker_launch());
         self.close_tick(&ctx);
@@ -3077,9 +3069,7 @@ impl App {
                 }
             });
             if self.models_open {
-                if self.models.ui(ui) {
-                    self.ai.begin_stop();
-                }
+                self.models.ui(ui);
             }
         } else if self.settings_open {
             Panel::top("settings_nav").show(ui, |ui| {
@@ -3261,18 +3251,6 @@ impl App {
 mod settings_handoff_tests {
     use super::*;
     use std::time::Duration;
-
-    #[test]
-    fn a_models_stop_request_is_acted_on_while_the_page_is_closed() {
-        let ctx = egui::Context::default();
-        let mut app = App::with_ctx(&ctx, AppOptions::default());
-        assert!(!app.models_open);
-        app.models.raise_stop_request_for_test();
-        app.ai.rearm_after_stop = false;
-        app.stop_worker_for_models();
-        assert!(app.ai.rearm_after_stop, "begin_stop ran");
-        assert!(!app.models.take_stop_request(), "request consumed once");
-    }
 
     #[test]
     fn settings_opens_models_without_discarding_its_draft() {

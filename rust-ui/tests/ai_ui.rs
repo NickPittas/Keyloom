@@ -304,7 +304,7 @@ fn live_publication_appears_before_the_job_finishes() {
 }
 
 #[test]
-fn model_asset_changes_wait_for_idle_workers_to_exit() {
+fn an_idle_worker_never_gates_a_model_change() {
     let e = env(
         "model-mutation-gate",
         &[("c", 1, matte_png())],
@@ -319,17 +319,9 @@ fn model_asset_changes_wait_for_idle_workers_to_exit() {
             ck::scheduler::TargetStatus::Ready
         )
     });
-    assert!(!app.ai().model_asset_mutation_safe());
-    assert!(app.ai().workers_need_stop_for_model_change());
-    app.ai_mut().begin_stop();
-    assert!(
-        !app.ai().model_asset_mutation_safe(),
-        "stop request is not observed process exit"
-    );
-    pump(&ctx, &mut app, "worker exit observed", |a| {
-        a.ai().all_stopped()
-    });
+    // The worker is alive and idle, and the change is allowed as it stands: nothing is stopped or waited for.
     assert!(app.ai().model_asset_mutation_safe());
+    assert!(app.ai().workers_alive());
     fs::remove_dir_all(e.base).unwrap();
 }
 

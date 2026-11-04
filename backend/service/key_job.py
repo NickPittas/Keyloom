@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from ..clip_state import ClipEntry, ClipState
+from .. import hint_compat
 from ..errors import CorridorKeyError, JobCancelledError
 from ..frame_io import _linear_to_srgb
 from .core import InferenceParams, OutputConfig
@@ -52,7 +53,7 @@ _JOB_KEYS = ("job_id", "clip_id", "clip_root", "range", "params", "output_config
              "hint_keyframes_abs", "outputs", "manifest_dir", "mode", "publish", "path_map",
              "require")
 # Optional keys a network receiver adds; absent == the local default (no map, warn-only fixed windows).
-_OPTIONAL_KEYS = ("source_map", "enforce_fixed_window")
+_OPTIONAL_KEYS = ("source_map", "enforce_fixed_window", "hint_identity")
 _RANGE_KEYS = ("in_point", "out_point", "in_stem", "out_stem")
 _FORMAT_OF = {"fg": "fg_format", "matte": "matte_format", "comp": "comp_format",
               "processed": "processed_format"}
@@ -167,6 +168,9 @@ class KeyJob:
     source_map: tuple = ()
     # A fixed temporal window that does not fit the available GPU memory fails the job instead of only warning.
     enforce_fixed_window: bool = False
+    # stem -> "size:mtime_ns" of the existing hint frames the user chose to reuse at queue time (None = the hint
+    # is made before this job or not used). Checked again when the job starts and recorded for Resume.
+    hint_identity: MappingProxyType | None = None
 
     @property
     def frames(self) -> int:
@@ -178,6 +182,8 @@ class KeyJob:
             out["source_map"] = [list(e) for e in self.source_map]
         if self.enforce_fixed_window:
             out["enforce_fixed_window"] = True
+        if self.hint_identity is not None:
+            out["hint_identity"] = _thaw(self.hint_identity)
         return out
 
     @classmethod
@@ -217,6 +223,11 @@ class KeyJob:
             _rej("invalid", f"params/output_config rejected: {exc}")
         if not same:
             _rej("invalid", "params/output_config has unknown or non-canonical fields")
+        ident = d.get("hint_identity")
+        if ident is not None and (params.hint_mode == "none" or not isinstance(ident, dict) or not ident
+                                  or not all(isinstance(k, str) and isinstance(v, str) for k, v in ident.items())
+                                  or len(ident) != (len(d["hint_keyframes_abs"] or ()) if params.hint_mode == "keyframes" else n)):
+            _rej("hint", "hint_identity must name exactly the hint frames Key reads")
         marks = d["hint_keyframes_abs"]
         if params.hint_mode == "keyframes":
             if (not isinstance(marks, list) or not marks or not all(_is_int(k) for k in marks)
@@ -257,7 +268,8 @@ class KeyJob:
             _rej("invalid", f"require must be {{protocol: {PROTOCOL}, models: {{name: sha|null}}}}")
         return cls(jid, d["clip_id"], d["clip_root"], _freeze(r), _freeze(d["params"]),
                    _freeze(d["output_config"]), None if marks is None else tuple(marks),
-                   _freeze(outs), mdir, d["mode"], d["publish"], (), _freeze(req), smap, enforce)
+                   _freeze(outs), mdir, d["mode"], d["publish"], (), _freeze(req), smap, enforce,
+                   None if ident is None else _freeze(ident))
 
 
 # ------------------------------------------------------------------- disk validation
@@ -310,6 +322,16 @@ def _open_clip(job: KeyJob) -> tuple[_KeyClip, list[str]]:
             _rej("hint", "Needs keyframe marks (none inside In/Out)")
         if inside != list(job.hint_keyframes_abs):
             _rej("hint", "Keyframe marks changed since the job was submitted")
+    clip.hint_seen = None  # what Key reads, recorded in the manifest so a later Reuse/Resume can compare it
+    if mode != "none":
+        stems_read = [stems[k] for k in job.hint_keyframes_abs] if mode == "keyframes" else stems[a:b + 1]
+        clip.hint_seen = hint_compat.identity(clip.alpha_asset.path, stems_read)
+    if job.hint_identity is not None:
+        if sorted(job.hint_identity) != sorted(stems_read):
+            _rej("hint", "The reused hint frames are not the frames Key reads")
+        why = hint_compat.verify_identity(clip.alpha_asset.path, _thaw(job.hint_identity))
+        if why:
+            _rej("hint", f"The hint you chose to reuse changed since it was queued: {why}. Queue again.")
     return clip, files[a:b + 1]
 
 
@@ -403,6 +425,11 @@ def resume_problem(manifest, job: KeyJob, stems=None) -> str | None:
         (manifest.get("exr_compression") == cfg.exr_compression, "EXR compression changed"),
         (manifest.get("exr_pixel_type") == EXR_PIXEL_TYPE, "EXR pixel type changed"),
         (manifest.get("hint_keyframes") == marks, "keyframe marks changed"),
+        # a job that froze a reused hint resumes only a result that recorded the same hint: one that recorded
+        # none was keyed with a hint we cannot name, so old and new frames could mix
+        (job.hint_identity is None or manifest.get("hint_identity") == _thaw(job.hint_identity),
+         "the hint changed since this result was started, or this result did not record which hint it used "
+         "(start a new version)"),
         (manifest.get("files") == _rel_files(job), "output paths changed"),
         (isinstance(manifest.get("effective_profile"), dict), "no recorded temporal profile"),
         (_pinned_profile(job.params) in (None, manifest.get("effective_profile")),
@@ -826,6 +853,8 @@ def _manifest(job, cfg, params, a, b, prepared, profile, worker, jid) -> dict:
     }
     if job.hint_keyframes_abs is not None:
         manifest["hint_keyframes"] = list(job.hint_keyframes_abs)
+    if job.hint_identity is not None:
+        manifest["hint_identity"] = _thaw(job.hint_identity)
     return manifest
 
 
@@ -1022,6 +1051,9 @@ def run_key_job(service, job: KeyJob, *, emit: Callable[[dict], None],
         lease.acquire()
         recover_replace(job.manifest_dir)  # an interrupted replace is settled before anything else
         owned = _check_targets(job, mdir, stems)  # the disk may have changed while we waited
+        if (job.mode == "resume" and job.hint_identity is None and clip.hint_seen
+                and owned.get("hint_identity") not in (None, clip.hint_seen)):
+            _rej("exists", "Cannot resume: the hint changed since this result was started. Write as a new version.")
         dirs = sorted({os.path.dirname(p) for ps in job.outputs.values() for p in ps})
         _make_dirs_or_reject(dirs, created)
         for d in dirs:
@@ -1089,6 +1121,8 @@ def run_key_job(service, job: KeyJob, *, emit: Callable[[dict], None],
                     f"existing frames used {old.get('hann_chunk')}/{old.get('hann_stride')}. "
                     "Write as v002, or pin the temporal window.")
             manifest = _manifest(job, cfg, params, a, b, prepared, profile, worker, jid)
+            if clip.hint_seen and "hint_identity" not in manifest:
+                manifest["hint_identity"] = clip.hint_seen  # a hint made inside a chain: what Key actually read
             if job.mode == "replace":
                 manifest.update(replaces=owned.get("job_id"), complete=True)
                 _replace_publish(service, job, cfg, result, manifest, lease, check_cancel, ev, done,

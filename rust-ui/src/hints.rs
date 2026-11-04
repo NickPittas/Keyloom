@@ -986,6 +986,152 @@ pub fn read_hint_ranges(dir: &Path) -> Vec<HintRange> {
     }]
 }
 
+/// How the hint frames already on disk compare with the render a queue would make (Python twin:
+/// `backend/hint_compat.py`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Compat {
+    /// Every requested frame is certified and was made as `HintWant` says.
+    Compatible,
+    /// No record proves it (legacy or imported results): "Settings not recorded". The user decides.
+    Unrecorded,
+    /// A record or the file itself proves it differs; the reason names what.
+    Mismatch(String),
+    /// A requested frame does not exist: nothing to reuse.
+    Missing,
+}
+
+impl Compat {
+    /// Severity order for combining several checks: the worst one is shown.
+    fn rank(&self) -> u8 {
+        match self {
+            Compat::Compatible => 0,
+            Compat::Unrecorded => 1,
+            Compat::Mismatch(_) => 2,
+            Compat::Missing => 3,
+        }
+    }
+    pub fn worst(self, o: Compat) -> Compat {
+        if o.rank() > self.rank() { o } else { self }
+    }
+}
+
+/// The render a queue would make into a folder. `source` values are `[size, mtime_ns]`, `upstream` values the
+/// sha256 of the guide frame; a stem missing from a map is not compared.
+pub struct HintWant {
+    pub kind: String,
+    pub params: Value,
+    pub source: BTreeMap<String, Value>,
+    pub upstream: BTreeMap<String, String>,
+    pub prompt_fp: Option<String>,
+}
+
+fn stamp(p: &Path) -> Option<(u64, u64)> {
+    let m = std::fs::metadata(p).ok()?;
+    let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((m.len(), u64::try_from(t.as_nanos()).ok()?))
+}
+
+/// `[size, mtime_ns]` as the worker records source frames.
+pub fn stamp_value(p: &Path) -> Value {
+    stamp(p).map_or(json!("unknown"), |(a, b)| json!([a, b]))
+}
+
+/// `stem -> file` of the hint/guide frames in `dir`, listed exactly like the worker (`hint_compat._files`): no
+/// dot-files, no `.dpx`, and the last name in sort order wins when a stem exists twice (`f1.exr` over `f1.png`).
+pub fn hint_files(dir: &Path) -> BTreeMap<String, PathBuf> {
+    const EXTS: [&str; 7] = ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "exr"];
+    let mut v = crate::project::list_images(dir);
+    v.retain(|(_, p)| {
+        let n = p.file_name().and_then(|n| n.to_str()).unwrap_or(".");
+        !n.starts_with('.') && EXTS.iter().any(|e| n.to_lowercase().ends_with(&format!(".{e}")))
+    });
+    v.sort_by(|a, b| a.1.file_name().cmp(&b.1.file_name()));
+    v.into_iter().collect()
+}
+
+/// `stem -> "size:mtime_ns"` of those frames of `dir`; `None` when one is missing (what Key revalidates).
+pub fn identity(dir: &Path, stems: &[String]) -> Option<BTreeMap<String, String>> {
+    let have = hint_files(dir);
+    stems
+        .iter()
+        .map(|s| {
+            let (a, b) = stamp(have.get(s)?)?;
+            Some((s.clone(), format!("{a}:{b}")))
+        })
+        .collect()
+}
+
+/// Every setting in `want` has the same value in `have` (the worker fills in defaults `want` does not name).
+fn same(want: &Value, have: &Value) -> bool {
+    match (want, have) {
+        (Value::Object(w), Value::Object(h)) => w.iter().all(|(k, v)| h.get(k).is_some_and(|x| same(v, x))),
+        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        (a, b) => a == b,
+    }
+}
+
+fn differs(rec: &Value, stem: &str, want: &HintWant) -> Option<String> {
+    if rec.get("kind").and_then(Value::as_str) != Some(want.kind.as_str()) {
+        return Some(format!("made by {}, not {}", rec.get("kind").and_then(Value::as_str).unwrap_or("?"), want.kind));
+    }
+    let mut wp = want.params.clone();
+    if let Some(o) = wp.as_object_mut() {
+        o.remove("source_map");
+    }
+    if !same(&wp, rec.get("params").unwrap_or(&Value::Null)) {
+        return Some("generation settings differ".into());
+    }
+    if let Some(w) = want.source.get(stem) {
+        // `get`, not a JSON pointer: a stem containing `~` or `/` would be misread as an escape
+        if rec.get("source").and_then(|m| m.get(stem)) != Some(w) {
+            return Some(format!("source frame {stem} differs from the one this was made from"));
+        }
+    }
+    if let Some(w) = want.upstream.get(stem) {
+        if rec.get("upstream").and_then(|u| u.get(stem)).and_then(Value::as_str) != Some(w) {
+            return Some(format!("pre-matte {stem} differs from the one this was made from"));
+        }
+    }
+    match &want.prompt_fp {
+        Some(fp) if rec.get("prompt_fp").and_then(Value::as_str) != Some(fp) => Some("prompts differ".into()),
+        _ => None,
+    }
+}
+
+/// Compares the frames `stems` of `dir` with `want`. A broader earlier render serves a subset. Reads only.
+/// ponytail: the SAM prompt fingerprint is compared only when the caller supplies one; the batch planner never
+/// makes a SAM hint itself (its SAM guide is the user's own), so it passes `None`.
+pub fn check_hint(dir: &Path, stems: &[String], want: &HintWant) -> Compat {
+    let have = hint_files(dir);
+    if stems.iter().any(|s| !have.contains_key(s)) {
+        return Compat::Missing;
+    }
+    let ranges = read_hint_ranges(dir);
+    let mut unrecorded = false;
+    for s in stems {
+        let rec = ranges.iter().find(|r| !r.legacy && r.stems.contains(s));
+        let Some((r, dig)) = rec.and_then(|r| Some((r, r.digests.get(s)?))) else {
+            unrecorded = true;
+            continue;
+        };
+        let path = &have[s];
+        let by_stat = r.record.get("stats").and_then(|m| m.get(s)).is_some_and(|v| *v == stamp_value(path));
+        let by_hash = || {
+            crate::sha256::file(path, &std::sync::atomic::AtomicBool::new(false), |_, _| {})
+                .ok()
+                .flatten()
+                .is_some_and(|h| h == *dig)
+        };
+        if !(by_stat || by_hash()) {
+            return Compat::Mismatch(format!("frame {s} was changed after it was made"));
+        }
+        if let Some(why) = differs(&r.record, s, want) {
+            return Compat::Mismatch(why);
+        }
+    }
+    if unrecorded { Compat::Unrecorded } else { Compat::Compatible }
+}
+
 /// Builds the hint-generation jobs of one clip from a frozen config (the UI passes its live annotations,
 /// the batch/Key planner loads the saved ones).
 pub struct Gen<'a> {
