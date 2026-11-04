@@ -28,7 +28,7 @@ fn frame(ctx: &egui::Context, app: &mut App, size: Vec2) -> Vec<egui::epaint::Cl
 }
 
 fn check(pref: &str, screen: &str, shapes: &[egui::epaint::ClippedShape], base: Color32) {
-    let (n, mut bad) = theme::text_contrast_report(shapes, base, 4.5);
+    let (n, bad) = theme::text_contrast_report(shapes, base, 4.5);
     assert!(n > 5, "{pref} {screen}: only {n} texts painted, the screen did not draw");
     assert!(bad.is_empty(), "{pref} {screen}: {} text(s) under 4.5:1:\n{}", bad.len(), bad.join("\n"));
 }

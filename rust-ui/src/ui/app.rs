@@ -5,7 +5,7 @@ use super::import::{CardState, Dest, ImportUi};
 use super::picker::{rfd_backend, Backend, PickKind, Picker};
 use super::settings::Page as SettingsPage;
 use super::theme;
-use super::viewer::{Viewer, DIM, WARN}; // DIM/WARN: still used by app/project_shell.rs
+use super::viewer::Viewer;
 use crate::contracts::*;
 use crate::decode::exr_header_summary;
 use crate::frames::{Availability, FrameIndex};
