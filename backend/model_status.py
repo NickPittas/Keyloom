@@ -496,6 +496,17 @@ class StatusChecker:
         }
 
 
+def readiness_state(item: dict) -> str:
+    """Models-screen state of a check_artifact() result: missing | verify_needed | verified | error."""
+    if item["state"] == "missing":
+        return "missing"
+    if item["ready"]:
+        return "verified"
+    if item["state"] != "installed" or item["problems"] or item["unhashed_files"]:
+        return "error"  # partial/changed files, or nothing trusted to verify against
+    return "verify_needed" if item["verify_state"].startswith("unknown") else "error"
+
+
 def _probe_import(module_name: str | None) -> bool:
     if not module_name:
         return False

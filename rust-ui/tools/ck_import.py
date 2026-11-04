@@ -212,11 +212,8 @@ def make_plan(a):
 
 
 def extract_clip(clip_root):
-    """Source/ video -> Frames/ (via a hidden temp dir so a half-extracted clip never looks playable)."""
-    src = next((os.path.join(clip_root, "Source", f) for f in sorted(os.listdir(os.path.join(clip_root, "Source")))
-                if P.is_video_file(f)), None)
-    if not src:
-        raise RuntimeError("No source video in Source/")
+    """Source movie (legacy Source/ copy, else the original in place) -> Frames/ (via a hidden temp dir so a half-extracted clip never looks playable)."""
+    src = P.resolve_source_movie(clip_root)  # FileNotFoundError names the missing path; never copies
     frames = os.path.join(clip_root, "Frames")
     if os.path.isdir(frames) and os.listdir(frames):
         raise RuntimeError("Frames/ already has files; not touching it")
@@ -294,9 +291,9 @@ def main():
         return
     if not oks:
         fatal("Nothing to import")
-    emit(event="stage", message="Creating clips and copying source movies")
+    emit(event="stage", message="Creating clips")
     # One item at a time, in plan order (so the backend's dedup gives the planned names), checking cancel
-    # before each copy. An already-copied movie stays; project.json is rewritten atomically after each.
+    # before each clip. An already-created clip stays; project.json is rewritten atomically after each.
     proj = None if a.cmd == "new" else a.project
     made = []
     fresh = None  # a project folder THIS run created: named in errors, never deleted
@@ -310,7 +307,7 @@ def main():
             fresh = proj
         try:
             if v:
-                P.add_clips_to_project(proj, v, copy_source=True)
+                P.add_clips_to_project(proj, v)
             else:
                 add_sequences_to_project(proj, q, copy_source=False)
         except Exception as e:  # noqa: BLE001

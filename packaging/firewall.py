@@ -1,4 +1,4 @@
-"""Linux installer step: let this PC's trusted networks reach the Keyloom network service through an ACTIVE UFW.
+"""Installer step: let this PC's trusted networks reach the Keyloom app's endpoint (Linux: an ACTIVE UFW, by port; Windows: rules for keyloom-ui.exe).
 
 Stdlib only; used by lifecycle.py for the offline and the online installer alike (one common path).
 Only UFW is managed. It is never installed, enabled or reconfigured, and no rule is added unless the installer's firewall choice is yes.
@@ -22,7 +22,7 @@ import time
 
 TCP_RANGE = "8443:8452"  # automatic port choice in backend/network_service.py
 UDP_PORT = "44554"       # discovery, backend/discovery.py
-COMMENT = {"tcp": "Keyloom installer: service", "udp": "Keyloom installer: discovery"}
+COMMENT = {"tcp": "Keyloom installer: app endpoint", "udp": "Keyloom installer: discovery"}  # older "...: service" rules keep working (OWNER_PREFIX)
 OWNER_PREFIX = "Keyloom installer"
 # Same exclusions as backend/discovery.py: container/VM bridges are never trusted networks.
 VIRTUAL = re.compile(r"(docker|br-|veth|virbr|vboxnet|vethernet)", re.I)
@@ -241,11 +241,12 @@ def ask(question: str) -> bool:
 
 # ---- install ---------------------------------------------------------------------------------------
 
-def run(mode: str, prior: dict | None) -> dict | None:
+def run(mode: str, prior: dict | None, program: str | None = None) -> dict | None:
     """Make sure the trusted networks can reach the service. Returns the receipt record (None: not applicable here).
-    status: ok | not_needed | pending | unsupported. Never raises for an ordinary failure; never changes anything unasked."""
+    status: ok | not_needed | pending | unsupported. Never raises for an ordinary failure; never changes anything unasked.
+    `program` (Windows): the installed keyloom-ui.exe that now answers other PCs; None = the old service's pythonw.exe."""
     if sys.platform.startswith("win"):
-        return run_windows(mode, prior)
+        return run_windows(mode, prior, program)
     if not sys.platform.startswith("linux"):
         return None
     owned = list((prior or {}).get("owned") or [])
@@ -305,15 +306,17 @@ def _one(cidr: str, proto: str) -> str:
 
 # ---- uninstall -------------------------------------------------------------------------------------
 
-# ---- Windows: program-specific Allow rules for the installed pythonw.exe (the network service) -----------------------------
-# Windows firewall rules are tied to the program path. A new version/prefix has a new pythonw.exe, which would make Windows ask
+# ---- Windows: program-specific Allow rules for the installed keyloom-ui.exe (the app answers other PCs itself) --------------
+# (Older builds ran a background service and had the same rules for its pythonw.exe; run_windows swaps those for the app's.)
+# Windows firewall rules are tied to the program path. A new version/prefix has a new path, which would make Windows ask
 # the user ("Python" prompt) and, unanswered, leave the PC unreachable. The installer checks (read-only, no admin) whether the
 # path is already allowed and otherwise offers ONE elevated step (UAC) that adds exactly these rules, records them, and never
 # touches rules it did not create.
 WIN_GROUP = "Keyloom"
 WIN_REMOTE = ["LocalSubnet", "100.64.0.0/10", "fd7a:115c:a1e0::/48", "192.168.195.0/24"]  # LAN, Tailscale, ZeroTier
 WIN_PROFILES = ["Private", "Public"]
-WIN_RULES = (("tcp", "8443-8452", "service"), ("udp", "44554", "discovery"))
+WIN_RULES = (("tcp", "8443-8452", "service"), ("udp", "44554", "discovery"))  # the old pythonw.exe service
+WIN_APP_RULES = (("tcp", "8443-8452", "endpoint"), ("udp", "44554", "discovery"))  # the app
 
 
 def win_ps(script: str, timeout: int = 60) -> tuple[int, str]:
@@ -327,13 +330,16 @@ def win_program() -> str:
 
 
 def win_version_name(program: str) -> str:
-    parts = re.split(r"[\\/]", program)  # ...\versions\<id>\runtime\python\pythonw.exe
+    parts = re.split(r"[\\/]", program)  # ...\versions\<id>\bin\keyloom-ui.exe  or  ...\versions\<id>\runtime\python\pythonw.exe
+    if "versions" in parts[:-1]:
+        return parts[max(i for i, x in enumerate(parts[:-1]) if x == "versions") + 1]
     return parts[-4] if len(parts) >= 4 else "Keyloom"
 
 
-def win_rule_specs(program: str) -> list[dict]:
-    return [{"name": f"Keyloom network {what} ({win_version_name(program)})", "program": program, "protocol": proto.upper(),
-             "ports": ports, "remote": WIN_REMOTE, "profiles": WIN_PROFILES} for proto, ports, what in WIN_RULES]
+def win_rule_specs(program: str, app: bool = False) -> list[dict]:
+    head, rules = ("Keyloom app", WIN_APP_RULES) if app else ("Keyloom network", WIN_RULES)
+    return [{"name": f"{head} {what} ({win_version_name(program)})", "program": program, "protocol": proto.upper(),
+             "ports": ports, "remote": WIN_REMOTE, "profiles": WIN_PROFILES} for proto, ports, what in rules]
 
 
 def win_allowed(program: str) -> bool | None:
@@ -390,36 +396,46 @@ def win_ask(question: str) -> bool:
     return bool(answer) and answer[0].strip().lower() in ("", "y", "yes")
 
 
-def run_windows(mode: str, prior: dict | None) -> dict | None:
-    program = win_program()
-    specs = win_rule_specs(program)
+def run_windows(mode: str, prior: dict | None, program: str | None = None) -> dict | None:
+    app = program is not None
+    program = program or win_program()
+    specs = win_rule_specs(program, app)
     owned = [r for r in (prior or {}).get("owned") or [] if isinstance(r, dict)]
+    # Swap: rules this installer made for the old service's pythonw.exe are dropped once the app's own rules are in.
+    stale = [r for r in owned if app and str(r.get("program", "")).lower().endswith("pythonw.exe")]
+    what = "keyloom-ui.exe" if app else "pythonw.exe"
     rec = {"owned": owned, "program": program, "commands": [], "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
     def done(status, detail, commands=()):
         rec.update(status=status, detail=detail, commands=list(commands))
         return rec
 
-    manual = ["powershell (as Administrator): " + win_add_script(specs)]
+    manual = ["powershell (as Administrator): " + "; ".join(filter(None, [win_remove_script(stale) if stale else "", win_add_script(specs)]))]
     allowed = win_allowed(program)
     if allowed:
-        return done("ok", "Windows Firewall already allows this version's pythonw.exe; nothing was added or changed")
+        if stale and mode != "skip" and win_elevated(win_remove_script(stale)):
+            owned[:] = [r for r in owned if r not in stale]
+            return done("ok", f"Windows Firewall already allows this version's {what}; the old service's rules were removed")
+        return done("ok", f"Windows Firewall already allows this version's {what}; nothing was added or changed")
     if allowed is None:
         return done("pending", "Windows Firewall could not be read", manual)
     if mode == "skip":
-        return done("pending", "Windows Firewall has no Allow rule for this version's pythonw.exe (setup not selected); "
-                    "other PCs may be blocked until it is added, and Windows may show a 'Python' prompt", manual)
-    say("\nWindows Firewall\n  This version of Keyloom runs its network service as\n    " + program + "\n"
-        "  Windows only allows incoming connections per program path, so the new path needs its own rules:\n"
+        return done("pending", f"Windows Firewall has no Allow rule for this version's {what} (setup not selected); "
+                    "other PCs may be blocked until it is added, and Windows may show a prompt", manual)
+    say("\nWindows Firewall\n  This version of Keyloom answers other PCs from inside the app itself:\n    " + program + "\n"
+        if app else "\nWindows Firewall\n  This version of Keyloom runs its network service as\n    " + program + "\n")
+    say("  Windows only allows incoming connections per program path, so the new path needs its own rules:\n"
         "  TCP 8443-8452 and UDP 44554, Private and Public networks, from the local subnet, Tailscale and ZeroTier only.\n"
-        "  A Windows administrator (UAC) prompt follows now; approve it to add the rules. Nothing else is changed; rules from older versions stay.")
-    if not win_elevated(win_add_script(specs)):
+        + ("  The rules made for the old background service are replaced by these.\n" if stale else "")
+        + "  A Windows administrator (UAC) prompt follows now; approve it to add the rules. Nothing else is changed; rules from older versions stay.")
+    if not win_elevated("; ".join(filter(None, [win_remove_script(stale) if stale else "", win_add_script(specs)]))):
         return done("pending", "the elevated step was cancelled or failed", manual)
     if win_allowed(program) is not True:
         return done("pending", "the rules were not found after the elevated step", manual)
+    owned[:] = [r for r in owned if r not in stale]
     have = {(r.get("name"), r.get("program")) for r in owned}
     owned.extend(r for r in specs if (r["name"], r["program"]) not in have)
-    return done("ok", f"added {len(specs)} Windows Firewall rule(s) for this version's pythonw.exe")
+    return done("ok", f"added {len(specs)} Windows Firewall rule(s) for this version's {what}")
 
 
 def remove_windows(rec: dict | None, mode: str) -> str:
@@ -468,12 +484,12 @@ def remove(rec: dict | None, mode: str) -> str:
 
 
 def main(argv=None) -> int:
-    """`firewall.py MODE PRIOR_JSON OUT`: run() in this interpreter; the record goes to OUT (lifecycle.firewall_step)."""
+    """`firewall.py MODE PRIOR_JSON OUT [APP_EXE]`: run() in this interpreter; the record goes to OUT (lifecycle.firewall_step)."""
     import json
-    mode, prior, out = (argv if argv is not None else sys.argv[1:])
-    if mode not in ("yes", "ask", "skip"):
+    mode, prior, out, *program = (argv if argv is not None else sys.argv[1:])
+    if mode not in ("yes", "ask", "skip") or len(program) > 1:
         return 64
-    rec = run(mode, json.loads(prior) or None)
+    rec = run(mode, json.loads(prior) or None, program[0] if program else None)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(rec, f)
     return 0

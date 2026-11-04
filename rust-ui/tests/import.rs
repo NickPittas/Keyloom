@@ -253,10 +253,8 @@ fn cancel_leaves_resumable_clip_and_resume_completes() {
         "partial frames must not look playable"
     );
     assert!(matches!(c.source, Source::Video { .. }) && ck::ui::import::needs_frames(c));
-    assert!(
-        c.root.join("Source").read_dir().unwrap().count() == 1,
-        "source copy kept"
-    );
+    assert!(!c.root.join("Source").exists(), "no source copy is made");
+    assert!(matches!(&c.source, Source::Video { path } if *path == d.join("long.mp4")));
     // Resume.
     let ev = run(
         &Request::Resume {

@@ -173,7 +173,8 @@ def test_worker_dispatches_by_platform(tmp_path, monkeypatch, win):
 def stage_with(tmp_path, firewall_src):
     pk = tmp_path / "stage/app/packaging"
     pk.mkdir(parents=True)
-    (pk / "lifecycle.py").write_text((REPO / "packaging/lifecycle.py").read_text())
+    for f in ("lifecycle.py", "legacy_network_cleanup.py"):  # the gate also loads the old-service cleanup
+        (pk / f).write_text((REPO / "packaging" / f).read_text())
     if firewall_src is not None:
         (pk / "firewall.py").write_text(firewall_src)
     return tmp_path / "stage"

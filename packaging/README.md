@@ -2,7 +2,7 @@
 
 The source repository is public. **Only the latest Linux and Windows online installers are distributed**; see the [installation guide](../docs/install.md) for public downloads. This tooling can still generate full/offline artifacts internally, but that is a build capability, not an available offline release or a promise to publish one.
 
-Build success and public availability do not establish redistribution clearance or upstream endorsement; see [Licence and sharing](../README.md#licence-and-sharing). Activation configures the per-user network host automatically unless the user removed it. Firewall permissions remain OS-managed. Online installers fetch missing large public wheels.
+Build success and public availability do not establish redistribution clearance or upstream endorsement; see [Licence and sharing](../README.md#licence-and-sharing). Activation prepares the app to host the network endpoint itself and retires the old per-user background service (see Network endpoint below). Firewall permissions remain OS-managed. Online installers fetch missing large public wheels.
 
 ## What a bundle contains
 `bin/keyloom-ui` (Rust UI) · `app/` (Python helper tree: backend, engines, `scripts/setup_models.py`,
@@ -176,12 +176,25 @@ with a visible console. `/PREFIX=DIR` and `/REPAIR=1` are accepted; otherwise th
 registry key (`Inno Setup: App Path`), where the recorded folder is looked up under HKCU first, then HKLM, is used if it holds `receipt.json`, else `%LOCALAPPDATA%\Programs\Keyloom`. It has its own AppId, `Uninstallable=no` and no Add/Remove Programs
 entry, so it never touches the full installer's entry; remove an online-only install with `<prefix>\bin\keyloom-setup.cmd uninstall`.
 
-## Background autostart contract (written by the app, removed by uninstall)
-The network host is configured during activation using the installed version's full Python runtime with the `STALL_SECONDS` (300 s)
-hang guard. Existing identities, service state and explicit removal choices are preserved. Setup failures leave the app
-installed and report that **Clients → Start / Refresh** is needed. This host coordinates discovery and queues; the rendering
-client still needs Keyloom running, visibly or in its existing background mode.
+## Network endpoint (inside the app)
+The app answers other PCs itself, in its own process; the installers no longer install or start a background service.
+- **Embedded runtime.** Both installers ship the pinned runtime's shared library, which the app loads from its version folder:
+  Linux `runtime/python/lib/libpython3.11.so.1.0`, Windows `runtime\python\python311.dll` (`PYTHONHOME` = `runtime/python`, import
+  roots = `app` only). `bundle.py` fails the build when it is missing, `online.validate_manifest` rejects a manifest without it, and
+  `bundle.check_ui_libpython` (also run by `build-ui-old-glibc.sh`) refuses a UI binary that links libpython without
+  `RUNPATH $ORIGIN/../runtime/python/lib`. The glibc floor (2.31) is checked on the whole stage, libpython included.
+- **Gate.** The service is removed only when the app really contains the endpoint: `bundle.write_endpoint_marker` writes
+  `app-endpoint.json` into the stage when the UI binary contains the string `KEYLOOM_APP_ENDPOINT_V1` (the app's `app_api.rs` must embed
+  it). Without that file an install behaves as before (service refreshed, `pythonw.exe` firewall rules), so a PC never ends up with no endpoint.
+- **Upgrade.** `legacy_network_cleanup.py` (run by the installed interpreter, `-I -B`) stops and removes only the service this prefix
+  owns: systemd user unit, or the Windows task / Run value. Certificate, key, pin, join token, PC identity, `coordinator.sqlite3` and the
+  registered PCs are not touched, and no "removed" tombstone is written, so an older build installed on top finds its state and sets its
+  service up again. Repeating it is safe. Uninstall uses the same code.
+- **Firewall.** Windows: rules cover the installed `bin\keyloom-ui.exe` ("Keyloom app endpoint/discovery (<version>)", TCP 8443-8452, UDP 44554, same
+  networks); in the same UAC step the rules this installer made for the old `pythonw.exe` are removed. Linux UFW rules are by port and
+  network, so they stay as they are (new ones are commented "Keyloom installer: app endpoint"). Uninstall removes the recorded rules.
 
+## Background autostart contract (written by the app, removed by uninstall)
 Linux launches the stable shim `PREFIX/bin/keyloom`. Windows launches the GUI exe directly; activation and rollback rewrite an existing owned entry. Linux:
 `$XDG_CONFIG_HOME/autostart/keyloom.desktop` containing `X-Keyloom-Owner=<sha256(str(PREFIX))[:16]>` (`lifecycle.owner_id`).
 Windows: `HKCU\\...\\Run` value `Keyloom` whose command points into this prefix. `lifecycle.remove_autostart` deletes only a matching entry.

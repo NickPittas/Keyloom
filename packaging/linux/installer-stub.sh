@@ -1,6 +1,6 @@
 #!/bin/sh
 # Keyloom @VERSION_ID@ self-extracting Linux user installer (needs only sh, tar, gzip, awk, sha256sum).
-# No root (only an optional, asked-for sudo for UFW rules). Configures a per-user network host; user data stays outside PREFIX.
+# No root (only an optional, asked-for sudo for UFW rules). Retires the old per-user network service when the app hosts the endpoint itself; user data stays outside PREFIX.
 set -eu
 # Layout after this stub: boot.tar.gz, app.tar.gz, runtime.tar.gz (independent gzip streams). Offsets are relative to the first
 # byte after the stub, which is STUB_BYTES long.

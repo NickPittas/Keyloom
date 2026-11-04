@@ -243,6 +243,10 @@ fn count_images(dir: &Path) -> usize {
     list_images(dir).len()
 }
 
+fn source_movie_missing(p: &Path) -> String {
+    format!("Source movie not found at {}: reconnect or relink it", p.display())
+}
+
 fn first_video(dir: &Path) -> Option<PathBuf> {
     let mut v: Vec<PathBuf> = fs::read_dir(dir)
         .ok()?
@@ -561,8 +565,8 @@ fn load_clip(
         .unwrap_or(&name)
         .to_owned();
 
-    // Source, same order as `ClipEntry.find_assets`: Frames → Input → Source/ video (or clip.json original
-    // file) → external sequence (ERROR if gone) → root Input.* video. Anything else is not listed.
+    // Source, same order as `ClipEntry.find_assets`: Frames → Input → Source/ video (legacy copy, or clip.json original
+    // file) → in-place original movie → external sequence (ERROR if gone) → root Input.* video. Anything else is not listed.
     let src_meta = get("source");
     let src_type = src_meta.and_then(|s| s.get("type")).and_then(Value::as_str);
     let orig = src_meta
@@ -588,10 +592,13 @@ fn load_clip(
             // A movie clip whose movie vanished stays listed (error state) so it can be relinked; the Qt app
             // does not list it. Anything else without a source is still not listed.
             None if src_meta.and_then(|m| m.get("filename")).is_some() => {
-                error = Some(format!(
-                    "Source movie missing: nothing in {} (relink the movie to extract frames again)",
-                    cr.join("Source").display()
-                ));
+                error = Some(match &orig {
+                    Some(o) => source_movie_missing(o),
+                    None => format!(
+                        "Source movie missing: nothing in {} (relink the movie to extract frames again)",
+                        cr.join("Source").display()
+                    ),
+                });
                 Source::Missing
             }
             None => return Err(format!("Clip '{folder}': 'Source' dir has no video.")),
@@ -604,6 +611,18 @@ fn load_clip(
             }
         } else {
             error = Some(format!("Source folder missing: {}", p.display()));
+            Source::Missing
+        }
+    } else if let (Some(p), true) = (
+        orig.as_ref().filter(|_| src_type != Some("sequence")),
+        src_meta.and_then(|m| m.get("filename")).is_some(),
+    ) {
+        // Movie imported in place (no Source/ copy): the original is the source; a gone movie stays listed
+        // (error state) so it can be relinked.
+        if p.is_file() {
+            Source::Video { path: p.clone() }
+        } else {
+            error = Some(source_movie_missing(p));
             Source::Missing
         }
     } else if let Some(v) = root_input_video(cr) {
@@ -714,8 +733,22 @@ fn load_clip(
         (None, String::new())
     };
 
-    let alpha_frames = count_images(&cr.join("AlphaHint"));
-    let mask_frames = count_images(&cr.join("VideoMamaMaskHint"));
+    let recorded_hint = |kind: &str| {
+        src_meta
+            .and_then(|s| s.get("hint_sequences"))
+            .and_then(|h| h.get(kind))
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+    };
+    let alpha_frames = recorded_hint("AlphaHint")
+        .as_deref()
+        .map(count_images)
+        .unwrap_or_else(|| count_images(&cr.join("AlphaHint")));
+    let mask_frames = recorded_hint("VideoMamaMaskHint")
+        .as_deref()
+        .map(count_images)
+        .unwrap_or_else(|| count_images(&cr.join("VideoMamaMaskHint")));
 
     // The folder of the last Key job (`key_result`) wins over the legacy output folder.
     let result_dir = get("key_result")

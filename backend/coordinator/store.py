@@ -4,6 +4,7 @@ No timer ever reassigns a started attempt: only an explicit receiver terminal ev
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -53,6 +54,10 @@ CREATE TABLE job_rejections(job_id TEXT NOT NULL, installation_id TEXT NOT NULL,
 _DDL_V2 = """
 CREATE TABLE shared_invitations(code_hash TEXT PRIMARY KEY, created_by TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL);
 """
+# App inbox marker; the additive table keeps the database readable by schema-2 builds.
+_DDL_V3 = """
+CREATE TABLE inbox_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
 
 
 def token_hash(token):
@@ -64,8 +69,9 @@ def new_id(prefix):
 
 
 class Store:
-    def __init__(self, path, clock=time.time):
+    def __init__(self, path, clock=time.time, on_commit=None):
         self.clock = clock
+        self.on_commit = on_commit  # (kind, job_id) after a NEW submission or a cancel commits; never called under the lock
         self._lock = threading.Lock()
         self._ready = False
         self._stats_lock = threading.Lock()
@@ -83,15 +89,50 @@ class Store:
             if self.db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
                 raise RuntimeError("coordinator database has tables but no schema version; refusing to touch it")
             with self._tx():
-                for stmt in (_DDL + _DDL_V2).split(";\n"):
+                for stmt in (_DDL + _DDL_V2 + _DDL_V3).split(";\n"):
                     if stmt.strip():
                         self.db.execute(stmt)
+                self.db.execute("INSERT INTO inbox_meta VALUES('migrated_from', '0')")
                 self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-        elif ver == 1:  # in-place, additive, one transaction: existing installations, jobs and unused one-use codes are kept
-            with self._tx():
-                self.db.execute(_DDL_V2.strip().rstrip(";"))
-                self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        else:
+            if ver == 1:
+                self._backup(path, ver)
+                with self._tx():
+                    self.db.execute(_DDL_V2.strip().rstrip(";"))
+                    self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbox_meta'").fetchone():
+                self._backup(path, ver)
+                with self._tx():
+                    self.db.execute(_DDL_V3.strip().rstrip(";"))
+            if not self.db.execute("SELECT 1 FROM inbox_meta WHERE key='migrated_from'").fetchone():
+                self._backup(path, ver)
+                with self._tx():
+                    now = self.clock()
+                    for att in self.db.execute("SELECT * FROM attempts WHERE state='offered'").fetchall():
+                        self._requeue_offer(self.db, att, "offer cleared by the app inbox upgrade", now)
+                    self.db.execute("INSERT INTO inbox_meta VALUES('migrated_from', ?)", (str(ver),))
         self._ready = True
+
+    def _backup(self, path, ver):
+        """Consistent copy of the old database beside it, taken once before the first in-place upgrade."""
+        dest = f"{path}.v{ver}.bak"
+        if not os.path.exists(dest):
+            out = sqlite3.connect(dest)
+            try:
+                self.db.backup(out)
+            finally:
+                out.close()
+            try:
+                os.chmod(dest, 0o600)
+            except OSError:
+                pass
+
+    def _notify(self, kind, job_id):
+        if self.on_commit:
+            try:
+                self.on_commit(kind, job_id)
+            except Exception:
+                pass  # a broken listener must never undo or fail a committed submission
 
     def close(self):
         self.db.close()
@@ -255,6 +296,7 @@ class Store:
                        (jid, inst["id"], target, canonical(body["spec"]), json.dumps(info["roots"]), canonical(info["models"]), now, now))
             resp = {"job_id": jid, "state": "queued"}
             db.execute("INSERT INTO submissions VALUES(?,?,?,?)", (sid, inst["id"], phash, canonical(resp)))
+        self._notify("submitted", jid)  # after COMMIT: the app learns of the shot only once it is durable
         return resp
 
     # ---- claim / reject / start -------------------------------------------------------------------
@@ -385,34 +427,37 @@ class Store:
             validate_event(e)
         with self._tx() as db:
             att = self._attempt(db, inst, attempt_id, body["session_id"])
-            if att["state"] == "offered":
-                raise ApiError(409, "attempt_not_started", "acknowledge start before reporting events")
-            last, state, now = att["last_seq"], att["state"], self.clock()
-            for i, e in enumerate(evs):
-                payload, ph = canonical(e), digest(e)
-                if e["seq"] <= last:  # replay: identical content is a no-op, anything else is a conflict
-                    old = db.execute("SELECT payload_hash FROM events WHERE attempt_id=? AND seq=?", (attempt_id, e["seq"])).fetchone()
-                    if not old or old[0] != ph:
-                        raise ApiError(409, "seq_conflict", f"seq {e['seq']} was already reported with different content")
-                    continue
-                if state != "started":
-                    raise ApiError(409, "attempt_terminal", "attempt already ended")
-                if e["seq"] != last + 1:
-                    raise ApiError(409, "seq_gap", f"expected seq {last + 1}, got {e['seq']}")
-                if e["type"] == "terminal" and i != len(evs) - 1:
-                    bad("terminal event must be last in its batch")
-                db.execute("INSERT INTO events(attempt_id,job_id,seq,type,payload_json,payload_hash,created_at) VALUES(?,?,?,?,?,?,?)",
-                           (attempt_id, att["job_id"], e["seq"], e["type"], payload, ph, now))
-                last = e["seq"]
-                if e["type"] == "terminal":
-                    state = e["data"]["state"]
-                    db.execute("UPDATE attempts SET state=?, ended_at=?, reason=? WHERE attempt_id=?",
-                               (state, now, e["data"].get("message"), attempt_id))
-                    db.execute("UPDATE jobs SET state=?, reason=?, updated_at=? WHERE job_id=?",
-                               (state, e["data"].get("message"), now, att["job_id"]))
-            db.execute("UPDATE attempts SET last_seq=? WHERE attempt_id=?", (last, attempt_id))
-            att = db.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
-            return self._ctl(db, att)
+            return self._record(db, att, evs, attempt_id)
+
+    def _record(self, db, att, evs, attempt_id):
+        if att["state"] == "offered":
+            raise ApiError(409, "attempt_not_started", "acknowledge start before reporting events")
+        last, state, now = att["last_seq"], att["state"], self.clock()
+        for i, e in enumerate(evs):
+            payload, ph = canonical(e), digest(e)
+            if e["seq"] <= last:  # replay: identical content is a no-op, anything else is a conflict
+                old = db.execute("SELECT payload_hash FROM events WHERE attempt_id=? AND seq=?", (attempt_id, e["seq"])).fetchone()
+                if not old or old[0] != ph:
+                    raise ApiError(409, "seq_conflict", f"seq {e['seq']} was already reported with different content")
+                continue
+            if state != "started":
+                raise ApiError(409, "attempt_terminal", "attempt already ended")
+            if e["seq"] != last + 1:
+                raise ApiError(409, "seq_gap", f"expected seq {last + 1}, got {e['seq']}")
+            if e["type"] == "terminal" and i != len(evs) - 1:
+                bad("terminal event must be last in its batch")
+            db.execute("INSERT INTO events(attempt_id,job_id,seq,type,payload_json,payload_hash,created_at) VALUES(?,?,?,?,?,?,?)",
+                       (attempt_id, att["job_id"], e["seq"], e["type"], payload, ph, now))
+            last = e["seq"]
+            if e["type"] == "terminal":
+                state = e["data"]["state"]
+                db.execute("UPDATE attempts SET state=?, ended_at=?, reason=? WHERE attempt_id=?",
+                           (state, now, e["data"].get("message"), attempt_id))
+                db.execute("UPDATE jobs SET state=?, reason=?, updated_at=? WHERE job_id=?",
+                           (state, e["data"].get("message"), now, att["job_id"]))
+        db.execute("UPDATE attempts SET last_seq=? WHERE attempt_id=?", (last, attempt_id))
+        att = db.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        return self._ctl(db, att)
 
     # ---- submitter side ---------------------------------------------------------------------------
 
@@ -433,6 +478,11 @@ class Store:
                             effective_plan=json.loads(a["effective_plan_json"]) if a["effective_plan_json"] else None)
             if job["state"] == "queued":
                 view["ineligible"] = self._ineligible(db, job)
+                view["queue_position"] = db.execute("SELECT count(*) FROM jobs WHERE state='queued' AND seq<=?", (job["seq"],)).fetchone()[0]
+            for kind in ("progress", "terminal"):  # the sender's whole answer: how far, and how it ended
+                r = db.execute("SELECT payload_json FROM events WHERE job_id=? AND type=? ORDER BY id DESC LIMIT 1", (job_id, kind)).fetchone()
+                if r:
+                    view["result" if kind == "terminal" else kind] = json.loads(r[0])["data"]
             return view
 
     def _ineligible(self, db, job):
@@ -463,6 +513,8 @@ class Store:
                 db.execute("UPDATE jobs SET state='cancelled', cancel_requested=1, updated_at=? WHERE job_id=?", (now, job_id))
             elif st == "started":  # request only: the receiver must report its own terminal state
                 db.execute("UPDATE jobs SET cancel_requested=1, updated_at=? WHERE job_id=?", (now, job_id))
+        if st in ("queued", "offered", "started"):
+            self._notify("cancelled", job_id)
         return self.job_view(inst, job_id)
 
     def job_events(self, inst, job_id, after=0, limit=100):
@@ -474,6 +526,55 @@ class Store:
                               (job_id, after, limit)).fetchall()
         evs = [{"cursor": r["id"], "attempt_id": r["attempt_id"], **json.loads(r["payload_json"])} for r in rows]
         return {"events": evs, "cursor": evs[-1]["cursor"] if evs else after}
+
+    # ---- app inbox (the receiving app is the only reader; no session, offer or claim) -------------
+
+    def inbox_pending(self, host_id):
+        """Queued shots for this PC (aimed at it or at nobody), oldest first. Read at startup and on a commit notice."""
+        with self._lock:
+            rows = self.db.execute("SELECT job_id, spec_json, cancel_requested FROM jobs WHERE state='queued' AND (target IS NULL OR target=?)"
+                                   " ORDER BY seq", (host_id,)).fetchall()
+        return [{"job_id": r["job_id"], "spec": json.loads(r["spec_json"]), "cancel_requested": bool(r["cancel_requested"])} for r in rows]
+
+    def inbox_held(self, host_id):
+        """Started shots with no terminal event: uncertain after a restart. Never replayed; the user resolves them (abandon)."""
+        with self._lock:
+            return [dict(r) for r in self.db.execute("SELECT job_id, attempt_id, started_at FROM attempts WHERE state='started' AND installation_id=? ORDER BY started_at", (host_id,))]
+
+    def inbox_begin(self, host_id, job_id, slot, plan):
+        """The app starts one queued shot on its own worker `slot`. A busy slot refuses (the shot stays queued)."""
+        if not isinstance(plan, dict) or len(canonical(plan)) > 8192:
+            bad("plan must be an object of at most 8 KiB")
+        now, aid = self.clock(), new_id("att")
+        with self._tx() as db:
+            job = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if not job or (job["target"] not in (None, host_id)):
+                raise ApiError(404, "unknown_job", "no such job")
+            if job["state"] != "queued":
+                raise ApiError(409, "not_queued", f"job is {job['state']}")
+            if db.execute("SELECT 1 FROM attempts WHERE slot_id=? AND state IN ('offered','started')", (slot,)).fetchone():
+                raise ApiError(409, "slot_busy", "that worker already runs a shot")
+            db.execute("INSERT INTO attempts(attempt_id,job_id,installation_id,slot_id,state,offered_at,started_at,start_hash,effective_plan_json)"
+                       " VALUES(?,?,?,?,'started',?,?,?,?)", (aid, job_id, host_id, slot, now, now, digest(plan), canonical(plan)))
+            db.execute("UPDATE jobs SET state='started', attempt_id=?, updated_at=? WHERE job_id=?", (aid, now, job_id))
+        return {"attempt_id": aid}
+
+    def inbox_report(self, host_id, job_id, events):
+        """Progress/terminal events from the app's own worker; same sequencing rules as a remote report."""
+        if not isinstance(events, list) or len(events) > MAX_BATCH:
+            bad(f"events must be a list of at most {MAX_BATCH}")
+        for e in events:
+            validate_event(e)
+        with self._tx() as db:
+            att = db.execute("SELECT * FROM attempts WHERE job_id=? AND installation_id=? ORDER BY offered_at DESC LIMIT 1", (job_id, host_id)).fetchone()
+            if not att:
+                raise ApiError(404, "unknown_job", "no such job")
+            return self._record(db, att, events, att["attempt_id"])
+
+    def inbox_cancel_requested(self, job_id):
+        with self._lock:
+            r = self.db.execute("SELECT cancel_requested FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        return bool(r and r[0])
 
     # ---- live stats (separate from job events; works while idle) ----------------------------------
 

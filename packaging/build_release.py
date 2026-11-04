@@ -274,6 +274,9 @@ lc = importlib.util.module_from_spec(spec); sys.modules["ck_lifecycle"] = lc; sp
 fw = lc._firewall()
 if fw is None or not all(callable(getattr(fw, n, None)) for n in ("run", "remove", "main")):
     raise SystemExit("staged firewall helper is missing or lacks run()/remove()/main()")
+cl = lc._legacy_cleanup()  # the old-service cleanup the activation step runs
+if not callable(getattr(cl, "retire", None)):
+    raise SystemExit("staged legacy_network_cleanup.py lacks retire()")
 print("installer helper load ok")
 """
 

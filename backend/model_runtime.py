@@ -42,8 +42,8 @@ class ModelArtifactLease:
         self.close()
 
 
-def _catalog_artifact(artifact_id: str):
-    catalog = load_catalog()
+def _catalog_artifact(artifact_id: str, catalog=None):
+    catalog = catalog or load_catalog()
     try:
         artifact = catalog.get(artifact_id)
     except CatalogError as exc:
@@ -51,9 +51,9 @@ def _catalog_artifact(artifact_id: str):
     return catalog, artifact
 
 
-def model_artifact_dir(artifact_id: str, *, roots: Roots | None = None) -> Path:
+def model_artifact_dir(artifact_id: str, *, roots: Roots | None = None, catalog=None) -> Path:
     """Resolve a catalog model directory without checking or loading its files."""
-    catalog, artifact = _catalog_artifact(artifact_id)
+    catalog, artifact = _catalog_artifact(artifact_id, catalog)
     roots = roots or Roots.defaults()
     if artifact.kind == "hf_cache_file":
         path = hf_cache_snapshot_path(
@@ -122,15 +122,53 @@ def validate_local_model_path(
     return root
 
 
+def dependency_problem(checker: StatusChecker, dependency) -> str | None:
+    """Why one catalog entry is not ready to load (None when ready); offline, never hashes."""
+    status = checker.check_artifact(dependency)
+    messages = list(status["problems"])
+    for file in dependency.required_files():
+        path = checker.file_path(dependency, file)
+        if path is not None and path.is_file() and path.stat().st_size == 0:
+            messages.append(f"empty: {file.layout_path}")
+    if status["state"] != "installed" or messages:
+        action = "Repair required"
+        detail = ", ".join(messages) or "required files are missing"
+    elif status["ready"]:
+        return None
+    elif status["verify_state"] == "unknown (not verified yet)":
+        action = "Verify required"
+        detail = "installed files have not been verified against trusted digests"
+    elif status["unhashed_files"]:
+        action = "Verification unavailable"
+        detail = "catalog has no trusted digest for " + ", ".join(status["unhashed_files"])
+    else:
+        action = "Repair required"
+        detail = "known trusted-digest mismatch"
+    return f"{dependency.id} at {status['path'] or 'package'}: {detail} ({action})"
+
+
+def dependency_path(checker: StatusChecker, dependency) -> Path | None:
+    """The runtime path a loader receives for one entry: a file, a directory, or None for packages."""
+    if dependency.kind == "local_package":
+        return None
+    if dependency.kind in ("hf_cache_file", "http_file"):
+        required = dependency.required_files()
+        path = checker.file_path(dependency, required[0]) if required else None
+    else:
+        path = model_artifact_dir(dependency.id, roots=checker.roots, catalog=checker.catalog)
+    return Path(path) if path is not None else None
+
+
 def acquire_model_artifact(
     artifact_id: str,
     *,
     roots: Roots | None = None,
     exclude_dependencies: tuple[str, ...] = (),
     exclude_components: tuple[str, ...] = (),
+    catalog=None,
 ) -> ModelArtifactLease:
     """Validate and lease an artifact and its dependency closure for its loaded lifetime."""
-    catalog, artifact = _catalog_artifact(artifact_id)
+    catalog, artifact = _catalog_artifact(artifact_id, catalog)
     checker = StatusChecker(catalog, roots or Roots.defaults())
     problems: list[str] = []
     closure = catalog.closure([artifact_id])
@@ -166,30 +204,9 @@ def acquire_model_artifact(
         for _identity, destination in ordered:
             locks.enter_context(DestinationLock(destination, shared=True))
         for dependency in selected:
-            status = checker.check_artifact(dependency)
-            messages = list(status["problems"])
-            for file in dependency.required_files():
-                path = checker.file_path(dependency, file)
-                if path is not None and path.is_file() and path.stat().st_size == 0:
-                    messages.append(f"empty: {file.layout_path}")
-            if status["state"] != "installed" or messages:
-                action = "Repair required"
-                detail = ", ".join(messages) or "required files are missing"
-            elif status["ready"]:
-                continue
-            elif status["verify_state"] == "unknown (not verified yet)":
-                action = "Verify required"
-                detail = "installed files have not been verified against trusted digests"
-            elif status["unhashed_files"]:
-                action = "Verification unavailable"
-                detail = "catalog has no trusted digest for " + ", ".join(status["unhashed_files"])
-            else:
-                action = "Repair required"
-                detail = "known trusted-digest mismatch"
-            if not status["ready"] or messages:
-                problems.append(
-                    f"{dependency.id} at {status['path'] or 'package'}: {detail} ({action})"
-                )
+            problem = dependency_problem(checker, dependency)
+            if problem:
+                problems.append(problem)
         if problems:
             raise ModelAssetsUnavailableError(
                 f"Model assets for {artifact_id} are missing or incomplete: "
@@ -199,15 +216,9 @@ def acquire_model_artifact(
 
         paths = {}
         for dependency in selected:
-            if dependency.kind == "local_package":
-                continue  # Package readiness is checked above; it has no model-file path.
-            if dependency.kind in ("hf_cache_file", "http_file"):
-                required = dependency.required_files()
-                path = checker.file_path(dependency, required[0]) if required else None
-            else:
-                path = model_artifact_dir(dependency.id, roots=checker.roots)
+            path = dependency_path(checker, dependency)
             if path is not None:
-                paths[dependency.id] = Path(path)
+                paths[dependency.id] = path
         if artifact_id not in paths:
             raise ModelAssetsUnavailableError(
                 f"Model catalog entry {artifact_id} has no local runtime path; repair the install."

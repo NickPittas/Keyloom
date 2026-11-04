@@ -404,6 +404,55 @@ pub fn prepare_python_command(c: &mut std::process::Command, install: Option<&In
     }
 }
 
+/// The library file of the Python runtime in `home`: `lib/libpython3.N.so.1.0` (Linux) or `python3NN.dll` (Windows).
+fn python_library(home: &Path) -> Option<PathBuf> {
+    let (dirs, ok): (&[&str], fn(&str) -> bool) = if cfg!(windows) {
+        (&["."], |n| n.starts_with("python3") && n.ends_with(".dll") && n != "python3.dll")
+    } else {
+        (&["lib", "lib64"], |n| n.starts_with("libpython3.") && n.contains(".so."))
+    };
+    dirs.iter()
+        .filter_map(|d| std::fs::read_dir(home.join(d)).ok())
+        .flat_map(|rd| rd.filter_map(Result::ok))
+        .filter(|e| e.file_name().to_str().is_some_and(ok))
+        .map(|e| e.path())
+        .min()
+}
+
+/// Where the app finds the interpreter it embeds (ARCH-PLAN section 8): the pinned runtime of an install (home = the folder that holds
+/// `bin/python3` / `python.exe`, import root = the install's app folder), or in a developer checkout the base of `CK_PYTHON` / the repo `.venv`
+/// (import root = the repo). Nothing is loaded here.
+pub fn embed_paths(l: &Launch) -> Result<crate::app_api::Paths, String> {
+    let (py, root) = match (&l.install, &l.repo) {
+        (Some(i), _) if l.problem.is_none() => (i.python.clone(), i.helper.clone()),
+        (_, Some(repo)) => (l.python.clone().unwrap_or_else(|| crate::import::python(repo)), repo.clone()),
+        _ => return Err(l.problem.clone().unwrap_or_else(|| "no Keyloom runtime folder was found".into())),
+    };
+    // A venv's python is a link to the base interpreter, whose parent folder holds the library.
+    let real = std::fs::canonicalize(&py).map_err(|e| format!("the Python runtime was not found ({}): {e}", py.display()))?;
+    let bin = real.parent().ok_or("the Python runtime path has no folder")?;
+    let home = if cfg!(windows) { bin.to_path_buf() } else { bin.parent().ok_or("the Python runtime path has no folder")?.to_path_buf() };
+    let library = python_library(&home).ok_or_else(|| format!("no Python shared library was found in {}", home.display()))?;
+    // A dev checkout's venv holds the dependencies (cryptography, ...); the installed runtime carries them in the app folder, so it stays isolated.
+    let mut roots = vec![root];
+    if l.install.is_none() || l.problem.is_some() {
+        roots.extend(venv_site_packages(&py));
+    }
+    Ok(crate::app_api::Paths { library, home, roots })
+}
+
+/// `<venv>/lib/python3.N/site-packages` (Windows `<venv>\Lib\site-packages`) when `py` is a venv's interpreter (`pyvenv.cfg` beside its `bin`/`Scripts`).
+fn venv_site_packages(py: &Path) -> Option<PathBuf> {
+    let venv = py.parent()?.parent()?;
+    if !venv.join("pyvenv.cfg").is_file() {
+        return None;
+    }
+    if cfg!(windows) {
+        return Some(venv.join("Lib/site-packages"));
+    }
+    std::fs::read_dir(venv.join("lib")).ok()?.filter_map(Result::ok).map(|e| e.path().join("site-packages")).filter(|p| p.is_dir()).min()
+}
+
 fn nonempty(v: Option<std::ffi::OsString>) -> Option<PathBuf> {
     v.filter(|s| !s.is_empty()).map(PathBuf::from)
 }

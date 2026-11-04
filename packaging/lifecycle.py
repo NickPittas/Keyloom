@@ -734,11 +734,23 @@ def remove_autostart(prefix: Path) -> None:
         d.unlink()
 
 
-def _network_service(version_dir: Path):
-    """The version's own stdlib-only service manager, loaded by path (no sys.path or cwd involvement)."""
+ENDPOINT_FILE = "app-endpoint.json"  # written by bundle.py only when the UI binary carries the in-app endpoint
+
+
+def app_endpoint_ready(version_dir: Path) -> bool:
+    """True when this version's app answers other PCs itself (so the old background service may go). Decided at build time by
+    bundle.write_endpoint_marker from the UI binary; the file is part of the verified bundle."""
+    try:
+        d = load_json(version_dir / ENDPOINT_FILE)
+    except InstallError:  # unreadable: assume no endpoint, so the service is never removed on a doubt
+        return False
+    return isinstance(d, dict) and d.get("schema") == 1 and d.get("app_endpoint") == 1
+
+
+def _legacy_cleanup():
+    """packaging/legacy_network_cleanup.py next to this file, loaded in this interpreter (uninstall)."""
     import importlib.util
-    f = version_dir / "app/backend/network_service.py"
-    spec = importlib.util.spec_from_file_location("ck_network_service", f)
+    spec = importlib.util.spec_from_file_location("ck_legacy_network_cleanup", Path(__file__).resolve().with_name("legacy_network_cleanup.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -763,6 +775,10 @@ def _net_attempt(version_dir: Path, prefix: Path) -> dict:
                        "network", env=clean_env(), timeout=INNER_TIMEOUT)  # hang guard; a timeout is reported, never success
     except subprocess.TimeoutExpired:
         return dict(failed, code="timeout", message=f"no result within {INNER_TIMEOUT} s")
+    return _net_result(r, failed)
+
+
+def _net_result(r, failed: dict) -> dict:
     line = next((ln for ln in r.stdout.splitlines() if ln.startswith("KEYLOOM-NET-RESULT ")), None)
     if r.returncode or line is None:
         return dict(failed, code="crashed", message=f"network setup exited with code {r.returncode} without a result")
@@ -772,6 +788,42 @@ def _net_attempt(version_dir: Path, prefix: Path) -> dict:
         return dict(failed, code=err.get("code") or "internal", message=f"{err['type']}: {err['message']}")
     return {"action": out.get("action"), "installed": bool(out.get("installed")), "running": bool(out.get("running")),
             "mode": out.get("mode"), "code": out.get("error_code"), "message": out.get("message", "")}
+
+
+def _record_network(prefix: Path, receipt: dict | None, net: dict) -> None:
+    try:
+        saved = receipt if receipt is not None else read_receipt(prefix)
+        saved["network"] = {"services": net["installed"], "listeners": net["running"],
+                            "firewall_rules": (saved.get("network") or {}).get("firewall_rules", False), "setup": net}
+        atomic_write_json(prefix / RECEIPT, saved)
+    except Exception as e:
+        log_exc("recording the network setup", e)
+
+
+def retire_legacy_service(version_dir: Path, prefix: Path, receipt: dict | None = None) -> dict:
+    """The version's app hosts the endpoint: stop and remove the old background service this prefix owns (state, certificate, key,
+    pin, token, identity, database and registered PCs stay). Run by the installed interpreter; never fails activation."""
+    say("Removing the old background network service (the app answers other PCs itself now) ...")
+    failed = {"action": "failed", "installed": False, "running": False, "mode": None}
+    try:
+        r = run_logged([str(descriptor_python(version_dir)), "-I", "-B", str(version_dir / "app/packaging/legacy_network_cleanup.py"), str(prefix)],
+                       "network", env=clean_env(), timeout=INNER_TIMEOUT)
+        net = _net_result(r, failed)
+    except subprocess.TimeoutExpired:
+        net = dict(failed, code="timeout", message=f"no result within {INNER_TIMEOUT} s")
+    except Exception as e:
+        log_exc("legacy network cleanup", e)
+        net = dict(failed, code="internal", message=f"{type(e).__name__}: {e}")
+    net = dict(net, ok=net["action"] != "failed", attempts=1, time=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    say(f"network: {net['action']}; {net['message']}")
+    _record_network(prefix, receipt, net)
+    return net
+
+
+def network_step(version_dir: Path, prefix: Path, receipt: dict | None = None) -> dict:
+    """The one network decision of an activation: retire the old service only when this version's app hosts the endpoint
+    (app-endpoint.json); otherwise keep the previous behaviour, so no PC is ever left without an endpoint."""
+    return (retire_legacy_service if app_endpoint_ready(version_dir) else refresh_network_service)(version_dir, prefix, receipt)
 
 
 def refresh_network_service(version_dir: Path, prefix: Path, receipt: dict | None = None) -> dict:
@@ -791,13 +843,7 @@ def refresh_network_service(version_dir: Path, prefix: Path, receipt: dict | Non
                "message": f"{type(e).__name__}: {e}"}
     net = dict(net, ok=net["action"] != "failed", attempts=attempts, time=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     say(f"network: {net['action']}; installed={net['installed']} running={net['running']}; {net['message']}")
-    try:
-        saved = receipt if receipt is not None else read_receipt(prefix)
-        saved["network"] = {"services": net["installed"], "listeners": net["running"],
-                            "firewall_rules": (saved.get("network") or {}).get("firewall_rules", False), "setup": net}
-        atomic_write_json(prefix / RECEIPT, saved)
-    except Exception as e:
-        log_exc("recording the network setup", e)
+    _record_network(prefix, receipt, net)
     return net
 
 
@@ -806,12 +852,11 @@ def remove_network_service(prefix: Path, version: str | None) -> None:
     if not (prefix / "network-service.json").is_file():
         return
     try:
-        msg = _network_service(vpath(prefix, version)).remove_owned(prefix)
-        if msg:
-            say(msg)
+        out = _legacy_cleanup().retire(prefix)
+        say(out["message"])
     except Exception as e:
         log_exc("network service removal", e)
-        raise InstallError(f"the network service could not be stopped and removed ({type(e).__name__}: {getattr(e, 'message', None) or e}); the app was kept installed so you can stop the service from Clients and retry") from e
+        raise InstallError(f"the network service could not be stopped and removed ({type(e).__name__}: {e}); the app was kept installed so you can stop the service and retry") from e
 
 
 def _firewall():
@@ -826,14 +871,14 @@ def _firewall():
     return mod
 
 
-def _firewall_run(version_dir: Path, mode: str, prior: dict | None) -> dict | None:
+def _firewall_run(version_dir: Path, mode: str, prior: dict | None, program: str | None = None) -> dict | None:
     """Run firewall.run in the INSTALLED interpreter. cmd_install renames the staged payload (and its Python) before this
     step, so the starting interpreter can no longer import stdlib modules it had not loaded yet. stdio stays on the terminal
     for the prompts and sudo; the record comes back through a private file."""
     out = Path(tempfile.mkdtemp(prefix=".firewall.", dir=version_dir.parents[1])) / "record.json"
     try:
         cmd = [str(descriptor_python(version_dir)), "-I", "-B", str(version_dir / "app/packaging/firewall.py"),
-               mode, json.dumps(prior or {}), str(out)]
+               mode, json.dumps(prior or {}), str(out), *([program] if program else [])]
         # The helper itself declares the wait (user_wait in firewall.py) around sudo/UAC; its 180 s sudo deadline bounds it.
         say(f"[firewall] run: {' '.join(redact(cmd))}")
         t0 = time.monotonic()
@@ -851,7 +896,11 @@ def firewall_step(prefix: Path, mode: str) -> str | None:
     recorded in the receipt as `firewall` and printed. Returns its status, None when not applicable."""
     try:
         receipt = read_receipt(prefix)
-        rec = _firewall_run(vpath(prefix, receipt["current"]), mode, receipt.get("firewall"))
+        vdir = vpath(prefix, receipt["current"])
+        # Windows rules follow the program that listens: the app once it hosts the endpoint, else the old service's pythonw.exe.
+        setup = (receipt.get("network") or {}).get("setup") or {}
+        app = [str(ui_exe(vdir))] if IS_WIN and app_endpoint_ready(vdir) and setup.get("action") in ("retired", "none") else []
+        rec = _firewall_run(vdir, mode, receipt.get("firewall"), *app)
         if rec is None:
             return None
         receipt["firewall"] = rec
@@ -1086,7 +1135,8 @@ def activate(prefix: Path, version: str, *, shortcuts: bool = True, selfcheck: b
             receipt["versions"].append(version)
         prune_versions(prefix, receipt)
         atomic_write_json(prefix / RECEIPT, receipt)
-        net = refresh_network_service(vdir, prefix, receipt)  # never fails activation; its outcome is recorded in receipt network.setup
+        # Never fails activation; the outcome is recorded in receipt network.setup. A build without the in-app endpoint keeps the service.
+        net = network_step(vdir, prefix, receipt)
     except BaseException as e:
         log_exc("activation failed", e)
         try:

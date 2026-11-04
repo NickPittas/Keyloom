@@ -96,6 +96,8 @@ fn main() -> eframe::Result {
             "--auto-confirm" => o.auto_confirm = true,
             "--keys" => o.keys = next(&mut i).split(',').map(str::to_owned).collect(),
             "--frame" => o.frame = next(&mut i).parse().ok(),
+            // Opt-in until the app-to-app cutover: the old network service still owns this PC's network state by default.
+            "--app-endpoint" => o.endpoint = true,
             "--metrics-fixture" => o.metrics = ck::metrics::Source::Fixture(next(&mut i).into()),
             "--screenshot" => o.screenshot = Some(next(&mut i).into()),
             "--screenshot-after" => o.screenshot_after = next(&mut i).parse().ok(),
@@ -110,6 +112,7 @@ fn main() -> eframe::Result {
         }
         i += 1;
     }
+    o.net = ck::netlink::Source::for_app(o.endpoint, o.repo.as_deref());
     // One window/receiver per user: a second launch shows the first window and exits. Dev/QA runs are exempt.
     let dev = o.screenshot.is_some() || !o.keys.is_empty() || !matches!(o.metrics, ck::metrics::Source::Local);
     let settings_dir = ck::settings::default_path().and_then(|p| p.parent().map(std::path::Path::to_path_buf));

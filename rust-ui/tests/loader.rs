@@ -149,6 +149,24 @@ fn v2_discovery_state_output_root_color_and_no_write() {
 }
 
 #[test]
+fn imported_sequence_uses_recorded_companion_hint_folder() {
+    let root = tmpdir("external-hint");
+    let hint = root.join("Shot01_AlphaHint");
+    for n in [1, 2] {
+        touch(&root.join(format!("clips/shot/Frames/f_{n}.png")));
+        touch(&hint.join(format!("f_{n}.png")));
+    }
+    put(&root.join("project.json"), r#"{"version":2,"clips":["shot"]}"#);
+    put(
+        &root.join("clips/shot/clip.json"),
+        &format!(r#"{{"source":{{"type":"sequence","hint_sequences":{{"AlphaHint":"{}"}}}}}}"#, hint.display()),
+    );
+
+    let p = load_project(&root, &LoadOptions::default()).unwrap();
+    assert_eq!(p.clips[0].alpha_frames, 2);
+}
+
+#[test]
 fn global_output_dir_used_only_when_no_override() {
     let root = tmpdir("glob");
     put(&root.join("project.json"), r#"{"version":2,"clips":["c"]}"#);
@@ -493,4 +511,31 @@ fn root_input_video_and_empty_source_dir_with_original_file() {
     let p = load_project(&root, &LoadOptions::default()).unwrap();
     assert!(matches!(&p.clips[0].source, Source::Video { path } if path.ends_with("Input.mov")));
     assert!(matches!(&p.clips[1].source, Source::Video { path } if *path == orig));
+}
+
+#[test]
+fn movie_imported_in_place_uses_the_original_and_names_it_when_gone() {
+    let root = tmpdir("inplace");
+    put(&root.join("project.json"), r#"{"version":2,"clips":["a","b"]}"#);
+    let orig = root.join("médïa/shot ω.mov");
+    touch(&orig);
+    put(
+        &root.join("clips/a/clip.json"),
+        &format!(
+            r#"{{"source":{{"filename":"shot ω.mov","original_path":"{}","copied":false}}}}"#,
+            orig.display()
+        ),
+    );
+    put(
+        &root.join("clips/b/clip.json"),
+        r#"{"source":{"filename":"gone.mov","original_path":"/definitely/not/here/gone.mov","copied":false}}"#,
+    );
+    let p = load_project(&root, &LoadOptions::default()).unwrap();
+    assert!(!root.join("clips/a/Source").exists());
+    assert!(matches!(&p.clips[0].source, Source::Video { path } if *path == orig));
+    let e = &p.clips[1];
+    assert_eq!(e.state, ClipState::Error);
+    assert!(readiness(e).contains(
+        "Source movie not found at /definitely/not/here/gone.mov: reconnect or relink it"
+    ));
 }

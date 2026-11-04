@@ -548,6 +548,33 @@ class ClipEntry:
         )
         return None
 
+    def _hint_ref(self, name: str, key: str, want_dir: bool) -> Optional[str]:
+        """Companion hint recorded in clip.json source.<key>[name] (referenced in place, never copied)."""
+        from .project import _read_clip_or_project_json
+        path = ((_read_clip_or_project_json(self.root_path) or {}).get("source") or {}).get(key, {}).get(name)
+        path = self._map_source(path) if path else path
+        if path and (os.path.isdir(path) if want_dir else os.path.isfile(path)):
+            return path
+        return None
+
+    def _resolve_external_movie(self) -> Optional[str]:
+        """Original movie of an in-place movie import (no Source/ copy), or None.
+
+        A recorded movie that is gone sets ERROR with a message naming the path.
+        """
+        from .project import _read_clip_or_project_json, source_movie_missing_message
+        source = (_read_clip_or_project_json(self.root_path) or {}).get("source") or {}
+        if source.get("type") == "sequence" or not (source.get("filename") and source.get("original_path")):
+            return None
+        path = self._map_source(source["original_path"])
+        if os.path.isfile(path):
+            return path
+        self.state = ClipState.ERROR
+        self.error_message = source_movie_missing_message(path)
+        self.source_type = "video"
+        logger.warning(f"Clip '{self.name}': {self.error_message}")
+        return None
+
     def _resolve_source_type(self) -> str:
         """Determine source_type from clip.json metadata.
 
@@ -613,13 +640,17 @@ class ClipEntry:
                 else:
                     raise ClipScanError(f"Clip '{self.name}': 'Source' dir has no video.")
         else:
-            # No local Frames/Input/Source — check clip.json for external sequence ref
+            # No local Frames/Input/Source — check clip.json for an external sequence or movie
             ext_seq = self._resolve_external_sequence()
-            if ext_seq:
+            ext_movie = None if ext_seq else self._resolve_external_movie()
+            if ext_movie:
+                self.input_asset = ClipAsset(ext_movie, 'video')
+                self.source_type = "video"
+            elif ext_seq:
                 self.input_asset = ClipAsset(ext_seq, 'sequence')
                 self.source_type = "sequence"
             elif self.state == ClipState.ERROR:
-                # _resolve_external_sequence() set ERROR (missing source folder)
+                # _resolve_external_sequence/_movie() set ERROR (missing source)
                 # Clip remains visible with error state — don't raise
                 self._load_hint_keyframes()
                 return
@@ -644,7 +675,13 @@ class ClipEntry:
 
         # Alpha hint asset
         alpha_dir = os.path.join(self.root_path, "AlphaHint")
-        if os.path.isdir(alpha_dir) and os.listdir(alpha_dir):
+        alpha_sequence = self._hint_ref("AlphaHint", "hint_sequences", True)
+        alpha_movie = self._hint_ref("AlphaHint", "hint_movies", False)
+        if alpha_sequence:
+            self.alpha_asset = ClipAsset(alpha_sequence, 'sequence')
+        elif alpha_movie:
+            self.alpha_asset = ClipAsset(alpha_movie, 'video')
+        elif os.path.isdir(alpha_dir) and os.listdir(alpha_dir):
             self.alpha_asset = ClipAsset(alpha_dir, 'sequence')
         else:
             alpha_candidates = glob_module.glob(
@@ -656,7 +693,13 @@ class ClipEntry:
 
         # VideoMaMa mask hint — directory OR video file
         mask_dir = os.path.join(self.root_path, "VideoMamaMaskHint")
-        if os.path.isdir(mask_dir) and os.listdir(mask_dir):
+        mask_sequence = self._hint_ref("VideoMamaMaskHint", "hint_sequences", True)
+        mask_movie = self._hint_ref("VideoMamaMaskHint", "hint_movies", False)
+        if mask_sequence:
+            self.mask_asset = ClipAsset(mask_sequence, 'sequence')
+        elif mask_movie:
+            self.mask_asset = ClipAsset(mask_movie, 'video')
+        elif os.path.isdir(mask_dir) and os.listdir(mask_dir):
             self.mask_asset = ClipAsset(mask_dir, 'sequence')
         else:
             # Check for mask video file (VideoMamaMaskHint.mp4 etc.)

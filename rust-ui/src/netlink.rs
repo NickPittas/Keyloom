@@ -207,7 +207,8 @@ pub enum State {
 
 pub struct Link {
     shared: Arc<Mutex<Shared>>,
-    child: Child,
+    /// `None` for the in-process link.
+    child: Option<Child>,
     tx: Option<Sender<Vec<u8>>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     started: Instant,
@@ -218,7 +219,31 @@ pub struct Link {
 impl std::fmt::Debug for Link {
     // Never prints request arguments.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Link(pid {}, {:?})", self.child.id(), self.state())
+        write!(f, "Link(pid {}, {:?})", self.pid(), self.state())
+    }
+}
+
+/// One line from the bridge (process or in-process). `Err` = the link must end, with the reason.
+fn deliver(shared: &Mutex<Shared>, wake: &dyn Fn(), line: &[u8]) -> Result<(), String> {
+    match std::str::from_utf8(line).map_err(|e| e.to_string()).and_then(parse_line) {
+        Ok(Message::Ready { protocol }) if protocol == PROTOCOL => {
+            shared.lock().unwrap().ready = Some(protocol);
+            wake();
+            Ok(())
+        }
+        Ok(Message::Ready { protocol }) => Err(format!("the link speaks protocol {protocol}, this app needs {PROTOCOL}")),
+        Ok(Message::Reply(rep)) => {
+            let mut g = shared.lock().unwrap();
+            // Only a reply to a request we are still waiting for is kept; the rest is counted, not trusted.
+            match rep.id.as_ref().map(|i| g.pending.remove(i)) {
+                Some(true) => g.replies.push_back(rep),
+                _ => g.stray = g.stray.saturating_add(1),
+            }
+            drop(g);
+            wake();
+            Ok(())
+        }
+        Err(e) => Err(format!("the link sent unreadable output ({e})")),
     }
 }
 
@@ -240,25 +265,9 @@ impl Link {
             let mut buf = vec![];
             loop {
                 let why = match read_bounded_line(&mut r, &mut buf) {
-                    Ok(Line::Text) => match std::str::from_utf8(&buf).map_err(|e| e.to_string()).and_then(parse_line) {
-                        Ok(Message::Ready { protocol }) if protocol == PROTOCOL => {
-                            s1.lock().unwrap().ready = Some(protocol);
-                            w1();
-                            continue;
-                        }
-                        Ok(Message::Ready { protocol }) => format!("the link speaks protocol {protocol}, this app needs {PROTOCOL}"),
-                        Ok(Message::Reply(rep)) => {
-                            let mut g = s1.lock().unwrap();
-                            // Only a reply to a request we are still waiting for is kept; the rest is counted, not trusted.
-                            match rep.id.as_ref().map(|i| g.pending.remove(i)) {
-                                Some(true) => g.replies.push_back(rep),
-                                _ => g.stray = g.stray.saturating_add(1),
-                            }
-                            drop(g);
-                            w1();
-                            continue;
-                        }
-                        Err(e) => format!("the link sent unreadable output ({e})"),
+                    Ok(Line::Text) => match deliver(&s1, &*w1, &buf) {
+                        Ok(()) => continue,
+                        Err(why) => why,
                     },
                     Ok(Line::TooLong) => "the link sent a line over the size limit".into(),
                     Ok(Line::Eof) | Err(_) => "the network link process ended".into(),
@@ -292,11 +301,54 @@ impl Link {
             }
         });
         let threads = [reader, writer, drain].into_iter().filter_map(Result::ok).collect();
-        Ok(Self { shared, child, tx: Some(tx), threads, started: Instant::now(), next: 1, reaped: false })
+        Ok(Self { shared, child: Some(child), tx: Some(tx), threads, started: Instant::now(), next: 1, reaped: false })
+    }
+
+    /// The same link served by the Python bridge running inside this process (no child, no pipes): one thread feeds the
+    /// requests, in order, to `backend.netlink.Bridge.handle`. Same protocol, limits and error codes as the process link.
+    pub fn start_embedded(paths: crate::app_api::Paths, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (tx, rx) = channel::<Vec<u8>>();
+        let (s, w) = (shared.clone(), wake);
+        let t = std::thread::Builder::new()
+            .name("netlink-embedded".into())
+            .spawn(move || {
+                let opened = crate::app_api::init(&paths).map_err(|e| e.to_string()).and_then(|_| {
+                    crate::app_api::call("bridge_open", json!({"timeout": BRIDGE_TIMEOUT_S})).map_err(|e| e.message)
+                });
+                let id = match opened.ok().and_then(|v| v["id"].as_u64()) {
+                    Some(id) => id,
+                    None => return end(&s, "the in-app network link could not start".into(), &*w),
+                };
+                let _ = deliver(&s, &*w, format!(r#"{{"event":"ready","protocol":{PROTOCOL}}}"#).as_bytes());
+                while let Ok(line) = rx.recv() {
+                    let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+                    let step = crate::app_api::call("bridge_line", json!({"id": id, "line": text})).map_err(|e| format!("the in-app network link failed ({})", e.message)).and_then(|v| {
+                        let l = v["line"].as_str().unwrap_or("");
+                        if l.len() > MAX_REPLY_LINE {
+                            return Err("the link sent a line over the size limit".to_string());
+                        }
+                        deliver(&s, &*w, l.as_bytes())?;
+                        Ok(v["stop"].as_bool().unwrap_or(false))
+                    });
+                    match step {
+                        Ok(false) => {}
+                        Ok(true) => break,
+                        Err(why) => {
+                            end(&s, why, &*w);
+                            break;
+                        }
+                    }
+                }
+                let _ = crate::app_api::call("bridge_close", json!({"id": id})); // releases the credentials lock
+                end(&s, "the network link closed".into(), &*w);
+            })
+            .map_err(|e| format!("cannot start the network link: {e}"))?;
+        Ok(Self { shared, child: None, tx: Some(tx), threads: vec![t], started: Instant::now(), next: 1, reaped: false })
     }
 
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.as_ref().map_or_else(std::process::id, Child::id)
     }
 
     pub fn state(&self) -> State {
@@ -390,14 +442,28 @@ impl Link {
         out
     }
 
+    fn running(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => self.threads.iter().any(|t| !t.is_finished()),
+        }
+    }
+
     fn stop_process(&mut self) {
         if self.reaped {
             return;
         }
         self.reaped = true;
-        let _ = self.child.kill();
-        let _ = self.child.wait();
         self.tx = None;
+        let Some(child) = self.child.as_mut() else {
+            // In-process: the thread ends after its in-flight request; join it only if it already has (never wait on the network).
+            for t in self.threads.drain(..).filter(|t| t.is_finished()) {
+                let _ = t.join();
+            }
+            return;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -411,7 +477,7 @@ impl Link {
             let _ = tx.send(b"{\"id\":\"close\",\"op\":\"close\"}\n".to_vec());
         } // dropping the sender also ends the writer, closing stdin (EOF)
         let end = Instant::now() + CLOSE_GRACE;
-        while Instant::now() < end && matches!(self.child.try_wait(), Ok(None)) {
+        while Instant::now() < end && self.running() {
             std::thread::sleep(Duration::from_millis(20));
         }
         self.stop_process();
@@ -433,12 +499,30 @@ pub enum Source {
     Local,
     /// Tests: any command that speaks the bridge protocol.
     Command(Vec<String>),
+    /// The bridge running inside this process (no child); use [`Source::open`].
+    Embedded(crate::app_api::Paths),
 }
 
 impl Source {
+    /// The app's link source: with the in-app endpoint on and its runtime resolvable the bridge runs in-process; otherwise the child process.
+    pub fn for_app(endpoint: bool, repo: Option<&std::path::Path>) -> Self {
+        match endpoint.then(|| crate::runtime::embed_paths(&crate::runtime::launch(repo))) {
+            Some(Ok(p)) => Source::Embedded(p),
+            _ => Source::Local,
+        }
+    }
+
+    /// Start a link from this source: a child process, or for `Embedded` the in-process bridge. `Off` starts nothing.
+    pub fn open(&self, repo: Option<&std::path::Path>, python: Option<&std::path::Path>, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Option<Link>, String> {
+        match self {
+            Source::Embedded(p) => Link::start_embedded(p.clone(), wake).map(Some),
+            other => other.command(repo, python)?.map(|c| Link::start(c, wake)).transpose(),
+        }
+    }
+
     pub fn command(&self, repo: Option<&std::path::Path>, python: Option<&std::path::Path>) -> Result<Option<Command>, String> {
         match self {
-            Source::Off => Ok(None),
+            Source::Off | Source::Embedded(_) => Ok(None),
             Source::Local => repo.map(|r| Some(bridge_command(r, python))).ok_or_else(|| "no runtime folder was found for the network link".into()),
             Source::Command(a) => {
                 let (p, rest) = a.split_first().ok_or("empty link command")?;

@@ -170,3 +170,45 @@ fn viewer_chip_rows_never_overlap_at_three_window_sizes() {
         }
     }
 }
+
+/// A shot whose original movie is gone shows the "not found at <path>: reconnect or relink it" text on its Board card and in Media, readable in both themes.
+#[test]
+fn missing_original_movie_text_shows_on_board_card_and_in_media() {
+    use egui::Shape;
+    fn texts(s: &Shape, out: &mut Vec<String>) {
+        match s {
+            Shape::Vec(v) => v.iter().for_each(|x| texts(x, out)),
+            Shape::Text(t) => out.push(t.galley.job.text.clone()),
+            _ => {}
+        }
+    }
+    let want = "Source movie not found at /gone/movie.mp4: reconnect or relink it";
+    for pref in ["Dark", "Light"] {
+        let root = project(&format!("gone{pref}"));
+        fs::create_dir_all(root.join("clips/m/Source")).unwrap();
+        fs::write(root.join("clips/m/clip.json"), r#"{"source":{"type":"video","filename":"movie.mp4","original_path":"/gone/movie.mp4"}}"#).unwrap();
+        let ctx = egui::Context::default();
+        let dialogs: ck::ui::picker::Backend = Arc::new(|k, _| panic!("a real dialog ({k:?}) must never open in tests"));
+        let sp = std::env::temp_dir().join(format!("ck-theme-gone-{pref}-{}", std::process::id()));
+        fs::create_dir_all(&sp).unwrap();
+        let mut app = App::with_picker(&ctx, AppOptions { project: Some(root), settings_path: Some(sp.join("settings.json")), ..Default::default() }, dialogs);
+        theme::apply_preference(&ctx, pref);
+        let size = Vec2::new(1440.0, 900.0);
+        for _ in 0..3 { frame(&ctx, &mut app, size); }
+        let base = ctx.global_style().visuals.panel_fill;
+        let shapes = frame(&ctx, &mut app, size);
+        let mut t = vec![];
+        for cs in &shapes { texts(&cs.shape, &mut t); }
+        assert!(t.iter().any(|s| s.contains("Source movie not found at /gone/movie.mp4")), "{pref} Board card lacks the text: {t:?}");
+        check(pref, "Board missing movie", &shapes, base);
+        app.open_clip(&ctx, 1); // clips are listed by folder name: c, m
+        assert!(app.in_workspace());
+        app.switch_tab(Tab::Media);
+        for _ in 0..3 { frame(&ctx, &mut app, size); }
+        let shapes = frame(&ctx, &mut app, size);
+        let mut t = vec![];
+        for cs in &shapes { texts(&cs.shape, &mut t); }
+        assert!(t.iter().any(|s| s == want), "{pref} Media lacks the full text: {t:?}");
+        check(pref, "Media missing movie", &shapes, base);
+    }
+}

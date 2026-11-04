@@ -24,6 +24,7 @@ import os
 import posixpath
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -334,6 +335,85 @@ def min_glibc(stage: Path) -> str | None:
     return ".".join(map(str, best[:2] if best[2] == 0 else best)) if best != (0, 0, 0) else None
 
 
+# ---- the app answers other PCs itself: embedded Python runtime + endpoint marker ---------------------------------------------
+# The app loads the pinned runtime's shared library in its own process (ARCH-PLAN section 8): Linux
+# <version>/runtime/python/lib/libpython3.11.so.1.0, Windows <version>\\runtime\\python\\python311.dll. The UI binary carries
+# ENDPOINT_MARKER when it really contains that endpoint; only then does the stage get ENDPOINT_FILE, which tells the installer
+# that the old background service may be retired.
+ENDPOINT_MARKER = b"KEYLOOM_APP_ENDPOINT_DEFAULT_V1"
+ENDPOINT_FILE = "app-endpoint.json"
+LIB_RUNPATH = "$ORIGIN/../runtime/python/lib"  # bin/keyloom-ui -> runtime/python/lib
+
+
+def embed_lib(py_version: str) -> str:
+    major, minor = py_version.split(".")[:2]
+    return f"runtime/python/python{major}{minor}.dll" if IS_WIN else f"runtime/python/lib/libpython{major}.{minor}.so.1.0"
+
+
+def check_embed_runtime(stage: Path, py_version: str) -> str:
+    """The shared Python library the app loads must be in the stage (hence in both installers' manifest)."""
+    rel = embed_lib(py_version)
+    f = stage / rel
+    if f.is_symlink() or not f.is_file():
+        raise SystemExit(f"{rel} is missing from the staged runtime: the app cannot load Python in-process")
+    return rel
+
+
+def elf_dynamic(path: Path) -> tuple[list[str], list[str]]:
+    """(DT_NEEDED, DT_RUNPATH/DT_RPATH entries) of a 64-bit little-endian ELF; ([], []) for anything else."""
+    d = Path(path).read_bytes()
+    if d[:5] != b"\x7fELF\x02" or d[5] != 1:
+        return [], []
+    phoff, = struct.unpack_from("<Q", d, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", d, 0x36)
+    loads, dyn = [], None
+    for i in range(phnum):
+        t, _, off, va, _, fsz, _, _ = struct.unpack_from("<IIQQQQQQ", d, phoff + i * phentsize)
+        if t == 1:
+            loads.append((va, off, fsz))
+        elif t == 2:
+            dyn = (off, fsz)
+    if dyn is None:
+        return [], []
+    tags = [struct.unpack_from("<qQ", d, dyn[0] + k) for k in range(0, dyn[1], 16)]
+    strtab = next((v for t, v in tags if t == 5), None)
+    base = next((off + strtab - va for va, off, fsz in loads if strtab is not None and va <= strtab < va + fsz), None)
+    if base is None:
+        return [], []
+    name = lambda o: d[base + o:d.index(b"\0", base + o)].decode("utf-8", "replace")
+    needed = [name(v) for t, v in tags if t == 1]
+    run = [x for t, v in tags if t in (15, 29) for x in name(v).split(":")]
+    return needed, run
+
+
+def check_ui_libpython(binary: Path) -> None:
+    """Linux: a UI binary that links libpython (instead of dlopen-ing it) must find the bundled one next to itself, so the
+    old-glibc build can never end up depending on a system libpython."""
+    if IS_WIN or not Path(binary).is_file():
+        return
+    needed, run = elf_dynamic(binary)
+    if any(n.startswith("libpython") for n in needed) and LIB_RUNPATH not in run:
+        raise SystemExit(f"{binary} links libpython but has no RUNPATH {LIB_RUNPATH}; link with -C link-arg=-Wl,-rpath,'{LIB_RUNPATH}'")
+
+
+def has_endpoint_marker(binary: Path) -> bool:
+    tail = b""
+    with open(binary, "rb") as f:
+        while chunk := f.read(8 << 20):
+            if ENDPOINT_MARKER in tail + chunk:
+                return True
+            tail = chunk[-len(ENDPOINT_MARKER):]
+    return False
+
+
+def write_endpoint_marker(stage: Path) -> bool:
+    exe = stage / "bin" / ("keyloom-ui.exe" if IS_WIN else "keyloom-ui")
+    ok = exe.is_file() and has_endpoint_marker(exe)
+    if ok:
+        (stage / ENDPOINT_FILE).write_text(json.dumps({"schema": 1, "app_endpoint": 1}) + "\n")
+    return ok
+
+
 def descriptor(stage: Path, version: str) -> None:
     py = "runtime/python/python.exe" if IS_WIN else "runtime/python/bin/python3"
     (stage / "keyloom-install.json").write_text(json.dumps({
@@ -431,6 +511,9 @@ def build_stage(out: Path, *, ui_binary=None, build_ui=False, ffmpeg_dir: Path, 
         lock_sha = stage_runtime(stage, py_version, uv, wheel_cache)
     if IS_WIN:
         stage_vc_runtime(stage)
+    check_embed_runtime(stage, py_version)
+    check_ui_libpython(stage / "bin" / ("keyloom-ui.exe" if IS_WIN else "keyloom-ui"))
+    log("in-app endpoint: " + ("yes" if write_endpoint_marker(stage) else "no (the old background service stays)"))
     descriptor(stage, version)
     catalog_sha = sha256_file(REPO / "backend/model_catalog.json")
     log("scanning ELF glibc floor")

@@ -536,11 +536,8 @@ impl Setup {
             return;
         }
         if self.link.is_none() && !self.queue.is_empty() {
-            match self.source.command(repo, python) {
-                Ok(Some(cmd)) => match Link::start(cmd, wake.clone()) {
-                    Ok(l) => self.link = Some(l),
-                    Err(e) => self.drop_link(&format!("Network setup is unavailable: {e}"), false),
-                },
+            match self.source.open(repo, python, wake.clone()) {
+                Ok(Some(l)) => self.link = Some(l),
                 Ok(None) => self.drop_link("Network setup is unavailable: network is not available in this build", false),
                 Err(e) => self.drop_link(&format!("Network setup is unavailable: {e}"), false),
             }
@@ -586,11 +583,8 @@ impl Setup {
             return;
         }
         if self.scan_link.is_none() {
-            match self.source.command(repo, python) {
-                Ok(Some(cmd)) => match Link::start(cmd, wake.clone()) {
-                    Ok(l) => self.scan_link = Some(l),
-                    Err(e) => return self.end_scan(&format!("Network setup is unavailable: {e}")),
-                },
+            match self.source.open(repo, python, wake.clone()) {
+                Ok(Some(l)) => self.scan_link = Some(l),
                 Ok(None) => return self.end_scan("Network setup is unavailable: network is not available in this build"),
                 Err(e) => return self.end_scan(&format!("Network setup is unavailable: {e}")),
             }

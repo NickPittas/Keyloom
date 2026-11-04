@@ -1131,6 +1131,7 @@ version = "2.5.0"
 dependencies = [
  "eframe",
  "exr",
+ "libloading",
  "natord",
  "parking_lot",
  "png",

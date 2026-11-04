@@ -152,6 +152,9 @@ pub struct AppOptions {
     pub metrics: crate::metrics::Source,
     /// Network client link: `Off` (default, what tests use) starts nothing; the binary uses `Local`.
     pub net: crate::netlink::Source,
+    /// Run the app's network endpoint (embedded Python, `app_api`) in this process. Off by default (tests, dev runs, and the old
+    /// service path until the cutover); only the window path (`App::new`) starts it.
+    pub endpoint: bool,
 }
 
 pub struct App {
@@ -226,6 +229,9 @@ pub struct App {
     setup: crate::network_setup::Setup,
     /// The runtime driver thread (set by `App::new`, the window path); `None` = this host ticks inline from `frame`.
     driver: Option<driver::Driver>,
+    /// The in-process network endpoint (`opts.endpoint`); started by `App::new`, closed by `on_exit`.
+    endpoint: Option<crate::app_api::AppApi>,
+    endpoint_noted: bool,
     net_repo: Option<PathBuf>,
     net_python: Option<PathBuf>,
     clients_rect: Option<egui::Rect>,
@@ -288,8 +294,60 @@ impl App {
             Ok(d) => app.driver = Some(d),
             Err(e) => app.ai.notice = Some(format!("The background driver could not start ({e}); work advances only while the window is drawn.")),
         }
+        app.start_endpoint(&cc.egui_ctx);
         app.release_shared();
         app
+    }
+
+    /// Bring the app's endpoint up on a background thread (the window opens without waiting for it). Commit events wake the driver.
+    fn start_endpoint(&mut self, ctx: &egui::Context) {
+        if !self.opts.endpoint {
+            return;
+        }
+        let Some(sp) = self.settings.store_path() else {
+            self.ai.notice = Some("The network endpoint did not start: there is no settings folder for this PC's network state.".into());
+            return;
+        };
+        let state_dir = crate::app_api::state_dir(sp);
+        let launch = crate::runtime::launch(self.opts.repo.as_deref());
+        let paths = match crate::runtime::embed_paths(&launch) {
+            Ok(p) => p,
+            Err(e) => {
+                self.ai.notice = Some(format!("The network endpoint did not start: {e}"));
+                return;
+            }
+        };
+        let wake = self.driver.as_ref().map(|d| d.waker(ctx));
+        let ctx = ctx.clone();
+        self.endpoint = Some(crate::app_api::AppApi::start(
+            paths,
+            state_dir,
+            std::sync::Arc::new(move || {
+                if let Some(w) = &wake {
+                    w();
+                }
+                ctx.request_repaint();
+            }),
+        ));
+    }
+
+    /// Once the endpoint has settled, say so if it could not take over (the old service still owns this PC's state, or it failed).
+    fn endpoint_notice(&mut self) {
+        use crate::app_api::Status;
+        if self.endpoint_noted {
+            return;
+        }
+        let msg = match self.endpoint.as_ref().map(|e| e.status()) {
+            Some(Status::Passive { message, .. }) => format!("The app's network endpoint stays off: {message}."),
+            Some(Status::Failed { message, .. }) => format!("The app's network endpoint could not start: {message}."),
+            Some(Status::Running(_)) | Some(Status::Stopped) => {
+                self.endpoint_noted = true;
+                return;
+            }
+            Some(Status::Starting) | None => return,
+        };
+        self.endpoint_noted = true;
+        self.ai.notice = Some(msg);
     }
 
     /// Window-free constructor (tests drive the same `frame` the window does).
@@ -383,6 +441,8 @@ impl App {
             remote: driver::Held::new(crate::remote_set::RemoteSet::new(opts.net.clone())),
             setup: crate::network_setup::Setup::new(opts.net.clone()),
             driver: None,
+            endpoint: None,
+            endpoint_noted: false,
             net_repo: opts.repo.clone().or(launch.repo.clone()),
             net_python: launch.python.clone(),
             clients_rect: None,
@@ -1845,6 +1905,7 @@ impl App {
     fn ai_tick(&mut self, ctx: &egui::Context) {
         // With the driver running, scheduling already happened off-frame: the UI only adopts its results.
         let due = if self.driver.is_some() { self.ai.take_refreshes() } else { self.ai.tick() };
+        self.endpoint_notice();
         for r in due {
             self.refresh_clip(ctx, &r.folder);
         }
@@ -2151,6 +2212,9 @@ fn board_card(
         }
         CardState::Idle => {}
     }
+    if let Some(e) = &c.error {
+        ui.add(egui::Label::new(RichText::new(e).color(theme::error(ui)).size(10.5)).truncate()).on_hover_text(e);
+    }
     if matches!(st, CardState::Idle) {
         let facts = match c.sample_size {
             Some((w, h)) => format!("{}×{} · {:.0} fps · {} fr", w, h, c.fps, c.input_files.len()),
@@ -2225,6 +2289,10 @@ impl eframe::App for App {
         self.release_shared();
         if let Some(d) = &self.driver {
             d.stop();
+        }
+        // Quit (window Quit and File > Quit both end here): stop accepting, close the listener and discovery. No UI lock is held.
+        if let Some(e) = self.endpoint.take() {
+            e.stop(std::time::Duration::from_secs(5));
         }
         self.metrics.stop(); // kill + reap the helper
     }

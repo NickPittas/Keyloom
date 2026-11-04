@@ -1,5 +1,5 @@
 ; Keyloom Windows installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
-; Per-user (no admin or automatic firewall rule); activation configures the network host. Each version lands in
+; Per-user (no admin or automatic firewall rule); activation retires the old background network service when the app hosts the endpoint itself. Each version lands in
 ; {app}\versions\<id>; lifecycle.py validates it, switches the active version, writes the Start Menu
 ; shortcut + receipt and (optionally) runs the shared model manager. User data lives outside {app}.
 #define VID "@VERSION_ID@"
@@ -33,7 +33,7 @@ DirExistsWarning=no
 
 [Tasks]
 Name: models; Description: "Download and verify ALL models now (very large; resumable). Off by default: updates and reinstalls never download models; use the app's Models page or keyloom-setup models later."; Flags: unchecked
-Name: firewall; Description: "Configure Windows Firewall rules for the network service (a Windows administrator prompt follows during setup)"
+Name: firewall; Description: "Configure Windows Firewall rules for the Keyloom app (a Windows administrator prompt follows during setup)"
 
 [Files]
 ; 1) The supervisor script is extractable before the wizard starts (same-build check); 2) the minimal bundled Python closure goes
@@ -249,7 +249,7 @@ begin
       if E = 32 then
       begin
         LogLine('Keyloom is running (instance.lock is held); setup stopped before any change');
-        Result := 'Keyloom is running. Quit it with File > Quit (a background network service does not need to be stopped), then run setup again. Nothing was changed.';
+        Result := 'Keyloom is running. Quit it with File > Quit (it also closes this PC''s network endpoint), then run setup again. Nothing was changed.';
       end
       else LogLine('instance.lock check failed: ' + SysErrorMessage(E) + ' (' + IntToStr(E) + ')');
     end;

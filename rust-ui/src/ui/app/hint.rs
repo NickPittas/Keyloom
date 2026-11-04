@@ -1462,14 +1462,12 @@ impl App {
         }
     }
 
+    /// The movie to extract/import against: `project.rs` already resolves a legacy `Source/` copy first, then the
+    /// original in place.
     fn source_movie(clip: &Clip) -> Option<PathBuf> {
         match &clip.source {
             Source::Video { path } => Some(path.clone()),
-            _ => std::fs::read_dir(clip.root.join("Source"))
-                .ok()?
-                .flatten()
-                .map(|e| e.path())
-                .find(|p| crate::project::VIDEO_EXTS.contains(&ext_of(p).as_str())),
+            _ => None,
         }
     }
 
@@ -1690,7 +1688,7 @@ impl App {
             card(ui, "Source / Import", None, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if movie.is_some() {
-                        let tip = if src.is_none() { "Companion movies need a movie source (Source/); import PNG/EXR sequences by placing them in AlphaHint" } else { "the worker cannot import movies (FFmpeg)" };
+                        let tip = if src.is_none() { "Companion movies need a movie source; import PNG/EXR sequences by placing them in AlphaHint" } else { "the worker cannot import movies (FFmpeg)" };
                         import = theme::accent(ui, import_ok && !busy, |ui| ui.add(egui::Button::new("Import movie"))).on_disabled_hover_text(tip).clicked();
                         cancel_import = ui.button("Cancel").clicked();
                         if let Some(m) = &movie {
@@ -1698,7 +1696,7 @@ impl App {
                         }
                     }
                     if src.is_some() {
-                        extract = ui.add_enabled(ready(TaskKind::PrepareSource) && !busy, egui::Button::new("Extract frames (validated)")).on_hover_text("Copies Source/ movie into a verified Frames/ sequence; cancellable and resumable").clicked();
+                        extract = ui.add_enabled(ready(TaskKind::PrepareSource) && !busy, egui::Button::new("Extract frames (validated)")).on_hover_text("Reads the source movie from where it is and writes a verified Frames/ sequence; cancellable and resumable").clicked();
                     }
                 });
             });

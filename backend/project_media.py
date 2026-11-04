@@ -15,6 +15,7 @@ from .project import (
     sanitize_stem,
     write_clip_json,
     write_project_json,
+    read_clip_json,
     read_project_json,
     _VIDEO_EXTS,
 )
@@ -28,104 +29,37 @@ _KEYWORD_DEST_MAP = {
 }
 
 
-def _copy_companion_hint_sequences(
-    source_folder: str, clip_dir: str, copy_source: bool,
-) -> None:
-    """Detect companion hint folders or videos next to *source_folder*.
+def _find_companion_hints(source_folder: str) -> dict[str, dict]:
+    """Detect companion hint folders or videos next to *source_folder* (referenced in place, never copied).
 
-    Scans siblings for entries named ``{source_stem}_{keyword}`` (case
-    insensitive). Supports both folder-of-frames and video files:
-    ☼ ``MyClip_AlphaHint/`` or ``MyClip_AlphaHint.mov`` -> AlphaHint/ or AlphaHint.mov
-    ☼ ``MyClip_MaskHint/``  or ``MyClip_MaskHint.mov``  -> VideoMamaMaskHint/ or VideoMamaMaskHint.mov
-
-    The hint entry must contain both the keyword and the source folder's stem
-    so that ``Shot01_AlphaHint/`` matches ``Shot01/`` but not ``Shot02/``.
+    Siblings named ``{source_stem}_{keyword}`` (case insensitive), as a folder of frames or a video file:
+    ``MyClip_AlphaHint`` -> ``AlphaHint``, ``MyClip_MaskHint`` -> ``VideoMamaMaskHint``.
+    The entry must contain both the keyword and the source folder's stem.
+    Returns ``{dest_name: {"path": abs path, "kind": "sequence"|"video"}}``.
     """
     source_basename = os.path.basename(source_folder).lower()
     source_stem = os.path.splitext(source_basename)[0]
     parent = os.path.dirname(source_folder)
     if not parent or not os.path.isdir(parent):
-        return
+        return {}
 
-    found: dict[str, bool] = {}
-    for entry in os.listdir(parent):
+    found: dict[str, dict] = {}
+    for entry in sorted(os.listdir(parent)):
         entry_lower = entry.lower()
-        # Skip the source folder itself
         if entry_lower == source_basename:
             continue
         entry_stem, entry_ext = os.path.splitext(entry_lower)
         entry_path = os.path.join(parent, entry)
-
+        is_dir = os.path.isdir(entry_path)
+        if not is_dir and not (os.path.isfile(entry_path) and entry_ext in _VIDEO_EXTS):
+            continue
+        check = entry_lower if is_dir else entry_stem
         for keyword, dest_name in _KEYWORD_DEST_MAP.items():
-            if keyword in found:
+            if dest_name in found or keyword not in check or source_stem not in check:
                 continue
-            # Check stem for folders, or full lowered name for files
-            check = entry_lower if os.path.isdir(entry_path) else entry_stem
-            if keyword not in check:
-                continue
-            # Must also contain the source stem
-            if source_stem not in check:
-                continue
-
-            if os.path.isdir(entry_path):
-                # Companion is a folder of frames
-                dest_dir = os.path.join(clip_dir, dest_name)
-                if os.path.exists(dest_dir):
-                    continue
-                if copy_source:
-                    os.makedirs(dest_dir, exist_ok=True)
-                    frames = [
-                        f for f in os.listdir(entry_path)
-                        if os.path.isfile(os.path.join(entry_path, f))
-                        and is_image_file(f)
-                    ]
-                    for f in frames:
-                        src = os.path.join(entry_path, f)
-                        dst = os.path.join(dest_dir, f)
-                        if not os.path.isfile(dst):
-                            shutil.copy2(src, dst)
-                    logger.info(
-                        "Copied companion %s sequence (%d frames): %s -> %s",
-                        dest_name, len(frames), entry_path, dest_dir,
-                    )
-                else:
-                    try:
-                        os.symlink(entry_path, dest_dir)
-                        logger.info(
-                            "Linked companion %s sequence: %s -> %s",
-                            dest_name, entry_path, dest_dir,
-                        )
-                    except OSError:
-                        # Symlink failed (common on Windows), fall back to copy
-                        os.makedirs(dest_dir, exist_ok=True)
-                        frames = [
-                            f for f in os.listdir(entry_path)
-                            if os.path.isfile(os.path.join(entry_path, f))
-                            and is_image_file(f)
-                        ]
-                        for f in frames:
-                            src = os.path.join(entry_path, f)
-                            dst = os.path.join(dest_dir, f)
-                            if not os.path.isfile(dst):
-                                shutil.copy2(src, dst)
-                        logger.info(
-                            "Copied companion %s sequence (symlink failed, %d frames): "
-                            "%s -> %s",
-                            dest_name, len(frames), entry_path, dest_dir,
-                        )
-                found[keyword] = True
-
-            elif os.path.isfile(entry_path) and entry_ext in _VIDEO_EXTS:
-                # Companion is a video file
-                _, real_ext = os.path.splitext(entry)
-                dst = os.path.join(clip_dir, f"{dest_name}{real_ext}")
-                if not os.path.isfile(dst):
-                    shutil.copy2(entry_path, dst)
-                    logger.info(
-                        "Copied companion %s video: %s -> %s",
-                        dest_name, entry_path, dst,
-                    )
-                found[keyword] = True
+            found[dest_name] = {"path": os.path.abspath(entry_path),
+                                "kind": "sequence" if is_dir else "video"}
+    return found
 
 
 def create_clip_from_sequence(
@@ -212,8 +146,15 @@ def create_clip_from_sequence(
         "display_name": clip_display,
     })
 
-    # Auto-detect companion hint folders/videos next to the source folder
-    _copy_companion_hint_sequences(source_folder, clip_dir, copy_source)
+    # Companion hint folders/videos next to the source folder: recorded, never copied.
+    hints = _find_companion_hints(source_folder)
+    if hints:
+        data = read_clip_json(clip_dir) or {}
+        for kind, key in (("video", "hint_movies"), ("sequence", "hint_sequences")):
+            refs = {k: v["path"] for k, v in hints.items() if v["kind"] == kind}
+            if refs:
+                data["source"][key] = refs
+        write_clip_json(clip_dir, data)
 
     return clip_name
 

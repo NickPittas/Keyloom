@@ -6,14 +6,13 @@ A project is a timestamped container holding one or more clips:
             project.json                    (v2 — project-level metadata)
             clips/
                 Woman_Jumps/                (ClipEntry.root_path → here)
-                    Source/
-                        Woman_Jumps_For_Joy.mp4
-                    Frames/
+                    Frames/                 (extracted EXRs; the movie stays where it was,
+                                             clip.json source.original_path)
                     AlphaHint/
                     Output/FG/ Matte/ Comp/ Processed/
                     clip.json               (per-clip metadata)
                 Man_Walks/
-                    Source/...
+                    ...
 
 Legacy v1 format (no clips/ dir) is still supported for backward compat.
 """
@@ -23,7 +22,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 
 logger = logging.getLogger(__name__)
@@ -81,15 +79,14 @@ def sanitize_stem(filename: str, max_len: int = 60) -> str:
 def add_clips_to_project(
     project_dir: str,
     source_video_paths: list[str],
-    *,
-    copy_source: bool = True,
 ) -> list[str]:
     """Add new clips to an existing project.
 
     Args:
         project_dir: Absolute path to the project folder.
         source_video_paths: List of video file paths to add.
-        copy_source: Whether to copy videos into clip folders.
+
+    Movies are referenced in place (clip.json ``source.original_path``); nothing is copied.
 
     Returns:
         List of new clip subfolder paths (absolute).
@@ -99,9 +96,7 @@ def add_clips_to_project(
 
     new_paths: list[str] = []
     for video_path in source_video_paths:
-        clip_name = _create_clip_folder(
-            clips_dir, video_path, copy_source=copy_source,
-        )
+        clip_name = _create_clip_folder(clips_dir, video_path)
         new_paths.append(os.path.join(clips_dir, clip_name))
 
     # Update project.json clips list + clear from removed_clips if re-imported
@@ -119,55 +114,33 @@ def add_clips_to_project(
     return new_paths
 
 
-def _copy_companion_hints(video_path: str, clip_dir: str) -> None:
-    """Copy companion hint videos into the clip folder if found.
+def _find_companion_hints(video_path: str) -> dict[str, str]:
+    """Find companion hint movies next to *video_path* (referenced in place, never copied).
 
-    Scans the same directory as *video_path* for sibling files named
-    ``{source_stem}_{keyword}.{ext}`` (case insensitive), where keyword
-    is "alphahint" or "maskhint":
-    ☼ ``MyClip_AlphaHint.mov`` -> ``AlphaHint.mov`` at clip root
-    ☼ ``MyClip_MaskHint.mov``  -> ``VideoMamaMaskHint.mov`` at clip root
-
-    The hint file must contain both the keyword and the source video's stem
+    ``{source_stem}_alphahint.{ext}`` -> key ``AlphaHint``,
+    ``{source_stem}_maskhint.{ext}``  -> key ``VideoMamaMaskHint``.
+    The hint file name must contain both the keyword and the source stem
     so that ``Shot01_AlphaHint.mp4`` matches ``Shot01.mp4`` but not ``Shot02.mp4``.
     """
     parent = os.path.dirname(video_path)
     video_basename = os.path.basename(video_path).lower()
     source_stem = os.path.splitext(video_basename)[0]
-
-    _KEYWORD_MAP = {
-        "alphahint": "AlphaHint",
-        "maskhint": "VideoMamaMaskHint",
-    }
-
-    found: dict[str, bool] = {}
-    for f in os.listdir(parent):
+    keyword_map = {"alphahint": "AlphaHint", "maskhint": "VideoMamaMaskHint"}
+    found: dict[str, str] = {}
+    for f in sorted(os.listdir(parent)):
         f_lower = f.lower()
         if f_lower == video_basename:
             continue
         f_stem, f_ext = os.path.splitext(f_lower)
         if f_ext not in _VIDEO_EXTS:
             continue
-        for keyword, dest_name in _KEYWORD_MAP.items():
-            if keyword in found:
-                continue
-            # Hint must contain both the keyword AND the source stem
-            if keyword in f_stem and source_stem in f_stem:
-                _, real_ext = os.path.splitext(f)
-                dst = os.path.join(clip_dir, f"{dest_name}{real_ext}")
-                src = os.path.join(parent, f)
-                if not os.path.isfile(dst):
-                    shutil.copy2(src, dst)
-                    logger.info("Copied companion %s: %s -> %s", dest_name, src, dst)
-                found[keyword] = True
+        for keyword, key in keyword_map.items():
+            if key not in found and keyword in f_stem and source_stem in f_stem:
+                found[key] = os.path.abspath(os.path.join(parent, f))
+    return found
 
 
-def _create_clip_folder(
-    clips_dir: str,
-    video_path: str,
-    *,
-    copy_source: bool = True,
-) -> str:
+def _create_clip_folder(clips_dir: str, video_path: str) -> str:
     """Create a single clip subfolder inside clips_dir.
 
     Returns the clip folder name (not full path).
@@ -185,31 +158,42 @@ def _create_clip_folder(
                 clip_name = f"{clip_name}_{i}"
                 break
 
-    source_dir = os.path.join(clip_dir, "Source")
-    os.makedirs(source_dir, exist_ok=True)
+    os.makedirs(clip_dir, exist_ok=True)
+    logger.info(f"Referencing source video in place: {video_path}")
 
-    if copy_source:
-        target = os.path.join(source_dir, filename)
-        if not os.path.isfile(target):
-            shutil.copy2(video_path, target)
-            logger.info(f"Copied source video: {video_path} -> {target}")
-
-        # Auto-copy companion hint videos if present next to source
-        # Convention: {stem}_alphahint.{ext} and {stem}_maskhint.{ext}
-        _copy_companion_hints(video_path, clip_dir)
-    else:
-        logger.info(f"Referencing source video in place: {video_path}")
-
-    # Write clip.json (per-clip metadata)
-    write_clip_json(clip_dir, {
-        "source": {
-            "original_path": os.path.abspath(video_path),
-            "filename": filename,
-            "copied": copy_source,
-        },
-    })
+    source: dict = {
+        "original_path": os.path.abspath(video_path),
+        "filename": filename,
+        "copied": False,
+    }
+    hints = _find_companion_hints(video_path)
+    if hints:
+        source["hint_movies"] = hints
+    write_clip_json(clip_dir, {"source": source})
 
     return clip_name
+
+
+def source_movie_missing_message(path: str) -> str:
+    return f"Source movie not found at {path}: reconnect or relink it"
+
+
+def resolve_source_movie(clip_root: str) -> str:
+    """Path of the clip's source movie: a legacy ``Source/`` copy if present, else the original.
+
+    Raises FileNotFoundError (message names the path) when neither exists. Never copies.
+    """
+    src_dir = os.path.join(clip_root, "Source")
+    if os.path.isdir(src_dir):
+        for f in sorted(os.listdir(src_dir)):
+            if is_video_file(f):
+                return os.path.join(src_dir, f)
+    orig = ((read_clip_json(clip_root) or {}).get("source") or {}).get("original_path")
+    if not orig:
+        raise FileNotFoundError(f"No source movie recorded for clip '{os.path.basename(clip_root)}'")
+    if not os.path.isfile(orig):
+        raise FileNotFoundError(source_movie_missing_message(orig))
+    return orig
 
 
 def get_clip_dirs(project_dir: str) -> list[str]:

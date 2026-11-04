@@ -133,6 +133,16 @@ impl Driver {
         }
     }
 
+    /// A callback that runs the driver's next pass now and repaints: handed to the network endpoint so a committed shot is picked up
+    /// at once instead of at the next timed pass. It takes no lock and never waits.
+    pub fn waker(&self, ctx: &eframe::egui::Context) -> Arc<dyn Fn() + Send + Sync> {
+        let (t, ctx) = (self.thread.clone(), ctx.clone());
+        Arc::new(move || {
+            t.unpark();
+            ctx.request_repaint();
+        })
+    }
+
     /// Ask the thread to end (it owns its own handles; no join, so a held UI lock can never deadlock this).
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);

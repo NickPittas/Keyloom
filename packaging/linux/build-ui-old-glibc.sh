@@ -2,6 +2,9 @@
 # Unprivileged older-glibc build of the Rust UI: pinned zig (task-local, sha256-checked) acts as the
 # C compiler/linker with a glibc 2.31 target, so no docker/root/sysroot is needed. The UI links only
 # libc/libm/libgcc_s (wgpu/wayland/x11 are dlopen'd at run time), so no native -dev packages are required.
+# The in-app endpoint loads the bundled libpython (<version>/runtime/python/lib/libpython3.11.so.1.0, glibc floor checked on the
+# whole stage by bundle.py) by dlopen at run time; if the app is ever linked against it instead, the binary must carry
+# RUNPATH $ORIGIN/../runtime/python/lib (checked below), never a system libpython path.
 #   sh packaging/linux/build-ui-old-glibc.sh            # resumable: rerun after any interruption/timeout
 #   -> rust-ui/target-oldglibc/x86_64-unknown-linux-gnu/release/keyloom-ui  (+ glibc floor check)
 # Env: CK_TOOLCHAIN (default ~/.cache/ck-toolchain), CK_GLIBC (default 2.31), CK_CARGO_FLAGS (default --locked).
@@ -41,5 +44,6 @@ best = (0, 0)
 for m in bundle.GLIBC_RE.finditer(open(sys.argv[1], "rb").read()):
     best = max(best, (int(m[1]), int(m[2])))
 print("glibc floor of %s = %d.%d" % (sys.argv[1], *best))
+bundle.check_ui_libpython(bundle.Path(sys.argv[1]))
 sys.exit(0 if best <= tuple(map(int, sys.argv[2].split("."))) else "glibc floor above target")
 PY

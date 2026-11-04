@@ -2,7 +2,7 @@
 # Keyloom @VERSION_ID@ online installer for Linux (needs only sh, tar, gzip, head, tail, sha256sum).
 # Carries Keyloom itself (app, UI, FFmpeg, bundled Python and every small dependency). Only the large public wheels
 # (torch, triton, NVIDIA CUDA libraries) are downloaded from PyPI / download.pytorch.org: no account, no sign-in.
-# No root (only an optional, asked-for sudo for UFW rules). Configures a per-user network host. Models download from the app.
+# No root (only an optional, asked-for sudo for UFW rules). Retires the old per-user network service when the app hosts the endpoint itself. Models download from the app.
 # User data, settings, models, network identities and jobs are never touched.
 set -eu
 # Layout after this stub: boot.tar.gz (minimal Python + installer_payload.py), online.tar.gz (keyloom-online/: payload/ and

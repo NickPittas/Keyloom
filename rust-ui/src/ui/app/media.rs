@@ -345,6 +345,9 @@ impl App {
         if movie_gone {
             ui.separator();
             ui.label(RichText::new("Source movie missing").strong());
+            if let Some(e) = &clip.error {
+                ui.colored_label(theme::error(ui), e);
+            }
             if self.media.movie.is_none() && ui.button("Relink movie…").on_hover_text("Choose the movie again: its size, frame rate and frame count are checked against what this clip recorded before anything is extracted").clicked() {
                 let ctx = ui.ctx().clone();
                 self.request_pick(&ctx, PickKind::RelinkMovie);

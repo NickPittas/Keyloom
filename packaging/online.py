@@ -360,6 +360,10 @@ def validate_manifest(m) -> dict:
                 raise Fail(f"install manifest: unsafe symlink target for {r[:80]!r}")
         elif not (_int(meta.get("size")) and SHA_RE.match(str(meta.get("sha256", "")))):
             raise Fail(f"install manifest: bad entry for {r[:80]!r}")
+    if "app-endpoint.json" in files:  # this build's app answers other PCs in-process: it needs the shared Python library
+        lib = r"runtime/python/python3\d+\.dll" if IS_WIN else r"runtime/python/lib/libpython3\.\d+\.so\.1\.0"
+        if not any(re.fullmatch(lib, r) for r in files):
+            raise Fail("install manifest: the embedded Python runtime library (libpython / python3xx.dll) is missing; the installer is damaged")
     key = str.casefold if IS_WIN else (lambda s: s)  # Windows: names differing only by case are the same file
     keys = {key(r) for r in files}
     if len(keys) != len(files):

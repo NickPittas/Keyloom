@@ -1,5 +1,5 @@
 ; Keyloom Windows ONLINE installer (Inno Setup 6). Rendered by packaging/bundle.py; do not edit the output.
-; Per-user, no admin or automatic firewall rule, no account or sign-in. Activation configures the network host. This exe carries Keyloom itself
+; Per-user, no admin or automatic firewall rule, no account or sign-in. Activation retires the old background network service when the app hosts the endpoint itself. This exe carries Keyloom itself
 ; (app, UI, FFmpeg, bundled Python and every small dependency) unpacked into {tmp} (deleted when Setup exits); online.py
 ; then downloads only the large public wheels (torch, triton, NVIDIA CUDA libraries) from PyPI / download.pytorch.org,
 ; reusing files of the installed versions, and hands the assembled payload to lifecycle.py (same transactional install as
@@ -36,7 +36,7 @@ SetupMutex=KeyloomOnlineSetupMutex
 CloseApplications=no
 
 [Tasks]
-Name: firewall; Description: "Configure Windows Firewall rules for the network service (a Windows administrator prompt follows during setup)"
+Name: firewall; Description: "Configure Windows Firewall rules for the Keyloom app (a Windows administrator prompt follows during setup)"
 
 [Files]
 ; The minimal bundled Python (and the supervisor script) live in {tmp}\kb, OUTSIDE the payload that online.py assembles and
@@ -201,7 +201,7 @@ begin
   if Rc = 124 then
     SuppressibleMsgBox('Keyloom setup STOPPED: a step showed no progress for 5 minutes and was ended. The previous install (if any) is unchanged.' + LogHint, mbError, MB_OK, IDOK)
   else if Rc = 4 then
-    SuppressibleMsgBox('Keyloom is running. Quit it with File > Quit (a background network service does not need to be stopped) and run setup again. Nothing was changed.' + LogHint, mbError, MB_OK, IDOK)
+    SuppressibleMsgBox('Keyloom is running. Quit it with File > Quit (it also closes this PC''s network endpoint) and run setup again. Nothing was changed.' + LogHint, mbError, MB_OK, IDOK)
   else if Rc = 130 then
     SuppressibleMsgBox('Setup was cancelled. The previous Keyloom install (if any) is unchanged.' + LogHint, mbInformation, MB_OK, IDOK)
   else

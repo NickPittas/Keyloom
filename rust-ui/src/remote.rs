@@ -861,15 +861,12 @@ impl Remote {
             if self.retry_at.is_some_and(|t| now < t) {
                 return;
             }
-            match self.source.command(env.repo, env.python) {
-                Ok(Some(cmd)) => match Link::start(cmd, env.wake.clone()) {
-                    Ok(l) => {
-                        self.link = Some(l);
-                        nlog("bridge started");
-                        self.phase = Phase::Starting;
-                    }
-                    Err(e) => self.fail(now, e),
-                },
+            match self.source.open(env.repo, env.python, env.wake.clone()) {
+                Ok(Some(l)) => {
+                    self.link = Some(l);
+                    nlog("bridge started");
+                    self.phase = Phase::Starting;
+                }
                 Ok(None) => self.phase = Phase::Off,
                 Err(e) => self.fail(now, e),
             }
