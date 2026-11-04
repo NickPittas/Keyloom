@@ -145,6 +145,13 @@ impl AnnState {
     pub fn active(&self) -> bool {
         self.tool != Tool::None
     }
+    /// Generated masks were deleted: drop the tinted overlay and preview textures that were built from them.
+    pub fn forget_masks(&mut self) {
+        self.preview = None;
+        self.mask = None;
+        self.mask_tex = None;
+        self.tex = None;
+    }
 
     fn preview_tex(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
         let want = self.preview.clone()?;

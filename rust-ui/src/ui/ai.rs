@@ -789,6 +789,19 @@ impl AiUi {
         self.disk_gen += 1;
         &mut self.sched
     }
+    /// Generated masks of `folder` were deleted: forget the SAM previews, bump the disk generation (the gates
+    /// re-evaluate against the rescanned clip) and return every job id known now, so a result that arrives late
+    /// from one of them is never shown again.
+    pub fn forget_masks(&mut self, folder: &str) -> Vec<String> {
+        self.disk_gen += 1;
+        let gone: Vec<String> = self.tk.previews.iter().filter(|(_, p)| p.folder == folder).map(|(k, _)| k.clone()).collect();
+        for k in gone {
+            if let Some(p) = self.tk.previews.remove(&k) {
+                p.mask_png.parent().map(tasks::drop_staging);
+            }
+        }
+        self.tracked.iter().filter(|t| t.folder == folder).map(|t| t.job_id.clone()).collect()
+    }
     /// A job is queued, starting or running, or a Lost writer is still fencing its folder.
     pub fn busy(&self) -> bool {
         self.sched.busy()
