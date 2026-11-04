@@ -6,6 +6,10 @@ use egui::Vec2;
 use crate::hints::HINT_DIR;
 use crate::tasks::TaskKind;
 
+/// Width of the inline Cancel button: wider than the small button's own text and padding (57.8 px), or the row
+/// would be wider than the panel and push it out.
+const CANCEL_W: f32 = 64.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stage {
     Prepare,
@@ -342,6 +346,19 @@ impl AiUi {
         QueueRun { client: jobs.first().map(|f| f.client.clone()).unwrap_or_else(|| "This computer".into()), rows, active, reason }
     }
 
+    /// The Board order changed: work that has not started (queued jobs, shots waiting for a PC) follows it.
+    /// Running and finished work never moves.
+    pub fn apply_board_order(&mut self, roots: &[PathBuf]) {
+        self.sched.reorder_queued(roots);
+        let rank = |r: &Path| roots.iter().position(|x| x == r).unwrap_or(usize::MAX);
+        self.auto_pending.make_contiguous().sort_by_key(|a| rank(&a.row.clip.root));
+    }
+
+    /// The shot has work that is queued, waiting for a PC, starting or running (it may not be removed then).
+    pub fn clip_busy(&self, root: &Path) -> bool {
+        self.auto_pending.iter().any(|a| a.row.clip.root == root) || self.facts().iter().any(|(_, f)| f.root == root && !f.state.is_terminal())
+    }
+
     /// How many Automatic shots wait for a PC (the Queue's Waiting tab).
     pub fn waiting_count(&self) -> usize {
         self.auto_pending.len()
@@ -397,6 +414,7 @@ impl AiUi {
     /// whole clips are limited (newest 12).
     pub fn queue_ui(&mut self, ui: &mut Ui, local: &crate::metrics::View, active: &[u32]) {
         // Never let the content ask the panel for more than it has been given.
+        self.cancel_rects.clear();
         let w = ui.available_width();
         ui.set_max_width(w);
         let all = self.queue_view();
@@ -470,7 +488,7 @@ impl AiUi {
             // Wide panel: stage, bar and Cancel on one line. Narrow: the full stage name above, bar below.
             let one_line = avail >= 290.0;
             let label_w = if one_line { 136.0 + gap } else { 0.0 };
-            let cancel_w = if live { 54.0 + gap } else { 0.0 };
+            let cancel_w = if live { CANCEL_W + gap } else { 0.0 };
             let w = (avail - label_w - cancel_w - 2.0).max(40.0);
             if !one_line {
                 ui.add(egui::Label::new(RichText::new(&row.heading).size(12.0)).wrap());
@@ -488,8 +506,12 @@ impl AiUi {
                     else if row.precomputed { if dark { Color32::from_rgb(72, 78, 86) } else { Color32::from_rgb(206, 212, 220) } }
                     else { ui.visuals().selection.bg_fill };
                 ui.add_sized([w, 16.0], egui::ProgressBar::new(row.cell.frac).desired_width(w).desired_height(16.0).fill(fill).text(RichText::new(&row.cell.text).size(11.0)));
-                if live && ui.add_sized([54.0, 16.0], egui::Button::new("Cancel").small()).clicked() {
-                    cancel.extend(row.ids.iter().cloned());
+                if live {
+                    let b = ui.add_sized([CANCEL_W, 16.0], egui::Button::new("Cancel").small());
+                    self.cancel_rects.push(b.rect);
+                    if b.clicked() {
+                        cancel.extend(row.ids.iter().cloned());
+                    }
                 }
             });
             ui.add_space(4.0);

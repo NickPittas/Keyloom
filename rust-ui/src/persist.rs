@@ -383,3 +383,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Board order: the clip folder names, first to last, in `project.json["clip_order"]` (read back by `load_project`).
+pub fn save_clip_order(project_root: &Path, folders: &[String]) -> Result<(), String> {
+    update_json(&project_root.join("project.json"), |m| {
+        m.insert("clip_order".into(), json!(folders));
+    })
+}
+
+/// What `remove_shot` did to the files.
+#[derive(Debug, Default)]
+pub struct Removed {
+    pub deleted: Vec<String>,
+    /// The shot is already off the list; this says which files could not be deleted.
+    pub problem: Option<String>,
+}
+
+/// Take a shot off the project: its folder joins `project.json["removed_clips"]` (the Qt app's own list, so both
+/// apps stop listing it) and leaves `clips` and `clip_order`. Every file stays unless `delete_files`, which removes
+/// only the extracted frames, masks and renders INSIDE this clip's folder under the project: never `Source/`,
+/// `clip.json`, an external source sequence, or an output folder elsewhere.
+pub fn remove_shot(project_root: &Path, clip: &Clip, delete_files: bool) -> Result<Removed, String> {
+    let clips_dir = project_root.join("clips");
+    let (Ok(cr), Ok(cd)) = (clip.root.canonicalize(), clips_dir.canonicalize()) else {
+        return Err("this shot's folder is not inside the project's clips folder".into());
+    };
+    if cr.parent() != Some(cd.as_path()) {
+        return Err("only shots in the project's clips folder can be removed".into());
+    }
+    let folder = clip.folder.clone();
+    update_json(&project_root.join("project.json"), |m| {
+        let mut gone: Vec<String> = m.get("removed_clips").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+        if !gone.contains(&folder) {
+            gone.push(folder.clone());
+        }
+        gone.sort();
+        m.insert("removed_clips".into(), json!(gone));
+        for key in ["clips", "clip_order"] {
+            if let Some(Value::Array(a)) = m.get_mut(key) {
+                a.retain(|v| v.as_str() != Some(folder.as_str()));
+            }
+        }
+    })?;
+    let mut out = Removed::default();
+    if !delete_files {
+        return Ok(out);
+    }
+    // Frames are the only copy of a sequence import: they go only when the original movie sits in Source/.
+    let mut names = vec!["AlphaHint", "VideoMamaMaskHint", "Output", crate::hints::STAGING];
+    if crate::project::first_video(&cr.join("Source")).is_some() {
+        names.push("Frames");
+    }
+    let mut failed = vec![];
+    for n in names {
+        let p = cr.join(n);
+        // A real folder directly inside the clip folder (a link is never followed).
+        if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) || p.canonicalize().ok().as_deref() != Some(p.as_path()) {
+            continue;
+        }
+        match std::fs::remove_dir_all(&p) {
+            Ok(()) => out.deleted.push(n.to_string()),
+            Err(e) => failed.push(format!("{n}: {e}")),
+        }
+    }
+    if !failed.is_empty() {
+        out.problem = Some(format!("Removed from the project, but some files could not be deleted ({})", failed.join("; ")));
+    }
+    Ok(out)
+}

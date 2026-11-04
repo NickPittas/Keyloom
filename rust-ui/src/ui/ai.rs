@@ -616,6 +616,8 @@ pub struct AiUi {
     /// Confirmed Automatic shots waiting for a free PC, in order.
     // ponytail: dropped on quit, not saved; the user confirms them again.
     auto_pending: std::collections::VecDeque<AutoShot>,
+    /// Inline Cancel button rectangles from the last Queue frame (layout tests).
+    pub cancel_rects: Vec<egui::Rect>,
     /// Each network send's shot by submission id, while a connection follows it: "Send again" puts it back in Automatic.
     sent_shots: std::collections::HashMap<String, AutoShot>,
     /// Automatic shots running on this computer, by the id of their chain's last job.
@@ -766,6 +768,7 @@ impl AiUi {
             sending_auto: false,
             net_outbox: vec![],
             auto_pending: Default::default(),
+            cancel_rects: vec![],
             sent_shots: Default::default(),
             auto_live: vec![],
             auto_wait: None,
