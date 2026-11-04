@@ -284,3 +284,24 @@ def test_stats_validation(store, clock, patch):
         store.publish_self(rec["id"], gpu=gpu(), stats={**base, **patch})
     assert e.value.status == 400
     store.publish_self(rec["id"], gpu=gpu(), stats={"seq": 1, "measured_age_ms": 0})  # all metrics optional
+
+
+def _workflow(**hint):
+    s = copy.deepcopy(SPEC)
+    s["kind"] = "workflow"
+    s["hint"] = {"guide": "sam", "marks_pre": True, "marks_hint": False, **hint}
+    s["hint_stages"] = ["sam"]
+    return s
+
+
+def test_workflow_hint_marks_flags_accepted(store, clock):
+    sub, _ = setup_pair(store, clock)
+    store.submit(sub, {"submission_id": sid(7), "spec": _workflow(), "target": None})
+
+
+@pytest.mark.parametrize("key", ["marks_pre", "marks_hint"])
+def test_workflow_hint_marks_flags_must_be_boolean(store, clock, key):
+    sub, _ = setup_pair(store, clock)
+    with pytest.raises(ApiError) as e:
+        store.submit(sub, {"submission_id": sid(8), "spec": _workflow(**{key: "yes"}), "target": None})
+    assert code(e) == "invalid"

@@ -1091,6 +1091,7 @@ impl AiUi {
     pub fn clear_finished(&mut self) {
         let done: Vec<String> = self.queue_view().into_iter().flat_map(|s| s.runs).filter(|r| !r.active).flat_map(|r| r.rows.into_iter().flat_map(|x| x.ids)).collect();
         self.cleared.extend(done);
+        self.refused.clear();
         let mine: Vec<String> = self.tracked.iter().map(|t| t.job_id.clone()).collect();
         let received: Vec<String> = self.tk.history.iter().filter(|h| h.kind == "received" && !matches!(h.state.as_str(), "running" | "held")).map(|h| h.id.clone()).collect();
         let _ = crate::queue::forget(&received);

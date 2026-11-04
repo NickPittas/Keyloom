@@ -377,6 +377,23 @@ impl AiUi {
         });
     }
 
+    /// Shots a PC refused: the reason on the shot, Clear to remove it, Send again to plan it once more.
+    pub fn refused_ui(&mut self, ui: &mut Ui) {
+        let (mut clear, mut again) = (None, None);
+        for (i, r) in self.refused.iter().enumerate() {
+            let same = matches!(r.shot.row.placement, crate::scheduler::Placement::Target(_));
+            let line = format!("{} · Refused by {}: {}", r.shot.row.clip.display_name, r.pc, r.why);
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 20.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Clear").clicked() { clear = Some(i); }
+                if same && ui.small_button("Automatic").on_hover_text("Plan it again for the next free PC.").clicked() { again = Some((i, true)); }
+                if ui.small_button(if same { format!("Send again to {}", r.pc) } else { "Send again".to_owned() }).clicked() { again = Some((i, !same)); }
+                ui.add(egui::Label::new(RichText::new(&line).color(egui::Color32::from_rgb(225, 110, 110)).size(12.0)).truncate()).on_hover_text(&line);
+            });
+        }
+        if let Some(i) = clear { self.clear_refused(i); }
+        if let Some((i, auto)) = again { self.resend_refused(i, auto); }
+    }
+
     pub fn auto_waiting_ui(&mut self, ui: &mut Ui) {
         if self.auto_pending.is_empty() {
             ui.label(RichText::new("No shots are waiting. Automatic shots wait here until a PC is free.").color(theme::text_dim(ui)));

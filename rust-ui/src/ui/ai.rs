@@ -325,6 +325,13 @@ struct AutoShot {
     on: Option<String>,
 }
 
+/// A send its PC refused for good (the PC's name as people know it, and its reason).
+struct Refused {
+    shot: AutoShot,
+    pc: String,
+    why: String,
+}
+
 /// Automatic's key for this computer in `AutoShot::failed_on`/`on`.
 const LOCAL_PC: &str = "local";
 
@@ -620,6 +627,8 @@ pub struct AiUi {
     pub cancel_rects: Vec<egui::Rect>,
     /// Each network send's shot by submission id, while a connection follows it: "Send again" puts it back in Automatic.
     sent_shots: std::collections::HashMap<String, AutoShot>,
+    /// Sends a PC refused for good: kept with the reason until the user clears them or sends them again.
+    refused: Vec<Refused>,
     /// Automatic shots running on this computer, by the id of their chain's last job.
     auto_live: Vec<(String, AutoShot)>,
     /// Why the last Automatic dispatch left shots waiting (shown after "Waiting for a free PC").
@@ -770,6 +779,7 @@ impl AiUi {
             auto_pending: Default::default(),
             cancel_rects: vec![],
             sent_shots: Default::default(),
+            refused: vec![],
             auto_live: vec![],
             auto_wait: None,
             auto_clients: 0,
@@ -2984,7 +2994,9 @@ impl AiUi {
             self.network_row(project, st, preset_name, r, &p, Some(target.to_owned())).map(|n| {
                 let id = n.submission_id.clone();
                 let mut row = r.clone();
-                row.placement = Placement::Auto;
+                if self.sending_auto {
+                    row.placement = Placement::Auto; // a manual send keeps its PC, so "Send again" can go back to it
+                }
                 self.sent_shots.insert(id.clone(), AutoShot { row, plan: p.clone(), project: project.clone(), st: st.clone(), preset_name: preset_name.map(str::to_owned), failed_on: vec![], paused: false, on: None });
                 self.net_outbox.push(n);
                 id
@@ -3085,9 +3097,52 @@ impl AiUi {
     pub fn requeue_sent(&mut self, submission_id: &str) -> bool {
         let Some(mut a) = self.sent_shots.remove(submission_id) else { return false };
         a.on = None;
+        a.row.placement = Placement::Auto;
         self.notice = Some(format!("{}: back in Automatic, it goes to the next free PC.", a.row.clip.display_name));
         self.auto_pending.push_back(a);
         true
+    }
+
+    /// The PC refused this send for good: the shot stays visible with the reason (Clear / Send again) instead of
+    /// vanishing. False = left to the old flow (not followed here, or an Automatic shot a PC could not take
+    /// because it lacks something: another PC may).
+    pub fn refuse_sent(&mut self, submission_id: &str, why: &str) -> bool {
+        let Some(a) = self.sent_shots.get(submission_id) else { return false };
+        if a.on.is_some() && !why.starts_with("invalid") {
+            return false;
+        }
+        let a = self.sent_shots.remove(submission_id).expect("listed");
+        let pc = a.on.clone().or_else(|| match &a.row.placement { Placement::Target(t) => Some(t.clone()), Placement::Auto => None });
+        let pc = pc.map_or_else(|| "the PC".to_owned(), |p| self.pc_label(&p));
+        self.notice = Some(format!("{}: refused by {pc}: {why}", a.row.clip.display_name));
+        self.refused.push(Refused { shot: a, pc, why: why.to_owned() });
+        true
+    }
+
+    /// Remove a refused shot's entry.
+    pub fn clear_refused(&mut self, i: usize) {
+        if i < self.refused.len() {
+            self.refused.remove(i);
+        }
+    }
+
+    /// Plan a refused shot again: to the PC it was sent to, or into Automatic.
+    pub fn resend_refused(&mut self, i: usize, automatic: bool) {
+        if i >= self.refused.len() {
+            return;
+        }
+        let Refused { mut shot, pc, why } = self.refused.remove(i);
+        shot.failed_on.clear();
+        shot.on = None;
+        if automatic {
+            shot.row.placement = Placement::Auto;
+            self.auto_pending.push_back(shot);
+            return;
+        }
+        if let Err(e) = self.submit_row(&shot.project, &shot.st, shot.preset_name.as_deref(), &shot.row, shot.plan.clone()) {
+            self.notice = Some(format!("{}: not sent, {e}", shot.row.clip.display_name));
+            self.refused.push(Refused { shot, pc, why });
+        }
     }
 
     /// Local Automatic shots whose chain ended: a failure goes back for another PC, anything else is done.
@@ -4036,6 +4091,41 @@ mod tests {
         ai.settle_sent(|_| None);
         assert!(!ai.requeue_sent(&again[0].submission_id), "no longer followed: forgotten");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_refused_send_shows_the_reason_and_can_be_cleared_or_sent_again() {
+        let (mut ai, d) = auto_fixture("refused", 1);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into())];
+        // Automatic gave the shot to A; A answered 400 invalid.
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        let sent = ai.take_net_outbox().remove(0);
+        let why = "invalid: hint: unknown keys ['x']";
+        assert!(!ai.refuse_sent(&sent.submission_id, "model_missing: not on that PC"), "another PC may have the model: old flow");
+        assert!(ai.refuse_sent(&sent.submission_id, why));
+        assert_eq!((ai.refused.len(), ai.auto_pending.len(), ai.sent_shots.len()), (1, 0, 0), "nothing else holds the shot");
+        assert_eq!(ai.notice.as_deref(), Some(format!("{}: refused by A: {why}", sent.name).as_str()));
+        ai.clear_refused(0);
+        assert!(ai.refused.is_empty());
+        // The same refusal again, this time sent again into Automatic, and then straight to the PC that accepts it.
+        ai.dispatch_auto(&[], &busy_view());
+        assert!(ai.auto_pending.is_empty() && ai.sent_shots.is_empty(), "cleared means gone");
+        let (mut ai, d2) = auto_fixture("refused2", 1);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into())];
+        let mut a = ai.auto_pending.pop_front().unwrap();
+        a.row.placement = Placement::Target("network:n/a".into());
+        ai.refused.push(Refused { shot: a, pc: "A".into(), why: why.into() });
+        ai.resend_refused(0, false);
+        let again = ai.take_net_outbox();
+        assert_eq!((ai.refused.len(), again.len(), again[0].target.as_deref(), again[0].automatic), (0, 1, Some("n/a"), false), "back to the same PC");
+        assert!(ai.sent_shots.contains_key(&again[0].submission_id), "followed again");
+        ai.refuse_sent(&again[0].submission_id, why);
+        ai.resend_refused(0, true);
+        assert_eq!((ai.refused.len(), ai.auto_pending.len()), (0, 1), "or into Automatic");
+        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(d2);
     }
 
     #[test]

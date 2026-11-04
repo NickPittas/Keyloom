@@ -619,6 +619,17 @@ impl Remote {
         self.write_jobs(Path::new(&key));
         true
     }
+    /// Sends the PC refused for good (submission id, reason). A busy-race `not_free` is not one: Automatic just moves on.
+    pub(crate) fn refusals(&self) -> Vec<(String, String)> {
+        self.jobs.iter().filter(|j| j.state == "not sent" && j.job_id.is_none())
+            .filter_map(|j| j.reason.clone().filter(|r| !r.starts_with("not_free")).map(|r| (j.submission_id.clone(), r))).collect()
+    }
+    /// Drop a finished send's record (the app showed the refusal itself).
+    pub(crate) fn forget(&mut self, submission_id: &str) {
+        self.jobs.retain(|j| j.submission_id != submission_id);
+        let key = self.key.clone();
+        self.write_jobs(Path::new(&key));
+    }
     /// A send of ours this connection follows: `Ok(())` while it runs, `Err(None)` once it ended without failing
     /// (done or cancelled), `Err(Some(why))` once it failed or the host refused it. `None` = not followed here.
     pub(crate) fn sent_outcome(&self, submission_id: &str) -> Option<Result<(), Option<String>>> {
@@ -1518,6 +1529,20 @@ mod discovery_tests {
         assert_eq!(r.sent_outcome("refused"), Some(Err(Some("model not available on that PC".into()))), "a definite refusal keeps its reason, like a failure");
         assert_eq!(r.sent_outcome("cancelled"), Some(Err(None)), "cancelled stays ended-without-failing");
         assert_eq!(r.sent_outcome("running"), Some(Ok(())), "still running: followed");
+    }
+
+    #[test]
+    fn a_definite_refusal_is_listed_once_and_forgotten_but_not_free_is_not_one() {
+        let mut bad = job_on("X", "not sent");
+        bad.submission_id = "bad".into();
+        bad.reason = Some("invalid: hint: unknown keys ['marks_pre']".into());
+        let mut busy = job_on("X", "not sent");
+        busy.submission_id = "busy".into();
+        busy.reason = Some("not_free: busy".into());
+        let mut r = Remote { jobs: vec![bad, busy, job_on("X", "running")], ..Remote::blank(Source::Off, String::new()) };
+        assert_eq!(r.refusals(), [("bad".to_owned(), "invalid: hint: unknown keys ['marks_pre']".to_owned())]);
+        r.forget("bad");
+        assert!(r.refusals().is_empty() && r.jobs.len() == 2, "only the refused record left the PC's queue");
     }
 
     #[test]

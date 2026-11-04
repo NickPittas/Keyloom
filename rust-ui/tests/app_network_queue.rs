@@ -657,6 +657,32 @@ fn an_automatic_push_to_a_pc_that_is_no_longer_free_is_refused_not_free() {
     w.until("the queued shot to end", 40, |w| w.state_of(&explicit).as_deref() == Some("cancelled"));
 }
 
+/// The receiver answers 400 invalid to the first submit: the sender's record ends as "not sent" with the receiver's reason (nothing
+/// stays "sending"), the PC is free for the next send, and the same shot sent again once it is valid is accepted.
+#[test]
+fn a_400_invalid_first_send_ends_not_sent_with_the_reason_and_a_second_send_is_accepted() {
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut w) = world("b5-invalid", json!({})) else { return };
+    free_b(&mut w);
+    let mut bad = spec(&w.mount_a, 1);
+    bad.preset_name = Some(String::new()); // the receiver's schema refuses an empty preset name
+    let sid = "sub_00000000000000000001".to_owned();
+    let net = NetSubmit { submission_id: sid.clone(), spec: bad, target: Some(format!("{}/{}", w.ns, w.host_iid)), folder: "shot_01".into(), name: "shot_01 v1".into(), automatic: false };
+    let view = View::Unavailable(String::new());
+    let mut env = Env { settings: &w.a_settings, settings_path: None, ai: &mut w.a_ai, metrics: &view, repo: None, python: None, wake: &w.wake, cfg: Default::default() };
+    w.a_set.send(net, &mut env).expect("routed to B");
+    w.until("B to refuse it", 30, |w| w.state_of(&sid).as_deref() == Some("not sent"));
+    let reason = w.a_set.jobs().iter().find(|j| j.submission_id == sid).and_then(|j| j.reason.clone()).unwrap();
+    assert!(reason.starts_with("invalid"), "{reason}");
+    assert!(job_id(&w, &sid).is_none());
+    assert!(app_api::call("inbox", json!({"method": "pending"})).unwrap().as_array().unwrap().is_empty(), "nothing stored on B");
+    let again = w.push(2);
+    w.until("B to accept the valid shot", 30, |w| job_id(w, &again).is_some());
+    let (creds, job) = (w.creds.display().to_string(), job_id(&w, &again).unwrap());
+    w.a_set.cancel_job(&creds, &job);
+    w.until("the shot to end", 40, |w| w.state_of(&again).as_deref() == Some("cancelled"));
+}
+
 /// A shot another PC sent here, finished: the history entry has the receiver's own project and clip, so a restarted app shows it on
 /// the Board when the project opens - and an open project's list is updated when the entry changes (no polling, no reopen).
 #[test]

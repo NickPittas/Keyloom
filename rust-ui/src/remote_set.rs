@@ -163,7 +163,14 @@ impl RemoteSet {
                 env.ai.notice = Some(format!("{name}: not sent, {e}."));
             }
         }
-        // After routing, so this tick's new sends are already followed.
+        // After routing, so this tick's new sends are already followed. A refusal moves to the app's own list first.
+        for r in &mut self.remotes {
+            for (sid, why) in r.refusals() {
+                if env.ai.refuse_sent(&sid, &why) {
+                    r.forget(&sid);
+                }
+            }
+        }
         env.ai.settle_sent(|sid| self.remotes.iter().find_map(|r| r.sent_outcome(sid)));
         for (i, r) in self.remotes.iter_mut().enumerate() {
             env.cfg = conns[i].0.clone();

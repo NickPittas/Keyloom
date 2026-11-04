@@ -205,7 +205,8 @@ _PARAMS = {
 
 
 JOB_KINDS = ("key", "workflow")
-_HINT_KEYS = ("guide", "final", "bypass", "birefnet_variant", "sam_model", "chroma", "videomama_chunk", "mask_cleanup")
+_HINT_KEYS = ("guide", "final", "bypass", "birefnet_variant", "sam_model", "chroma", "videomama_chunk", "mask_cleanup",
+              "marks_pre", "marks_hint")
 
 
 def _validate_workflow(spec, enabled_outputs):
@@ -221,8 +222,9 @@ def _validate_workflow(spec, enabled_outputs):
         for k in ("guide", "final", "birefnet_variant", "sam_model"):
             if k in h:
                 text(h[k], f"hint.{k}", 64)
-        if "bypass" in h:
-            boolean(h["bypass"], "hint.bypass")
+        for k in ("bypass", "marks_pre", "marks_hint"):
+            if k in h:
+                boolean(h[k], f"hint.{k}")
         if "videomama_chunk" in h:
             integer(h["videomama_chunk"], "hint.videomama_chunk", 1, 4096)
         for k in ("chroma", "mask_cleanup"):

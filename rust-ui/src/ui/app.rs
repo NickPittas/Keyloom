@@ -1196,6 +1196,7 @@ impl App {
         ai.net_inactive_ui(ui);
         let mut actions = vec![];
         egui::ScrollArea::vertical().id_salt("batch_work_queue").auto_shrink([false; 2]).show(ui, |ui| {
+            ai.refused_ui(ui);
             if waiting {
                 ai.auto_waiting_ui(ui);
             } else {
