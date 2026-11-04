@@ -92,7 +92,7 @@ impl JobState {
                 }
             )
     }
-    fn completed(&self) -> bool {
+    pub fn completed(&self) -> bool {
         matches!(self, JobState::Done { info, .. } if info.outcome == Outcome::Complete)
     }
 }
@@ -720,9 +720,13 @@ impl Scheduler {
                 with: t.job.job_id.clone(),
             });
         }
+        // A Key still waiting in the queue is not a conflict: it consumes this writer's result, so it is made to
+        // wait for the new step (below) and the hint goes first. A Key that already started does collide.
+        let mut keys_after: Vec<String> = vec![];
         if job.kind.writes_clip() {
             if let Some(e) = self.jobs.iter().find(|e| {
                 e.state.fences()
+                    && e.state != JobState::Queued
                     && e.job.clip_root == job.clip_root
                     && !before.contains(&e.job.job_id)
             }) {
@@ -730,7 +734,14 @@ impl Scheduler {
                     with: e.job.job_id.clone(),
                 });
             }
+            keys_after = self
+                .jobs
+                .iter()
+                .filter(|e| e.state == JobState::Queued && e.job.clip_root == job.clip_root && !before.contains(&e.job.job_id))
+                .map(|e| e.job.job_id.clone())
+                .collect();
         }
+        let id = job.job_id.clone();
         self.tasks.push(TaskEntry {
             job: Arc::new(job),
             after,
@@ -738,10 +749,29 @@ impl Scheduler {
             cancel_requested: false,
             last_activity: None,
         });
+        for k in keys_after {
+            self.add_after(&k, &id);
+        }
         Ok(())
     }
     pub fn job(&self, id: &str) -> Option<&JobEntry> {
         self.jobs.iter().find(|e| e.job.job_id == id)
+    }
+    /// Make a still-queued Key job wait for `dep` too (a hint queued after it, which Key must consume). Refused,
+    /// returning false, when it would form a cycle or either job is unknown/started.
+    pub fn add_after(&mut self, id: &str, dep: &str) -> bool {
+        if id == dep || self.state_of(dep).is_none() || self.ancestors(&[dep.to_owned()]).iter().any(|a| a == id) {
+            return false;
+        }
+        match self.jobs.iter_mut().find(|e| e.job.job_id == id && e.state == JobState::Queued) {
+            Some(e) => {
+                if !e.after.iter().any(|a| a == dep) {
+                    e.after.push(dep.to_owned());
+                }
+                true
+            }
+            None => false,
+        }
     }
     /// The app's readiness snapshot changed (startup, Check/Verify, root change, finished model operation). Queued
     /// jobs are judged against it at dispatch; running ones keep the files they were sent.

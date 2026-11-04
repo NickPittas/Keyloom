@@ -7,6 +7,7 @@ use crate::hints::{
     self, Annotations, Ctx, Final, HintCfg, Producer, BIREFNET_VARIANTS, SAM_MODELS,
 };
 use crate::presets::{Delivery, PipelineExport, QualityKind, VideoDelivery, VIDEO_CODECS};
+use crate::actions::{decide, Action};
 use crate::tasks::TaskKind;
 use crate::ui::ai::{card, fill_slider, pair, sig_of};
 use crate::ui::annotate::{self, Ann, Tool};
@@ -1378,8 +1379,10 @@ impl App {
         job: Result<crate::tasks::TaskJob, String>,
         sig: u64,
         what: &str,
+        action: Action,
     ) {
-        match job.and_then(|j| self.ai.submit_task(clip, j, vec![], sig)) {
+        let waits = crate::actions::waits_for(self.ai.scheduler(), &clip.root, action);
+        match job.and_then(|j| self.ai.submit_task(clip, j, waits, sig)) {
             Ok(_) => self.hint.note = Some(format!("{what} queued.")),
             Err(e) => self.hint_note(format!("{what} not queued: {e}")),
         }
@@ -1416,7 +1419,7 @@ impl App {
             ),
         }
         .sam_preview(&self.hint.cfg, &self.hint.ann, &stem, lin);
-        self.submit_task_job(&clip, job, sig, "SAM preview");
+        self.submit_task_job(&clip, job, sig, "SAM preview", Action::SamPreview);
     }
 
     /// Queue a hint/pre-matte run from outside this page (the node graph's context menu), by node meaning:
@@ -1470,7 +1473,14 @@ impl App {
             Run::Hint => hint_marks,
         };
         let before = self.ai.task_ids(&clip.folder);
-        match steps.and_then(|s| self.ai.submit_chain(&clip, s, None)) {
+        // Settings and prompts are frozen in `steps` now; the run waits for the earlier same-clip steps.
+        let action = match what {
+            Run::Guide if self.hint.cfg.guide == Producer::Sam => Action::Track,
+            Run::Guide => Action::PreMatte,
+            Run::Hint => Action::Hint,
+        };
+        let waits = crate::actions::waits_for(self.ai.scheduler(), &clip.root, action);
+        match steps.and_then(|s| self.ai.submit_chain_after(&clip, s, None, waits)) {
             Ok(_) => {
                 // Frozen settings of a whole-range run: they become the baseline only if the job completes.
                 if !marks_only {
@@ -1676,7 +1686,9 @@ impl App {
         // A worker that was never started reports nothing: actions queue and the worker starts with the job.
         let lazy = local.is_none() && self.ai.models_unknown();
         let ready = |k: TaskKind| lazy || local.as_ref().is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false));
-        let busy = self.ai.task_busy(&clip.folder);
+        // A busy clip no longer disables the buttons: they say "Queue ..." (actions::decide). Only a companion
+        // import writing the hint folders still refuses new work.
+        let ext = self.ai.external_writer(&clip.root).then(|| "A companion-sequence import is writing this clip's hints; wait for it to finish".to_string());
         let (guide, fin) = (self.hint.cfg.guide, self.hint.cfg.finish);
         // A producer whose model the app's check found missing is off, with the model named; the rest keeps working.
         let miss_guide = missing_guide(&local, lazy, &self.hint.cfg);
@@ -1686,17 +1698,6 @@ impl App {
         let guide_name = miss_guide.clone().unwrap_or_else(|| guide.label().to_string());
         let fin_name = miss_fin.clone().unwrap_or_else(|| fin.label().to_string());
         let bypass = self.hint.cfg.bypass;
-        let why = |b: bool, what: &str| -> String {
-            if bypass {
-                "Bypass is on".into()
-            } else if busy {
-                "A hint job is running for this clip".into()
-            } else if b {
-                String::new()
-            } else {
-                reason(&local, what)
-            }
-        };
         let sam = guide == Producer::Sam;
         let tool_on = sam && self.viewer.as_ref().is_some_and(|v| v.ann.tool != Tool::None);
         let sam_ok = ready(TaskKind::SamPreview) && ready(TaskKind::SamTrack) && miss_guide.is_none();
@@ -1717,34 +1718,52 @@ impl App {
             Err(_) => vec![],
         };
         let gate = self.ai_open_range().ok().and_then(|r| hints::in_frame_gate(clip, &self.hint.cfg, r, &marks_in).err());
+        // One decision per button (enabled, label, reason): the same rules the graph menus and Media tab use.
+        let (sched, root) = (self.ai.scheduler(), &clip.root);
+        let d_preview = decide(sched, root, Action::SamPreview, "Preview frame", if !sam_ok { Some(reason(&local, &guide_name)) } else if !annotated { Some("Add a point, box or paint on this frame first".into()) } else { ext.clone() });
+        let d_track = decide(sched, root, Action::Track, "Track prompts", if bypass { Some("Bypass is on".into()) } else if !sam_ok { Some(reason(&local, &guide_name)) } else { ext.clone() });
+        let d_guide = decide(sched, root, Action::PreMatte, "Generate pre-matte", if bypass { Some("Bypass is on".into()) } else if !guide_ready { Some(reason(&local, &guide_name)) } else { ext.clone() });
+        let d_hint = decide(
+            sched,
+            root,
+            Action::Hint,
+            "Generate hint",
+            if bypass {
+                Some("Bypass is on".into())
+            } else if fin == Final::Import {
+                Some("Imported alpha has nothing to generate: choose a movie in Properties".into())
+            } else if let Some(g) = &gate {
+                Some(g.clone())
+            } else if !fin_ready {
+                Some(reason(&local, &fin_name))
+            } else {
+                ext.clone()
+            },
+        );
+        let d_extract = decide(sched, root, Action::Extract, "Extract frames (validated)", if !ready(TaskKind::PrepareSource) { Some(reason(&local, "FFmpeg")) } else { ext.clone() });
+        let import_ok = import_ok && ext.is_none();
         let this = &*self;
         ui.columns(2, |cols| {
             let ui = &mut cols[0];
             let stale = this.stale(&ctx, Node::PreMatte);
             let r = ui.scope(|ui| {
                 card(ui, &format!("Pre-matte · {}", guide.label()), stale, |ui| {
-                    let on = guide_ready && !busy && !bypass;
                     ui.horizontal_wrapped(|ui| {
                         if sam {
                             // SAM preview/tracking belong to SAM only: Track is the pre-matte run, so no second Generate.
-                            let tip = if !sam_ok {
-                                reason(&local, &guide_name)
-                            } else if busy {
-                                "A hint job is running for this clip".into()
-                            } else if !annotated {
-                                "Add a point, box or paint on this frame first".into()
-                            } else {
-                                "Run SAM on this frame's prompts (nothing is written)".into()
-                            };
-                            preview = this.action_button(ui, "Preview frame", Node::PreMatte, false, sam_ok && annotated && !busy).on_hover_text(tip.clone()).on_disabled_hover_text(tip).clicked();
-                            let tip = if bypass { "Bypass is on".to_string() } else if busy { "A hint job is running for this clip".to_string() } else { reason(&local, &guide_name) };
-                            if this.action_button(ui, "Track prompts", Node::PreMatte, true, sam_ok && !busy && !bypass).on_hover_text("Track the saved prompts over In/Out into the pre-matte").on_disabled_hover_text(tip).clicked() {
+                            preview = decided_button(this, ui, &d_preview, Node::PreMatte, false, "Run SAM on this frame's prompts (nothing is written)");
+                            if decided_button(this, ui, &d_track, Node::PreMatte, true, "Track the saved prompts over In/Out into the pre-matte") {
                                 run = Some(Run::Guide);
                             }
-                        } else if this.action_button(ui, "Generate pre-matte", Node::PreMatte, true, on).on_hover_text("Run the Pre-matte over In/Out into VideoMamaMaskHint").on_disabled_hover_text(why(guide_ready, &guide_name)).clicked() {
+                        } else if decided_button(this, ui, &d_guide, Node::PreMatte, true, "Run the Pre-matte over In/Out into VideoMamaMaskHint") {
                             run = Some(Run::Guide);
                         }
                     });
+                    if sam {
+                        reason_line(ui, &[&d_preview, &d_track]);
+                    } else {
+                        reason_line(ui, &[&d_guide]);
+                    }
                     ui.label(RichText::new(format!("{} frames on disk", clip.mask_frames)).color(theme::text_dim(ui)).size(12.0));
                     if ui.small_button("Delete frames…").on_hover_text("Delete generated pre-matte or hint frames from disk").clicked() {
                         del_open = Some(true);
@@ -1757,13 +1776,12 @@ impl App {
             let ui = &mut cols[1];
             let stale = this.stale(&ctx, Node::Hint);
             card(ui, &format!("Hint · {}", fin.label()), stale, |ui| {
-                let on = fin_ready && !busy && !bypass && fin != Final::Import && gate.is_none();
-                let tip = if fin == Final::Import { "Imported alpha has nothing to generate: choose a movie in Properties".to_string() } else if let Some(g) = &gate { g.clone() } else { why(fin_ready, &fin_name) };
                 ui.horizontal_wrapped(|ui| {
-                    if this.action_button(ui, "Generate hint", Node::Hint, true, on).on_hover_text(if fin.needs_guide() { "Refine the Pre-matte over In/Out into AlphaHint (needs the Pre-matte first)" } else { "Publish the Pre-matte straight into AlphaHint" }).on_disabled_hover_text(tip.clone()).clicked() {
+                    if decided_button(this, ui, &d_hint, Node::Hint, true, if fin.needs_guide() { "Refine the Pre-matte over In/Out into AlphaHint (needs the Pre-matte first)" } else { "Publish the Pre-matte straight into AlphaHint" }) {
                         run = Some(Run::Hint);
                     }
                 });
+                reason_line(ui, &[&d_hint]);
                 ui.label(RichText::new(format!("{} frames on disk", clip.alpha_frames)).color(theme::text_dim(ui)).size(12.0));
                 if ui.small_button("Delete frames…").on_hover_text("Delete generated pre-matte or hint frames from disk").clicked() {
                     del_open = Some(false);
@@ -1812,16 +1830,17 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     if movie.is_some() {
                         let tip = if src.is_none() { "Companion movies need a movie source; import PNG/EXR sequences by placing them in AlphaHint" } else { "the worker cannot import movies (FFmpeg)" };
-                        import = theme::accent(ui, import_ok && !busy, |ui| ui.add(egui::Button::new("Import movie"))).on_disabled_hover_text(tip).clicked();
+                        import = theme::accent(ui, import_ok, |ui| ui.add(egui::Button::new("Import movie"))).on_disabled_hover_text(tip).clicked();
                         cancel_import = ui.button("Cancel").clicked();
                         if let Some(m) = &movie {
                             ui.label(RichText::new(m.display().to_string()).monospace().size(11.0).color(theme::text_dim(ui)));
                         }
                     }
                     if src.is_some() {
-                        extract = ui.add_enabled(ready(TaskKind::PrepareSource) && !busy, egui::Button::new("Extract frames (validated)")).on_hover_text("Reads the source movie from where it is and writes a verified Frames/ sequence; cancellable and resumable").clicked();
+                        extract = decided_button(&*self, ui, &d_extract, Node::Media, false, "Reads the source movie from where it is and writes a verified Frames/ sequence; cancellable and resumable");
                     }
                 });
+                reason_line(ui, &[&d_extract]);
             });
         }
         if preview {
@@ -1831,14 +1850,14 @@ impl App {
             if let Some(src) = src.clone() {
                 let job = Ctx { clip, range: (0, 0), job_id: new_id(), staging: PathBuf::new() }.prepare_source(&src);
                 let c = clip.clone();
-                self.submit_task_job(&c, Ok(job), 0, "Frame extraction");
+                self.submit_task_job(&c, Ok(job), 0, "Frame extraction", Action::Extract);
             }
         }
         if import {
             if let (Some(m), Some(src)) = (movie, src) {
                 let job = Ctx { clip, range: (0, 0), job_id: new_id(), staging: PathBuf::new() }.import_hint(&m, &src, self.hint.movie_mask, self.hint.movie_alpha_channel);
                 let c = clip.clone();
-                self.submit_task_job(&c, Ok(job), 0, "Hint movie import");
+                self.submit_task_job(&c, Ok(job), 0, "Hint movie import", Action::Hint);
                 self.hint.movie = None;
             }
         }
@@ -2491,9 +2510,10 @@ impl App {
             }
         }
         let mut export_now = false;
+        let queued_export = decide(self.ai.scheduler(), &clip.root, Action::Export, "", None).label == "Already queued";
         if let Some(c) = &self.hint.render_confirm {
             let existing = c.existing.join(", ");
-            let can_export = clip.manifest.is_some() && ffmpeg && !busy && range.is_ok();
+            let can_export = clip.manifest.is_some() && ffmpeg && range.is_ok() && !queued_export;
             let (mut run, mut cancel) = (false, false);
             egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -2523,10 +2543,17 @@ impl App {
         // While the confirmation is open its own export choice is the only one (no duplicate export buttons).
         let mut export_click = export_now;
         if clip.manifest.is_some() && !confirming {
-            let ready = ffmpeg && !busy && range.is_ok();
-            let export = ui.vertical_centered(|ui| ui.add_enabled(ready, egui::Button::new("Export existing Key result").min_size(egui::vec2(220.0, 30.0)))).inner;
+            let blocked = if !ffmpeg { Some(reason(&self.ai.local_caps(), "FFmpeg")) } else { range.as_ref().err().cloned() };
+            let d = decide(self.ai.scheduler(), &clip.root, Action::Export, "Export existing Key result", blocked);
+            let export = ui.vertical_centered(|ui| ui.add_enabled(d.enabled, egui::Button::new(d.label.as_str()).min_size(egui::vec2(220.0, 30.0)))).inner;
             self.hint.deliver_rects.push(("export_existing".into(), export.rect));
-            export_click |= export.on_hover_text("Encode the selected video outputs from the current Key result, without running Key again.").clicked();
+            let tip = "Encode the selected video outputs from the current Key result, without running Key again.";
+            export_click |= if d.enabled {
+                export.on_hover_text(if d.reason.is_empty() { tip.to_string() } else { format!("{tip}\n{}", d.reason) }).clicked()
+            } else {
+                export.on_disabled_hover_text(d.reason.as_str()).clicked()
+            };
+            reason_line(ui, &[&d]);
         }
         if export_click {
             if let (Ok(r), Some(p)) = (range, self.project.as_ref()) {
@@ -2585,6 +2612,30 @@ fn codec_text(c: &crate::presets::VideoCodec) -> String {
         o => o,
     };
     format!("{n} ({})", if c.alpha { "alpha" } else { "no alpha" })
+}
+
+/// A processing button driven by the shared action decision: its label, enabled state and hover text come from `d`.
+/// Returns true when clicked.
+fn decided_button(app: &App, ui: &mut Ui, d: &crate::actions::Decision, stage: Node, primary: bool, tip: &str) -> bool {
+    let r = app.action_button(ui, &d.label, stage, primary, d.enabled);
+    if d.enabled {
+        r.on_hover_text(if d.reason.is_empty() { tip.to_string() } else { format!("{tip}\n{}", d.reason) }).clicked()
+    } else {
+        r.on_disabled_hover_text(d.reason.as_str()).clicked()
+    }
+}
+
+/// The short line beside the buttons: why one is disabled (warning colour) or why it will wait (dim).
+fn reason_line(ui: &mut Ui, ds: &[&crate::actions::Decision]) {
+    let mut seen: Vec<&str> = vec![];
+    for d in ds.iter().filter(|d| !d.reason.is_empty()) {
+        if seen.contains(&d.reason.as_str()) {
+            continue;
+        }
+        seen.push(&d.reason);
+        let c = if d.enabled || d.label == "Already queued" { theme::text_dim(ui) } else { theme::warn(ui) };
+        ui.label(RichText::new(d.reason.as_str()).color(c).size(12.0));
+    }
 }
 
 /// The model the selected Pre-matte producer needs when the app's one check found it missing ("GVM", "BiRefNet

@@ -1,4 +1,5 @@
 //! Keyloom native app core and UI-independent project utilities (see `ui`).
+pub mod actions;
 pub mod app_api;
 pub mod background;
 pub mod contracts;

@@ -128,15 +128,26 @@ impl AiUi {
         steps: Vec<TaskJob>,
         key: Option<(Plan, Params, OutputCfg)>,
     ) -> Result<String, String> {
+        self.submit_chain_after(clip, steps, key, vec![])
+    }
+
+    /// `submit_chain` whose first step also waits for `first_after` (the earlier same-clip steps, `actions::waits_for`).
+    pub fn submit_chain_after(
+        &mut self,
+        clip: &Clip,
+        steps: Vec<TaskJob>,
+        key: Option<(Plan, Params, OutputCfg)>,
+        first_after: Vec<String>,
+    ) -> Result<String, String> {
         let mut ids: Vec<String> = vec![];
         let run = || -> Result<(), String> {
             for s in steps {
-                let after = ids.last().cloned().into_iter().collect();
+                let after = if ids.is_empty() { first_after.clone() } else { ids.last().cloned().into_iter().collect() };
                 let id = self.submit_task(clip, s, after, 0)?;
                 ids.push(id);
             }
             if let Some((plan, params, out)) = key {
-                let after: Vec<String> = ids.last().cloned().into_iter().collect();
+                let after: Vec<String> = if ids.is_empty() { first_after.clone() } else { ids.last().cloned().into_iter().collect() };
                 let id = self.submit_plan_after(clip, plan, &params, &out, after)?;
                 ids.push(id);
             }
@@ -740,7 +751,8 @@ impl AiUi {
                     ui.colored_label(theme::error(ui), format!("Not started ({code}): {}", trunc(message)));
                 }
                 JobState::Failed { reason } => {
-                    ui.colored_label(theme::error(ui), format!("Not started: {}", trunc(reason)));
+                    let head = if crate::actions::waiting_step_failed(&self.sched, id) { "Waiting step failed" } else { "Not started" };
+                    ui.colored_label(theme::error(ui), format!("{head}: {}", trunc(reason)));
                 }
                 JobState::Cancelled => {
                     ui.label("Cancelled before it started");
