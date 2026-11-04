@@ -650,7 +650,7 @@ impl Inbound {
             Rx::Idle => self.dispatch(now, env),
             Rx::Preflight { id, rx } => match rx.try_recv() {
                 Err(TryRecvError::Empty) => self.rx = Rx::Preflight { id, rx },
-                Ok(Ok(pf)) => self.preflight_passed(id, pf, env),
+                Ok(Ok(pf)) => self.preflight_passed(id, pf, now, env),
                 Ok(Err(problems)) => {
                     nlog(&format!("shot {id}: preflight refused: {}", problems.join("; ")));
                     self.begin(id, None, Some(format!("refused by this PC: {}", truncate(&problems.join("; "), 700))), json!({"refused": true}));
@@ -669,10 +669,10 @@ impl Inbound {
                 Ok(Ok(v)) => {
                     let mut plan = plan;
                     plan["estimate"] = json!({"required_gib": v.get("required_gib"), "budget_gib": v.get("budget_gib")});
-                    self.begin(id, Some(pf), None, plan);
+                    self.begin_prepared(id, pf, plan, now, env);
                 }
                 // No answer: the worker still enforces the window at launch.
-                Ok(Err(_)) | Err(TryRecvError::Disconnected) => self.begin(id, Some(pf), None, plan),
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => self.begin_prepared(id, pf, plan, now, env),
             },
             Rx::Beginning { id, pf, fail, rx } => match rx.try_recv() {
                 Err(TryRecvError::Empty) => self.rx = Rx::Beginning { id, pf, fail, rx },
@@ -720,7 +720,7 @@ impl Inbound {
         }
     }
 
-    fn preflight_passed(&mut self, id: String, pf: Preflight, env: &mut Env) {
+    fn preflight_passed(&mut self, id: String, pf: Preflight, now: Instant, env: &mut Env) {
         nlog(&format!("shot {id}: preflight passed"));
         let sample = if let View::Live(s) = env.metrics { Some(s) } else { None };
         let uuid = env.ai.scheduler().targets().into_iter().find(|t| t.local && t.enabled).and_then(|t| t.ready).and_then(|r| r.gpu).and_then(|g| g.verified_uuid().ok().map(str::to_owned));
@@ -734,8 +734,21 @@ impl Inbound {
                 plan["estimate_asked"] = json!(true);
                 self.rx = Rx::Estimating { id, pf: Box::new(pf), plan, rx: app_api::spawn_call("estimate", args) };
             }
-            _ => self.begin(id, Some(Box::new(pf)), None, plan),
+            _ => self.begin_prepared(id, Box::new(pf), plan, now, env),
         }
+    }
+
+    fn begin_prepared(&mut self, id: String, pf: Box<Preflight>, plan: Value, now: Instant, env: &mut Env) {
+        // Receive jobs may have been turned off while this shot was being prepared.
+        if !env.settings.network.receives() {
+            env.ai.release_network_slot(SLOT);
+            self.seen.remove(&id);
+            self.homes.remove(&id);
+            self.reload = true;
+            self.retry_load_at = Some(now + RETRY);
+            return;
+        }
+        self.begin(id, Some(pf), None, plan);
     }
 
     /// Ask the inbox to record the start (durable BEFORE anything runs).
