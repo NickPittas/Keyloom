@@ -302,7 +302,7 @@ impl App {
         self.new_project_draft = Some((parent, name));
     }
 
-    fn quit_request(&mut self, ctx: &egui::Context) {
+    pub(super) fn quit_request(&mut self, ctx: &egui::Context) {
         // Flush pending edits before the existing running-job close flow.
         if self.project.is_some() && self.unsaved() {
             if let Err(e) = self.save_project() { self.ai.notice = Some(format!("Not closing: {e}")); return; }

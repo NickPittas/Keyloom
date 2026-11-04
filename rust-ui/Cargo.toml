@@ -28,7 +28,12 @@ rfd = "0.17.2"
 libloading = "0.8"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 
+# Tray: Linux speaks StatusNotifierItem over D-Bus (no GTK in a winit app); Windows uses the common tray-icon crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+
 [target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.21", default-features = false }
 raw-window-handle = "0.6"
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading"] }
 

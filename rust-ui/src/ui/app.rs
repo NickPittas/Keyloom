@@ -249,6 +249,14 @@ pub struct App {
     close_force: bool,
     /// Explicit Quit was chosen: closing really closes even in background mode.
     pub(super) quitting: bool,
+    /// The system tray icon (`None` = no tray: Close quits). Closing the window hides it only while this exists.
+    tray: Option<super::tray::Tray>,
+    /// The first-hide note is open (waiting for its button before the window hides).
+    tray_note: bool,
+    /// The tray's Quit was chosen: the next drawn frame runs the normal Quit (save, then the running-job question).
+    quit_pending: bool,
+    /// Shutdown steps in the order they ran (`endpoint`, then `workers`).
+    shutdown_log: Vec<&'static str>,
     close_rects: Vec<egui::Rect>,
     /// Output-location editor for the open project (Deliver tab).
     loc_note: Option<String>,
@@ -280,24 +288,34 @@ impl App {
         app.ai.forget_models(); // the real window waits for its first real model check
         app.ai.notice = notice;
         app.models.start_background(&cc.egui_ctx);
-        // The window path runs scheduling, workers and the network client off the frame loop.
-        app.release_shared();
-        let parts = driver::Parts {
-            ai: app.ai.shared(),
-            remote: app.remote.shared(),
-            metrics: app.metrics.shared(),
-            repo: app.net_repo.clone(),
-            python: app.net_python.clone(),
-            ctx: cc.egui_ctx.clone(),
-        };
-        let first = driver::Snapshot { settings: app.settings.saved().clone(), path: app.settings.store_path().map(PathBuf::from) };
-        match driver::Driver::start(parts, first) {
-            Ok(d) => app.driver = Some(d),
-            Err(e) => app.ai.notice = Some(format!("The background driver could not start ({e}); work advances only while the window is drawn.")),
-        }
+        app.start_driver(&cc.egui_ctx);
         app.start_endpoint(&cc.egui_ctx);
+        let (ctx, wake) = (cc.egui_ctx.clone(), app.driver.as_ref().map(|d| d.waker(&cc.egui_ctx)));
+        match super::tray::Tray::start(std::sync::Arc::new(move || match &wake { Some(w) => w(), None => ctx.request_repaint() })) {
+            Ok(t) => app.tray = Some(t),
+            Err(e) => app.ai.notice = Some(format!("No system tray ({e}): closing the window quits Keyloom.")),
+        }
         app.release_shared();
         app
+    }
+
+    /// The window path runs scheduling, workers and the network client off the frame loop (tests call this to get the same).
+    pub fn start_driver(&mut self, ctx: &egui::Context) {
+        // The window path runs scheduling, workers and the network client off the frame loop.
+        self.release_shared();
+        let parts = driver::Parts {
+            ai: self.ai.shared(),
+            remote: self.remote.shared(),
+            metrics: self.metrics.shared(),
+            repo: self.net_repo.clone(),
+            python: self.net_python.clone(),
+            ctx: ctx.clone(),
+        };
+        let first = driver::Snapshot { settings: self.settings.saved().clone(), path: self.settings.store_path().map(PathBuf::from) };
+        match driver::Driver::start(parts, first) {
+            Ok(d) => self.driver = Some(d),
+            Err(e) => self.ai.notice = Some(format!("The background driver could not start ({e}); work advances only while the window is drawn.")),
+        }
     }
 
     /// Bring the app's endpoint up on a background thread (the window opens without waiting for it). Commit events wake the driver.
@@ -458,6 +476,10 @@ impl App {
             close: CloseState::None,
             close_force: false,
             quitting: false,
+            tray: None,
+            tray_note: false,
+            quit_pending: false,
+            shutdown_log: vec![],
             close_rects: vec![],
             loc_note: None,
             persist_failed: None,
@@ -1924,15 +1946,19 @@ impl App {
 
     /// Active work cancels the close request; graceful stop keeps the window updating until it exits.
     fn close_tick(&mut self, ctx: &egui::Context) {
-        // Hiding also works on compositors without minimize support; relaunch restores this window.
+        // Close hides to the tray (Quit is the tray entry or File > Quit); without a tray it falls through to a normal close.
         if ctx.input(|i| i.viewport().close_requested())
             && !self.close_force
             && !self.quitting
             && self.close == CloseState::None
-            && self.settings.saved().interface.background
+            && self.tray.is_some()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if self.tray_note_marker().is_some_and(|m| !m.exists()) {
+                self.tray_note = true; // first time: say where it went, then hide
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
             return;
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_force {
@@ -1947,8 +1973,7 @@ impl App {
                     if jobs || models {
                         self.close = CloseState::Prompt;
                     } else {
-                        self.ai.begin_stop(); // only idle workers: no question to ask
-                        self.remote.shutdown_requested();
+                        self.begin_shutdown(); // only idle workers: no question to ask
                         self.close = CloseState::Stopping;
                     }
                 }
@@ -1975,7 +2000,8 @@ impl App {
             .show(ctx, |ui| match self.close {
                 CloseState::Prompt => {
                     if self.ai.running_jobs() {
-                        ui.label("AI jobs are still running. Stopping them gracefully keeps frames already written so a run can be resumed.");
+                        ui.label("A job is running on this PC. Quit anyway? It will be cancelled.");
+                        ui.label(RichText::new("\"Stop work, then quit\" stops it gracefully and keeps the frames already written, so the run can be resumed.").color(theme::text_dim(ui)).size(12.0));
                     }
                     if self.models.busy() {
                         ui.label(self.models.close_status());
@@ -2012,16 +2038,88 @@ impl App {
             if self.models.busy() {
                 self.models.stop_for_close(ctx);
             }
-            self.ai.begin_stop();
-            self.remote.shutdown_requested();
+            self.begin_shutdown();
             next = CloseState::Stopping;
         }
         self.close = next;
         if quit {
+            self.stop_endpoint();
             self.close_force = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// Ordered shutdown: the endpoint stops accepting first, then the workers are told to stop (their own cancel/unload/recovery).
+    fn begin_shutdown(&mut self) {
+        self.stop_endpoint();
+        self.ai.begin_stop();
+        self.remote.shutdown_requested();
+        self.shutdown_log.push("workers");
+    }
+
+    fn stop_endpoint(&mut self) {
+        if !self.shutdown_log.contains(&"endpoint") {
+            if let Some(e) = self.endpoint.take() {
+                e.stop(std::time::Duration::from_secs(5));
+            }
+            self.shutdown_log.push("endpoint");
+        }
+    }
+
+    pub fn shutdown_steps(&self) -> &[&'static str] {
+        &self.shutdown_log
+    }
+
+    pub fn set_tray(&mut self, t: Option<super::tray::Tray>) {
+        self.tray = t;
+    }
+    pub fn has_tray(&self) -> bool {
+        self.tray.is_some()
+    }
+    /// The first-hide note is showing (the window hides when its button is pressed).
+    pub fn tray_note_open(&self) -> bool {
+        self.tray_note
+    }
+
+    /// Tray menu entries. Runs from `logic()` too, so it works while the window is hidden.
+    pub fn tray_tick(&mut self, ctx: &egui::Context) {
+        use super::tray::TrayCmd;
+        while let Some(c) = self.tray.as_ref().and_then(|t| t.poll()) {
+            match c {
+                TrayCmd::Show => crate::background::show(ctx),
+                TrayCmd::Lost => {
+                    self.tray = None; // never leave a hidden window without a tray
+                    crate::background::show(ctx);
+                }
+                TrayCmd::Quit => {
+                    crate::background::show(ctx); // the running-job question needs a visible window
+                    self.quit_pending = true;
+                }
+            }
+        }
+    }
+
+    fn tray_note_marker(&self) -> Option<PathBuf> {
+        Some(self.settings.store_path()?.parent()?.join("tray-note-shown"))
+    }
+
+    fn tray_note_ui(&mut self, ctx: &egui::Context) {
+        if !self.tray_note {
+            return;
+        }
+        let mut hide = false;
+        egui::Window::new("Keyloom keeps running").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.label("Keyloom keeps running in the tray. Quit from the tray or File > Quit.");
+            hide = ui.button("Hide to tray").clicked();
+        });
+        if hide {
+            if let Some(m) = self.tray_note_marker() {
+                let _ = std::fs::write(m, "");
+            }
+            self.tray_note = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
     }
 
     pub fn close_state(&self) -> CloseState {
@@ -2276,6 +2374,7 @@ fn board_status(c: &Clip) -> String {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.net_logic(ctx);
+        self.tray_tick(ctx); // logic() still runs while the window is hidden
         // eframe skips ui() for hidden/occluded Windows windows, but keeps calling logic().
         if let Some(dir) = &self.opts.instance_dir {
             if std::fs::remove_file(dir.join("instance.show")).is_ok() {
@@ -2299,9 +2398,7 @@ impl eframe::App for App {
             d.stop();
         }
         // Quit (window Quit and File > Quit both end here): stop accepting, close the listener and discovery. No UI lock is held.
-        if let Some(e) = self.endpoint.take() {
-            e.stop(std::time::Duration::from_secs(5));
-        }
+        self.stop_endpoint();
         self.metrics.stop(); // kill + reap the helper
     }
 
@@ -3045,7 +3142,7 @@ impl App {
     }
 
     /// Hand the shared runtime objects back to the driver.
-    fn release_shared(&mut self) {
+    pub fn release_shared(&mut self) {
         self.ai.release();
         self.remote.release();
         self.metrics.release();
@@ -3069,6 +3166,10 @@ impl App {
             super::theme::apply_preference(&ctx, &self.settings.saved().interface.theme);
         }
         self.import_tick(&ctx);
+        self.tray_tick(&ctx);
+        if std::mem::take(&mut self.quit_pending) {
+            self.quit_request(&ctx);
+        }
         self.ai_tick(&ctx);
         self.last_ctx = Some(ctx.clone());
         self.persist_media();
@@ -3272,6 +3373,7 @@ impl App {
         } else {
             egui::CentralPanel::default().show(ui, |ui| self.board(ui));
         }
+        self.tray_note_ui(&ctx);
         self.close_ui(&ctx);
         self.remove_ui(&ctx);
         // Dev-only evidence capture: wait for the first frame, then write a PNG and quit.
