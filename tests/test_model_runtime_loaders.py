@@ -145,7 +145,7 @@ def test_runtime_uses_descriptor_user_data_and_checks_dependency_closure(monkeyp
     lease.close()
 
     (data / "gvm_core/code/loader.py").unlink()
-    with pytest.raises(model_runtime.ModelAssetsUnavailableError, match="gvm-code.*Repair required"):
+    with pytest.raises(model_runtime.ModelAssetsUnavailableError, match="gvm-code.*download it on the Models page"):
         model_runtime.require_model_artifact("gvm", roots=roots)
 
 
@@ -208,7 +208,7 @@ def test_explicit_local_model_root_requires_selected_component_files(monkeypatch
     ) == local
 
 
-def test_runtime_distinguishes_verify_required_from_digest_mismatch(monkeypatch, tmp_path):
+def test_runtime_needs_presence_only_never_a_hash_record(monkeypatch, tmp_path):
     artifact = _artifact("model", "models/model", ("weights.bin",), sha256="a" * 64)
     catalog = Catalog(1, "", {}, {artifact.id: artifact})
     monkeypatch.setattr(model_runtime, "load_catalog", lambda: catalog)
@@ -218,104 +218,27 @@ def test_runtime_distinguishes_verify_required_from_digest_mismatch(monkeypatch,
     model.write_bytes(b"synthetic")
     roots = Roots(data, tmp_path / "models", tmp_path / "package", tmp_path / "hf", tmp_path / "cache")
 
-    with pytest.raises(model_runtime.ModelAssetsUnavailableError, match="Verify required"):
-        model_runtime.require_model_artifact("model", roots=roots)
-
+    model_runtime.require_model_artifact("model", roots=roots).close()  # no verification record: still loads
     _seed_verified(catalog, roots, mismatch=("model", "weights.bin"))
-    with pytest.raises(model_runtime.ModelAssetsUnavailableError, match="known trusted-digest mismatch.*Repair required"):
+    model_runtime.require_model_artifact("model", roots=roots).close()  # a stale hash record is never consulted
+    model.unlink()
+    with pytest.raises(model_runtime.ModelAssetsUnavailableError, match="missing: weights.bin.*download it"):
         model_runtime.require_model_artifact("model", roots=roots)
 
 
-def test_runtime_rejects_unverified_dependency_before_loading_code(monkeypatch, tmp_path):
+def test_runtime_rejects_missing_dependency_before_loading_code(monkeypatch, tmp_path):
     model = _artifact("model", "models/model", ("weights.bin",), depends=("remote-code",), sha256="a" * 64)
     code = _artifact("remote-code", "models/code", ("modeling.py",), sha256="b" * 64)
     catalog = Catalog(1, "", {}, {model.id: model, code.id: code})
     monkeypatch.setattr(model_runtime, "load_catalog", lambda: catalog)
     data = tmp_path / "data"
-    for artifact in catalog.artifacts.values():
-        file_path = data / artifact.layout_rel / artifact.required_files()[0].layout_path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_bytes(b"synthetic")
+    file_path = data / model.layout_rel / "weights.bin"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_bytes(b"synthetic")
     roots = Roots(data, tmp_path / "models", tmp_path / "package", tmp_path / "hf", tmp_path / "cache")
-    _seed_verified(catalog, roots, mismatch=("remote-code", "modeling.py"))
 
-    with pytest.raises(
-        model_runtime.ModelAssetsUnavailableError,
-        match="remote-code.*known trusted-digest mismatch.*Repair required",
-    ):
+    with pytest.raises(model_runtime.ModelAssetsUnavailableError, match="remote-code.*download it"):
         model_runtime.require_model_artifact("model", roots=roots)
-
-
-def test_sam2_tracker_uses_catalog_artifact_without_hub_download(monkeypatch, tmp_path):
-    build_calls = []
-    artifact = load_catalog().get("sam2-small")
-    sam2 = types.ModuleType("sam2")
-    sam2.__path__ = []
-    build_sam = types.ModuleType("sam2.build_sam")
-    build_sam.HF_MODEL_ID_TO_FILENAMES = {
-        artifact.repo_id: ("configs/sam2.1_hiera_s.yaml", artifact.hf_filename)
-    }
-    build_sam.build_sam2_video_predictor = lambda **kwargs: build_calls.append(kwargs) or object()
-    monkeypatch.setitem(sys.modules, "sam2", sam2)
-    monkeypatch.setitem(sys.modules, "sam2.build_sam", build_sam)
-
-    checkpoint = tmp_path / artifact.hf_filename
-    with checkpoint.open("wb") as f:
-        f.write(b"PK")
-        f.truncate(11 * 1024 * 1024)
-    selected = []
-    leases = []
-    monkeypatch.setattr(model_runtime, "acquire_model_artifact",
-                        lambda aid: selected.append(aid) or leases.append(FakeLease(checkpoint)) or leases[-1])
-    monkeypatch.setattr("sam2_tracker.wrapper._disable_external_progress_bars", lambda: None)
-
-    tracker = __import__("sam2_tracker.wrapper", fromlist=["SAM2Tracker"]).SAM2Tracker(
-        model_id=artifact.repo_id, device="cpu"
-    )
-    tracker._get_predictor()
-
-    assert selected == ["sam2-small"]
-    assert build_calls[0]["ckpt_path"] == str(checkpoint)
-    tracker.unload()
-    assert leases[-1].closed
-
-
-def test_birefnet_loads_catalog_path_local_only(monkeypatch, tmp_path):
-    from modules.BiRefNetModule import wrapper
-
-    model_dir = tmp_path / "BiRefNet-matting"
-    model_dir.mkdir()
-    calls = []
-
-    class Model:
-        def to(self, *_): return self
-        def eval(self): return self
-        def half(self): return self
-
-    class AutoModel:
-        @staticmethod
-        def from_pretrained(path, **kwargs):
-            calls.append((path, kwargs))
-            return Model()
-
-    leases = []
-    monkeypatch.setattr(model_runtime, "acquire_model_artifact",
-                        lambda aid: calls.append(aid) or leases.append(FakeLease(model_dir)) or leases[-1])
-    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModelForImageSegmentation=AutoModel))
-    processor = wrapper.BiRefNetProcessor(device="cpu")
-    processor._ensure_loaded()
-
-    assert calls[0] == "birefnet-BiRefNet-matting"
-    assert calls[1][0] == str(model_dir)
-    assert calls[1][1]["local_files_only"] is True
-    assert calls[1][1]["trust_remote_code"] is True
-    assert processor._model_asset_lease is leases[-1]
-
-    explicit_dir = tmp_path / "explicit"
-    explicit_dir.mkdir()
-    monkeypatch.setattr(model_runtime, "acquire_model_artifact", lambda _aid: pytest.fail("explicit path ignored"))
-    wrapper.BiRefNetProcessor(device="cpu", model_path=explicit_dir)._ensure_loaded()
-    assert calls[-1][0] == str(explicit_dir)
 
 
 def test_matanyone_explicit_path_and_config_avoid_lazy_download(monkeypatch, tmp_path):
@@ -324,7 +247,7 @@ def test_matanyone_explicit_path_and_config_avoid_lazy_download(monkeypatch, tmp
     checkpoint = tmp_path / "matanyone2.pth"
     checkpoint.write_bytes(b"synthetic")
     assert wrapper._ensure_checkpoint(str(checkpoint)) == str(checkpoint)
-    with pytest.raises(FileNotFoundError, match="Explicit MatAnyone2 checkpoint"):
+    with pytest.raises(FileNotFoundError, match="model file missing"):
         wrapper._ensure_checkpoint(str(tmp_path / "missing.pth"))
 
     module_path = Path(__file__).resolve().parents[1] / "modules/MatAnyone2Module"
@@ -373,163 +296,3 @@ def test_matanyone_explicit_path_and_config_avoid_lazy_download(monkeypatch, tmp
     monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: {})
     with pytest.raises(RuntimeError, match="missing ResNet backbone weights.*Repair"):
         get_default_model.get_matanyone2_model(str(checkpoint), device="cpu")
-
-
-def test_gvm_uses_catalog_path_and_diffusers_local_only(monkeypatch, tmp_path):
-    from gvm_core import wrapper
-
-    calls = []
-    requested = []
-    validated = []
-
-    class Component:
-        @classmethod
-        def from_pretrained(cls, path, **kwargs):
-            calls.append((path, kwargs))
-            return cls()
-
-    class Pipeline:
-        def __init__(self, **_): pass
-        def to(self, *_args, **_kwargs): return self
-
-    leases = []
-    monkeypatch.setattr(
-        model_runtime, "acquire_model_artifact",
-        lambda aid, **kwargs: requested.append((aid, kwargs)) or leases.append(FakeLease(tmp_path)) or leases[-1],
-    )
-    monkeypatch.setattr(
-        model_runtime, "validate_local_model_path",
-        lambda aid, path, components=None: validated.append((aid, path, components)) or Path(path),
-    )
-    monkeypatch.setattr(wrapper, "AutoencoderKLTemporalDecoder", Component)
-    monkeypatch.setattr(wrapper, "FlowMatchEulerDiscreteScheduler", Component)
-    monkeypatch.setattr(wrapper, "UNetSpatioTemporalConditionModel", Component)
-    monkeypatch.setattr(wrapper, "GVMPipeline", Pipeline)
-
-    processor = wrapper.GVMProcessor(device="cpu", seed=1)
-
-    assert requested == [("gvm", {"exclude_components": ()})]
-    assert len(calls) == 3
-    assert all(call[1]["local_files_only"] is True for call in calls)
-    assert processor._model_asset_lease is leases[-1]
-
-    calls.clear()
-    explicit_processor = wrapper.GVMProcessor(model_base=str(tmp_path), device="cpu", seed=1)
-    assert validated == [("gvm", str(tmp_path), None)]
-    assert all(call[1]["local_files_only"] is True for call in calls)
-    assert explicit_processor._model_asset_lease is None
-
-    calls.clear()
-    requested.clear()
-    validated.clear()
-    explicit_unet = tmp_path / "explicit-unet"
-    explicit_unet.mkdir()
-    explicit_unet_processor = wrapper.GVMProcessor(unet_base=str(explicit_unet), device="cpu", seed=1)
-    assert requested == [("gvm", {"exclude_components": ("unet",)})]
-    assert validated == [("gvm", str(explicit_unet), ("unet",))]
-    assert calls[-1][0] == str(explicit_unet)
-    assert all(call[1]["local_files_only"] is True for call in calls)
-    assert explicit_unet_processor._model_asset_lease is leases[-1]
-
-    from gvm_core.gvm.pipelines import pipeline_gvm
-    lora_calls = []
-
-    class LoraConfig:
-        @staticmethod
-        def from_pretrained(path, **kwargs):
-            lora_calls.append((path, kwargs))
-            return object()
-
-    monkeypatch.setattr(pipeline_gvm, "LoraConfig", LoraConfig)
-    monkeypatch.setattr(pipeline_gvm.torch, "load", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(pipeline_gvm, "LoraModel", lambda model, *_: model)
-    monkeypatch.setattr(pipeline_gvm, "set_peft_model_state_dict", lambda *_: None)
-    pipeline_gvm.GVMLoraLoader.load_lora_weights(types.SimpleNamespace(unet=object()), str(tmp_path))
-    assert lora_calls == [(str(tmp_path), {"local_files_only": True})]
-
-
-def test_videomama_uses_artifact_paths_and_component_loaders_are_local_only(monkeypatch, tmp_path):
-    from VideoMaMaInferenceModule import inference, pipeline
-
-    base = tmp_path / "svd"
-    unet = tmp_path / "videomama"
-    base.mkdir()
-    unet.mkdir()
-    resolved = []
-    validated = []
-    leases = []
-    monkeypatch.setattr(
-        model_runtime, "acquire_model_artifact",
-        lambda aid, **kwargs: resolved.append((aid, kwargs)) or leases.append(FakeLease(
-            {"videomama-svd": base, "videomama": unet}[aid],
-            {"videomama-svd": base, "videomama": unet},
-        )) or leases[-1],
-    )
-    monkeypatch.setattr(
-        model_runtime, "model_artifact_dir",
-        lambda aid: {"videomama-svd": base, "videomama": unet}[aid],
-    )
-    monkeypatch.setattr(
-        model_runtime, "validate_local_model_path",
-        lambda aid, path, components=None: validated.append((aid, path, components)) or Path(path),
-    )
-
-    class Loaded:
-        def to(self, *_args, **_kwargs): return self
-        def eval(self): return self
-
-    class Loader:
-        @staticmethod
-        def from_pretrained(path, **kwargs):
-            calls.append((path, kwargs))
-            return Loaded()
-
-    loaded_pipelines = []
-    pipeline_calls = []
-    def make_pipeline(**kwargs):
-        pipeline_calls.append(kwargs)
-        pipeline_instance = types.SimpleNamespace()
-        loaded_pipelines.append(pipeline_instance)
-        return pipeline_instance
-
-    monkeypatch.setattr(inference, "VideoInferencePipeline", make_pipeline)
-    assert inference.load_videomama_model(device="cpu") is loaded_pipelines[-1]
-    assert resolved == [("videomama", {})]
-    assert loaded_pipelines[-1]._model_asset_lease is leases[-1]
-    assert pipeline_calls[-1]["base_model_path"] == str(base)
-    assert pipeline_calls[-1]["unet_checkpoint_path"] == str(unet)
-
-    resolved.clear()
-    assert inference.load_videomama_model(str(base), device="cpu") is loaded_pipelines[-1]
-    assert resolved == [("videomama", {"exclude_dependencies": ("videomama-svd",)})]
-    assert loaded_pipelines[-1]._model_asset_lease is leases[-1]
-    assert validated == [("videomama-svd", str(base), None)]
-
-    resolved.clear()
-    validated.clear()
-    assert inference.load_videomama_model(unet_checkpoint_path=str(unet), device="cpu") is loaded_pipelines[-1]
-    assert resolved == [("videomama-svd", {})]
-    assert loaded_pipelines[-1]._model_asset_lease is leases[-1]
-    assert validated == [("videomama", str(unet), ("unet",))]
-
-    resolved.clear()
-    validated.clear()
-    assert inference.load_videomama_model(str(base), str(unet), device="cpu") is loaded_pipelines[-1]
-    assert not hasattr(loaded_pipelines[-1], "_model_asset_lease")
-    assert resolved == []
-    assert validated == [
-        ("videomama-svd", str(base), None), ("videomama", str(unet), ("unet",))
-    ]
-    assert pipeline_calls[-1]["base_model_path"] == str(base)
-    assert pipeline_calls[-1]["unet_checkpoint_path"] == str(unet)
-
-    calls = []
-    for name in (
-        "CLIPImageProcessor", "CLIPVisionModelWithProjection",
-        "AutoencoderKLTemporalDecoder", "UNetSpatioTemporalConditionModel",
-    ):
-        monkeypatch.setattr(pipeline, name, Loader)
-    pipeline.VideoInferencePipeline(str(base), str(unet), device="cpu")
-
-    assert len(calls) == 4
-    assert all(call[1]["local_files_only"] is True for call in calls)

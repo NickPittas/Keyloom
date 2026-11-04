@@ -36,40 +36,26 @@ def _models(roots):  # noqa: F811
     return AppModels(roots, make_catalog(hf_snapshot_artifact("gvm", specs))), specs
 
 
-def test_verify_then_check_then_reopen(roots):  # noqa: F811
+def test_present_missing_and_wrong_size(roots):  # noqa: F811
     models, specs = _models(roots)
-    b = models.resolve("gvm")
-    assert b.state == "verify_needed" and not b.ready and "Verify required" in b.dependencies[0].detail
+    b = models.resolve("gvm")  # never verified: present files are usable
+    assert b.state == "present" and b.ready and not b.dependencies[0].detail
     assert {f.name for f in b.files} == {s.layout_path for s in specs}
-    assert models.verify("gvm").state == "verified"
-    assert models.resolve("gvm").ready  # Check after Verify
     assert AppModels(roots, models.catalog).resolve("gvm").ready  # reopen
-
-
-def test_changed_file_invalidates_readiness(roots):  # noqa: F811
-    models, _ = _models(roots)
-    assert models.verify("gvm").ready
-    (roots.data_dir / "model" / "w.bin").write_bytes(b"WEIGHTS")  # same size, new content
-    assert models.resolve("gvm").state == "verify_needed"
+    (roots.data_dir / "model" / "w.bin").write_bytes(b"WEIGHTS")  # same size, new content: still present, no hashing
+    assert models.resolve("gvm").state == "present"
+    (roots.data_dir / "model" / "w.bin").write_bytes(b"short")  # wrong size
+    b = models.resolve("gvm")
+    assert b.state == "missing" and not b.ready and "size mismatch" in b.dependencies[0].detail
+    (roots.data_dir / "model" / "w.bin").write_bytes(b"weights")
     (roots.data_dir / "model" / "c.json").unlink()
     b = models.resolve("gvm")
-    assert b.state == "error" and "missing: c.json" in b.dependencies[0].detail
-    assert AppModels(roots, models.catalog).resolve("gvm").state == "error"
-
-
-def test_unreadable_record_is_visible(roots):  # noqa: F811
-    models, _ = _models(roots)
-    models.verify("gvm")
-    (roots.cache_dir / "model_verify.json").write_text("{bad", encoding="utf-8")
-    b = AppModels(roots, models.catalog).resolve("gvm")
-    assert b.state == "verify_needed" and "could not be read" in b.dependencies[0].note
+    assert b.state == "missing" and "missing: c.json" in b.dependencies[0].detail
+    assert "download it on the Models page" in b.dependencies[0].detail
 
 
 def test_idle_change_allowed_running_use_refused(roots):  # noqa: F811
     models, _ = _models(roots)
-    with pytest.raises(ModelAssetsUnavailableError):
-        models.start_job("j0", "gvm")  # not Verified: no protection granted, nothing held
-    models.verify("gvm")
     with models.changing(["gvm"]):  # idle: allowed
         with pytest.raises(ModelInUseError):
             models.start_job("j1", "gvm")  # cannot start while being changed
@@ -82,6 +68,14 @@ def test_idle_change_allowed_running_use_refused(roots):  # noqa: F811
     models.finish_job("j1")
     with models.changing(["gvm"]):
         pass
+    assert models.active_jobs(["gvm"]) == []
+
+
+def test_missing_model_is_refused_with_download_advice(roots):  # noqa: F811
+    models, _ = _models(roots)
+    (roots.data_dir / "model" / "c.json").unlink()
+    with pytest.raises(ModelAssetsUnavailableError, match="download it on the Models page"):
+        models.start_job("j0", "gvm")
     assert models.active_jobs(["gvm"]) == []
 
 

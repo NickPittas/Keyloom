@@ -600,27 +600,31 @@ def test_prepare_source_then_import_mask(env, svc):
 
 def worker_with(tasks, svc, **caps):
     out = io.StringIO()
-    hello = {"host": "h", "worker_rev": "r", "gpu": {"name": "g"}, "models": {},
-             "capabilities": {"key": False, "tasks": tasks, **caps}}
-    return Worker(svc, out, hello), out
+    ready = {"host": "h", "worker_rev": "r", "gpu": {"name": "g"}}
+    return Worker(svc, out, ready), out
+
+
+def wire(job):
+    """The app sends the exact model files with every model-loading job."""
+    return {**job, "model_files": {"gvm": "/m/gvm"}}
 
 
 def lines(out):
     return [json.loads(x) for x in out.getvalue().splitlines()]
 
 
-def test_worker_dispatches_task_and_rejects_unavailable(env, svc, monkeypatch):
+def test_worker_dispatches_task_and_rejects_jobs_without_model_files(env, svc, monkeypatch):
     monkeypatch.setattr(svc, "run_gvm", fake_hint(222))
     w, out = worker_with({"gvm": True, "videomama": False}, svc)
-    w._handle_task({"v": 1, "cmd": "task", "job": env.job("gvm")})
+    w._handle_task({"v": 1, "cmd": "task", "job": wire(env.job("gvm"))})
     w._thread.join(10)
     ev = lines(out)
     assert [e["event"] for e in ev if e["event"] in ("accepted", "done")] == ["accepted", "done"]
     assert ev[-1]["outcome"] == "complete" and ev[-1]["kind"] == "gvm"
-    w._handle_task({"v": 1, "cmd": "task", "job": env.job("videomama", {}, job_id="job-2")})
+    w._handle_task({"v": 1, "cmd": "task", "job": env.job("videomama", {}, job_id="job-2")})  # no model_files
     rej = lines(out)[-1]
-    assert rej["event"] == "rejected" and rej["code"] == "model_missing"
-    w._handle_task({"v": 1, "cmd": "task", "job": env.job("gvm")})  # same job_id again
+    assert rej["event"] == "rejected" and rej["code"] == "invalid" and "model_files" in rej["message"]
+    w._handle_task({"v": 1, "cmd": "task", "job": wire(env.job("gvm"))})  # same job_id again
     assert lines(out)[-1]["code"] == "busy"
 
 
@@ -632,8 +636,8 @@ def test_worker_serves_one_job_at_a_time(env, svc, monkeypatch):
         fake_hint(1)(clip)
     monkeypatch.setattr(svc, "run_gvm", slow)
     w, out = worker_with({"gvm": True}, svc)
-    w._handle_task({"v": 1, "cmd": "task", "job": env.job("gvm")})
-    w._handle_task({"v": 1, "cmd": "task", "job": env.job("gvm", job_id="job-2")})
+    w._handle_task({"v": 1, "cmd": "task", "job": wire(env.job("gvm"))})
+    w._handle_task({"v": 1, "cmd": "task", "job": wire(env.job("gvm", job_id="job-2"))})
     assert lines(out)[-1]["code"] == "busy"
     gate.set()
     w._thread.join(10)
@@ -654,12 +658,12 @@ def test_main_detects_device_for_default_service_only(monkeypatch):
             self.detected.append(os.environ.get("CUDA_VISIBLE_DEVICES"))
 
     monkeypatch.setattr("backend.service.CorridorKeyService", Svc)
-    hello = {"host": "h", "worker_rev": "r", "gpu": None, "models": {}, "capabilities": {"key": False}}
-    worker.main(["--gpu", "1"], stdin=io.BytesIO(b""), out=io.StringIO(), hello=hello)
+    ready = {"host": "h", "worker_rev": "r", "gpu": None}
+    worker.main(["--gpu", "1"], stdin=io.BytesIO(b""), out=io.StringIO(), ready=ready)
     assert made[0].detected == ["1"]  # after CUDA_VISIBLE_DEVICES was set
     injected = Svc()
     injected.detected.clear()
-    worker.main([], stdin=io.BytesIO(b""), out=io.StringIO(), service=injected, hello=hello)
+    worker.main([], stdin=io.BytesIO(b""), out=io.StringIO(), service=injected, ready=ready)
     assert injected.detected == []
 
 
@@ -724,16 +728,16 @@ def write_lock(env, **over):
 
 
 def lock_cmd(env, svc, **msg):
-    w, out = worker_with({"gvm": True}, svc)
-    w.hello["host"] = __import__("socket").gethostname()
-    w._handle_lock_cmd({"v": 1, "request_id": "r1", "clip_root": str(env.root), **msg})
-    return lines(out)[-1]
+    """The app-side hint-lock helper (the worker no longer takes these commands)."""
+    from backend.hint_lock_cli import run as lock_run
+    cmd = {"inspect_hint_lock": "inspect", "clear_hint_lock": "clear"}[msg.pop("cmd")]
+    return lock_run({"cmd": cmd, "request_id": "r1", "clip_root": str(env.root), **msg})
 
 
 def test_busy_rejection_carries_lock_identity(env, svc):
     meta = write_lock(env)
     w, out = worker_with({"gvm": True}, svc)
-    w._handle_task({"v": 1, "cmd": "task", "job": env.job("gvm")})
+    w._handle_task({"v": 1, "cmd": "task", "job": wire(env.job("gvm"))})
     w._thread.join(10)
     rej = lines(out)[-1]
     assert rej["code"] == "busy" and rej["lock"]["job_id"] == "dead-job"

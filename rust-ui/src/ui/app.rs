@@ -277,6 +277,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, opts: AppOptions) -> Self {
         let notice = opts.startup_notice.clone();
         let mut app = Self::with_ctx(&cc.egui_ctx, opts);
+        app.ai.forget_models(); // the real window waits for its first real model check
         app.ai.notice = notice;
         app.models.start_background(&cc.egui_ctx);
         // The window path runs scheduling, workers and the network client off the frame loop.
@@ -350,7 +351,8 @@ impl App {
         self.ai.notice = Some(msg);
     }
 
-    /// Window-free constructor (tests drive the same `frame` the window does).
+    /// Window-free constructor (tests drive the same `frame` the window does). Tests never run the model helper, so
+    /// every model counts as ready here; `App::new` (the window) clears that and waits for the real check.
     pub fn with_ctx(ctx: &egui::Context, opts: AppOptions) -> Self {
         Self::with_picker(ctx, opts, rfd_backend())
     }
@@ -504,6 +506,7 @@ impl App {
                 }
             }
         }
+        app.ai.set_models(crate::models::Snapshot::for_tests());
         app
     }
 
@@ -1324,14 +1327,16 @@ impl App {
     ) -> Vec<(Node, Option<String>, Vec<(graph::Action, String, bool)>)> {
         let local = self.ai.local_caps();
         // Same rule as the panel buttons: a worker that was never started queues the job and starts with it.
-        let lazy = local.is_none() && self.ai.local_worker_unstarted();
+        let lazy = local.is_none() && self.ai.models_unknown();
         let ready = |k: crate::tasks::TaskKind| {
             lazy || local
                 .as_ref()
                 .is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false))
         };
         let busy = self.ai.task_busy(&clip.folder);
-        let guide_ok = !cfg.bypass && !busy && ready(cfg.guide.task());
+        // Same missing-model check as the producer buttons: the selected BiRefNet/SAM variant must be installed.
+        let miss_guide = hint::missing_guide(&local, lazy, cfg);
+        let guide_ok = !cfg.bypass && !busy && ready(cfg.guide.task()) && miss_guide.is_none();
         let fin_ok = !cfg.bypass
             && !busy
             && cfg
@@ -1356,7 +1361,10 @@ impl App {
                     )
                 }
                 Node::PreMatte => (
-                    Some("Pre-matte frames are written to VideoMamaMaskHint as 8-bit PNG.".into()),
+                    Some(match &miss_guide {
+                        Some(m) => format!("{m} is missing — download it on the Models page"),
+                        None => "Pre-matte frames are written to VideoMamaMaskHint as 8-bit PNG.".into(),
+                    }),
                     vec![
                         (graph::Action::Open, "Open Pre-matte".into(), true),
                         (
@@ -2630,7 +2638,7 @@ impl App {
             .targets()
             .iter()
             .filter(|t| t.local && t.busy_with.is_some())
-            .filter_map(|t| t.hello.as_ref()?.gpu.as_ref().map(|g| g.index))
+            .filter_map(|t| t.ready.as_ref()?.gpu.as_ref().map(|g| g.index))
             .collect()
     }
 
@@ -3061,8 +3069,6 @@ impl App {
             super::theme::apply_preference(&ctx, &self.settings.saved().interface.theme);
         }
         self.import_tick(&ctx);
-        self.ai
-            .set_model_mutation_active(self.models.blocks_worker_launch());
         self.ai_tick(&ctx);
         self.last_ctx = Some(ctx.clone());
         self.persist_media();
@@ -3088,12 +3094,23 @@ impl App {
             .set_asset_safety(!self.ai.model_asset_mutation_safe(), self.ai.unresolved_model_fences());
         self.models.set_worker_activity(Some(self.ai.worker_activity()));
         self.models.tick(&ctx);
-        if self.models.take_readiness_changed() {
-            self.ai.refresh_capabilities(); // also when the Models page is closed
+        self.models.take_readiness_changed();
+        // The one readiness snapshot reaches the scheduler and every button, whether or not the Models page is open.
+        if let Some(snapshot) = self.models.take_snapshot() {
+            self.ai.set_models(snapshot);
+        } else if self.ai.models_unknown() {
+            if let Some(why) = self.models.snapshot_failure() {
+                self.ai.set_models_unavailable(format!("Model status is unavailable: {why}"));
+            }
         }
-        self.ai.refresh_tick();
-        self.ai
-            .set_model_mutation_active(self.models.blocks_worker_launch());
+        self.ai.set_models_settling(self.models.snapshot_settling());
+        self.ai.set_models_changing(self.models.models_changing());
+        // The app opened: one idle worker per GPU it can see, whatever the project or Receive jobs state.
+        if let crate::metrics::View::Live(sample) = self.metrics.view(std::time::Instant::now()) {
+            let gpus: Vec<u32> = sample.gpus.iter().flatten().filter_map(|g| g.index).collect();
+            self.ai.set_gpus(&gpus);
+        }
+        self.ai.start_workers();
         self.close_tick(&ctx);
         self.keys(&ctx);
         let now = std::time::Instant::now();
@@ -3466,6 +3483,7 @@ mod settings_handoff_tests {
         std::fs::read_to_string(log)
             .unwrap_or_default()
             .lines()
+            .filter(|c| !c.contains("backend.worker")) // the app's own idle workers start at open: not an import
             .map(str::to_owned)
             .collect()
     }
@@ -3703,14 +3721,15 @@ mod settings_handoff_tests {
     }
 
     #[test]
-    fn graph_node_actions_are_enabled_while_the_worker_is_not_started() {
+    fn graph_node_actions_are_enabled_before_the_first_model_check_ended() {
         let (repo, _log) = stub_repo("lazymenu");
         let a = repo.parent().unwrap().join("A");
         project_with_clip(&a);
         let (ctx, mut app) = app_on(&repo, &a);
         app.open_clip(&ctx, 0);
         pump(&ctx, &mut app, |x| x.draft_clips.contains("a"));
-        assert!(app.ai.local_caps().is_none() && app.ai.local_worker_unstarted(), "opening a clip must not start the worker");
+        app.ai.forget_models(); // the app has not read the installed models yet: actions queue and wait for it
+        assert!(app.ai.local_caps().is_none() && app.ai.models_unknown());
         let clip = app.clip_for_test();
         let menu = app.node_menu(&clip, &crate::hints::HintCfg::default());
         for node in [Node::PreMatte, Node::Hint] {
@@ -3718,6 +3737,29 @@ mod settings_handoff_tests {
             let run: Vec<_> = acts.iter().filter(|a| a.0 != graph::Action::Open).collect();
             assert!(!run.is_empty() && run.iter().all(|a| a.2), "{node:?} generate actions enabled: {run:?}");
         }
+    }
+
+    #[test]
+    fn the_right_click_pre_matte_is_off_when_the_selected_variant_is_missing() {
+        let (repo, _log) = stub_repo("missvar");
+        let a = repo.parent().unwrap().join("A");
+        project_with_clip(&a);
+        let (ctx, mut app) = app_on(&repo, &a);
+        app.open_clip(&ctx, 0);
+        pump(&ctx, &mut app, |x| x.draft_clips.contains("a"));
+        app.ai.set_models(crate::models::Snapshot::for_tests()); // BiRefNet Matting only
+        let clip = app.clip_for_test();
+        let mut cfg = crate::hints::HintCfg::default();
+        cfg.guide = crate::hints::Producer::Birefnet;
+        let pre = |app: &App, cfg: &crate::hints::HintCfg| {
+            let menu = app.node_menu(&clip, cfg);
+            let m = menu.into_iter().find(|m| m.0 == Node::PreMatte).unwrap();
+            (m.1.unwrap_or_default(), m.2.into_iter().find(|a| a.0 == graph::Action::GenerateRange).unwrap().2)
+        };
+        assert!(pre(&app, &cfg).1, "the installed variant runs");
+        cfg.birefnet_variant = "Portrait".into();
+        let (note, on) = pre(&app, &cfg);
+        assert!(!on && note == "BiRefNet Portrait is missing — download it on the Models page", "{note}");
     }
 
     #[test]

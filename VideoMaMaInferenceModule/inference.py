@@ -37,30 +37,14 @@ def load_videomama_model(base_model_path: Optional[str] = None, unet_checkpoint_
     Returns:
         VideoInferencePipeline: Loaded pipeline instance.
     """
-    from backend.model_runtime import acquire_model_artifact, validate_local_model_path
+    from backend.model_runtime import require_model_file, validate_local_model_path
 
-    lease = None
-    if base_model_path is None and unet_checkpoint_path is None:
-        lease = acquire_model_artifact("videomama")
-        base_model_path = str(lease.paths["videomama-svd"])
-        unet_checkpoint_path = str(lease.paths["videomama"])
-    elif base_model_path is None:
-        lease = acquire_model_artifact("videomama-svd")
-        base_model_path = str(lease.path)
-        unet_checkpoint_path = str(validate_local_model_path(
-            "videomama", unet_checkpoint_path, components=("unet",)
-        ))
-    elif unet_checkpoint_path is None:
-        lease = acquire_model_artifact(
-            "videomama", exclude_dependencies=("videomama-svd",)
-        )
-        unet_checkpoint_path = str(lease.path)
-        base_model_path = str(validate_local_model_path("videomama-svd", base_model_path))
-    else:
-        base_model_path = str(validate_local_model_path("videomama-svd", base_model_path))
-        unet_checkpoint_path = str(validate_local_model_path(
-            "videomama", unet_checkpoint_path, components=("unet",)
-        ))
+    if base_model_path is None or unet_checkpoint_path is None:
+        raise ValueError("VideoMaMa needs both component paths (SVD base and UNet): the app sends the exact folders")
+    require_model_file(base_model_path)
+    require_model_file(unet_checkpoint_path)
+    base_model_path = str(validate_local_model_path("videomama-svd", base_model_path))
+    unet_checkpoint_path = str(validate_local_model_path("videomama", unet_checkpoint_path, components=("unet",)))
 
     logger.info(f"Loading Base model from {base_model_path}...")
     logger.info(f"Loading VideoMaMa UNet from {unet_checkpoint_path}...")
@@ -78,11 +62,7 @@ def load_videomama_model(base_model_path: Optional[str] = None, unet_checkpoint_
             device=device
         )
     except Exception:
-        if lease is not None:
-            lease.close()
         raise
-    if lease is not None:
-        pipeline._model_asset_lease = lease
     
     logger.info("VideoMaMa pipeline loaded successfully")
     return pipeline

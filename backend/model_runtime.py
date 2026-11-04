@@ -122,6 +122,14 @@ def validate_local_model_path(
     return root
 
 
+def require_model_file(path: str | Path) -> Path:
+    """A path the app supplied must exist as given; the executor never looks anywhere else."""
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"model file missing: {p}")
+    return p
+
+
 def dependency_problem(checker: StatusChecker, dependency) -> str | None:
     """Why one catalog entry is not ready to load (None when ready); offline, never hashes."""
     status = checker.check_artifact(dependency)
@@ -130,21 +138,10 @@ def dependency_problem(checker: StatusChecker, dependency) -> str | None:
         path = checker.file_path(dependency, file)
         if path is not None and path.is_file() and path.stat().st_size == 0:
             messages.append(f"empty: {file.layout_path}")
-    if status["state"] != "installed" or messages:
-        action = "Repair required"
-        detail = ", ".join(messages) or "required files are missing"
-    elif status["ready"]:
-        return None
-    elif status["verify_state"] == "unknown (not verified yet)":
-        action = "Verify required"
-        detail = "installed files have not been verified against trusted digests"
-    elif status["unhashed_files"]:
-        action = "Verification unavailable"
-        detail = "catalog has no trusted digest for " + ", ".join(status["unhashed_files"])
-    else:
-        action = "Repair required"
-        detail = "known trusted-digest mismatch"
-    return f"{dependency.id} at {status['path'] or 'package'}: {detail} ({action})"
+    if status["state"] == "installed" and not messages:
+        return None  # present with the catalog size: usable; hashes are only checked inside a download
+    detail = ", ".join(messages) or "required files are missing"
+    return f"{dependency.id} at {status['path'] or 'package'}: {detail} (download it on the Models page)"
 
 
 def dependency_path(checker: StatusChecker, dependency) -> Path | None:

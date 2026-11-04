@@ -158,6 +158,8 @@ pub struct Page {
     worker: Option<WorkerActivity>,
     /// A verify/install/repair/delete finished: what the worker reports as ready may have changed.
     readiness_changed: bool,
+    /// The app's one readiness snapshot, from the last check; handed to the scheduler/buttons once (`take_snapshot`).
+    snapshot: Option<models::Snapshot>,
 }
 
 impl Page {
@@ -196,6 +198,7 @@ impl Page {
             confirm_delete: None,
             worker: None,
             readiness_changed: false,
+            snapshot: None,
         }
     }
 
@@ -269,20 +272,12 @@ impl Page {
     fn required_is_ready(&self) -> Option<bool> {
         let required = self.required_artifacts()?;
         if required.iter().any(|a| {
-            a.state.is_none()
-                || a.present.is_none()
-                || a.ready.is_none()
-                || (!matches!(a.kind.as_str(), "local_code" | "local_package")
-                    && a.verified.is_none())
+            a.state.is_none() || a.present.is_none()
         }) {
             return None;
         }
-        Some(required.iter().all(|a| {
-            a.present == Some(true)
-                && a.ready == Some(true)
-                && (matches!(a.kind.as_str(), "local_code" | "local_package")
-                    || a.verified == Some(true))
-        }))
+        // Present = every file at its location with the catalog size. Hash verification is a manual action only.
+        Some(required.iter().all(|a| a.present == Some(true)))
     }
 
     /// `blocked`: a job is queued or running (or a fence is unresolved) on this PC's worker. Nothing else blocks
@@ -296,16 +291,6 @@ impl Page {
         self.worker = a;
     }
 
-    /// A model operation is running, so the app must not start a worker (it would read files mid-change).
-    pub fn blocks_worker_launch(&self) -> bool {
-        self.active.as_ref().is_some_and(|r| {
-            matches!(
-                r.action,
-                Action::Download(_) | Action::DownloadProfile(_) | Action::Repair(_) | Action::Delete(_)
-            )
-        })
-    }
-
     pub fn startup_label(&self) -> String {
         if let Some(error) = &self.startup_error {
             format!("OFFLINE · Model status unavailable: {error}")
@@ -317,18 +302,9 @@ impl Page {
         {
             "OFFLINE · Checking installed model files…".into()
         } else if self.required_ready == Some(false) {
-            let required = self.required_artifacts().unwrap_or_default();
-            if !required.is_empty()
-                && required
-                    .iter()
-                    .all(|a| a.state.as_deref() == Some("installed"))
-            {
-                "OFFLINE · Required files are present but unverified. Run Verify before they are Ready.".into()
-            } else {
-                "OFFLINE · Required model files are missing or incomplete.".into()
-            }
+            "OFFLINE · Required model files are missing or incomplete. Download them below.".into()
         } else {
-            "OFFLINE · READY · Required model assets are verified; required runtime dependencies are present.".into()
+            "OFFLINE · READY · Required model files are present.".into()
         }
     }
 
@@ -658,6 +634,11 @@ impl Page {
                     }
                 }
             }
+            Some("snapshot") => {
+                if let Some(snap) = models::Snapshot::from_json(&v) {
+                    self.snapshot = Some(snap);
+                }
+            }
             Some("artifact-start") => {
                 if let Some(r) = &mut self.active {
                     r.current_artifact =
@@ -774,7 +755,7 @@ impl Page {
             };
             format!("check returned incomplete status coverage; missing: {missing}")
         } else if op == "check" && term_ok == Some(false) {
-            "check completed; one or more models are missing or unverified".into()
+            "check completed; one or more models are missing".into()
         } else if cancelled {
             format!("{op} cancelled (helper exit {code:?})")
         } else if term_ok == Some(false) {
@@ -985,6 +966,27 @@ impl Page {
     }
 
     /// An operation that can change what is installed and verified just ended well (taken once).
+    /// The newest readiness snapshot, once per check (startup, Check/Verify, root change, finished model operation).
+    pub fn take_snapshot(&mut self) -> Option<models::Snapshot> {
+        self.snapshot.take()
+    }
+    /// Why no snapshot can ever arrive (no usable runtime / the helper failed to start), if so.
+    pub fn snapshot_failure(&self) -> Option<String> {
+        self.runtime.as_ref().err().cloned().or_else(|| self.startup_error.clone())
+    }
+    /// The snapshot is about to be replaced (a check is running or just ended): queued jobs wait rather than start.
+    pub fn snapshot_settling(&self) -> bool {
+        self.pending_check || self.active.as_ref().is_some_and(|r| matches!(r.action, Action::Catalog | Action::Check))
+    }
+    /// A download/repair/delete is changing model files: the catalog ids it touches (empty = a whole profile).
+    /// Only jobs that load one of those models wait; everything else keeps running.
+    pub fn models_changing(&self) -> Option<Vec<String>> {
+        match &self.active.as_ref()?.action {
+            Action::Download(id) | Action::Repair(id) | Action::Delete(id) => Some(vec![id.clone()]),
+            Action::DownloadProfile(_) => Some(vec![]),
+            _ => None,
+        }
+    }
     pub fn take_readiness_changed(&mut self) -> bool {
         std::mem::take(&mut self.readiness_changed)
     }
@@ -1035,7 +1037,7 @@ impl Page {
                 if item.default_variant { ui.label("Default variant"); }
                 ui.label(RichText::new(&item.capability).color(theme::TEXT_DIM));
             });
-            ui.label(if item.ready == Some(true) { "Files installed and verified" } else if item.present == Some(true) { "Installed · verification required" } else { "Model files not installed" });
+            ui.label(if item.present == Some(true) { "Present" } else { "Missing — download it" });
             let size = item.bytes_required.or(item.size_bytes_estimate);
             ui.label(size.map_or_else(|| "Expected size unavailable".into(), |n| format!("Expected: {}", format_bytes(n))));
             if !item.dependencies.is_empty() {
@@ -1068,7 +1070,7 @@ impl Page {
                     if ui.add_enabled(can_change, egui::Button::new(RichText::new("Download").color(if item.present != Some(true) { Color32::from_rgb(21, 36, 26) } else { theme::TEXT })).fill(if item.present != Some(true) { theme::ACCENT } else { theme::BUTTON })).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
                         self.start(Action::Download(item.id.clone()), ui.ctx());
                     }
-                    if ui.add_enabled(actions_enabled, egui::Button::new(RichText::new("Verify").color(if item.present == Some(true) { Color32::from_rgb(21, 36, 26) } else { theme::TEXT })).fill(if item.present == Some(true) { theme::ACCENT } else { theme::BUTTON })).clicked() {
+                    if ui.add_enabled(actions_enabled, egui::Button::new("Verify")).on_hover_text("Optional: re-hash the files against the catalog. The app never needs it.").clicked() {
                         self.start(Action::Verify(item.id.clone()), ui.ctx());
                     }
                     if ui.add_enabled(can_change, egui::Button::new("Repair")).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
@@ -1123,9 +1125,8 @@ impl Page {
 /// Short status text plus colour for the nav dot and detail header.
 fn status_dot(a: &Artifact) -> (&'static str, Color32) {
     match a.state.as_deref() {
-        Some("installed") if a.ready == Some(true) => ("Ready", OK),
-        Some("installed") => ("Installed, unverified", theme::FOCUS),
-        Some("partial") => ("Partial", BAD),
+        Some("installed") => ("Present", OK),
+        Some("partial") => ("Missing", BAD),
         Some("missing") => ("Missing", BAD),
         _ => ("Status not checked", theme::TEXT_DIM),
     }
@@ -1256,7 +1257,7 @@ mod tests {
             page.artifacts["sam2-package"].state.as_deref(),
             Some("missing")
         );
-        assert!(page.startup_label().contains("present but unverified"));
+        assert!(page.startup_label().contains("missing or incomplete"));
         assert!(page.needs_attention());
         assert!(format_bytes(1_500_000_000).contains("GB"));
     }
@@ -1336,7 +1337,7 @@ mod tests {
             {"artifact":"weights","kind":"hf_files","required_profile":true,"depends":[],"probe_imports":["torch","timm.layers"],"revision":"rev-1","revision_status":"pinned","gated":"manual","provenance":{"source":"upstream","weights_license":"recorded"}}
         ]}));
         page.artifacts.get_mut("weights").unwrap().apply_status(&serde_json::json!({
-            "artifact":"weights","state":"installed","present":true,"verified":false,"ready":false
+            "artifact":"weights","state":"partial","present":false,"verified":false,"ready":false
         }));
         page.required_ready = Some(false);
         page.check_expected.insert("weights".into());
@@ -1362,7 +1363,7 @@ mod tests {
         );
         assert_eq!(
             page.artifacts["weights"].state.as_deref(),
-            Some("installed")
+            Some("partial")
         );
         assert_eq!(page.artifacts["weights"].verified, Some(false));
         assert_eq!(page.artifacts["weights"].revision.as_deref(), Some("rev-1"));
@@ -1752,7 +1753,21 @@ mod tests {
     }
 
     #[test]
-    fn presence_does_not_make_weight_assets_ready() {
+    fn a_check_hands_the_app_one_snapshot_once_and_a_dead_helper_is_reported() {
+        let mut page = Page::from_runtime(Err("no runtime".into()));
+        assert_eq!(page.snapshot_failure().as_deref(), Some("no runtime"));
+        assert!(page.take_snapshot().is_none());
+        page.apply_json(serde_json::json!({"event":"snapshot","models":{"key":{"corridorkey-weights":
+            {"ready":true,"state":"present","paths":{"corridorkey-weights":"/m/w"}}}},"ffmpeg":true,"sam2":{},"birefnet":{}}));
+        assert!(page.take_snapshot().is_some_and(|s| s.key_files().is_ok()));
+        assert!(page.take_snapshot().is_none(), "taken once per check");
+        page.apply_json(serde_json::json!({"event":"snapshot","models":"garbage"}));
+        assert!(page.take_snapshot().is_none(), "a malformed snapshot is ignored, the old one stays");
+        assert!(!page.snapshot_settling());
+    }
+
+    #[test]
+    fn present_files_are_ready_without_any_verification_and_a_missing_file_is_not() {
         let mut page = Page::from_runtime(Err("unused".into()));
         page.apply_json(serde_json::json!({"event":"catalog","artifacts":[
             {"artifact":"engine","kind":"local_code","required_profile":true,"depends":[]},
@@ -1761,10 +1776,9 @@ mod tests {
         page.artifacts.get_mut("engine").unwrap().apply_status(&serde_json::json!({"artifact":"engine","state":"installed","ready":true,"verified":true}));
         page.artifacts.get_mut("engine").unwrap().present = Some(true);
         page.artifacts.get_mut("key").unwrap().apply_status(&serde_json::json!({"artifact":"key","state":"installed","present":true,"ready":false,"verified":false}));
+        assert_eq!(page.required_is_ready(), Some(true), "never verified, but every file is there");
+        page.artifacts.get_mut("key").unwrap().present = Some(false);
         assert_eq!(page.required_is_ready(), Some(false));
-        page.artifacts.get_mut("key").unwrap().verified = Some(true);
-        page.artifacts.get_mut("key").unwrap().ready = Some(true);
-        assert_eq!(page.required_is_ready(), Some(true));
     }
 
     #[test]
@@ -1802,7 +1816,7 @@ mod tests {
         for activity in [WorkerActivity::Idle, WorkerActivity::Stopped] {
             page.set_asset_safety(false, false);
             page.set_worker_activity(Some(activity));
-            assert!(!page.assets_in_use && !page.blocks_worker_launch());
+            assert!(!page.assets_in_use);
         }
         page.set_asset_safety(true, false);
         page.set_worker_activity(Some(WorkerActivity::Working("Key".into())));

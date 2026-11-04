@@ -97,9 +97,6 @@ impl AiUi {
         after: Vec<String>,
         sig: u64,
     ) -> Result<String, String> {
-        if self.model_mutation_active {
-            return Err("Model installation or repair is active; wait for it to finish before starting work.".into());
-        }
         if self.external_writer(&clip.root) {
             return Err(
                 "a companion-sequence import is writing this clip's hints; wait for it to finish"
@@ -156,27 +153,16 @@ impl AiUi {
         }
     }
 
-    /// What the local worker reports (`None` until its hello arrived).
-    pub fn local_caps(&self) -> Option<crate::worker::Capabilities> {
-        self.sched
-            .targets()
-            .into_iter()
-            .find(|t| t.local && t.enabled && t.hello.is_some())
-            .and_then(|t| t.hello.map(|h| h.capabilities))
+    /// What the app's own model snapshot allows (`None` until the first check ended). The GPU part follows what
+    /// the workers report once one has acknowledged; before that a GPU is assumed (the scheduler waits for it).
+    pub fn local_caps(&self) -> Option<crate::models::Capabilities> {
+        let gpu_missing = self.sched.targets().iter().any(|t| t.local && t.enabled && t.ready.as_ref().is_some_and(|r| r.gpu.is_none()));
+        self.sched.models().map(|m| m.capabilities(!gpu_missing))
     }
-    /// The local worker has not been started or is starting, and told us nothing yet. Actions then queue
-    /// normally (the scheduler starts or waits for it): only Down/Refused (and a worker the user stopped) make
-    /// an action unavailable.
-    pub fn local_worker_unstarted(&self) -> bool {
-        self.sched.targets().iter().any(|t| {
-            t.local
-                && t.enabled
-                && t.hello.is_none()
-                && match t.status {
-                    TargetStatus::Fresh | TargetStatus::Starting | TargetStatus::Ready => true,
-                    _ => false,
-                }
-        })
+    /// The app has not finished its first model check, so what is installed is unknown. Actions then queue
+    /// normally (the scheduler holds the job until the snapshot arrives); a failed check fails the job with its reason.
+    pub fn models_unknown(&self) -> bool {
+        self.sched.models().is_none()
     }
 
     /// Truthful worker state for the Models page and labels: working on a step only while a job really runs;
@@ -193,13 +179,6 @@ impl AiUi {
         }
         if self.sched.all_stopped() { W::Stopped } else { W::Idle }
     }
-    /// Start the local worker now so capabilities are known before the user asks for work.
-    pub fn probe_workers(&mut self) {
-        if !self.model_mutation_active {
-            self.sched.probe(None);
-        }
-    }
-
     pub fn task_status_row(&mut self, ui: &mut Ui, id: &str) {
         self.task_row(ui, id, false);
     }
@@ -710,7 +689,9 @@ impl AiUi {
             ui.label(RichText::new(e.job.kind.label()).color(theme::text_dim(ui)));
             match &e.state {
                 JobState::Queued => {
-                    ui.label(if e.after.is_empty() {
+                    ui.label(if let Some(why) = self.sched.task_hold_reason(id) {
+                        format!("Queued · {why}")
+                    } else if e.after.is_empty() {
                         "Queued".to_string()
                     } else {
                         "Waiting for the previous step".to_string()

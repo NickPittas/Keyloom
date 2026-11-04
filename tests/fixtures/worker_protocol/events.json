@@ -1,10 +1,8 @@
 {
   "description": "Worker -> app events, one JSON object per line on stdout. Field sets are exact.",
   "events": [
-    {"v":1,"event":"hello","protocol":1,"worker_rev":"unknown","engine":"corridorkey-v2","host":"render2","platform":"linux",
-     "gpu":{"index":0,"name":"NVIDIA GeForce RTX 4090","vram_gb":24.0},
-     "models":{"corridorkey_v2":{"path":"/models/weights/corridorkey_v2.safetensors","bytes":123,"sha256":"abababababababababababababababababababababababababababababababab"}},
-     "capabilities":{"key":true,"generate_hint":false,"publish_modes":["final"]}},
+    {"v":1,"event":"ready","protocol":1,"worker_rev":"unknown","engine":"corridorkey-v2","host":"render2","platform":"linux",
+     "gpu":{"index":0,"name":"NVIDIA GeForce RTX 4090","vram_gb":24.0}},
     {"v":1,"event":"accepted","job_id":"job-key-new"},
     {"v":1,"event":"rejected","job_id":"job-bad-paths","code":"paths","message":"outputs.matte: bad, duplicate or out-of-folder path"},
     {"v":1,"event":"rejected","job_id":null,"code":"protocol","message":"not JSON"},

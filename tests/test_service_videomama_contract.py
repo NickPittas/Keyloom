@@ -20,6 +20,15 @@ from backend.errors import CorridorKeyError, JobCancelledError
 from backend.job_queue import GPUJob, JobType
 
 
+@pytest.fixture(autouse=True)
+def _app_supplied_files(monkeypatch):
+    """These tests fake the loaders; which files the app names is not what they check (see test_executor_model_inputs)."""
+    from backend.service import CorridorKeyService as _Svc
+    monkeypatch.setattr(_Svc, "_supplied", lambda self, *ids: tuple(f"/m/{i}" for i in ids))
+    monkeypatch.setattr("backend.v2_paths.v2_asset_paths_from_files", lambda files: None)
+
+
+
 def _write_mask_manifest(root: str, source: str = "sam2") -> None:
     with open(os.path.join(root, ".corridorkey_mask_manifest.json"), "w", encoding="utf-8") as handle:
         json.dump({"source": source, "frame_stems": ["frame_00000"]}, handle)

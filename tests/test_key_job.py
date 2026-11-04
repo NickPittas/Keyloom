@@ -97,6 +97,13 @@ class Env:
             assert cv2.imwrite(str(self.frames / f"{s}.png"), np.full((4, 4, 3), 90, np.uint8))
         self.out = tmp_path / "out" / "v001"
         self.tmp = tmp_path
+        # The app sends the exact model files with every Key job: real (fake-content) files under the temp folder.
+        m = tmp_path / "models"
+        for f in ("weights/corridorkey_v2.safetensors", "weights/foundation_stats.safetensors", "moge/model.pt", "cradio/x", "rvm.npz"):
+            (m / f).parent.mkdir(parents=True, exist_ok=True)
+            (m / f).write_bytes(b"x")
+        self.model_files = {"corridorkey-weights": str(m / "weights"), "moge": str(m / "moge"),
+                            "cradio": str(m / "cradio"), "rvm": str(m / "rvm.npz")}
 
     def job(self, **over) -> dict:
         base = dict(fg_enabled=True, matte_enabled=True, comp_enabled=False,
@@ -112,6 +119,7 @@ class Env:
                             for s in STEMS[A:B + 1]] for o in cfg.enabled_outputs},
             "manifest_dir": str(self.out), "mode": "new", "publish": "final", "path_map": [],
             "require": {"protocol": 1, "models": {"corridorkey_v2": None}},
+            "model_files": self.model_files,
         }
         d.update(over)
         return d
@@ -201,7 +209,7 @@ def test_cross_language_fixtures(name):
 def test_events_fixture_is_well_formed():
     fx = json.loads((FIXTURES / "events.json").read_text())
     assert {e["event"] for e in fx["events"]} == {
-        "hello", "accepted", "rejected", "status", "progress", "warning", "profile",
+        "ready", "accepted", "rejected", "status", "progress", "warning", "profile",
         "published", "done"}
     assert all(e["v"] == 1 for e in fx["events"])
 
@@ -656,6 +664,7 @@ def win_job(env, **over):
     d = env.job()
     d["clip_root"] = "\\\\nas\\share\\proj\\clips\\clip1"
     d["manifest_dir"] = over.pop("manifest_dir", WIN_MDIR)
+    d["model_files"] = {k: "C:\\Models\\" + k for k in d["model_files"]}
     d["outputs"] = {o: [f"{d['manifest_dir']}\\{o.capitalize()}\\{s}.exr" for s in STEMS[A:B + 1]]
                     for o in d["outputs"]}
     d.update(over)

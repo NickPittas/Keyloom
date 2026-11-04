@@ -15,9 +15,19 @@ from backend.worker import Worker
 from tests.test_key_job import STEMS, A, B, Env, FakeEngine, svc  # noqa: F401 (svc is a fixture)
 
 REPO = Path(__file__).resolve().parent.parent
-HELLO = {"worker_rev": "abc", "engine": "corridorkey-v2", "host": "testhost", "gpu": None,
-         "models": {"corridorkey_v2": {"path": "/m", "bytes": 1, "sha256": None}},
-         "capabilities": {"key": True, "generate_hint": False, "publish_modes": ["final"]}}
+READY = {"worker_rev": "abc", "engine": "corridorkey-v2", "host": "testhost", "gpu": None}
+def _model_files():
+    """Real (fake-content) files: the executor opens exactly what the app names."""
+    import tempfile
+    d = Path(tempfile.mkdtemp(prefix="ck-models-"))
+    w, m, c = d / "weights", d / "moge", d / "cradio"
+    for f in (w / "corridorkey_v2.safetensors", w / "foundation_stats.safetensors", m / "model.pt", c / "x", d / "rvm.npz"):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(b"x")
+    return {"corridorkey-weights": str(w), "moge": str(m), "cradio": str(c), "rvm": str(d / "rvm.npz")}
+
+
+MODEL_FILES = _model_files()
 
 
 class Sink:
@@ -46,9 +56,9 @@ class Sink:
 
 
 class Session:
-    def __init__(self, service, hello=HELLO):
+    def __init__(self, service, ready=READY):
         self.sink, self.r, self.w = Sink(), *os.pipe()
-        self.worker = Worker(service, self.sink, hello)
+        self.worker = Worker(service, self.sink, ready)
         self.rc = None
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
@@ -62,7 +72,7 @@ class Session:
         os.write(self.w, raw)
 
     def key(self, job):
-        self.send({"v": 1, "cmd": "key", "job": job})
+        self.send({"v": 1, "cmd": "key", "job": {"model_files": MODEL_FILES, **job}})
 
     def eof(self):
         os.close(self.w)
@@ -75,14 +85,13 @@ def env(tmp_path):
     return Env(tmp_path)
 
 
-def test_hello_first_and_truthful(svc):
+def test_ready_first_and_transport_only(svc):
     s = Session(svc)
-    hello = s.sink.wait(lambda e: e["event"] == "hello")
-    assert hello["v"] == 1 and hello["protocol"] == 1 and hello["gpu"] is None
-    assert hello["models"]["corridorkey_v2"]["sha256"] is None
-    assert hello["capabilities"] == {"key": True, "generate_hint": False, "publish_modes": ["final"]}
+    ready = s.sink.wait(lambda e: e["event"] == "ready")
+    assert ready["v"] == 1 and ready["protocol"] == 1 and ready["gpu"] is None
+    assert "models" not in ready and "capabilities" not in ready  # the app owns model state
     s.eof()
-    assert s.rc == 0 and s.sink.events()[0]["event"] == "hello"
+    assert s.rc == 0 and s.sink.events()[0]["event"] == "ready"
 
 
 @pytest.mark.parametrize("raw,code", [
@@ -184,24 +193,6 @@ def test_shutdown_cancels_and_exits(svc, env, slow_engine):
     os.close(s.w)
 
 
-def test_model_hash_requirement_not_assumed(svc, env):
-    d = env.job()
-    d["require"]["models"]["corridorkey_v2"] = "deadbeef"
-    s = Session(svc)
-    s.key(d)
-    rej = s.sink.wait(lambda e: e["event"] == "rejected")
-    assert rej["code"] == "invalid" and "hash" in rej["message"]
-    s.eof()
-
-
-def test_key_unavailable_is_rejected_not_faked(svc, env):
-    hello = {**HELLO, "capabilities": {**HELLO["capabilities"], "key": False}}
-    s = Session(svc, hello)
-    s.key(env.job())
-    assert "unavailable" in s.sink.wait(lambda e: e["event"] == "rejected")["message"]
-    s.eof()
-
-
 RUNNER = """
 import sys
 sys.path.insert(0, {repo!r})
@@ -222,21 +213,21 @@ class Noisy(t.FakeEngine):
         return super().run_clip(*a, **k)
 
 v2.CorridorKeyV2Engine = Noisy
-sys.exit(w.main([], service=CorridorKeyService(), hello={hello!r}))
+sys.exit(w.main([], service=CorridorKeyService(), ready={ready!r}))
 """
 
 
 def test_subprocess_stdout_is_protocol_only_stderr_drained_eof_cancels(env, tmp_path):
     e = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CORRIDORKEY_V2_SCRATCH_DIR": str(tmp_path / "sc"),
          "PYTHONDONTWRITEBYTECODE": "1"}
-    p = subprocess.Popen([sys.executable, "-B", "-c", RUNNER.format(repo=str(REPO), hello=HELLO)],
+    p = subprocess.Popen([sys.executable, "-B", "-c", RUNNER.format(repo=str(REPO), ready=READY)],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          cwd=REPO, env=e)
     err = []
     threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True).start()  # drain
     out = p.stdout
-    assert json.loads(out.readline())["event"] == "hello"
-    p.stdin.write((json.dumps({"v": 1, "cmd": "key", "job": env.job()}) + "\n").encode())
+    assert json.loads(out.readline())["event"] == "ready"
+    p.stdin.write((json.dumps({"v": 1, "cmd": "key", "job": {"model_files": MODEL_FILES, **env.job()}}) + "\n").encode())
     p.stdin.flush()
     seen = []
     while not seen or seen[-1]["event"] != "progress":  # engine is now running (and noisy)
@@ -253,53 +244,12 @@ def test_subprocess_stdout_is_protocol_only_stderr_drained_eof_cancels(env, tmp_
     assert len(blob) > 100_000
 
 
-# ------------------------------------------------------------- hello: hash, GPU, env order
+# ------------------------------------------------------------- ready: GPU facts, env order
 
-import hashlib  # noqa: E402
 import io  # noqa: E402
 import types  # noqa: E402
 
 import backend.worker as worker_mod  # noqa: E402
-
-
-def test_model_sha256_real_and_cached_outside_repo(tmp_path, monkeypatch):
-    f, cache = tmp_path / "w.safetensors", tmp_path / "scratch" / "cache"
-    f.write_bytes(b"abc" * 1000)
-    want = hashlib.sha256(b"abc" * 1000).hexdigest()
-    assert worker_mod.model_sha256(f, cache) == want
-    assert (cache / "model_sha256.json").is_file() and not str(cache).startswith(str(REPO))
-    monkeypatch.setattr(worker_mod.hashlib, "sha256", lambda *a: (_ for _ in ()).throw(AssertionError("rehash")))
-    assert worker_mod.model_sha256(f, cache) == want  # served from cache, file untouched
-
-
-def test_model_sha256_cache_invalidated_by_any_identity_change(tmp_path):
-    f, cache = tmp_path / "w.bin", tmp_path / "cache"
-    f.write_bytes(b"one")
-    first = worker_mod.model_sha256(f, cache)
-    st = f.stat()
-    f.write_bytes(b"two")  # same size
-    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 5))
-    second = worker_mod.model_sha256(f, cache)
-    assert second == hashlib.sha256(b"two").hexdigest() != first
-    other = tmp_path / "other.bin"  # swapped file: same size and mtime, different inode
-    other.write_bytes(b"333")
-    os.utime(other, ns=(st.st_atime_ns, os.stat(f).st_mtime_ns))
-    os.replace(other, f)
-    assert worker_mod.model_sha256(f, cache) == hashlib.sha256(b"333").hexdigest()
-
-
-def test_model_sha256_unreadable_or_changing_is_unknown(tmp_path, monkeypatch):
-    assert worker_mod.model_sha256(tmp_path / "missing", tmp_path / "c") is None
-    f = tmp_path / "w.bin"
-    f.write_bytes(b"data")
-    real = hashlib.sha256
-
-    def racing(*a):
-        f.write_bytes(b"changed while hashing!")  # file mutates mid-hash
-        return real(*a)
-    monkeypatch.setattr(worker_mod.hashlib, "sha256", racing)
-    assert worker_mod.model_sha256(f, tmp_path / "c") is None
-    assert not (tmp_path / "c" / "model_sha256.json").exists()
 
 
 def fake_torch(monkeypatch, available):
@@ -309,58 +259,32 @@ def fake_torch(monkeypatch, available):
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
 
 
-def fake_assets(monkeypatch, tmp_path):
-    w = tmp_path / "weights.safetensors"
-    w.write_bytes(b"fake checkpoint")
-    monkeypatch.setenv("CORRIDORKEY_V2_SCRATCH_DIR", str(tmp_path / "scratch"))
-    monkeypatch.setattr("backend.v2_paths.get_v2_asset_paths", lambda: types.SimpleNamespace(weights=w))
-    monkeypatch.setattr("backend.v2_paths.validate_v2_assets", lambda paths=None: [])
-    return w
-
-
-def test_hello_reports_real_hash_and_gpu(tmp_path, monkeypatch):
-    w = fake_assets(monkeypatch, tmp_path)
+def test_ready_reports_the_device_and_nothing_about_models(monkeypatch):
     fake_torch(monkeypatch, True)
-    h = worker_mod.probe_hello(1)
-    m = h["models"]["corridorkey_v2"]
-    assert m["sha256"] == hashlib.sha256(b"fake checkpoint").hexdigest() and m["bytes"] == w.stat().st_size
-    assert h["gpu"]["uuid"] is None and h["gpu"]["uuid_status"] == "unverified"  # the fake props have no uuid: never guessed
-    assert {k: h["gpu"][k] for k in ("index", "name", "vram_gb")} == {"index": 1, "name": "Fake GPU", "vram_gb": 8.0}
-    assert h["capabilities"]["key"] is True
+    r = worker_mod.probe_ready(1)
+    assert r["gpu"]["uuid"] is None and r["gpu"]["uuid_status"] == "unverified"  # the fake props have no uuid: never guessed
+    assert {k: r["gpu"][k] for k in ("index", "name", "vram_gb")} == {"index": 1, "name": "Fake GPU", "vram_gb": 8.0}
+    assert r["platform"] == sys.platform and "models" not in r and "capabilities" not in r
 
 
-def test_no_gpu_means_key_unavailable(tmp_path, monkeypatch):
-    fake_assets(monkeypatch, tmp_path)
+def test_no_gpu_is_reported_as_none(monkeypatch):
     fake_torch(monkeypatch, False)
-    h = worker_mod.probe_hello(None)
-    assert h["gpu"] is None and h["capabilities"]["key"] is False
-    assert h["models"]["corridorkey_v2"]["sha256"]  # hash is still real
-
-
-def test_matching_required_hash_is_accepted(svc, env):
-    sha = "ab" * 32
-    hello = {**HELLO, "models": {"corridorkey_v2": {"path": "/m", "bytes": 1, "sha256": sha}}}
-    d = env.job()
-    d["require"]["models"]["corridorkey_v2"] = sha
-    s = Session(svc, hello)
-    s.key(d)
-    assert s.sink.wait(lambda e: e["event"] == "done")["outcome"] == "complete"
-    s.eof()
+    assert worker_mod.probe_ready(None)["gpu"] is None
 
 
 def test_pci_bus_order_is_set_before_probe_and_visibility(monkeypatch):
     seen = {}
     monkeypatch.setenv("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    monkeypatch.setattr(worker_mod, "probe_hello",
+    monkeypatch.setattr(worker_mod, "probe_ready",
                         lambda gpu: seen.update(order=os.environ["CUDA_DEVICE_ORDER"],
-                                                vis=os.environ["CUDA_VISIBLE_DEVICES"]) or HELLO)
+                                                vis=os.environ["CUDA_VISIBLE_DEVICES"]) or READY)
     out = Sink()
     rc = worker_mod.main(["--gpu", "2"], stdin=io.BytesIO(b""), out=out, service=object())
     assert rc == 0 and seen == {"order": "PCI_BUS_ID", "vis": "2"}
 
 
-def test_stdout_newline_is_not_translated_and_hello_has_platform(monkeypatch):
+def test_stdout_newline_is_not_translated_and_ready_has_platform(monkeypatch):
     calls = []
 
     class Out(Sink):
@@ -368,16 +292,10 @@ def test_stdout_newline_is_not_translated_and_hello_has_platform(monkeypatch):
             calls.append(kw)
     out = Out()
     assert worker_mod.main([], stdin=io.BytesIO(b""), out=out, service=object(),
-                           hello={**HELLO, "platform": sys.platform}) == 0
+                           ready={**READY, "platform": sys.platform}) == 0
     assert calls == [{"newline": "\n"}]
     assert json.loads(out.lines[0])["platform"] == sys.platform
     assert "\r" not in out.lines[0]
-
-
-def test_probe_hello_reports_platform(tmp_path, monkeypatch):
-    fake_assets(monkeypatch, tmp_path)
-    fake_torch(monkeypatch, True)
-    assert worker_mod.probe_hello(0)["platform"] == sys.platform
 
 
 def test_worker_survives_a_rejected_prepare_and_can_retry_the_same_job(svc, env):

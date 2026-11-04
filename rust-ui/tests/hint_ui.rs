@@ -363,7 +363,7 @@ print(json.dumps({"event": "plan", "items": [{"source": src, "kind": "video", "s
             .scheduler()
             .targets()
             .iter()
-            .any(|t| t.hello.is_some())
+            .any(|t| t.ready.is_some())
     });
     app.extract_relinked_movie().unwrap();
     wait(&mut app, &|a| {

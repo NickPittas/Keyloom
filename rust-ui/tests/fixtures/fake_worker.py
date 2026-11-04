@@ -39,23 +39,18 @@ def reader():
 
 
 threading.Thread(target=reader, daemon=True).start()
-time.sleep(cfg.get("hello_delay", 0))
+time.sleep(cfg.get("ready_delay", 0))
 
 
-def hello_msg(refreshed=False):
-    return ({
-    "event": "hello", "protocol": cfg.get("protocol", 1), "worker_rev": "fake", "engine": "corridorkey-v2",
-    "host": cfg.get("host", "fakehost"),
-    "gpu": None if cfg.get("no_gpu") else {"index": cfg.get("gpu", gpu), "name": "Fake GPU", "vram_gb": cfg.get("vram", 24.0),
-            **({"uuid": cfg["uuid"], "uuid_status": "verified"} if cfg.get("uuid") else {})},
-    "models": {"corridorkey_v2": {"path": "/m/ck.safetensors", "bytes": 1, "sha256": cfg.get("sha")}},
-    "capabilities": {"key": True, "generate_hint": True, "publish_modes": ["final"], "key_modes": cfg.get("key_modes", ["new", "resume", "replace"]),
-                     "birefnet_variants": cfg.get("variants", ["Matting"]), "sam_models": cfg.get("sam", ["small", "base_plus", "large"]),
-                     "tasks": cfg.get("tasks_after_refresh" if refreshed and "tasks_after_refresh" in cfg else "tasks", {k: True for k in ("gvm", "birefnet", "chroma", "sam_preview", "sam_track", "matanyone2", "videomama", "prematte_hint", "export_video", "prepare_source", "import_hint")})},
-})
+def ready_msg():
+    return {
+        "event": "ready", "protocol": cfg.get("protocol", 1), "engine": "corridorkey-v2", "host": cfg.get("host", "fakehost"),
+        "gpu": None if cfg.get("no_gpu") else {"index": cfg.get("gpu", gpu), "name": "Fake GPU", "vram_gb": cfg.get("vram", 24.0),
+                **({"uuid": cfg["uuid"], "uuid_status": "verified"} if cfg.get("uuid") else {})},
+    }
 
 
-emit(hello_msg())
+emit(ready_msg())
 
 
 def cancelled(job_id, wait=0.0):
@@ -75,7 +70,7 @@ def run(job):
     mode = cfg.get("modes", {}).get("key") or p.get("fake", "ok")  # FAKE_CFG.modes: per-kind override
     files = [path for paths in job["outputs"].values() for path in paths]
     log({"event": "job", "job_id": jid, "mode": mode, "key_mode": job.get("mode"), "first": files[0], "clip_root": job["clip_root"],
-         "require": job["require"], "path_map": job["path_map"], "manifest_dir": job["manifest_dir"]})
+         "require": job["require"], "path_map": job["path_map"], "manifest_dir": job["manifest_dir"], "model_files": job.get("model_files")})
     if mode == "reject":
         return emit({"event": "rejected", "job_id": jid, "code": "exists", "message": "nope"})
     emit({"event": "accepted", "job_id": jid})
@@ -151,7 +146,7 @@ def run_task(job):
     jid, p, kind = job["job_id"], job["params"], job["kind"]
     mode = cfg.get("modes", {}).get(kind) or p.get("fake", "ok")
     log({"event": "task", "job_id": jid, "kind": kind, "mode": mode, "params": p, "staging": job["staging_dir"],
-         "publish": job["publish_dir"], "range": job["range"]})
+         "publish": job["publish_dir"], "range": job["range"], "model_files": job.get("model_files")})
     if mode == "reject":
         return emit({"event": "rejected", "job_id": jid, "code": "model_missing", "message": "no model"})
     emit({"event": "accepted", "job_id": jid})
@@ -192,27 +187,6 @@ def run_task(job):
     emit(done)
 
 
-def lock_cmd(c):
-    rid, root = c["request_id"], c["clip_root"]
-    path = os.path.join(root, ".corridorkey_hint.lock")
-    info = None
-    if os.path.lexists(path):
-        d = json.load(open(path))
-        dead = cfg.get("lock_dead", True)
-        info = {"path": path, "readable": True, "problem": None, "job_id": d.get("job_id"), "host": d.get("host", "h"),
-                "pid": d.get("pid", 1), "same_host": True, "local_dead": dead, "safe_to_clear": dead}
-    log({"event": "lock_cmd", "cmd": c["cmd"], "expect": c.get("expect"), "reason": c.get("reason")})
-    if c["cmd"] == "inspect_hint_lock":
-        return emit({"event": "hint_lock", "request_id": rid, "clip_root": root, "lock": info})
-    e = c.get("expect") or {}
-    if info is None or any(info[k] != e.get(k) for k in ("job_id", "host", "pid")):
-        return emit({"event": "hint_lock_refused", "request_id": rid, "clip_root": root, "code": "mismatch", "message": "different writer", "lock": info})
-    if info["local_dead"] is False:
-        return emit({"event": "hint_lock_refused", "request_id": rid, "clip_root": root, "code": "alive", "message": "still running", "lock": info})
-    os.remove(path)
-    emit({"event": "hint_lock_cleared", "request_id": rid, "clip_root": root, "recovered": [], "warning": None})
-
-
 while True:
     c = cmds.get()
     if c is None or c.get("cmd") == "shutdown":
@@ -221,11 +195,6 @@ while True:
         run(c["job"])
         if eof:
             break
-    if c.get("cmd") == "refresh":  # the app asks an idle worker to re-read the installed models
-        log({"event": "refresh"})
-        emit(hello_msg(True))
-    if c.get("cmd") in ("inspect_hint_lock", "clear_hint_lock"):
-        lock_cmd(c)
     if c.get("cmd") == "task":
         run_task(c["job"])
         if eof:

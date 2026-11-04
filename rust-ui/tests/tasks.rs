@@ -21,7 +21,7 @@ fn task(base: &Path, id: &str, kind: TaskKind, fake: &str) -> TaskJob {
             in_stem: "a".into(),
             out_stem: "d".into(),
         }),
-        params: json!({"fake": fake, "dest": base.join(format!("{id}.mp4"))}),
+        params: json!({"fake": fake, "dest": base.join(format!("{id}.mp4")), "tracker_model": "base_plus", "variant": "Matting"}),
         staging_dir: kind.needs_staging().then(|| base.join("stg").join(id)),
         publish_dir: kind.writes_hint().then(|| root.join("AlphaHint")),
         require: Require {
@@ -44,7 +44,9 @@ fn settle(s: &mut Scheduler, ids: &[&str]) -> Vec<SchedEvent> {
 fn sched(name: &str, cfg: serde_json::Value) -> (std::path::PathBuf, Scheduler) {
     let base = tmp(name);
     let repo = make_repo(&base, "w0", cfg);
-    (base, Scheduler::new(vec![local("l0", 0, &repo)]).unwrap())
+    let mut s = Scheduler::new(vec![local("l0", 0, &repo)]).unwrap();
+    s.set_models(std::sync::Arc::new(ck::models::Snapshot::for_tests()));
+    (base, s)
 }
 fn ok(s: &JobState) -> bool {
     matches!(s, JobState::Done { info, .. } if info.outcome == ck::worker::Outcome::Complete)
@@ -123,7 +125,13 @@ fn failed_or_cancelled_prerequisite_blocks_dependents_and_cancel_reaches_worker(
 
 #[test]
 fn preview_event_surfaces_and_unready_route_is_refused_without_a_worker_call() {
-    let (base, mut s) = sched("prev", json!({"tasks": {"sam_preview": true}}));
+    let (base, mut s) = sched("prev", json!({}));
+    // GVM is missing; SAM is present.
+    let gvm_only_unverified = json!({"models": {
+        "gvm": {"gvm": {"ready": false, "state": "missing", "paths": {"gvm": "/m/gvm"}}},
+        "sam2": {"sam2-base-plus": {"ready": true, "state": "present", "paths": {"sam2-base-plus": "/m/sam.pt"}}}},
+        "sam2": {"base_plus": "sam2-base-plus"}});
+    s.set_models(std::sync::Arc::new(ck::models::Snapshot::from_json(&gvm_only_unverified).unwrap()));
     let mut t = task(&base, "p1", TaskKind::SamPreview, "ok");
     t.params["frame_stem"] = json!("a");
     s.submit_task(t, vec![]).unwrap();
@@ -133,7 +141,7 @@ fn preview_event_surfaces_and_unready_route_is_refused_without_a_worker_call() {
     assert!(ev
         .iter()
         .any(|e| matches!(e, SchedEvent::Preview { frame_stem, .. } if frame_stem == "a")));
-    assert!(matches!(st(&s, "h1"), JobState::Failed { reason } if reason.contains("cannot run")));
+    assert!(matches!(st(&s, "h1"), JobState::Failed { reason } if reason == "GVM is missing — download it on the Models page"));
     assert!(log_lines(&base, "w0").iter().all(|l| l["job_id"] != "h1"));
 }
 
@@ -164,7 +172,7 @@ fn lock_outcome(s: &mut Scheduler, rid: &str) -> LockOutcome {
 }
 
 #[test]
-fn lock_requests_go_through_the_worker_with_exact_identity_and_never_race_a_job() {
+fn lock_requests_go_through_the_app_side_helper_with_exact_identity_and_never_race_a_job() {
     use ck::worker::LockCmd;
     let (base, mut s) = sched("lock", json!({}));
     let root = base.join("c1");
@@ -215,6 +223,7 @@ fn lock_requests_go_through_the_worker_with_exact_identity_and_never_race_a_job(
         .filter(|l| l["event"] == "lock_cmd")
         .collect();
     assert_eq!(sent.len(), 3);
+    assert!(log_lines(&base, "w0").iter().filter(|l| l["event"] == "start").count() <= 1, "no lock command reached a worker");
     assert_eq!(
         sent[2]["expect"],
         json!({"job_id":"old-job","host":"h","pid":7})
@@ -241,38 +250,6 @@ fn lock_requests_go_through_the_worker_with_exact_identity_and_never_race_a_job(
         lock_outcome(&mut s, &late),
         LockOutcome::Inspected(Some(_))
     ));
-}
-
-#[test]
-fn replace_mode_reaches_only_workers_that_advertise_it() {
-    let mk = |name: &str, modes: serde_json::Value| {
-        let (base, mut s) = sched(name, json!({"key_modes": modes}));
-        let mut k = job(&base, "k1", 2, "ok");
-        k.mode = ck::jobs::JobMode::Replace;
-        s.submit(Submit {
-            job: k,
-            placement: Placement::Auto,
-            after: vec![],
-            min_vram_gb: None,
-        })
-        .unwrap();
-        wait_until("terminal", || {
-            s.tick();
-            s.state_of("k1").unwrap().is_terminal()
-        });
-        (base, s)
-    };
-    let (_b, s) = mk("old", json!(["new", "resume"]));
-    assert!(
-        matches!(s.state_of("k1").unwrap(), JobState::Failed { reason } if reason.contains("cannot replace"))
-    );
-    let (b, s) = mk("new", json!(["new", "resume", "replace"]));
-    assert!(ok(s.state_of("k1").unwrap()));
-    let j: Vec<_> = log_lines(&b, "w0")
-        .into_iter()
-        .filter(|l| l["event"] == "job")
-        .collect();
-    assert_eq!(j[0]["key_mode"], "replace");
 }
 
 #[test]
@@ -307,27 +284,87 @@ fn key_after_two_chained_writers_is_accepted_but_a_stranger_still_collides() {
 }
 
 #[test]
-fn an_idle_worker_re_reads_the_models_without_a_restart_and_then_runs_the_job() {
-    // The worker started when GVM was not installed; the models changed; the same process answers `refresh`.
-    let (base, mut s) = sched(
-        "refresh",
-        json!({"tasks": {"gvm": false}, "tasks_after_refresh": {"gvm": true}}),
-    );
+fn model_changes_need_no_worker_restart_and_every_variant_gets_the_supplied_paths() {
+    let (base, mut s) = sched("models", json!({}));
     s.probe(None);
-    wait_until("worker ready", || {
+    wait_until("idle worker ready", || {
         s.tick();
-        s.targets().iter().any(|t| t.hello.is_some())
+        s.targets().iter().any(|t| t.ready.is_some())
     });
-    let caps = |s: &Scheduler| s.targets()[0].hello.as_ref().unwrap().capabilities.tasks.get("gvm").copied();
-    assert_eq!(caps(&s), Some(false));
-    assert!(s.refresh_idle_workers());
-    wait_until("fresh hello", || {
-        s.tick();
-        caps(&s) == Some(true)
-    });
-    s.submit_task(task(&base, "r1", TaskKind::Gvm, "ok"), vec![]).unwrap();
-    settle(&mut s, &["r1"]);
-    assert!(ok(&st(&s, "r1")));
+    // GVM missing: refused with the app's reason; the idle worker is untouched.
+    let unverified = json!({"models": {"gvm": {"gvm": {"ready": false, "state": "missing", "paths": {"gvm": "/m/gvm"}}}}});
+    s.set_models(std::sync::Arc::new(ck::models::Snapshot::from_json(&unverified).unwrap()));
+    s.submit_task(task(&base, "r0", TaskKind::Gvm, "ok"), vec![]).unwrap();
+    settle(&mut s, &["r0"]);
+    assert!(matches!(st(&s, "r0"), JobState::Failed { .. }));
+    // Verify/Repair finished: the app's new snapshot is all the next job needs.
+    s.set_models(std::sync::Arc::new(ck::models::Snapshot::for_tests()));
+    let cases = [
+        (TaskKind::Gvm, "gvm", json!({"gvm": "/models/gvm"})),
+        (TaskKind::Birefnet, "birefnet", json!({"birefnet-BiRefNet-matting": "/models/birefnet-BiRefNet-matting"})),
+        (TaskKind::SamPreview, "sam_preview", json!({"sam2-base-plus": "/models/sam2-base-plus"})),
+        (TaskKind::SamTrack, "sam_track", json!({"sam2-base-plus": "/models/sam2-base-plus"})),
+        (TaskKind::Matanyone2, "matanyone2", json!({"matanyone2": "/models/matanyone2"})),
+        (TaskKind::Videomama, "videomama", json!({"videomama": "/models/videomama"})),
+        (TaskKind::Chroma, "chroma", json!(null)),
+        (TaskKind::ExportVideo, "export_video", json!(null)),
+    ];
+    for (i, (kind, _, _)) in cases.iter().enumerate() {
+        let mut t = task(&base, &format!("r{}", i + 1), *kind, "ok");
+        t.clip_root = base.join(format!("clip{i}")); // one clip each: no collisions
+        t.staging_dir = t.staging_dir.map(|_| base.join(format!("stg/{i}")));
+        t.publish_dir = t.publish_dir.map(|_| t.clip_root.join("AlphaHint"));
+        s.submit_task(t, vec![]).unwrap();
+    }
+    let ids: Vec<String> = (1..=cases.len()).map(|i| format!("r{i}")).collect();
+    settle(&mut s, &ids.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(ids.iter().all(|i| ok(&st(&s, i))), "{:?}", ids.iter().map(|i| st(&s, i)).collect::<Vec<_>>());
+    let sent: Vec<_> = log_lines(&base, "w0").into_iter().filter(|l| l["event"] == "task").collect();
+    for (i, (_, wire, files)) in cases.iter().enumerate() {
+        let got = sent.iter().find(|l| l["job_id"] == format!("r{}", i + 1)).unwrap();
+        assert_eq!((got["kind"].as_str(), &got["model_files"]), (Some(*wire), files), "{wire}");
+    }
     let starts = log_lines(&base, "w0").iter().filter(|l| l["event"] == "start").count();
-    assert_eq!(starts, 1, "the same worker process served both: no restart");
+    assert_eq!(starts, 1, "the same worker process served all of it: no restart");
+}
+
+#[test]
+fn jobs_that_need_no_model_run_when_the_model_check_failed_and_a_download_holds_only_its_own_model() {
+    let (base, mut s) = sched("nomodel", json!({}));
+    s.set_models_unavailable("Model status is unavailable: the catalog could not be read".into());
+    s.submit_task(task(&base, "c1", TaskKind::Chroma, "ok"), vec![]).unwrap();
+    s.submit_task(task(&base, "g1", TaskKind::Gvm, "ok"), vec![]).unwrap();
+    settle(&mut s, &["c1", "g1"]);
+    assert!(ok(&st(&s, "c1")), "Chroma needs no model: the failed check does not touch it");
+    assert!(matches!(st(&s, "g1"), JobState::Failed { reason } if reason.contains("unavailable")));
+    // A download of GVM holds GVM jobs only: Chroma and a BiRefNet job go on.
+    s.set_models(std::sync::Arc::new(ck::models::Snapshot::for_tests()));
+    s.set_models_changing(Some(vec!["gvm".into()]));
+    s.submit_task(task(&base, "g2", TaskKind::Gvm, "ok"), vec![]).unwrap();
+    s.submit_task(task(&base, "c2", TaskKind::Chroma, "ok"), vec![]).unwrap();
+    s.submit_task(task(&base, "b2", TaskKind::Birefnet, "ok"), vec![]).unwrap();
+    settle(&mut s, &["c2", "b2"]);
+    assert!(ok(&st(&s, "c2")) && ok(&st(&s, "b2")));
+    assert_eq!(st(&s, "g2"), JobState::Queued, "its own model is being downloaded");
+    s.set_models_changing(None);
+    settle(&mut s, &["g2"]);
+    assert!(ok(&st(&s, "g2")));
+}
+
+#[test]
+fn during_a_birefnet_download_chroma_export_and_key_run_and_only_birefnet_jobs_are_held_with_the_reason() {
+    let (base, mut s) = sched("bidl", json!({}));
+    s.set_models_changing(Some(vec!["birefnet-BiRefNet-matting".into()]));
+    s.submit_task(task(&base, "c1", TaskKind::Chroma, "ok"), vec![]).unwrap();
+    s.submit_task(task(&base, "e1", TaskKind::ExportVideo, "ok"), vec![]).unwrap();
+    s.submit_task(task(&base, "b1", TaskKind::Birefnet, "ok"), vec![]).unwrap();
+    s.submit(Submit { job: job(&base, "k1", 2, "ok"), placement: Placement::Auto, after: vec![], min_vram_gb: None }).unwrap();
+    settle(&mut s, &["c1", "e1", "k1"]);
+    assert!(ok(&st(&s, "c1")) && ok(&st(&s, "e1")) && ok(&st(&s, "k1")));
+    assert_eq!(st(&s, "b1"), JobState::Queued, "BiRefNet is the model being downloaded");
+    assert_eq!(s.task_hold_reason("b1").as_deref(), Some("its model is being changed on the Models page"));
+    assert_eq!(s.task_hold_reason("c1"), None);
+    s.set_models_changing(None);
+    settle(&mut s, &["b1"]);
+    assert!(ok(&st(&s, "b1")));
 }

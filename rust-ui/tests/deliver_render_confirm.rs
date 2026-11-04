@@ -107,9 +107,9 @@ fn open_with(tag: &str, have: Have) -> (egui::Context, App, PathBuf) {
     let mut app = App::with_ctx(&ctx, AppOptions { project: Some(project), settings_path: Some(settings), open_clip: Some("a".into()), tab: Some(Tab::Deliver), ..Default::default() });
     app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
 
-    // Opening a clip no longer starts the worker, so there is no capability reply to wait for: let the clip load.
-    // The clip is loaded and its actions are enabled while the worker is still unstarted.
-    pump(&ctx, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && a.ai().local_worker_unstarted() && !a.deliver_rects().is_empty());
+    // The app starts its idle workers when it opens; nothing to wait for but the clip.
+    // The clip is loaded; its actions follow the app's model snapshot.
+    pump(&ctx, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && !a.deliver_rects().is_empty());
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18)), ("processed", video("mov_prores4444", "prores4444", 9))], None, false, None);
     pump(&ctx, &mut app, "deliver controls drawn", |a| a.deliver_rects().iter().any(|r| r.0 == "render"));
     (ctx, app, base)
@@ -194,9 +194,9 @@ fn a_shot_without_results_still_runs_directly() {
     let mut app = App::with_ctx(&ctx2, AppOptions { project: Some(base.join("proj")), settings_path: Some(base.join("settings.json")), open_clip: Some("a".into()), tab: Some(Tab::Deliver), ..Default::default() });
     app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
 
-    // Opening a clip no longer starts the worker, so there is no capability reply to wait for: let the clip load.
-    // The clip is loaded and its actions are enabled while the worker is still unstarted.
-    pump(&ctx2, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && a.ai().local_worker_unstarted() && !a.deliver_rects().is_empty());
+    // The app starts its idle workers when it opens; nothing to wait for but the clip.
+    // The clip is loaded; its actions follow the app's model snapshot.
+    pump(&ctx2, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && !a.deliver_rects().is_empty());
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, None);
     pump(&ctx2, &mut app, "deliver controls drawn", |a| a.deliver_rects().iter().any(|r| r.0 == "render"));
     press(&ctx2, &mut app, "render");

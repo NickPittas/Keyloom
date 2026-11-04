@@ -305,7 +305,6 @@ pub struct Remote {
     last_stats: Option<Instant>,
     last_installs: Option<Instant>,
     last_claim: Option<Instant>,
-    last_probe: Option<Instant>,
     claim_inflight: bool,
     stats_inflight: bool,
     installs_inflight: bool,
@@ -558,7 +557,6 @@ impl Remote {
             last_stats: None,
             last_installs: None,
             last_claim: None,
-            last_probe: None,
             claim_inflight: false,
             stats_inflight: false,
             installs_inflight: false,
@@ -1169,14 +1167,9 @@ impl Remote {
         let due = |last: Option<Instant>, every: Duration| last.is_none_or(|t| now.saturating_duration_since(t) >= every);
         // 1. This computer's verified GPU (needed to register, report stats and receive).
         let local = env.ai.scheduler().targets().into_iter().find(|t| t.local && t.enabled);
-        let hello_gpu = local.as_ref().and_then(|t| t.hello.as_ref()).and_then(|h| h.gpu.clone());
+        let hello_gpu = local.as_ref().and_then(|t| t.ready.as_ref()).and_then(|h| h.gpu.clone());
         let sample = if let View::Live(s) = env.metrics { Some(s.clone()) } else { None };
-        // Only "Receive jobs" starts the worker ahead of work ("Ready receive jobs"): it must report its GPU to accept
-        // offers. An idle worker holds no model file, so it never blocks local actions or model repair.
-        if env.cfg.local_host && env.cfg.receive && hello_gpu.is_none() && due(self.last_probe, Duration::from_secs(60)) {
-            self.last_probe = Some(now);
-            env.ai.probe_workers();
-        }
+        // The app starts the worker when it opens, so its GPU is reported without any request from here.
         // A renamed PC registers again right away; a host that cannot take names keeps the old registration.
         if self.registered && !self.reg_inflight && !self.name_unsupported && self.reg_name != truncate(env.cfg.name.trim(), 64) {
             self.registered = false;
@@ -1375,15 +1368,7 @@ impl Remote {
         if ok && !self.claim_inflight && self.last_claim.is_none_or(|t| now.saturating_duration_since(t) >= CLAIM_EVERY) {
             self.last_claim = Some(now);
             let maps: Vec<String> = env.settings.shared_roots.iter().map(|r| r.name.clone()).collect();
-            let models: serde_json::Map<String, Value> = env
-                .ai
-                .scheduler()
-                .targets()
-                .into_iter()
-                .find(|t| t.local && t.enabled)
-                .and_then(|t| t.hello)
-                .map(|h| h.models.iter().map(|(k, m)| (k.clone(), json!(m.sha256))).collect())
-                .unwrap_or_default();
+            let models = Self::claim_models(env.ai.scheduler().models().is_some_and(|m| m.key_files().is_ok()));
             let resources = sample.and_then(|s| Self::free_vram(s, uuid.as_deref()).zip(s.ram_total.zip(s.ram_used))).map(|(v, (t, u))| {
                 json!({"sampled_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs()), "free_vram_mb": v, "free_ram_mb": t.saturating_sub(u) / (1 << 20)})
             });
@@ -1392,6 +1377,16 @@ impl Remote {
             nlog("claiming");
             self.claim_inflight = self.req(Op::Claim, args, Pend::Claim);
         }
+    }
+
+    /// Models offered to the coordinator's job filter: Key jobs require `corridorkey_v2` (null = any digest; the app
+    /// sends its own exact files to its worker), so it is listed only when this app's Key files are present.
+    fn claim_models(key_present: bool) -> serde_json::Map<String, Value> {
+        let mut m = serde_json::Map::new();
+        if key_present {
+            m.insert("corridorkey_v2".into(), Value::Null);
+        }
+        m
     }
 
     fn free_vram(s: &Sample, uuid: Option<&str>) -> Option<u64> {
@@ -2242,6 +2237,13 @@ mod discovery_tests {
         assert_eq!(r.jobs[0].job_id.as_deref(), Some("job_1"));
         assert_eq!(r.jobs[0].state, "queued");
         assert!(r.jobs[0].submission.is_none());
+    }
+
+    #[test]
+    fn the_claim_lists_the_key_model_only_when_the_apps_key_files_are_present() {
+        // The same literal is fed to the coordinator's job filter in tests/coordinator/test_store.py.
+        assert_eq!(Value::Object(Remote::claim_models(true)), json!({"corridorkey_v2": null}));
+        assert_eq!(Value::Object(Remote::claim_models(false)), json!({}));
     }
 
     #[test]

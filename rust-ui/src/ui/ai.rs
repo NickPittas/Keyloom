@@ -586,9 +586,10 @@ pub struct AiUi {
     /// Saved worker targets waiting for the running/unresolved jobs to finish (applied by `tick`).
     pending_targets: Option<Vec<Target>>,
     /// Model assets are being installed or repaired; do not start workers against a changing tree.
-    model_mutation_active: bool,
-    /// A model operation ended: the idle local worker is asked once to re-read what is installed.
-    caps_stale: bool,
+    /// `targets_automatic` of the list waiting in `pending_targets`.
+    pending_auto: bool,
+    /// The target list is the automatic one (no list saved in Settings): it grows with the GPUs found.
+    targets_automatic: bool,
     /// Screen rectangles from the last frame (click tests).
     pub key_rect: Option<egui::Rect>,
     pub batch_confirm_rect: Option<egui::Rect>,
@@ -742,8 +743,8 @@ impl AiUi {
             presets_file: None,
             lock_remove_temps: false,
             pending_targets: None,
-            model_mutation_active: false,
-            caps_stale: false,
+            targets_automatic: st.ai_targets.is_empty(),
+            pending_auto: false,
             key_rect: None,
             batch_confirm_rect: None,
             batch_preset_rect: None,
@@ -788,12 +789,15 @@ impl AiUi {
     /// New target list (Settings applied). Refused while jobs are active: workers would be dropped under them.
     pub fn set_targets(&mut self, st: &Settings, repo: Option<&Path>) {
         let t = effective_targets(st, repo);
-        if t == self.targets {
+        let auto = st.ai_targets.is_empty();
+        // The automatic list grows with the GPUs found: only its first entry is comparable with a fresh default.
+        if t == self.targets || (auto && self.targets_automatic && self.targets.first() == t.first()) {
             self.pending_targets = None;
             return;
         }
         // Remember the newest saved list; `tick` applies it as soon as no job needs the current workers.
         self.pending_targets = Some(t);
+        self.pending_auto = auto;
         self.try_apply_targets();
     }
 
@@ -828,10 +832,12 @@ impl AiUi {
         };
         match Scheduler::new(t.clone()) {
             Ok(mut s) => {
+                s.inherit_models(&self.sched); // the app's model check is still true after Apply
                 std::mem::swap(&mut self.sched, &mut s);
                 s.stop_all(); // the old workers are idle: they get EOF
                 self.setup = setup_problems(&t, crate::runtime::launch(None).problem.as_deref());
                 self.targets = t;
+                self.targets_automatic = self.pending_auto;
                 self.tracked.clear();
                 self.cleared.clear();
                 self.notice = None;
@@ -970,7 +976,7 @@ impl AiUi {
             .sched
             .targets()
             .iter()
-            .map(|t| format!("{}={:?}/{:?};", t.id, t.status, t.trust))
+            .map(|t| format!("{}={:?};", t.id, t.status))
             .collect();
         // Mid-run publication must not re-run the gate (it stats every output path, slow on a NAS).
         if sig != self.status_sig || out.iter().any(|r| !r.live) {
@@ -1070,9 +1076,6 @@ impl AiUi {
         out: &OutputCfg,
         after: Vec<String>,
     ) -> Result<String, String> {
-        if self.model_mutation_active {
-            return Err("Model installation or repair is active; wait for it to finish before starting Key work.".into());
-        }
         if self.external_writer(&clip.root) {
             return Err(
                 "a companion-sequence import is writing this clip's hints; wait for it to finish"
@@ -1176,12 +1179,6 @@ impl AiUi {
         preset: Option<BatchPreset>,
         preset_name: Option<String>,
     ) {
-        if self.model_mutation_active {
-            self.notice = Some(
-                "Model installation or repair is active; wait before starting a batch.".into(),
-            );
-            return;
-        }
         let presets = self.batch_presets();
         let caps_block = match &preset {
             Some(BatchPreset::Pipeline(p)) if p.export.has_video() => self
@@ -2246,21 +2243,12 @@ impl AiUi {
                 // The client this clip renders on is its own setting (above); the machine list and the
                 // session default live on the Clients page.
                 ui.label(RichText::new("Clients").color(theme::text_dim(ui)).size(11.5));
-                if ui.add_enabled(
-                    !self.model_mutation_active,
-                    egui::Button::new("Check workers"),
-                ).on_hover_text("Start the worker(s) now to see GPU and model identity; disabled during model installation or repair").clicked() {
-                    self.sched.probe(None);
-                }
             });
             for t in self.sched.targets() {
                 ui.horizontal(|ui| {
                     ui.add(egui::Label::new(RichText::new(target_line(&t)).color(theme::text_dim(ui)).size(12.0)).truncate()).on_hover_text(target_line(&t));
                     let failed = matches!(t.status, TargetStatus::Down(_) | TargetStatus::Refused(_) | TargetStatus::Stopped);
-                    if failed && t.busy_with.is_none() && ui.add_enabled(
-                        !self.model_mutation_active,
-                        egui::Button::new("Retry").small(),
-                    ).on_hover_text("Forget this verdict and start the worker again; disabled during model installation or repair").clicked() {
+                    if failed && t.busy_with.is_none() && ui.add(egui::Button::new("Retry").small()).on_hover_text("Forget this verdict and start the worker again").clicked() {
                         self.sched.reset_target(&t.id);
                     }
                 });
@@ -2302,31 +2290,21 @@ impl AiUi {
             .map(|p| self.sched.readiness(&placement, &p.job, None));
         let mut intent = None;
         let mut recover = None;
-        let (mut can, mut why) = if self.model_mutation_active {
-            (
-                false,
-                "Model installation or repair is active; Key workers are paused until it finishes."
-                    .into(),
-            )
-        } else {
+        let (mut can, mut why) = {
             match (&ready, &g) {
                 (_, None) => (false, "Checking the output folder…".to_string()),
                 _ if !setup.is_empty() => (false, "Worker setup needed (see above)".into()),
                 (
                     Some(Readiness::Ready {
-                        unverified,
                         busy,
                         target,
                     }),
                     _,
                 ) => {
-                    let mut s = format!(
+                    let s = format!(
                         "Runs on {target}{}",
                         if *busy { " (busy: it will wait)" } else { "" }
                     );
-                    if *unverified {
-                        s += " · model identity unverified";
-                    }
                     (true, s)
                 }
                 (Some(Readiness::Pending(w)), _) => {
@@ -2339,12 +2317,12 @@ impl AiUi {
                 _ => (false, "Review output & result actions below".into()),
             }
         };
-        if network && g.as_ref().is_some_and(|g| g.main.is_ok() || g.newver.is_some()) && !self.model_mutation_active {
+        if network && g.as_ref().is_some_and(|g| g.main.is_ok() || g.newver.is_some()) {
             can = self.net_online;
             why = if can { format!("Send to {}", self.placement_text(&placement)) } else { "Connect to the coordinator in Clients first".into() };
         }
         let new_version = g.as_ref().and_then(|g| g.main.as_ref().err()).and_then(|b| b.existing.as_ref()).and_then(|e| e.next_version)
-            .filter(|_| g.as_ref().is_some_and(|g| g.newver.is_some()) && setup.is_empty() && !self.model_mutation_active);
+            .filter(|_| g.as_ref().is_some_and(|g| g.newver.is_some()) && setup.is_empty());
         if new_version.is_some() && !network { can = true; why = "Keeps the existing result in place".into(); }
         let primary_label = new_version.map_or_else(|| action.to_string(), |v| format!("Key as v{v:03}"));
         ui.label(
@@ -2435,7 +2413,7 @@ impl AiUi {
                             }
                             ui.horizontal_wrapped(|ui| {
                                 if g.resume.is_some()
-                                    && ui.add_enabled(!self.model_mutation_active, egui::Button::new("Resume previous run")).clicked()
+                                    && ui.button("Resume previous run").clicked()
                                 {
                                     intent = Some(Intent::Resume);
                                 }
@@ -2444,7 +2422,6 @@ impl AiUi {
                                 let rep_block = match (&g.replace, &rep_ready) {
                                     (None, _) => Some(e.replace_why.clone().unwrap_or_else(|| "Replace is not available for this result".into())),
                                     (Some(_), Some(Readiness::Blocked(r))) => Some(r.join("; ")),
-                                    _ if self.model_mutation_active => Some("Model installation or repair is active".into()),
                                     _ => None,
                                 };
                                 let label = format!("Replace result ({} files)", e.replace_files);
@@ -2460,10 +2437,7 @@ impl AiUi {
                                 }
                                 match (e.next_version, &g.newver) {
                                     (Some(v), Some(_)) => {
-                                        if ui.add_enabled(
-                                            !self.model_mutation_active,
-                                            egui::Button::new(format!("Write as v{v:03}")),
-                                        ).on_hover_text("Same settings, next free version folder").clicked() {
+                                        if ui.button(format!("Write as v{v:03}")).on_hover_text("Same settings, next free version folder").clicked() {
                                             intent = Some(Intent::NewVersion);
                                         }
                                     }
@@ -2651,13 +2625,6 @@ impl AiUi {
                 }
             });
         }
-        if e.unverified_models {
-            ui.label(
-                RichText::new("Model identity unverified on this worker.")
-                    .color(theme::warn(ui))
-                    .size(12.0),
-            );
-        }
         if cancel {
             self.cancel(id);
         }
@@ -2760,7 +2727,7 @@ impl AiUi {
     /// Board batch controls: "Key selected N clips" starts the review (nothing is queued yet).
     pub fn batch_ui(&mut self, ui: &mut Ui, project: &Project, st: &Settings, picks: &[usize]) {
         let label = format!("Key selected {} clip{}…", picks.len(), if picks.len() == 1 { "" } else { "s" });
-        let enabled = !picks.is_empty() && self.batch.is_none() && !self.model_mutation_active;
+        let enabled = !picks.is_empty() && self.batch.is_none();
         let r = ui.add_enabled_ui(enabled, |ui| theme::primary_button(ui, label)).inner;
         self.board_key_rect = Some(r.rect);
         if r.clicked() {
@@ -2872,7 +2839,7 @@ impl AiUi {
                     .as_ref()
                     .map_or(0, |b| b.rows.iter().filter(|r| r.plan().is_some() && export_block(r).is_none()).count());
                 let b = ui.add_enabled(
-                    n > 0 && !self.model_mutation_active,
+                    n > 0,
                     egui::Button::new(format!(
                         "Queue {n} clip{}",
                         if n == 1 { "" } else { "s" },
@@ -3029,7 +2996,7 @@ impl AiUi {
     pub fn dispatch_auto(&mut self, free_remote: &[String], local: &crate::metrics::View) {
         self.auto_wait = None;
         self.settle_auto_local();
-        if self.auto_pending.is_empty() || self.model_mutation_active {
+        if self.auto_pending.is_empty() {
             return;
         }
         // Unknown load (no live sample, GPU unreadable) is NOT free.
@@ -3206,7 +3173,7 @@ impl AiUi {
     /// False when local work is queued or running: the claim must then be declined. Nothing dispatches locally
     /// meanwhile except this attempt's own stages.
     pub fn reserve_network_slot(&mut self, attempt: &str) -> bool {
-        !self.model_mutation_active && self.sched.reserve_net(attempt)
+        self.sched.reserve_net(attempt)
     }
     pub fn release_network_slot(&mut self, attempt: &str) {
         self.sched.release_net(attempt);
@@ -3218,9 +3185,6 @@ impl AiUi {
     /// nothing has run. The attempt must hold the GPU (`reserve_network_slot`).
     pub fn submit_network_plan(&mut self, attempt: &str, stages: Vec<crate::submission::Stage>) -> Result<(), String> {
         use crate::submission::Stage;
-        if self.model_mutation_active {
-            return Err("model installation or repair is active".into());
-        }
         let Some(local) = self.sched.targets().iter().find(|t| t.local && t.enabled).map(|t| t.id.clone()) else {
             return Err("no local client is configured".into());
         };
@@ -3437,8 +3401,13 @@ impl AiUi {
     pub fn running_jobs(&self) -> bool {
         self.sched.running()
     }
-    pub fn set_model_mutation_active(&mut self, active: bool) {
-        self.model_mutation_active = active;
+    /// A model check/install/repair/delete is running or about to replace the snapshot: nothing is dispatched.
+    pub fn set_models_settling(&mut self, settling: bool) {
+        self.sched.set_models_settling(settling);
+    }
+    /// A model download/repair/delete is running: only jobs that load those models (all, if the list is empty) wait.
+    pub fn set_models_changing(&mut self, changing: Option<Vec<String>>) {
+        self.sched.set_models_changing(changing);
     }
     /// The one rule for Install/Repair/Delete: no job is queued or running on this PC's worker and no fence is
     /// unresolved. An idle worker holds no model file (every job unloads its models), so it never matters.
@@ -3447,14 +3416,40 @@ impl AiUi {
             && self.sched.task_attention().is_empty()
             && !self.sched.running()
     }
-    /// The models changed: ask every idle local worker (once it is up) to re-read what is installed, so the
-    /// next job and the buttons see it without a restart.
-    pub fn refresh_capabilities(&mut self) {
-        self.caps_stale = true;
+    /// The app's model snapshot changed (a check ended: startup, Check/Verify, root change, finished Install/Repair/
+    /// Delete). Buttons and the scheduler read this one record; no worker is asked anything.
+    pub fn set_models(&mut self, snapshot: crate::models::Snapshot) {
+        self.sched.set_models(std::sync::Arc::new(snapshot));
+        self.disk_gen += 1;
     }
-    pub fn refresh_tick(&mut self) {
-        if self.caps_stale && !self.model_mutation_active && self.sched.refresh_idle_workers() {
-            self.caps_stale = false;
+    /// Back to "not read yet": jobs wait for the next snapshot.
+    pub fn forget_models(&mut self) {
+        self.sched.forget_models();
+    }
+    /// The model check cannot run at all (no usable runtime): model jobs fail with this reason instead of waiting.
+    pub fn set_models_unavailable(&mut self, why: String) {
+        self.sched.set_models_unavailable(why);
+    }
+    /// The app opened (and again after a crash restart): keep one idle worker per GPU running, whatever the
+    /// project is doing. Workers hold no model while idle, so this never blocks an action or a model change.
+    pub fn start_workers(&mut self) {
+        self.sched.probe(None);
+    }
+    /// One worker per usable GPU the app found (index = NVML/PCI index, the worker's `--gpu`). Only grows the
+    /// automatic target list; a list the user saved in Settings is never changed.
+    pub fn set_gpus(&mut self, gpus: &[u32]) {
+        if !self.targets_automatic {
+            return;
+        }
+        let Some(first) = self.targets.first().cloned() else { return };
+        for &g in gpus {
+            if self.targets.iter().any(|t| t.gpu == g) {
+                continue;
+            }
+            let t = Target { id: format!("local-{g}"), gpu: g, ..first.clone() };
+            if self.sched.add_target(t.clone()).is_ok() {
+                self.targets.push(t);
+            }
         }
     }
     pub fn unresolved_model_fences(&self) -> bool {
@@ -3573,7 +3568,7 @@ fn client_picker(
 fn target_line(t: &TargetView) -> String {
     let st = match &t.status {
         _ if !t.enabled => "disabled".to_string(),
-        TargetStatus::Fresh => "not started (press Check workers)".into(),
+        TargetStatus::Fresh => "not started".into(),
         TargetStatus::Starting => match t.starting_for {
             Some(e) => format!(
                 "starting… {} s of {} s allowed (model load on a NAS can be slow)",
@@ -3588,7 +3583,7 @@ fn target_line(t: &TargetView) -> String {
         TargetStatus::Stopping => "stopping".into(),
         TargetStatus::Stopped => "stopped".into(),
     };
-    let hw = t.hello.as_ref().map_or(String::new(), |h| {
+    let hw = t.ready.as_ref().map_or(String::new(), |h| {
         format!(
             " · {}",
             h.gpu.as_ref().map_or("no GPU".into(), |g| format!(
@@ -3597,14 +3592,7 @@ fn target_line(t: &TargetView) -> String {
             ))
         )
     });
-    let trust = match t.trust {
-        Trust::Unknown => "model identity: verifying",
-        Trust::Reference => "model identity: reference",
-        Trust::Matches => "model identity: matches local",
-        Trust::Mismatch => "model identity: DIFFERS from local",
-        Trust::Unverified => "model identity: unverifiable",
-    };
-    format!("{} (local): {st}{hw} · {trust}", t.id)
+    format!("{} (local): {st}{hw}", t.id)
 }
 
 fn notes(ui: &mut Ui, n: &[String]) {
@@ -3730,6 +3718,43 @@ mod tests {
         }
     }
 
+    /// A checkout whose workers are the AI fake worker, with NO saved targets: the automatic list.
+    fn auto_ai(tag: &str) -> (AiUi, Settings) {
+        let base = std::env::temp_dir().join(format!("ck-ai-auto-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("backend/worker")).unwrap();
+        std::fs::write(repo.join("backend/__init__.py"), "").unwrap();
+        std::fs::write(repo.join("backend/worker/__init__.py"), "").unwrap();
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ai_fake_worker.py");
+        std::fs::write(repo.join("backend/worker/__main__.py"), format!("import runpy\nrunpy.run_path({fake:?}, run_name='__main__')\n")).unwrap();
+        std::fs::create_dir_all(repo.join(".venv/bin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr/bin/python3", repo.join(".venv/bin/python")).unwrap();
+        let st = Settings::default();
+        (AiUi::new(&st, Some(&repo)), st)
+    }
+
+    #[test]
+    fn one_worker_per_gpu_the_app_finds_and_never_for_a_saved_list() {
+        let (mut ai, _st) = auto_ai("gpus");
+        assert_eq!(ai.sched.targets().len(), 1, "before any GPU is known: the one default worker");
+        ai.set_gpus(&[0, 1, 2]); // faked GPU list
+        let ids: Vec<_> = ai.sched.targets().iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids, ["local-0", "local-1", "local-2"]);
+        ai.set_gpus(&[0, 1, 2]);
+        ai.set_gpus(&[1]);
+        assert_eq!(ai.sched.targets().len(), 3, "idempotent; a GPU that disappears is not re-counted");
+        ai.start_workers();
+        assert!(ai.sched.targets().iter().all(|t| t.status == TargetStatus::Starting), "all started at once, no job needed");
+        let _ = ai.begin_stop();
+        until(&mut ai, "workers exited", |a| a.all_stopped());
+        // A list the user saved in Settings is never grown.
+        let mut fixed = fake_ai("saved");
+        fixed.set_gpus(&[0, 1]);
+        assert_eq!(fixed.sched.targets().len(), 1);
+    }
+
     #[test]
     fn model_changes_are_safe_with_no_worker_alive() {
         let ai = AiUi::new(&Settings::default(), None);
@@ -3740,23 +3765,44 @@ mod tests {
     #[test]
     fn an_idle_worker_never_blocks_a_model_change_and_is_never_restarted_for_one() {
         let mut ai = fake_ai("idle");
-        assert!(ai.local_worker_unstarted(), "a fresh worker counts as available");
-        ai.sched.probe(None);
-        assert!(ai.local_worker_unstarted(), "a starting (probing) worker counts as available");
-        until(&mut ai, "worker ready", |a| a.local_caps().is_some());
+        assert!(ai.models_unknown() && ai.local_caps().is_none(), "nothing is known before the app's first model check");
+        ai.start_workers(); // the app opened: the worker starts at once, no project, job or Receive-jobs state needed
+        until(&mut ai, "worker ready", |a| a.sched.targets()[0].status == TargetStatus::Ready);
+        ai.set_models(crate::models::Snapshot::for_tests());
+        assert!(ai.local_caps().is_some_and(|c| c.key));
         // Live and idle: no job, so it is Idle (never "working") and the change is allowed as it stands.
         assert_eq!(ai.worker_activity(), crate::ui::models::WorkerActivity::Idle);
         assert!(ai.workers_alive() && ai.model_asset_mutation_safe());
         assert!(!ai.unresolved_model_fences());
         // The change runs and ends with the worker untouched: same process, still Ready.
-        ai.set_model_mutation_active(true);
+        ai.set_models_settling(true); // a Verify/Repair/Check is running: dispatch pauses, the idle worker is untouched
         ai.sched.tick();
         assert_eq!(ai.sched.targets()[0].status, TargetStatus::Ready);
-        ai.set_model_mutation_active(false);
+        ai.set_models_settling(false);
         assert_eq!(ai.sched.targets()[0].status, TargetStatus::Ready);
         assert!(ai.local_caps().is_some() && ai.model_asset_mutation_safe());
         let _ = ai.begin_stop();
         until(&mut ai, "worker exited", |a| a.all_stopped());
+    }
+
+    #[test]
+    fn applying_a_worker_list_keeps_the_model_snapshot() {
+        let mut ai = fake_ai("apply");
+        ai.set_models(crate::models::Snapshot::for_tests());
+        ai.set_models_settling(true);
+        ai.set_models_changing(Some(vec!["gvm".into()]));
+        ai.pending_targets = Some(ai.targets.clone());
+        for _ in 0..50 {
+            ai.try_apply_targets();
+            if ai.pending_targets.is_none() {
+                break;
+            }
+            ai.sched.tick();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(ai.pending_targets.is_none(), "the new list was applied");
+        assert!(!ai.models_unknown() && ai.local_caps().is_some_and(|c| c.key), "the app's model check survives Apply");
+        assert!(ai.sched.models_changing().is_some());
     }
 
     fn plan_for(clip: &Clip) -> Plan {
@@ -4020,14 +4066,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_waits_without_free_pc_and_when_models_change() {
+    fn auto_waits_without_free_pc() {
         let (mut ai, d) = auto_fixture("none", 2);
         ai.net_online = true;
         ai.dispatch_auto(&[], &busy_view());
-        assert_eq!((ai.auto_pending.len(), ai.take_net_outbox().len()), (2, 0));
-        ai.model_mutation_active = true;
-        ai.net_targets = vec![("n/a".into(), "A".into())];
-        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
         assert_eq!((ai.auto_pending.len(), ai.take_net_outbox().len()), (2, 0));
         let _ = std::fs::remove_dir_all(d);
     }

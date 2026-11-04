@@ -1,5 +1,7 @@
-//! Authoritative job queue (`ai-implementation-brief.md` §6, §7.5). One job per target, whole clips only,
-//! Auto = local first then list order. Workers are spawned lazily (or by `probe`) and stay alive across jobs.
+//! Authoritative job queue (`ai-implementation-brief.md` §6, §7.5). One job per target (one worker per GPU), whole clips
+//! only, Auto = local first then list order. The app starts the workers when it opens (`probe`); they stay alive and idle
+//! between jobs, so several clips run one after another on each GPU. A worker only executes: every job carries the exact
+//! model files taken from the app's readiness snapshot (`set_models`).
 //! `tick()` never blocks: call it from the UI loop.
 //!
 //! Safety rules:
@@ -8,14 +10,13 @@
 //!   files cleaned (`KeyJob::recover_writer_gone`). No heartbeat-based retry or lock stealing exists.
 //! - A running inference is never killed automatically: silence is reported (`stalled`), the user decides
 //!   (`cancel`, then `force_stop`).
-//! - Model identity: the first local worker's hello digest is the trusted reference. Jobs that pin no digest
-//!   run on local workers and, on any other worker, only if its digest equals the reference. Unknown digests
-//!   need the explicit `allow_unverified` opt-in and are flagged on the job.
+//! - Model state is the app's: a job whose model is not Verified in the snapshot never reaches a worker, and its
+//!   files are taken from the snapshot at dispatch (queued jobs are re-checked against every new snapshot).
 use crate::jobs::{JobError, KeyJob, Recovery, MANIFEST_NAME, PROTOCOL};
 use crate::tasks::{TaskJob, TaskKind};
-use crate::worker::{Cmd, Done, Event, Hello, LockCmd, LockReq, Msg, Outcome, Target, WorkerConn};
+use crate::models::{ModelFiles, Snapshot};
+use crate::worker::{Cmd, Done, Event, LockCmd, LockReq, Msg, Outcome, Ready, Target, WorkerConn};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -104,8 +105,6 @@ pub struct JobEntry {
     pub after: Vec<String>,
     pub min_vram_gb: Option<f64>,
     pub state: JobState,
-    /// Running on a worker whose model digest could not be verified (show it).
-    pub unverified_models: bool,
     pub cancel_requested: bool,
     pub dispatched_at: Option<Instant>,
     pub accepted_at: Option<Instant>,
@@ -154,14 +153,14 @@ impl JobEntry {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TargetStatus {
-    /// Not started yet; spawned on demand or by `probe`.
+    /// Not started yet; the app starts it when it opens (`probe`) or a job needs it.
     Fresh,
-    /// Process spawned, waiting for `hello` (bounded by `hello_timeout`).
+    /// Process spawned, waiting for `ready` (bounded by `ready_timeout`).
     Starting,
     Ready,
     /// Protocol/GPU mismatch. Sticky until `reset_target`.
     Refused(String),
-    /// Spawn failure, exit, hello timeout or protocol violation. Sticky until `reset_target`.
+    /// Spawn failure, exit, ready timeout or protocol violation. Sticky until `reset_target`.
     Down(String),
     /// Stop requested (stdin closed); the process has not exited yet. Real termination = `Stopped`.
     Stopping,
@@ -169,38 +168,21 @@ pub enum TargetStatus {
     Stopped,
 }
 
-/// How a target's model digest relates to the trusted local reference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Trust {
-    /// No hello yet.
-    Unknown,
-    /// This local worker is the reference.
-    Reference,
-    /// Digest equals the reference.
-    Matches,
-    /// Digest differs from the reference: jobs without a pinned digest are refused.
-    Mismatch,
-    /// Digest or reference missing: only runs with `allow_unverified`.
-    Unverified,
-}
-
 struct Slot {
     target: Target,
     conn: Option<WorkerConn>,
-    hello: Option<Hello>,
+    ready: Option<Ready>,
     status: TargetStatus,
     job: Option<String>,
     started: Instant,
     /// Manifest path exactly as the worker was told (to spot a `done` that names something else).
     sent_manifest: Option<String>,
     /// Local filesystem preflight running on a helper thread; the job is sent when it succeeds.
-    preflight: Option<(Receiver<Result<(), JobError>>, KeyJob)>,
+    preflight: Option<(Receiver<Result<(), JobError>>, KeyJob, ModelFiles)>,
     /// Job that was lost on this slot while the process was still dying; proof is added when it exits.
     lost_job: Option<String>,
     /// Stop was requested (`stop_*`/`force_stop`): the final status is `Stopped` once the process exits.
     stopping: bool,
-    /// A `refresh` was sent to this idle worker: its next `hello` replaces the old one (models re-read).
-    refreshing: bool,
     /// When this slot's worker died on its own (not stopped by the user): a crash restarts it, at most
     /// `CRASH_RESTARTS` times in `CRASH_WINDOW`, so queued work waits for it instead of failing.
     crashes: Vec<Instant>,
@@ -223,8 +205,7 @@ pub struct TargetView {
     pub enabled: bool,
     pub status: TargetStatus,
     pub busy_with: Option<String>,
-    pub hello: Option<Hello>,
-    pub trust: Trust,
+    pub ready: Option<Ready>,
     /// Time since spawn while `Starting` (show "Starting AI worker… 42 s").
     pub starting_for: Option<Duration>,
     /// Start-up budget the target gets before it is declared `Down`.
@@ -281,10 +262,9 @@ pub enum SchedEvent {
 pub enum Readiness {
     Ready {
         target: String,
-        unverified: bool,
         busy: bool,
     },
-    /// Some target may still become eligible (starting, or the local reference is not known yet).
+    /// Some target may still become eligible (starting, or the app has not read the model state yet).
     Pending(String),
     Blocked(Vec<String>),
 }
@@ -297,8 +277,6 @@ pub struct Stalled {
     pub accepted: bool,
     pub idle: Duration,
 }
-
-type Digests = BTreeMap<String, Option<String>>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LockOutcome {
@@ -318,8 +296,16 @@ pub enum LockOutcome {
 
 struct LockEntry {
     req: LockReq,
-    /// Slot the command was sent to (`None` = still waiting for an idle local worker).
-    slot: Option<usize>,
+    /// The app-side helper's answer, once it was started (`None` = still waiting for the workers to be idle).
+    result: Option<Receiver<LockOutcome>>,
+}
+
+/// What the app knows about the installed models. Jobs wait while it is `Unknown`, fail when it is `Unavailable`.
+#[derive(Clone)]
+enum ModelState {
+    Unknown,
+    Known(Arc<Snapshot>),
+    Unavailable(String),
 }
 
 /// A queued/running non-Key job. Shares the slots (one GPU job per worker) with Key jobs.
@@ -349,15 +335,16 @@ pub struct Scheduler {
     slots: Vec<Slot>,
     /// Auto order: local targets first, then list order.
     order: Vec<usize>,
-    reference: Option<Digests>,
-    reference_from: Option<String>,
-    /// Accept workers whose model digests cannot be compared (never silently: see `unverified_models`).
-    pub allow_unverified: bool,
-    /// First start hashes the checkpoint, imports torch and initialises CUDA, which can take minutes on a NAS
-    /// or under antivirus. A spawned worker that has not said hello by then is killed (no job is involved yet)
+    models: ModelState,
+    models_settling: bool,
+    /// A model download/repair/delete is running: `Some(ids)` holds only jobs whose model files include one of those
+    /// catalog ids (an empty list = every job that loads a model). Jobs that need no model never wait on it.
+    models_changing: Option<Vec<String>>,
+    /// First start imports torch and initialises CUDA, which can take minutes on a NAS or under antivirus. A
+    /// spawned worker that has not said `ready` by then is killed (no job is involved yet)
     /// and the target is `Down` with that reason until `reset_target`: never respawned automatically. Default
     /// 600 s; `TargetView::starting_for` shows the elapsed startup time. Expose it in settings if needed.
-    pub hello_timeout: Duration,
+    pub ready_timeout: Duration,
     /// Test hook: while set to `true` the preflight helper thread waits, so a test can hold a preflight pending.
     #[doc(hidden)]
     pub preflight_hold: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -371,17 +358,11 @@ enum Cand {
     /// `wire` is the job as it will be sent; built only when asked (`deep`), never for a busy target.
     Go {
         wire: Option<Box<KeyJob>>,
-        unverified: bool,
+        /// The exact model files it carries (from the app's snapshot).
+        files: ModelFiles,
     },
     Wait(String),
     No(String),
-}
-
-fn digests(h: &Hello) -> Digests {
-    h.models
-        .iter()
-        .map(|(k, m)| (k.clone(), m.sha256.clone()))
-        .collect()
 }
 
 impl Scheduler {
@@ -398,7 +379,7 @@ impl Scheduler {
             .map(|target| Slot {
                 target,
                 conn: None,
-                hello: None,
+                ready: None,
                 status: TargetStatus::Fresh,
                 job: None,
                 started: Instant::now(),
@@ -407,7 +388,6 @@ impl Scheduler {
                 lost_job: None,
                 crashes: vec![],
                 stopping: false,
-                refreshing: false,
             })
             .collect();
         Ok(Self {
@@ -417,10 +397,10 @@ impl Scheduler {
             jobs: vec![],
             slots,
             order,
-            reference: None,
-            reference_from: None,
-            allow_unverified: false,
-            hello_timeout: Duration::from_secs(600),
+            models: ModelState::Unknown,
+            models_settling: false,
+            models_changing: None,
+            ready_timeout: Duration::from_secs(600),
             preflight_hold: None,
             net_hold: None,
         })
@@ -488,7 +468,6 @@ impl Scheduler {
             after: s.after,
             min_vram_gb: s.min_vram_gb,
             state: JobState::Queued,
-            unverified_models: false,
             cancel_requested: false,
             dispatched_at: None,
             accepted_at: None,
@@ -502,9 +481,9 @@ impl Scheduler {
         self.jobs.clone()
     }
 
-    /// Ask the idle local worker to inspect/clear a clip's hint lock. The answer arrives as
-    /// `SchedEvent::HintLock`; the request waits (starting or restarting the local worker if needed) and never
-    /// races a running job: the slot is held for it while it is outstanding.
+    /// Inspect/clear a clip's hint lock through the app-side helper (`backend/hint_lock_cli.py`, which keeps the
+    /// exact writer checks). The answer arrives as `SchedEvent::HintLock`. The request waits until no job runs on
+    /// any worker (a running job may be the lock's owner: never race it) and no job starts while it runs.
     pub fn lock_request(&mut self, cmd: LockCmd) -> Result<String, String> {
         if !self
             .slots
@@ -520,7 +499,7 @@ impl Scheduler {
                 request_id: request_id.clone(),
                 cmd,
             },
-            slot: None,
+            result: None,
         });
         Ok(request_id)
     }
@@ -529,121 +508,43 @@ impl Scheduler {
     }
 
     fn pump_locks(&mut self, ev: &mut Vec<SchedEvent>) {
-        for l in 0..self.locks.len() {
-            if self.locks[l].slot.is_some() || self.net_hold.is_some() {
-                continue;
-            }
-            let Some(&c) = self
-                .order
-                .iter()
-                .find(|c| self.slots[**c].target.enabled)
-            else {
-                continue;
+        // Collect finished helpers.
+        let mut l = 0;
+        while l < self.locks.len() {
+            let done = match self.locks[l].result.as_ref().map(|r| r.try_recv()) {
+                Some(Ok(outcome)) => Some(outcome),
+                Some(Err(TryRecvError::Disconnected)) => Some(LockOutcome::Refused {
+                    code: "unavailable".into(),
+                    message: "the lock helper ended without an answer; nothing was changed".into(),
+                    lock: None,
+                }),
+                _ => None,
             };
-            match self.slots[c].status.clone() {
-                TargetStatus::Fresh => self.spawn_if_fresh(c),
-                // The worker that owned the lost writer has exited: restarting it for this explicit recovery
-                // request is the point (no job is running on it).
-                TargetStatus::Down(_) | TargetStatus::Stopped if self.slots[c].conn.is_none() => {
-                    self.reset_target(&self.slots[c].target.id.clone());
-                    self.spawn_if_fresh(c);
-                }
-                TargetStatus::Ready
-                    if self.slots[c].job.is_none() && self.slots[c].hello.is_some() =>
-                {
-                    let req = self.locks[l].req.clone();
-                    self.slots[c].job = Some(format!("lock:{}", req.request_id));
-                    let sent = self.slots[c]
-                        .conn
-                        .as_mut()
-                        .map(|conn| conn.send(&Cmd::Lock(&req)));
-                    if matches!(sent, Some(Ok(()))) {
-                        self.locks[l].slot = Some(c);
-                    } else {
-                        self.lose(
-                            c,
-                            "could not send the lock request to the worker".into(),
-                            ev,
-                        );
-                        return;
-                    }
-                }
-                TargetStatus::Refused(why) => {
+            match done {
+                Some(outcome) => {
                     let e = self.locks.remove(l);
-                    ev.push(SchedEvent::HintLock {
-                        request_id: e.req.request_id,
-                        outcome: LockOutcome::Refused {
-                            code: "unavailable".into(),
-                            message: why,
-                            lock: None,
-                        },
-                    });
-                    return;
+                    ev.push(SchedEvent::HintLock { request_id: e.req.request_id, outcome });
                 }
-                _ => {}
+                None => l += 1,
             }
         }
-    }
-
-    fn lock_reply(&mut self, i: usize, event: Event, ev: &mut Vec<SchedEvent>) {
-        let (rid, outcome) = match event {
-            Event::HintLock {
-                request_id, lock, ..
-            } => (request_id, LockOutcome::Inspected(lock)),
-            Event::HintLockCleared {
-                request_id,
-                recovered,
-                warning,
-                ..
-            } => (request_id, LockOutcome::Cleared { recovered, warning }),
-            Event::HintLockRefused {
-                request_id,
-                code,
-                message,
-                lock,
-                ..
-            } => (
-                request_id,
-                LockOutcome::Refused {
-                    code,
-                    message,
-                    lock,
-                },
-            ),
-            Event::Rejected {
-                request_id: Some(request_id),
-                code,
-                message,
-                ..
-            } => (
-                request_id,
-                LockOutcome::Refused {
-                    code,
-                    message,
-                    lock: None,
-                },
-            ),
-            _ => return,
-        };
-        let Some(l) = self
-            .locks
-            .iter()
-            .position(|l| l.slot == Some(i) && l.req.request_id == rid)
-        else {
-            self.lose(i, format!("unexpected lock reply {rid}"), ev);
+        // Start waiting ones, one at a time, only while nothing runs anywhere.
+        if self.net_hold.is_some() || self.slots.iter().any(|s| s.job.is_some()) || self.locks.iter().any(|l| l.result.is_some()) {
+            return;
+        }
+        let Some(target) = self.order.iter().map(|c| &self.slots[*c].target).find(|t| t.enabled).cloned() else {
             return;
         };
-        self.locks.remove(l);
-        if self.slots[i].job.as_deref() == Some(format!("lock:{rid}").as_str()) {
-            self.slots[i].job = None;
+        if let Some(l) = self.locks.iter_mut().find(|l| l.result.is_none()) {
+            let (tx, rx) = channel();
+            let request = l.req.helper_request();
+            std::thread::spawn(move || {
+                let _ = tx.send(run_lock_helper(&target, &request));
+            });
+            l.result = Some(rx);
         }
-        ev.push(SchedEvent::HintLock {
-            request_id: rid,
-            outcome,
-        });
     }
 
-    /// Something is queued, starting or running (Key or task).
     /// Hold the GPU for a received attempt. False (nothing held) while any local job, task or lock is active
     /// or queued, or while another attempt holds it; the same attempt may call it again.
     pub fn reserve_net(&mut self, attempt: &str) -> bool {
@@ -815,9 +716,56 @@ impl Scheduler {
     pub fn job(&self, id: &str) -> Option<&JobEntry> {
         self.jobs.iter().find(|e| e.job.job_id == id)
     }
-    /// Trusted model digests (from the first local worker that said hello), if any.
-    pub fn reference(&self) -> Option<&BTreeMap<String, Option<String>>> {
-        self.reference.as_ref()
+    /// The app's readiness snapshot changed (startup, Check/Verify, root change, finished model operation). Queued
+    /// jobs are judged against it at dispatch; running ones keep the files they were sent.
+    pub fn set_models(&mut self, snapshot: Arc<Snapshot>) {
+        self.models = ModelState::Known(snapshot);
+    }
+    /// The app cannot read the model state at all (no usable runtime): queued model jobs fail with this reason.
+    pub fn set_models_unavailable(&mut self, why: String) {
+        self.models = ModelState::Unavailable(why);
+    }
+    pub fn forget_models(&mut self) {
+        self.models = ModelState::Unknown;
+    }
+    /// Files may be changing (model operation) or the snapshot is about to be replaced: dispatch pauses.
+    pub fn set_models_settling(&mut self, settling: bool) {
+        self.models_settling = settling;
+    }
+    /// A rebuilt scheduler (Settings > Apply) starts with what the app already knows about the models.
+    pub fn inherit_models(&mut self, old: &Scheduler) {
+        self.models = old.models.clone();
+        self.models_settling = old.models_settling;
+        self.models_changing = old.models_changing.clone();
+    }
+    pub fn set_models_changing(&mut self, changing: Option<Vec<String>>) {
+        self.models_changing = changing;
+    }
+    pub fn models_changing(&self) -> Option<&Vec<String>> {
+        self.models_changing.as_ref()
+    }
+    /// A job carrying these model files must wait for the model operation that is running.
+    fn model_held(&self, files: &ModelFiles) -> bool {
+        !files.is_empty()
+            && self.models_changing.as_ref().is_some_and(|ids| ids.is_empty() || ids.iter().any(|i| files.contains_key(i)))
+    }
+    /// Why a queued task waits only for the model operation in progress (None = not held by it).
+    pub fn task_hold_reason(&self, id: &str) -> Option<String> {
+        let t = self.task(id)?;
+        let files = self.model_task_files(&t.job)?;
+        self.model_held(&files).then(|| "its model is being changed on the Models page".to_string())
+    }
+    fn model_task_files(&self, job: &TaskJob) -> Option<ModelFiles> {
+        match &self.models {
+            ModelState::Known(m) => m.task_files(job.kind, &job.params).ok(),
+            _ => None,
+        }
+    }
+    pub fn models(&self) -> Option<&Arc<Snapshot>> {
+        match &self.models {
+            ModelState::Known(s) => Some(s),
+            _ => None,
+        }
     }
 
     pub fn targets(&self) -> Vec<TargetView> {
@@ -829,35 +777,38 @@ impl Scheduler {
                 enabled: s.target.enabled,
                 status: s.status.clone(),
                 busy_with: s.job.clone(),
-                hello: s.hello.clone(),
-                trust: self.trust(s),
+                ready: s.ready.clone(),
                 starting_for: (s.status == TargetStatus::Starting).then(|| s.started.elapsed()),
-                startup_budget: self.hello_timeout,
+                startup_budget: self.ready_timeout,
             })
             .collect()
     }
 
-    fn trust(&self, s: &Slot) -> Trust {
-        let (Some(h), Some(r)) = (&s.hello, &self.reference) else {
-            return Trust::Unknown;
-        };
-        if self.reference_from.as_deref() == Some(&s.target.id) {
-            return Trust::Reference;
+    /// A GPU appeared: add its worker slot (never removes or reorders existing ones; the id must be new).
+    pub fn add_target(&mut self, target: Target) -> Result<(), String> {
+        target.validate()?;
+        if self.slots.iter().any(|s| s.target.id == target.id) {
+            return Err(format!("duplicate target id {}", target.id));
         }
-        match (
-            r.get("corridorkey_v2").cloned().flatten(),
-            h.models
-                .get("corridorkey_v2")
-                .and_then(|m| m.sha256.clone()),
-        ) {
-            (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => Trust::Matches,
-            (Some(_), Some(_)) => Trust::Mismatch,
-            _ => Trust::Unverified,
-        }
+        self.slots.push(Slot {
+            target,
+            conn: None,
+            ready: None,
+            status: TargetStatus::Fresh,
+            job: None,
+            started: Instant::now(),
+            sent_manifest: None,
+            preflight: None,
+            lost_job: None,
+            crashes: vec![],
+            stopping: false,
+        });
+        self.order.push(self.slots.len() - 1);
+        Ok(())
     }
 
-    /// Start (not wait for) workers so hello, GPU and model digest are known before a job is submitted.
-    /// `None` = every enabled Fresh target. Safe to call repeatedly.
+    /// Start (not wait for) workers: the app calls this when it opens and keeps one idle worker per GPU, whatever
+    /// the project is doing. `None` = every enabled Fresh target. Safe to call repeatedly.
     pub fn probe(&mut self, target: Option<&str>) {
         for c in 0..self.slots.len() {
             if target.is_none_or(|t| t == self.slots[c].target.id) {
@@ -970,24 +921,9 @@ impl Scheduler {
         if s.job.is_some() || s.conn.is_some() {
             return;
         }
-        s.hello = None;
+        s.ready = None;
         s.stopping = false;
         s.status = TargetStatus::Fresh;
-        if self.reference_from.as_deref() == Some(id) {
-            self.reference = None;
-            self.reference_from = None;
-        }
-    }
-
-    /// Ask every idle, ready worker to re-read what is installed (no restart); its answer replaces its hello.
-    /// `true` once no worker is still starting (a starting one reads the models fresh anyway).
-    pub fn refresh_idle_workers(&mut self) -> bool {
-        for s in self.slots.iter_mut().filter(|s| s.status == TargetStatus::Ready && s.hello.is_some() && s.job.is_none() && !s.refreshing) {
-            if s.conn.as_mut().is_some_and(|c| c.send(&Cmd::Refresh).is_ok()) {
-                s.refreshing = true;
-            }
-        }
-        !self.slots.iter().any(|s| s.target.enabled && matches!(s.status, TargetStatus::Fresh | TargetStatus::Starting) && s.conn.is_some())
     }
 
     /// A job still in its preflight was never sent: drop it as `Cancelled` (nothing was written, no worker saw
@@ -1071,7 +1007,6 @@ impl Scheduler {
             after: vec![],
             min_vram_gb,
             state: JobState::Queued,
-            unverified_models: false,
             cancel_requested: false,
             dispatched_at: None,
             accepted_at: None,
@@ -1081,11 +1016,10 @@ impl Scheduler {
         let (mut wait, mut reasons) = (None, vec![]);
         for c in self.candidates(placement) {
             match self.candidate(&e, c, true) {
-                Cand::Go { unverified, .. } => {
+                Cand::Go { .. } => {
                     let s = &self.slots[c];
                     return Readiness::Ready {
                         target: s.target.id.clone(),
-                        unverified,
                         busy: s.job.is_some(),
                     };
                 }
@@ -1151,9 +1085,9 @@ impl Scheduler {
                 self.handle(i, m, &mut ev);
             }
             let s = &self.slots[i];
-            if s.status == TargetStatus::Starting && s.started.elapsed() > self.hello_timeout {
-                // No job is involved before hello, so killing here cannot interrupt inference.
-                let why = format!("no hello within {} s (model hash, torch and CUDA start-up can be slow on network storage); press Retry to start it again or raise the start-up timeout", self.hello_timeout.as_secs());
+            if s.status == TargetStatus::Starting && s.started.elapsed() > self.ready_timeout {
+                // No job is involved before ready, so killing here cannot interrupt inference.
+                let why = format!("no ready acknowledgment within {} s (torch and CUDA start-up can be slow on network storage); press Retry to start it again or raise the start-up timeout", self.ready_timeout.as_secs());
                 self.lose(i, why, &mut ev);
             }
         }
@@ -1176,7 +1110,7 @@ impl Scheduler {
         if let Some(c) = s.conn.as_mut() {
             c.kill();
         }
-        s.hello = None;
+        s.ready = None;
         if !matches!(
             s.status,
             TargetStatus::Refused(_)
@@ -1229,31 +1163,6 @@ impl Scheduler {
                     recovery: None,
                 };
                 ev.push(SchedEvent::Changed(self.tasks[t].job.job_id.clone()));
-            }
-        }
-        // A lock request in flight on this worker can no longer be answered.
-        let gone: Vec<String> = self
-            .locks
-            .iter()
-            .filter(|l| l.slot == Some(i))
-            .map(|l| l.req.request_id.clone())
-            .collect();
-        for rid in gone {
-            self.locks.retain(|l| l.req.request_id != rid);
-            ev.push(SchedEvent::HintLock {
-                request_id: rid,
-                outcome: LockOutcome::Refused {
-                    code: "worker_lost".into(),
-                    message: "the worker ended before answering; nothing was changed".into(),
-                    lock: None,
-                },
-            });
-            if self.slots[i]
-                .job
-                .as_deref()
-                .is_some_and(|j| j.starts_with("lock:"))
-            {
-                self.slots[i].job = None;
             }
         }
         if self.slots[i].conn.is_none() {
@@ -1322,7 +1231,7 @@ impl Scheduler {
                     if s.crashes.len() < CRASH_RESTARTS {
                         s.crashes.push(now);
                         s.job = None;
-                        s.hello = None;
+                        s.ready = None;
                         s.status = TargetStatus::Fresh;
                     } else if let TargetStatus::Down(reason) = &s.status {
                         let reason = reason.clone();
@@ -1336,20 +1245,8 @@ impl Scheduler {
             }
             Msg::Event(e) => e,
         };
-        if let Event::Hello(h) = event {
-            return self.hello(i, h, ev);
-        }
-        if matches!(
-            event,
-            Event::HintLock { .. }
-                | Event::HintLockCleared { .. }
-                | Event::HintLockRefused { .. }
-                | Event::Rejected {
-                    request_id: Some(_),
-                    ..
-                }
-        ) {
-            return self.lock_reply(i, event, ev);
+        if let Event::Ready(r) = event {
+            return self.ready(i, r, ev);
         }
         let want = self.slots[i].job.clone();
         let (Some(id), Some(got)) = (want, event.job_id().map(str::to_owned)) else {
@@ -1459,32 +1356,22 @@ impl Scheduler {
         }
     }
 
-    fn hello(&mut self, i: usize, h: Hello, ev: &mut Vec<SchedEvent>) {
+    fn ready(&mut self, i: usize, r: Ready, ev: &mut Vec<SchedEvent>) {
         if !matches!(
             self.slots[i].status,
             TargetStatus::Starting | TargetStatus::Ready
         ) {
-            return; // a dying/refused/stopped worker's hello means nothing
+            return; // a dying/refused/stopped worker's acknowledgment means nothing
         }
-        if self.slots[i].hello.is_some() {
-            let s = &mut self.slots[i];
-            if s.refreshing && s.status == TargetStatus::Ready && h.protocol == PROTOCOL {
-                // The answer to our `refresh`: same process, models re-read. A moved reference follows.
-                s.refreshing = false;
-                if self.reference_from.as_deref() == Some(s.target.id.as_str()) {
-                    self.reference = Some(digests(&h));
-                }
-                s.hello = Some(h);
-            } else {
-                self.lose(i, "duplicate hello".into(), ev);
-            }
+        if self.slots[i].ready.is_some() {
+            self.lose(i, "duplicate ready".into(), ev);
             return;
         }
         let s = &mut self.slots[i];
-        let bad = if h.protocol != PROTOCOL {
-            Some(format!("worker speaks protocol {}", h.protocol))
+        let bad = if r.protocol != PROTOCOL {
+            Some(format!("worker speaks protocol {}", r.protocol))
         } else {
-            h.gpu.as_ref().filter(|g| g.index != s.target.gpu).map(|g| {
+            r.gpu.as_ref().filter(|g| g.index != s.target.gpu).map(|g| {
                 format!(
                     "worker reports GPU {}, target is GPU {}",
                     g.index, s.target.gpu
@@ -1498,11 +1385,7 @@ impl Scheduler {
             s.status = TargetStatus::Refused(why);
             return;
         }
-        if self.reference.is_none() {
-            self.reference = Some(digests(&h));
-            self.reference_from = Some(s.target.id.clone());
-        }
-        s.hello = Some(h);
+        s.ready = Some(r);
         if s.status == TargetStatus::Starting {
             s.status = TargetStatus::Ready;
         }
@@ -1538,66 +1421,41 @@ impl Scheduler {
             }
             TargetStatus::Ready => {}
         }
-        let Some(h) = s.hello.as_ref() else {
+        let Some(r) = s.ready.as_ref() else {
             return Cand::Wait("worker not ready".into());
         };
-        // A Key job needs a GPU and the capability, whatever the VRAM estimate says.
-        let Some(gpu) = h.gpu.as_ref() else {
+        // A Key job needs a GPU, whatever the VRAM estimate says.
+        let Some(gpu) = r.gpu.as_ref() else {
             return Cand::No("worker reports no GPU".into());
         };
-        if !h.capabilities.key || !h.capabilities.publish_modes.contains(&e.job.publish) {
-            return Cand::No("worker cannot key with publish=final".into());
-        }
-        if e.job.mode == crate::jobs::JobMode::Replace
-            && !h.capabilities.key_modes.iter().any(|m| m == "replace")
-        {
-            return Cand::No("this worker cannot replace results (update it)".into());
-        }
         if let Some(need) = e.min_vram_gb.filter(|n| gpu.vram_gb < *n) {
             return Cand::No(format!(
                 "{:.1} GB VRAM, job needs {need:.1} GB",
                 gpu.vram_gb
             ));
         }
-        // Identity. A pinned digest must match. An unpinned one means "the trusted local reference": local
-        // workers are trusted even when the reference carries no digest.
-        let mut sent = e.job.require.clone();
-        let mut check = e.job.require.clone();
-        for (name, want) in sent.models.iter_mut() {
-            if want.is_none() {
-                match &self.reference {
-                    Some(r) => *want = r.get(name).cloned().flatten(),
-                    None => {}
-                }
-                if want.is_none() && h.models.contains_key(name) {
-                    check.models.remove(name); // trusted local, no digest anywhere
-                    continue;
-                }
-            }
-            check.models.insert(name.clone(), want.clone());
+        // The app's own model state decides, never the worker: the exact files travel with the job.
+        let files = match &self.models {
+            ModelState::Unknown => return Cand::Wait("the app has not read the installed models yet".into()),
+            ModelState::Unavailable(why) => return Cand::No(why.clone()),
+            ModelState::Known(m) => match m.key_files() {
+                Ok(f) => f,
+                Err(why) => return Cand::No(why),
+            },
+        };
+        if self.model_held(&files) {
+            return Cand::Wait("its model is being changed on the Models page".into());
         }
-        let unverified = match h.check_identity(&check, self.allow_unverified) {
-            Ok(u) => u,
-            Err(r) => return Cand::No(r),
-        };
         // Pure in-memory from here on: the local filesystem preflight happens at dispatch, off the UI thread.
-        let wire = if !deep {
-            None
-        } else {
-            let mut w = (*e.job).clone();
-            w.require = sent;
-            Some(Box::new(w))
-        };
-        Cand::Go { wire, unverified }
+        let wire = deep.then(|| Box::new((*e.job).clone()));
+        Cand::Go { wire, files }
     }
 
     fn dispatch(&mut self, ev: &mut Vec<SchedEvent>) {
-        if self.reference.is_none() && self.jobs.iter().any(|e| e.state == JobState::Queued) {
-            // Jobs need the local digest as reference: bring up the first worker.
-            if let Some(&c) = self.order.first() {
-                self.spawn_if_fresh(c);
-            }
+        if self.models_settling || self.locks.iter().any(|l| l.result.is_some()) {
+            return; // model files may be changing, or a hint-lock helper is running: nothing may start under it
         }
+        // Queued jobs are judged against the CURRENT model snapshot: a model that became unusable fails them here.
         let mut reserved: Vec<usize> = vec![];
         for j in 0..self.jobs.len() {
             if self.jobs[j].state != JobState::Queued || self.held_out(&self.jobs[j].job.job_id) {
@@ -1627,9 +1485,9 @@ impl Scheduler {
                 match self.candidate(&self.jobs[j], c, idle) {
                     Cand::Go {
                         wire: Some(wire),
-                        unverified,
+                        files,
                     } if idle => {
-                        chosen = Some((c, *wire, unverified));
+                        chosen = Some((c, *wire, files));
                         break;
                     }
                     Cand::Go { .. } => pending = true,
@@ -1647,8 +1505,8 @@ impl Scheduler {
                     }
                 }
             }
-            if let Some((c, job, unverified)) = chosen {
-                self.start(j, c, job, unverified, ev);
+            if let Some((c, job, files)) = chosen {
+                self.start(j, c, job, files, ev);
             } else if let Some(c) = spawn.filter(|c| *c != usize::MAX) {
                 reserved.push(c);
                 self.spawn_if_fresh(c);
@@ -1668,7 +1526,7 @@ impl Scheduler {
         j: usize,
         c: usize,
         job: KeyJob,
-        unverified: bool,
+        files: ModelFiles,
         ev: &mut Vec<SchedEvent>,
     ) {
         let target = self.slots[c].target.id.clone();
@@ -1679,7 +1537,6 @@ impl Scheduler {
                 .to_string_lossy()
                 .into_owned(),
         );
-        self.jobs[j].unverified_models = unverified;
         self.jobs[j].sent = Some(Arc::new(job.clone()));
         self.jobs[j].dispatched_at = Some(Instant::now());
         self.jobs[j].last_activity = Some(Instant::now());
@@ -1697,22 +1554,38 @@ impl Scheduler {
             }
             let _ = tx.send(local.check_disk());
         });
-        self.slots[c].preflight = Some((rx, job));
+        self.slots[c].preflight = Some((rx, job, files));
     }
 
-    fn send_job(&mut self, c: usize, job: &KeyJob, ev: &mut Vec<SchedEvent>) {
+    fn send_job(&mut self, c: usize, job: &KeyJob, files: &ModelFiles, ev: &mut Vec<SchedEvent>) {
         let sent = self.slots[c]
             .conn
             .as_mut()
-            .map(|conn| conn.send(&Cmd::Key(job)));
+            .map(|conn| conn.send(&Cmd::Key(job, files)));
         if !matches!(sent, Some(Ok(()))) {
             self.lose(c, "could not send the job to the worker".into(), ev);
         }
     }
 
-    /// Tasks run on the local worker only. `Err` = never eligible, `Ok(None)` = worker not ready yet.
-    fn task_slot(&self, job: &TaskJob) -> Result<Option<usize>, String> {
+    /// Tasks run on the local worker only. `Err` = never eligible, `Ok(None)` = not ready yet. The slot comes with
+    /// the exact model files the task carries (from the app's snapshot; empty for kinds that load no model).
+    fn task_slot(&self, job: &TaskJob) -> Result<Option<(usize, ModelFiles)>, String> {
         let kind = job.kind;
+        // These kinds load a model (and need the GPU); the others (Chroma, pre-matte, extract, import, export) never
+        // look at the model state, so a failed or unread model check cannot stop them.
+        let needs_gpu = matches!(kind, TaskKind::Gvm | TaskKind::Birefnet | TaskKind::SamPreview | TaskKind::SamTrack | TaskKind::Matanyone2 | TaskKind::Videomama);
+        let files = if !needs_gpu {
+            ModelFiles::new()
+        } else {
+            match &self.models {
+                ModelState::Unknown => return Ok(None),
+                ModelState::Unavailable(why) => return Err(why.clone()),
+                ModelState::Known(m) => m.task_files(kind, &job.params)?,
+            }
+        };
+        if self.model_held(&files) {
+            return Ok(None);
+        }
         let mut pending = None;
         let mut reasons = vec![];
         for &c in &self.order {
@@ -1726,36 +1599,16 @@ impl Scheduler {
                 TargetStatus::Stopping | TargetStatus::Stopped => reasons.push("stopped".into()),
                 TargetStatus::Fresh | TargetStatus::Starting => pending = Some(c),
                 TargetStatus::Ready => {
-                    let Some(h) = s.hello.as_ref() else {
+                    let Some(r) = s.ready.as_ref() else {
                         pending = Some(c);
                         continue;
                     };
-                    let caps = &h.capabilities;
-                    if caps.tasks.get(kind.wire()).copied().unwrap_or(false) {
-                        let want = |k: &str| job.params.get(k).and_then(Value::as_str);
-                        let missing = match kind {
-                            TaskKind::Birefnet => want("variant")
-                                .filter(|v| !caps.birefnet_variants.iter().any(|x| x == v))
-                                .map(|v| {
-                                    format!("BiRefNet variant {v} is not installed on the worker")
-                                }),
-                            TaskKind::SamPreview | TaskKind::SamTrack => want("tracker_model")
-                                .filter(|v| !caps.sam_models.iter().any(|x| x == v))
-                                .map(|v| format!("SAM model {v} is not installed on the worker")),
-                            _ => None,
-                        };
-                        if let Some(why) = missing {
-                            reasons.push(why);
-                        } else if s.job.is_none() {
-                            return Ok(Some(c));
-                        } else {
-                            pending = Some(c);
-                        }
+                    if needs_gpu && r.gpu.is_none() {
+                        reasons.push(format!("{} reports no usable GPU", s.target.id));
+                    } else if s.job.is_none() {
+                        return Ok(Some((c, files)));
                     } else {
-                        reasons.push(format!(
-                            "the worker cannot run {} (model or dependency not ready: see Settings > Models)",
-                            kind.label()
-                        ));
+                        pending = Some(c);
                     }
                 }
             }
@@ -1764,7 +1617,7 @@ impl Scheduler {
             Some(c)
                 if self.slots[c].job.is_none() && self.slots[c].status == TargetStatus::Ready =>
             {
-                Ok(Some(c))
+                Ok(Some((c, files)))
             }
             Some(_) => Ok(None),
             None if reasons.is_empty() => Err("no enabled local worker".into()),
@@ -1773,6 +1626,9 @@ impl Scheduler {
     }
 
     fn dispatch_tasks(&mut self, ev: &mut Vec<SchedEvent>) {
+        if self.models_settling || self.locks.iter().any(|l| l.result.is_some()) {
+            return;
+        }
         for t in 0..self.tasks.len() {
             if self.tasks[t].state != JobState::Queued || self.held_out(&self.tasks[t].job.job_id) {
                 continue;
@@ -1808,7 +1664,7 @@ impl Scheduler {
                         self.spawn_if_fresh(c);
                     }
                 }
-                Ok(Some(c)) => {
+                Ok(Some((c, files))) => {
                     let job = self.tasks[t].job.clone();
                     self.slots[c].job = Some(job.job_id.clone());
                     self.tasks[t].last_activity = Some(Instant::now());
@@ -1819,7 +1675,7 @@ impl Scheduler {
                     let sent = self.slots[c]
                         .conn
                         .as_mut()
-                        .map(|conn| conn.send(&Cmd::Task(&job)));
+                        .map(|conn| conn.send(&Cmd::Task(&job, &files)));
                     if !matches!(sent, Some(Ok(()))) {
                         self.lose(c, "could not send the task to the worker".into(), ev);
                     }
@@ -1909,7 +1765,7 @@ impl Scheduler {
     /// Collect finished preflights: send the job, or fail it without ever having touched a worker.
     fn poll_preflight(&mut self, ev: &mut Vec<SchedEvent>) {
         for c in 0..self.slots.len() {
-            let Some((rx, _)) = &self.slots[c].preflight else {
+            let Some((rx, ..)) = &self.slots[c].preflight else {
                 continue;
             };
             let res = match rx.try_recv() {
@@ -1917,9 +1773,9 @@ impl Scheduler {
                 Err(TryRecvError::Empty) => continue,
                 Err(TryRecvError::Disconnected) => Err("preflight: checker thread died".into()),
             };
-            let (_, job) = self.slots[c].preflight.take().unwrap();
+            let (_, job, files) = self.slots[c].preflight.take().unwrap();
             match res {
-                Ok(()) => self.send_job(c, &job, ev),
+                Ok(()) => self.send_job(c, &job, &files, ev),
                 Err(reason) => {
                     self.slots[c].job = None;
                     if let Some(j) = self.jobs.iter().position(|e| e.job.job_id == job.job_id) {
@@ -1928,5 +1784,94 @@ impl Scheduler {
                 }
             }
         }
+    }
+}
+/// A stalled share must not stop the queue: the helper gets this long to answer.
+const LOCK_HELPER_LIMIT: Duration = Duration::from_secs(10);
+
+/// stdout of `cmd`, or an error when it does not finish within `limit` (it is killed) or cannot start.
+fn output_within(cmd: &mut std::process::Command, limit: Duration) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start the lock helper: {e}"))?;
+    let mut pipe = child.stdout.take().ok_or("the lock helper has no output")?;
+    let reader = std::thread::spawn(move || {
+        let mut b = vec![];
+        let _ = pipe.read_to_end(&mut b);
+        b
+    });
+    let end = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(reader.join().unwrap_or_default()),
+            Ok(None) if std::time::Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                // A helper stuck on a hard-mounted share cannot die until the share answers: reap it off this thread.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Err("the clip's folder did not answer; nothing was changed".into());
+            }
+            Err(e) => return Err(format!("could not wait for the lock helper: {e}")),
+        }
+    }
+}
+
+/// Run one hint-lock request through the app-side helper. Blocking: call it from a background thread only.
+fn run_lock_helper(target: &Target, request: &str) -> LockOutcome {
+    let refused = |m: String| LockOutcome::Refused { code: "unavailable".into(), message: m, lock: None };
+    let mut cmd = match target.one_shot("backend.hint_lock_cli", request) {
+        Ok(c) => c,
+        Err(e) => return refused(e),
+    };
+    let out = match output_within(&mut cmd, LOCK_HELPER_LIMIT) {
+        Ok(o) => o,
+        Err(e) => return refused(e),
+    };
+    let text = String::from_utf8_lossy(&out);
+    let Some(v) = text.lines().rev().find_map(|l| serde_json::from_str::<Value>(l).ok()) else {
+        return refused("the lock helper gave no answer; nothing was changed".into());
+    };
+    let text_of = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    match v.get("event").and_then(Value::as_str) {
+        Some("hint_lock") => LockOutcome::Inspected(v.get("lock").filter(|l| !l.is_null()).cloned()),
+        Some("hint_lock_cleared") => LockOutcome::Cleared {
+            recovered: v.get("recovered").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
+            warning: v.get("warning").and_then(Value::as_str).map(str::to_owned),
+        },
+        Some("hint_lock_refused") => LockOutcome::Refused { code: text_of("code"), message: text_of("message"), lock: v.get("lock").filter(|l| !l.is_null()).cloned() },
+        Some("rejected") => LockOutcome::Refused { code: text_of("code"), message: text_of("message"), lock: None },
+        _ => refused("the lock helper gave an unknown answer; nothing was changed".into()),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stalled_lock_helper_is_stopped_after_its_time_limit_and_a_quick_one_answers() {
+        let started = Instant::now();
+        let mut slow = std::process::Command::new("sleep");
+        slow.arg("5");
+        let err = output_within(&mut slow, Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("did not answer"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3), "killed at the limit, not after the sleep");
+        // A helper that ignores TERM and whose child keeps the pipe open still gives the answer at the limit
+        // (the kill and the reaping never block the caller; a D-state process cannot be simulated here).
+        let started = Instant::now();
+        let mut stuck = std::process::Command::new("sh");
+        stuck.args(["-c", "trap '' TERM; sleep 30 & sleep 30; wait"]);
+        assert!(output_within(&mut stuck, Duration::from_millis(300)).unwrap_err().contains("did not answer"));
+        assert!(started.elapsed() < Duration::from_secs(3), "returned at the limit");
+        let mut quick = std::process::Command::new("echo");
+        quick.arg("hello");
+        assert_eq!(output_within(&mut quick, Duration::from_secs(5)).unwrap(), b"hello\n");
     }
 }

@@ -376,3 +376,16 @@ def test_stats_validation(store, clock, patch):
         store.report_stats(rec, {**base, **patch})
     assert e.value.status == 400
     store.report_stats(rec, {"session_id": sid("s1"), "seq": 1, "measured_age_ms": 0})  # all metrics optional
+
+
+def test_job_filter_offers_key_only_with_the_models_the_rust_claim_sends(store, clock):
+    # rust-ui/src/remote.rs claim_models(): {"corridorkey_v2": null} with Key files present, {} without.
+    sub, rec = setup_pair(store, clock)
+    key_spec = spec(require={"protocol": 1, "models": {"corridorkey_v2": None}})
+    store.submit(sub, {"submission_id": sid(1), "spec": key_spec, "target": None})
+    job = store.db.execute("SELECT * FROM jobs").fetchone()
+    present = {**CAPS, "kinds": ["key", "workflow"], "maps": ["projects", "out"], "models": {"corridorkey_v2": None}}
+    assert Store._skip_reason(job, present) is None
+    assert Store._skip_reason(job, {**present, "models": {}}) == "model corridorkey_v2 is not installed"
+    assert store.claim(rec, claim_body(clock, caps={**present, "models": {}}))["offer"] is None
+    assert store.claim(rec, claim_body(clock, claim_n="c2", caps=present))["offer"]["job_id"] == job["job_id"]

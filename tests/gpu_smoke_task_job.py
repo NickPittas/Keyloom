@@ -20,6 +20,18 @@ REPO = Path(__file__).resolve().parent.parent
 KINDS = ('birefnet', 'gvm', 'sam_preview', 'sam_track', 'matanyone2', 'videomama')
 
 
+def _files(kind, params):
+    """The exact model files the app would send for this task (read-only resolution)."""
+    from backend.app_models import AppModels
+    from backend.model_variants import BIREFNET_MODELS, SAM_ARTIFACTS
+    m = AppModels()
+    if kind in ('sam_preview', 'sam_track'):
+        return {k: str(v) for k, v in m.resolve('sam2', SAM_ARTIFACTS[params['tracker_model']]).paths.items()}
+    if kind == 'birefnet':
+        return {k: str(v) for k, v in m.resolve('birefnet', 'birefnet-' + BIREFNET_MODELS[params['variant']]).paths.items()}
+    return {k: str(v) for k, v in m.resolve(kind).paths.items()}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('kind', choices=KINDS)
@@ -53,7 +65,7 @@ def main():
                range=dict(in_point=1, out_point=2, in_stem='shot.0001', out_stem='shot.0002'),
                params=params, staging_dir='/tmp/task-smoke/staging',
                publish_dir=str(destination) if kind != 'sam_preview' else None,
-               require={'protocol': 1, 'models': {}})
+               require={'protocol': 1, 'models': {}}, model_files=_files(kind, params))
     proc = subprocess.Popen([sys.executable, '-B', '-m', 'backend.worker', '--gpu', '0'],
                             cwd=REPO, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
@@ -70,8 +82,8 @@ def main():
         return event
 
     try:
-        hello = read()
-        assert hello['event'] == 'hello' and hello['capabilities']['tasks'][kind], hello
+        ready = read()
+        assert ready['event'] == 'ready', ready
         proc.stdin.write(json.dumps({'v': 1, 'cmd': 'task', 'job': job}) + '\n')
         proc.stdin.flush()
         while True:

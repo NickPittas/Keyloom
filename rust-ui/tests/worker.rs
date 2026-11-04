@@ -23,8 +23,8 @@ fn recv_until(c: &mut WorkerConn, mut stop: impl FnMut(&Msg) -> bool) -> Vec<Msg
         }
     }
 }
-fn is_hello(m: &Msg) -> bool {
-    matches!(m, Msg::Event(Event::Hello(_)))
+fn is_ready(m: &Msg) -> bool {
+    matches!(m, Msg::Event(Event::Ready(_)))
 }
 fn terminal(m: &Msg) -> bool {
     matches!(
@@ -39,9 +39,9 @@ fn started(name: &str, fake: &str, n: usize) -> (std::path::PathBuf, WorkerConn,
     let base = tmp(name);
     let repo = make_repo(&base, "repo", json!({}));
     let mut c = WorkerConn::spawn(&local("t", 0, &repo)).unwrap();
-    let hello = recv_until(&mut c, is_hello);
+    let hello = recv_until(&mut c, is_ready);
     let j = job(&base, "j1", n, fake);
-    c.send(&Cmd::Key(&j)).unwrap();
+    c.send(&Cmd::Key(&j, &Default::default())).unwrap();
     (base, c, j, hello)
 }
 
@@ -82,48 +82,27 @@ fn parse_line_checks_version_and_shape() {
 }
 
 #[test]
-fn identity_never_trusts_name_and_size() {
-    let mk = |sha: Option<&str>| {
-        match parse_line(&format!(
-        r#"{{"v":1,"event":"hello","protocol":1,"worker_rev":"r","engine":"e","host":"h","gpu":null,"models":{{"corridorkey_v2":{{"path":"/m/ck.safetensors","bytes":7,"sha256":{}}}}}}}"#,
-        sha.map(|s| format!("\"{s}\"")).unwrap_or("null".into())
-    ))
-    .unwrap()
-    {
-        Event::Hello(h) => h,
-        _ => unreachable!(),
-    }
-    };
-    let req = |sha: Option<&str>| ck::jobs::Require {
-        protocol: 1,
-        models: [("corridorkey_v2".to_string(), sha.map(String::from))].into(),
-    };
-    assert_eq!(
-        mk(Some("AB")).check_identity(&req(Some("ab")), false),
-        Ok(false)
-    ); // digest equal
-    assert!(mk(Some("cd"))
-        .check_identity(&req(Some("ab")), true)
-        .unwrap_err()
-        .contains("differs"));
-    assert!(mk(None)
-        .check_identity(&req(Some("ab")), true)
-        .unwrap_err()
-        .contains("no digest"));
-    assert!(mk(Some("ab"))
-        .check_identity(&req(None), false)
-        .unwrap_err()
-        .contains("unverifiable"));
-    assert_eq!(mk(Some("ab")).check_identity(&req(None), true), Ok(true)); // explicit opt-in, flagged
-    let mut r = req(Some("ab"));
-    r.protocol = 2;
-    assert!(mk(Some("ab")).check_identity(&r, true).is_err());
+fn model_jobs_carry_the_exact_files_and_others_carry_none() {
+    let j = serde_json::from_value::<KeyJob>(fixture("key_new")["message"]["job"].clone()).unwrap();
+    let files: ck::models::ModelFiles = [("moge".to_string(), "/m/moge".to_string())].into();
+    let sent: serde_json::Value = serde_json::from_str(&Cmd::Key(&j, &files).line()).unwrap();
+    assert_eq!(sent["job"]["model_files"], serde_json::json!({"moge": "/m/moge"}));
+    let bare: serde_json::Value = serde_json::from_str(&Cmd::Key(&j, &Default::default()).line()).unwrap();
+    assert!(bare["job"].get("model_files").is_none());
 }
 
 #[test]
-fn local_worker_hello_progress_publish_done() {
+fn ready_is_transport_only() {
+    let line = r#"{"v":1,"event":"ready","protocol":1,"engine":"e","host":"h","gpu":null,"models":{"x":1},"capabilities":{"key":true}}"#;
+    // Old fields from an older worker are ignored, never interpreted.
+    assert!(matches!(parse_line(line).unwrap(), Event::Ready(r) if r.protocol == 1 && r.gpu.is_none()));
+    assert!(parse_line(&line.replace("ready", "hello")).is_err(), "hello no longer exists");
+}
+
+#[test]
+fn local_worker_ready_progress_publish_done() {
     let (base, mut c, j, hello) = started("ok", "ok", 3);
-    let Msg::Event(Event::Hello(h)) = &hello[0] else {
+    let Msg::Event(Event::Ready(h)) = &hello[0] else {
         panic!()
     };
     assert_eq!(
@@ -160,7 +139,7 @@ fn local_worker_hello_progress_publish_done() {
         assert!(std::fs::read(p).unwrap().starts_with(b"\x89PNG"));
     }
     // The same worker takes a second job (persistent process): a repeat is skipped, not clobbered.
-    c.send(&Cmd::Key(&j)).unwrap();
+    c.send(&Cmd::Key(&j, &Default::default())).unwrap();
     let ev = recv_until(&mut c, terminal);
     let Some(Msg::Event(Event::Done(d))) = ev.last() else {
         panic!()
@@ -215,7 +194,7 @@ fn dropping_the_connection_closes_stdin_and_the_worker_exits() {
     let base = tmp("drop");
     let repo = make_repo(&base, "repo", json!({}));
     let mut c = WorkerConn::spawn(&local("t", 0, &repo)).unwrap();
-    recv_until(&mut c, is_hello);
+    recv_until(&mut c, is_ready);
     drop(c);
     wait_until("stdin_eof logged", || {
         log_lines(&base, "repo")
@@ -254,7 +233,7 @@ fn backend_golden_jobs_round_trip_as_values() {
         job.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(&serde_json::to_value(&job).unwrap(), &msg["job"], "{name}"); // nothing added/dropped/renamed
         assert_eq!(
-            &serde_json::from_str::<serde_json::Value>(&Cmd::Key(&job).line()).unwrap(),
+            &serde_json::from_str::<serde_json::Value>(&Cmd::Key(&job, &Default::default()).line()).unwrap(),
             msg,
             "{name}"
         );
@@ -271,7 +250,7 @@ fn backend_golden_events_and_commands_parse() {
         .collect();
     assert_eq!(parsed.len(), 11);
     assert!(
-        matches!(&parsed[0], Event::Hello(h) if h.host == "render2" && h.models["corridorkey_v2"].sha256.as_deref().is_some_and(|d| d.len() == 64) && h.capabilities.key)
+        matches!(&parsed[0], Event::Ready(r) if r.host == "render2" && r.gpu.as_ref().is_some_and(|g| g.index == 0))
     );
     assert!(matches!(&parsed[3], Event::Rejected { job_id: None, code, .. } if code == "protocol"));
     assert!(
@@ -296,7 +275,7 @@ fn backend_golden_events_and_commands_parse() {
 fn command_lines_are_ascii_only_so_remote_code_pages_cannot_alter_them() {
     let mut j = job(std::path::Path::new("/mnt/NAS"), "a", 1, "ok");
     j.clip_id = "proj/clip é 日本 😀".into();
-    let line = Cmd::Key(&j).line();
+    let line = Cmd::Key(&j, &Default::default()).line();
     assert!(line.is_ascii() && line.contains(r"\u00e9") && line.contains(r"\ud83d\ude00"));
     // Same JSON value after decoding.
     assert_eq!(

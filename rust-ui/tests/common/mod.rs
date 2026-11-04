@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 pub const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_worker.py");
+pub const LOCK_FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_lock_cli.py");
 pub const PY: &str = "/usr/bin/python3";
 
 pub fn tmp(tag: &str) -> PathBuf {
@@ -39,6 +40,15 @@ pub fn make_repo(parent: &Path, name: &str, mut cfg: Value) -> PathBuf {
         pkg.join("__main__.py"),
         format!(
             "import os, runpy\nos.environ['FAKE_CFG'] = {:?}\nrunpy.run_path({FAKE:?}, run_name='__main__')\n",
+            cfg.to_string()
+        ),
+    )
+    .unwrap();
+    // The app-side hint-lock helper (`python -m backend.hint_lock_cli`) is its own tiny fake, not the worker.
+    std::fs::write(
+        repo.join("backend/hint_lock_cli.py"),
+        format!(
+            "import os, runpy\nos.environ['FAKE_CFG'] = {:?}\nrunpy.run_path({LOCK_FAKE:?}, run_name='__main__')\n",
             cfg.to_string()
         ),
     )

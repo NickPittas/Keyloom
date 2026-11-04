@@ -497,14 +497,9 @@ class StatusChecker:
 
 
 def readiness_state(item: dict) -> str:
-    """Models-screen state of a check_artifact() result: missing | verify_needed | verified | error."""
-    if item["state"] == "missing":
-        return "missing"
-    if item["ready"]:
-        return "verified"
-    if item["state"] != "installed" or item["problems"] or item["unhashed_files"]:
-        return "error"  # partial/changed files, or nothing trusted to verify against
-    return "verify_needed" if item["verify_state"].startswith("unknown") else "error"
+    """present | missing. Every file exists at its location with the catalog size; a size mismatch is missing.
+    Hash verification is never part of this (it runs only inside a download or an explicit Verify)."""
+    return "present" if item["state"] == "installed" and not item["problems"] else "missing"
 
 
 def _probe_import(module_name: str | None) -> bool:

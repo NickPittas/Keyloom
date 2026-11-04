@@ -83,6 +83,24 @@ def get_v2_asset_paths() -> V2AssetPaths:
     )
 
 
+def v2_asset_paths_from_files(files: dict) -> V2AssetPaths:
+    """Key assets from the app's file bindings ({dependency id: path}); nothing is discovered."""
+    from backend.model_runtime import require_model_file
+
+    got = {k: require_model_file(files[k]) if k in files else None
+           for k in ("corridorkey-weights", "cradio", "moge", "rvm")}
+    absent = [k for k, v in got.items() if v is None]
+    if absent:
+        raise FileNotFoundError(f"model file missing: no path supplied for {', '.join(absent)}")
+    weights = got["corridorkey-weights"]
+    return V2AssetPaths(
+        package_root=get_v2_package_root(),
+        weights=require_model_file(weights / "corridorkey_v2.safetensors"),
+        foundation_stats=require_model_file(weights / "foundation_stats.safetensors"),
+        rvm_ckpt=got["rvm"], moge_checkpoint=require_model_file(got["moge"] / "model.pt"),
+        cradio_dir=got["cradio"])
+
+
 def _check_file(label: str, path: Path) -> list[str]:
     if not path.is_file():
         return [f"{label} missing: {path}"]

@@ -145,8 +145,8 @@ fn client_cards_show_local_numbers_and_never_invent_remote_ones() {
     let at = a.clients_rect().unwrap().center();
     let t = click(&ctx, &mut a, at);
     assert!(a.clients_open());
-    // The Clients page is an availability table: this computer's GPU is not reported by a worker, so no number is painted.
-    assert!(t.contains("This computer") && t.contains("Not reported") && t.contains("not started"), "{t}");
+    // The Clients page is an availability table: this computer's GPU is not reported by a worker yet (the app started it when it opened), so no number is painted.
+    assert!(t.contains("This computer") && t.contains("Not reported") && t.contains("starting"), "{t}");
     // Remote telemetry is painted by the Batch queue for a remote client with a run: these are the cells it paints.
     // The network API fills it through this model: same cells, server-computed age.
     let (s, age) = Sample::from_api(&json!({"seq": 2, "cpu_percent": 91.0, "ram_used_bytes": 3u64<<30, "ram_total_bytes": 8u64<<30, "measured_age_s": 2.0,

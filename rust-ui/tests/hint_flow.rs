@@ -129,6 +129,7 @@ fn saved_route_generates_the_hint_then_keys_and_history_survives_a_restart() {
     let mut st = Settings::default();
     st.ai_targets = vec![local("l0", 0, &repo)];
     let mut ai = AiUi::new(&st, None);
+    ai.set_models(ck::models::Snapshot::for_tests()); // the app has read its models; every job carries the files
     ai.queue_open(Some(&proj));
     let last = ai
         .submit_chain(&c, steps, Some((key, params, out)))

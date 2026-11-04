@@ -55,7 +55,7 @@ _JOB_KEYS = ("job_id", "clip_id", "clip_root", "range", "params", "output_config
              "hint_keyframes_abs", "outputs", "manifest_dir", "mode", "publish", "path_map",
              "require")
 # Optional keys a network receiver adds; absent == the local default (no map, warn-only fixed windows).
-_OPTIONAL_KEYS = ("source_map", "enforce_fixed_window", "hint_identity")
+_OPTIONAL_KEYS = ("source_map", "enforce_fixed_window", "hint_identity", "model_files")
 _RANGE_KEYS = ("in_point", "out_point", "in_stem", "out_stem")
 _FORMAT_OF = {"fg": "fg_format", "matte": "matte_format", "comp": "comp_format",
               "processed": "processed_format"}
@@ -150,6 +150,15 @@ def _check_source_map(m) -> tuple:
     return tuple((rec, _clean_abs(loc, "source_map local path")) for rec, loc in m)
 
 
+def _check_model_files(m) -> MappingProxyType | None:
+    """{dependency id: absolute path} the app resolved; None when the job carries none (old path)."""
+    if m is None:
+        return None
+    if not isinstance(m, dict) or not m or not all(isinstance(k, str) and k for k in m):
+        _rej("invalid", "model_files must be a non-empty {dependency id: path} object")
+    return _freeze({k: _clean_abs(v, f"model_files[{k}]") for k, v in m.items()})
+
+
 @dataclass(frozen=True)
 class KeyJob:
     """Immutable snapshot of a submitted Key job (mappings are read-only, lists are tuples)."""
@@ -173,6 +182,8 @@ class KeyJob:
     # stem -> "size:mtime_ns" of the existing hint frames the user chose to reuse at queue time (None = the hint
     # is made before this job or not used). Checked again when the job starts and recorded for Resume.
     hint_identity: MappingProxyType | None = None
+    # The exact model files the app resolved for this job; the worker loads these and never looks elsewhere.
+    model_files: MappingProxyType | None = None
 
     @property
     def frames(self) -> int:
@@ -186,6 +197,8 @@ class KeyJob:
             out["enforce_fixed_window"] = True
         if self.hint_identity is not None:
             out["hint_identity"] = _thaw(self.hint_identity)
+        if self.model_files is not None:
+            out["model_files"] = _thaw(self.model_files)
         return out
 
     @classmethod
@@ -198,6 +211,7 @@ class KeyJob:
             _rej("protocol", f"job keys: missing {sorted(missing)}, unknown {sorted(unknown)}")
         d = _thaw(d)  # private deep copy: later mutation of the caller's dict cannot leak in
         smap = _check_source_map(d.get("source_map", []))
+        model_files = _check_model_files(d.get("model_files"))
         enforce = d.get("enforce_fixed_window", False)
         if not isinstance(enforce, bool):
             _rej("invalid", "enforce_fixed_window must be a boolean")
@@ -271,7 +285,7 @@ class KeyJob:
         return cls(jid, d["clip_id"], d["clip_root"], _freeze(r), _freeze(d["params"]),
                    _freeze(d["output_config"]), None if marks is None else tuple(marks),
                    _freeze(outs), mdir, d["mode"], d["publish"], (), _freeze(req), smap, enforce,
-                   None if ident is None else _freeze(ident))
+                   None if ident is None else _freeze(ident), model_files)
 
 
 # ------------------------------------------------------------------- disk validation
@@ -1123,6 +1137,7 @@ def run_key_job(service, job: KeyJob, *, emit: Callable[[dict], None],
     ev = lambda event, **kw: emit({"event": event, "job_id": jid, **kw})  # noqa: E731
     clip, range_files = _open_clip(job)
     mdir = _check_paths(job, clip, range_files)
+    service._model_files = dict(job.model_files or {})  # one job at a time per worker
     try:
         a, b = job.range["in_point"], job.range["out_point"]
         n = job.frames

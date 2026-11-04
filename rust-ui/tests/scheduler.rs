@@ -40,10 +40,15 @@ fn proven(s: &mut Scheduler, id: &str) {
         )
     });
 }
+/// The app's model snapshot: everything ready (jobs wait for it; a real app reads it with its model check).
+fn ready_models(mut s: Scheduler) -> Scheduler {
+    s.set_models(Arc::new(ck::models::Snapshot::for_tests()));
+    s
+}
 fn one(name: &str, cfg: serde_json::Value) -> (std::path::PathBuf, Scheduler) {
     let base = tmp(name);
     let repo = make_repo(&base, "w0", cfg);
-    (base, Scheduler::new(vec![local("l0", 0, &repo)]).unwrap())
+    (base, ready_models(Scheduler::new(vec![local("l0", 0, &repo)]).unwrap()))
 }
 fn complete(s: &JobState) -> bool {
     matches!(s, JobState::Done { info, .. } if info.outcome == Outcome::Complete)
@@ -81,7 +86,6 @@ fn runs_a_job_with_progress_and_published_events_on_a_persistent_worker() {
         .flatten()
         .collect();
     assert_eq!(stems, ["clip_1101", "clip_1102", "clip_1103", "clip_1104"]);
-    assert!(!s.job("a").unwrap().unverified_models);
     // Second job reuses the same process (one `start` in the worker log).
     s.submit(sub(job(&base, "b", 1, "ok"), Placement::Auto))
         .unwrap();
@@ -396,7 +400,7 @@ fn multiple_targets_run_jobs_in_parallel_and_explicit_placement_is_honored() {
         make_repo(&base, "w0", json!({})),
         make_repo(&base, "w1", json!({})),
     );
-    let mut s = Scheduler::new(vec![local("g0", 0, &r0), local("g1", 1, &r1)]).unwrap();
+    let mut s = ready_models(Scheduler::new(vec![local("g0", 0, &r0), local("g1", 1, &r1)]).unwrap());
     for id in ["a", "b", "c"] {
         s.submit(sub(job(&base, id, 2, "hold"), Placement::Auto))
             .unwrap();
@@ -456,85 +460,88 @@ fn identity_and_protocol_gates_refuse_targets() {
     assert!(matches!(s.targets()[0].status, TargetStatus::Refused(_)));
     std::fs::remove_dir_all(base).unwrap();
 
-    // Pinned digest: mismatch / worker without digest are refused, a match (any case) runs verified.
-    let want = |sha: Option<&str>, base: &Path| {
-        let mut j = job(base, "a", 1, "ok");
-        j.require
-            .models
-            .insert("corridorkey_v2".into(), sha.map(String::from));
-        j
-    };
-    for (worker, reference, needle) in [
-        (json!("bb"), "aa", "differs"),
-        (json!(null), "aa", "no digest"),
-    ] {
-        let (base, mut s) = one("sha", json!({"sha": worker}));
-        s.allow_unverified = true; // must not rescue a pinned digest
-        s.submit(sub(want(Some(reference), &base), Placement::Auto))
-            .unwrap();
-        settle(&mut s, &["a"]);
-        assert!(
-            matches!(state(&s, "a"), JobState::Failed { reason } if reason.contains(needle)),
-            "{needle}: {:?}",
-            state(&s, "a")
-        );
-        std::fs::remove_dir_all(base).unwrap();
-    }
-    let (base, mut s) = one("sha-ok", json!({"sha": "aa"}));
-    s.submit(sub(want(Some("AA"), &base), Placement::Auto))
-        .unwrap();
+}
+
+#[test]
+fn every_key_job_carries_the_exact_files_from_the_apps_snapshot() {
+    let (base, mut s) = one("files", json!({}));
+    s.submit(sub(job(&base, "a", 1, "ok"), Placement::Auto)).unwrap();
     settle(&mut s, &["a"]);
-    assert!(complete(&state(&s, "a")) && !s.job("a").unwrap().unverified_models);
+    assert!(complete(&state(&s, "a")));
+    let sent = log_lines(&base, "w0").into_iter().find(|l| l["event"] == "job").unwrap();
+    assert_eq!(sent["model_files"], json!({"corridorkey-weights": "/models/corridorkey-weights"}));
     std::fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
-fn local_worker_is_the_trusted_reference_for_default_jobs_without_allow_unverified() {
-    let base = tmp("ref");
-    let (r0, r1) = (
-        make_repo(&base, "w0", json!({"sha": "aa"})),
-        make_repo(&base, "w1", json!({"sha": "bb"})),
-    );
-    let mut s = Scheduler::new(vec![local("g0", 0, &r0), local("g1", 1, &r1)]).unwrap();
-    assert!(!s.allow_unverified && s.reference().is_none());
-    s.probe(Some("g0"));
-    wait_until("g0 hello", || {
+fn a_job_waits_for_the_apps_first_model_check_and_fails_when_the_model_is_not_ready() {
+    let base = tmp("unknown");
+    let repo = make_repo(&base, "w0", json!({}));
+    let mut s = Scheduler::new(vec![local("l0", 0, &repo)]).unwrap();
+    s.submit(sub(job(&base, "a", 1, "ok"), Placement::Auto)).unwrap();
+    for _ in 0..30 {
         s.tick();
-        s.targets()[0].status == TargetStatus::Ready
-    });
-    assert_eq!(
-        s.reference().unwrap()["corridorkey_v2"].as_deref(),
-        Some("aa")
-    );
-    assert_eq!(s.targets()[0].trust, Trust::Reference);
-    // A default job (no pinned digest) runs on the reference worker, verified, and the wire job pins its digest.
-    let mut d = job(&base, "d", 1, "ok");
-    d.require.models.insert("corridorkey_v2".into(), None);
-    s.submit(sub(d, Placement::Auto)).unwrap();
-    settle(&mut s, &["d"]);
-    assert!(complete(&state(&s, "d")) && !s.job("d").unwrap().unverified_models);
-    assert_eq!(
-        log_lines(&base, "w0")
-            .iter()
-            .find(|l| l["event"] == "job")
-            .unwrap()["require"]["models"]["corridorkey_v2"],
-        "aa"
-    );
-    // A second local worker with a different digest is refused for default jobs (never silently accepted).
-    s.probe(Some("g1"));
-    wait_until("g1 hello", || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(state(&s, "a"), JobState::Queued, "nothing is known yet: it waits, it does not fail or start");
+    // The check ended: Key is missing. The queued job fails with the app's own reason, nothing reached the worker.
+    let mut snap = ck::models::Snapshot::from_json(&json!({"models": {"key": {"corridorkey-weights":
+        {"ready": false, "state": "missing", "paths": {"corridorkey-weights": "/m/w"}}}}})).unwrap();
+    s.set_models(Arc::new(snap.clone()));
+    settle(&mut s, &["a"]);
+    assert!(matches!(state(&s, "a"), JobState::Failed { reason } if reason.contains("The Key model is missing — download it on the Models page")));
+    assert!(log_lines(&base, "w0").iter().all(|l| l["event"] != "job"));
+    // A later snapshot where it is Verified lets a new job run on the same idle worker.
+    snap = ck::models::Snapshot::for_tests();
+    s.set_models(Arc::new(snap));
+    s.submit(sub(job(&base, "b", 1, "ok"), Placement::Auto)).unwrap();
+    settle(&mut s, &["b"]);
+    assert!(complete(&state(&s, "b")));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn dispatch_pauses_while_model_files_are_changing() {
+    let (base, mut s) = one("settling", json!({}));
+    s.set_models_settling(true);
+    s.submit(sub(job(&base, "a", 1, "ok"), Placement::Auto)).unwrap();
+    for _ in 0..30 {
         s.tick();
-        s.targets()[1].status == TargetStatus::Ready
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(state(&s, "a"), JobState::Queued);
+    s.set_models_settling(false);
+    settle(&mut s, &["a"]);
+    assert!(complete(&state(&s, "a")));
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn one_idle_worker_per_gpu_starts_with_the_app_and_clips_run_one_after_another_on_it() {
+    let base = tmp("seq");
+    let (r0, r1) = (make_repo(&base, "w0", json!({})), make_repo(&base, "w1", json!({"gpu": 1})));
+    let mut s = ready_models(Scheduler::new(vec![local("g0", 0, &r0)]).unwrap());
+    s.add_target(local("g1", 1, &r1)).unwrap();
+    assert!(s.add_target(local("g1", 1, &r1)).is_err(), "a GPU gets one worker");
+    s.probe(None); // the app opened: no project, no job
+    wait_until("both idle workers ready", || {
+        s.tick();
+        s.targets().iter().all(|t| t.status == TargetStatus::Ready && t.busy_with.is_none())
     });
-    assert_eq!(s.targets()[1].trust, Trust::Mismatch);
-    let mut e = job(&base, "e", 1, "ok");
-    e.require.models.insert("corridorkey_v2".into(), None);
-    assert!(
-        matches!(s.readiness(&Placement::Target("g1".into()), &e, None), Readiness::Blocked(r) if r[0].contains("differs"))
-    );
-    assert!(
-        matches!(s.readiness(&Placement::Auto, &e, None), Readiness::Ready { ref target, unverified: false, .. } if target == "g0")
-    );
+    assert_eq!(s.targets().len(), 2);
+    // Three clips pinned to one GPU: strictly in order, one at a time, one process.
+    for id in ["a", "b", "c"] {
+        s.submit(sub(job(&base, id, 1, "ok"), Placement::Target("g0".into()))).unwrap();
+    }
+    wait_until("all three done", || {
+        s.tick();
+        let active = ["a", "b", "c"].iter().filter(|o| matches!(state(&s, o), JobState::Dispatching { .. } | JobState::Running { .. })).count();
+        assert!(active <= 1, "one clip at a time on a GPU");
+        ["a", "b", "c"].iter().all(|i| state(&s, i).is_terminal())
+    });
+    let order: Vec<_> = log_lines(&base, "w0").iter().filter(|l| l["event"] == "job").map(|l| l["job_id"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(order, ["a", "b", "c"], "queue order");
+    assert_eq!(log_lines(&base, "w0").iter().filter(|l| l["event"] == "start").count(), 1);
     std::fs::remove_dir_all(base).unwrap();
 }
 
@@ -542,7 +549,7 @@ fn local_worker_is_the_trusted_reference_for_default_jobs_without_allow_unverifi
 fn key_needs_a_gpu_and_readiness_reports_it() {
     let (base, mut s) = one("nogpu", json!({"no_gpu": true}));
     s.probe(None);
-    wait_until("hello", || {
+    wait_until("ready", || {
         s.tick();
         s.targets()[0].status == TargetStatus::Ready
     });
@@ -574,31 +581,31 @@ fn readiness_is_pending_until_probe_finishes_then_ready() {
             Readiness::Ready { .. }
         )
     });
-    assert!(s.targets()[0].hello.as_ref().unwrap().gpu.is_some());
+    assert!(s.targets()[0].ready.as_ref().unwrap().gpu.is_some());
     std::fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
-fn hello_deadline_restarts_a_silent_worker_only_within_the_restart_limit() {
-    let (base, mut s) = one("hellodl", json!({"hello_delay": 30}));
-    s.hello_timeout = std::time::Duration::from_millis(300);
+fn ready_deadline_restarts_a_silent_worker_only_within_the_restart_limit() {
+    let (base, mut s) = one("readydl", json!({"ready_delay": 30}));
+    s.ready_timeout = std::time::Duration::from_millis(300);
     s.submit(sub(job(&base, "a", 1, "ok"), Placement::Auto))
         .unwrap();
     settle(&mut s, &["a"]);
     assert!(
-        matches!(s.targets()[0].status, TargetStatus::Down(ref r) if r.contains("no hello") && r.contains("automatic restart limit"))
+        matches!(s.targets()[0].status, TargetStatus::Down(ref r) if r.contains("no ready") && r.contains("automatic restart limit"))
     );
     assert_eq!(
         s.targets()[0].startup_budget,
         std::time::Duration::from_millis(300)
     );
     assert_eq!(
-        Scheduler::new(vec![]).unwrap().hello_timeout,
+        Scheduler::new(vec![]).unwrap().ready_timeout,
         std::time::Duration::from_secs(600)
     );
     s.tick(); // terminal Down does not spawn again
     assert!(matches!(s.targets()[0].status, TargetStatus::Down(_)));
-    assert!(matches!(state(&s, "a"), JobState::Failed { reason } if reason.contains("no hello") && reason.contains("automatic restart limit")));
+    assert!(matches!(state(&s, "a"), JobState::Failed { reason } if reason.contains("no ready") && reason.contains("automatic restart limit")));
     assert_eq!(
         log_lines(&base, "w0").iter().filter(|l| l["event"] == "start").count(),
         4

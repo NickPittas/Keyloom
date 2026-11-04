@@ -117,7 +117,12 @@ class SAM2Tracker:
         vos_optimized: bool = False,
         offload_video_to_cpu: bool = True,
         offload_state_to_cpu: bool = False,
+        checkpoint_path: str | None = None,
+        config_file: str | None = None,
     ) -> None:
+        # checkpoint_path/config_file are the app's exact files; nothing is looked up in the catalog here.
+        self.checkpoint_path = checkpoint_path
+        self.config_file = config_file
         self.model_id = model_id
         self.device = device
         self.vos_optimized = vos_optimized
@@ -233,40 +238,19 @@ class SAM2Tracker:
             self.model_id,
             self.vos_optimized,
         )
-        try:
-            config_name, checkpoint_name = HF_MODEL_ID_TO_FILENAMES[self.model_id]
-        except KeyError as exc:
-            raise ValueError(f"Unsupported SAM2 model id: {self.model_id}") from exc
-        if on_status:
-            on_status("Checking installed SAM2 model")
-        from backend.model_catalog import load_catalog
-        from backend.model_runtime import acquire_model_artifact
+        if self.checkpoint_path is None:
+            raise ValueError("SAM2 checkpoint_path was not supplied: the app sends the exact model file")
+        from backend.model_runtime import require_model_file
 
-        artifact = next((
-            art for art in load_catalog().artifacts.values()
-            if art.kind == "hf_cache_file" and art.repo_id == self.model_id
-        ), None)
-        if artifact is None:
-            raise ValueError(f"SAM2 model id is not present in the model catalog: {self.model_id}")
-        if artifact.hf_filename != checkpoint_name:
-            raise RuntimeError(
-                f"SAM2 catalog mismatch for {self.model_id}: expected "
-                f"{artifact.hf_filename}, runtime expects {checkpoint_name}. Update or repair the app."
-            )
-        lease = acquire_model_artifact(artifact.id)
-        try:
-            ckpt_path = lease.path
-            self._validate_checkpoint(str(ckpt_path))
-            self._predictor = build_sam2_video_predictor(
-                config_file=config_name,
-                ckpt_path=str(ckpt_path),
-                device=self.device,
-                vos_optimized=self.vos_optimized,
-            )
-        except Exception:
-            lease.close()
-            raise
-        self._model_asset_lease = lease
+        ckpt_path = require_model_file(self.checkpoint_path)
+        self._validate_checkpoint(str(ckpt_path))
+        entry = HF_MODEL_ID_TO_FILENAMES.get(self.model_id)  # (config, checkpoint name) in the sam2 package
+        config_name = self.config_file or (entry[0] if entry else None)
+        if config_name is None:
+            raise ValueError(f"Unsupported SAM2 model id: {self.model_id}")
+        self._predictor = build_sam2_video_predictor(
+            config_file=config_name, ckpt_path=str(ckpt_path),
+            device=self.device, vos_optimized=self.vos_optimized)
         return self._predictor
 
     def track_video(

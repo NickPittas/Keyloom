@@ -146,6 +146,8 @@ class CorridorKeyService(
 
     def __init__(self):
         self._v2_engine = None
+        self._loaded_files: dict[str, tuple | None] = {}  # attr -> files its model was built from
+        self._v2_engine_files = None  # V2AssetPaths the live engine was built from (None = old path)
         self._gvm_processor = None
         self._sam2_tracker = None
         self._videomama_pipeline = None
@@ -153,6 +155,8 @@ class CorridorKeyService(
         self._birefnet_processor = None
         self._active_model = _ActiveModel.NONE
         self._device: str = 'cpu'
+        # {dependency id: path} the app resolved for the running job (empty = old catalog path, A6 removes it).
+        self._model_files: dict[str, str] = {}
         self._device_detected: bool = False
         self._job_queue: Optional[GPUJobQueue] = None
         self._sam2_model_id: str = "facebook/sam2.1-hiera-base-plus"

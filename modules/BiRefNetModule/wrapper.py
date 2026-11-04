@@ -47,26 +47,8 @@ def _resolve_model_dir(repo_name: str, *, roots=None) -> tuple[Optional[str], st
     return existing, str(model_dir)
 
 
-# ── Model registry ──────────────────────────────────────────────────────────
-# Display name → HuggingFace repo suffix under ZhengPeng7/
-BIREFNET_MODELS: dict[str, str] = {
-    "Matting": "BiRefNet-matting",
-    "Matting HR": "BiRefNet_HR-Matting",
-    "Matting Lite": "BiRefNet_lite-matting",
-    "Matting Dynamic": "BiRefNet_dynamic-matting",
-    "General": "BiRefNet",
-    "General HR": "BiRefNet_HR",
-    "General Lite": "BiRefNet_lite",
-    "General Lite 2K": "BiRefNet_lite-2K",
-    "General Dynamic": "BiRefNet_dynamic",
-    "General 512": "BiRefNet_512x512",
-    "Portrait": "BiRefNet-portrait",
-    "DIS": "BiRefNet-DIS5K",
-    "HRSOD": "BiRefNet-HRSOD",
-    "COD": "BiRefNet-COD",
-    "DIS TR_TEs": "BiRefNet-DIS5K-TR_TEs",
-    "General Legacy": "BiRefNet-legacy",
-}
+# Display name → repo suffix: backend.model_variants.py (torch-free, shared with the app-side model snapshot).
+from backend.model_variants import BIREFNET_MODELS  # noqa: E402
 
 DEFAULT_MODEL = "Matting"
 
@@ -133,17 +115,10 @@ class BiRefNetProcessor:
                 f"Available: {list(BIREFNET_MODELS.keys())}"
             )
 
-        lease = None
         if self._model_path is None:
-            from backend.model_runtime import acquire_model_artifact
-            lease = acquire_model_artifact(f"birefnet-{repo_name}")
-            model_local_dir = lease.path
-        else:
-            model_local_dir = self._model_path
-            if not model_local_dir.is_dir():
-                raise FileNotFoundError(
-                    f"Explicit BiRefNet model directory is missing: {model_local_dir}"
-                )
+            raise ValueError("BiRefNet model_path was not supplied: the app sends the exact model folder")
+        from backend.model_runtime import require_model_file
+        model_local_dir = require_model_file(self._model_path)
 
         repo_id = f"ZhengPeng7/{repo_name}"
         logger.info(f"Using installed BiRefNet model: {model_local_dir} ({repo_id})")
@@ -158,8 +133,6 @@ class BiRefNetProcessor:
                 str(model_local_dir), trust_remote_code=True, local_files_only=True
             )
         except Exception as exc:
-            if lease is not None:
-                lease.close()
             raise RuntimeError(
                 f"BiRefNet local snapshot or its pinned runtime dependencies is incomplete at "
                 f"{model_local_dir}. Repair the model/runtime installation; inference does "
@@ -171,11 +144,8 @@ class BiRefNetProcessor:
             if self._half:
                 self._model.half()
         except Exception:
-            if lease is not None:
-                lease.close()
             self._model = None
             raise
-        self._model_asset_lease = lease
 
         # Set resolution based on model variant
         self._resolution = _MODEL_RESOLUTIONS.get(repo_name, _DEFAULT_RESOLUTION)

@@ -1,4 +1,7 @@
-"""Persistent Key worker: strict JSON-lines protocol v1 over stdin/stdout (one job at a time).
+"""Persistent executor: strict JSON-lines protocol v1 over stdin/stdout (one job at a time).
+
+It only executes what the app sends: after start it says ``ready`` (protocol + this device), then runs the
+jobs it is given with the exact ``model_files`` they carry. It claims, probes, discovers and decides nothing.
 
 stdout carries protocol lines only (``__main__`` points ``sys.stdout`` at stderr first); logs go
 to stderr, which the launching app must drain. stdin EOF means cancel and exit. This package
@@ -7,7 +10,6 @@ before any heavy import prints.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import socket
@@ -33,61 +35,8 @@ def _worker_rev() -> str:
         return "unknown"
 
 
-def model_sha256(path, cache_dir) -> str | None:
-    """SHA-256 of a checkpoint, cached under ``cache_dir`` (never the repo).
-
-    A cache entry is trusted only if path, device, inode, size and mtime_ns all match, and a
-    file that changes while it is being hashed yields None (unknown), never a guess."""
-    def ident():
-        st = os.stat(path)
-        return {"path": os.path.realpath(path), "dev": st.st_dev, "ino": st.st_ino,
-                "size": st.st_size, "mtime_ns": st.st_mtime_ns}
-    cache_file = os.path.join(cache_dir, "model_sha256.json")
-    try:
-        before = ident()
-        try:
-            with open(cache_file, encoding="utf-8") as f:
-                cache = json.load(f)
-        except (OSError, ValueError):
-            cache = {}
-        ent = cache.get(before["path"]) if isinstance(cache, dict) else None
-        if (isinstance(ent, dict) and all(ent.get(k) == v for k, v in before.items())
-                and isinstance(ent.get("sha256"), str) and len(ent["sha256"]) == 64):
-            return ent["sha256"]
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(4 << 20), b""):
-                h.update(chunk)
-        if ident() != before:
-            return None
-        digest = h.hexdigest()
-    except OSError as exc:
-        sys.stderr.write(f"cannot hash {path}: {exc}\n")
-        return None
-    try:
-        os.makedirs(cache_dir, exist_ok=True)
-        tmp = f"{cache_file}.tmp.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({**(cache if isinstance(cache, dict) else {}), before["path"]: {**before, "sha256": digest}}, f)
-        os.replace(tmp, cache_file)  # our own cache file, not user data
-    except OSError as exc:
-        sys.stderr.write(f"model hash cache not written: {exc}\n")
-    return digest
-
-
-def probe_hello(gpu_arg: int | None) -> dict:
-    """Facts about THIS machine; every unknown stays null/false rather than guessed."""
-    from backend.v2_paths import get_v2_asset_paths, validate_v2_assets
-    paths = get_v2_asset_paths()
-    problems = validate_v2_assets(paths)
-    for p in problems:
-        sys.stderr.write(f"model asset problem: {p}\n")
-    models = {}
-    if paths.weights.is_file():
-        from backend.service.inference import _scratch_root
-        models["corridorkey_v2"] = {
-            "path": str(paths.weights), "bytes": paths.weights.stat().st_size,
-            "sha256": model_sha256(paths.weights, os.path.join(_scratch_root(), "cache"))}
+def probe_ready(gpu_arg: int | None) -> dict:
+    """Facts about THIS process and device for the ready acknowledgment. No model or capability discovery."""
     gpu = None
     try:
         import torch
@@ -104,46 +53,18 @@ def probe_hello(gpu_arg: int | None) -> dict:
     except Exception as exc:  # noqa: BLE001 - no usable GPU is a valid answer
         sys.stderr.write(f"GPU probe failed: {exc}\n")
     if gpu is None:
-        sys.stderr.write("no usable CUDA GPU: Key is unavailable on this worker\n")
-    caps = probe_task_capabilities(gpu is not None)
-    tasks = caps["tasks"]
-    hint_kinds = ("gvm", "birefnet", "chroma", "sam_track", "matanyone2", "videomama")
+        sys.stderr.write("no usable CUDA GPU on this worker\n")
     return {"worker_rev": _worker_rev(), "engine": "corridorkey-v2", "host": socket.gethostname(),
-            "platform": sys.platform, "gpu": gpu, "models": models,
-            "capabilities": {"key": not problems and gpu is not None,
-                             "generate_hint": any(tasks[k] for k in hint_kinds),
-                             "key_modes": ["new", "resume", "replace"],
-                             "tasks": tasks, "birefnet_variants": caps["birefnet_variants"],
-                             "sam_models": caps["sam_models"], "task_unavailable": caps["reasons"],
-                             "publish_modes": ["final"]}}
+            "platform": sys.platform, "gpu": gpu}
 
 
-def probe_task_capabilities(gpu_ok: bool) -> dict:
-    """Per-task capability from the catalog status (verified artifacts only); unknown -> disabled."""
-    from backend.service.task_job import birefnet_repos, task_capabilities
-    status = repos = None
-    try:
-        from backend.model_catalog import load_catalog
-        from backend.model_status import Roots, StatusChecker
-        status = StatusChecker(load_catalog(), Roots.defaults()).status()
-    except Exception as exc:  # noqa: BLE001 - an unreadable catalog means "not ready", never a crash
-        sys.stderr.write(f"model status unavailable: {exc!r}\n")
-    try:
-        repos = birefnet_repos()
-    except Exception as exc:  # noqa: BLE001
-        sys.stderr.write(f"BiRefNet variants unavailable: {exc!r}\n")
-    try:
-        from backend.ffmpeg_tools.discovery import validate_ffmpeg_install
-        ffmpeg = bool(validate_ffmpeg_install(require_probe=False).ok)
-    except Exception:  # noqa: BLE001
-        ffmpeg = False
-    return task_capabilities(status, gpu=gpu_ok, ffmpeg=ffmpeg, repos=repos)
+# Task kinds that load a model: the app must send their exact files (the others need none).
+MODEL_KINDS = ("gvm", "birefnet", "sam_preview", "sam_track", "matanyone2", "videomama")
 
 
 class Worker:
-    def __init__(self, service, out, hello: dict, reprobe=None):
-        self.service, self.out, self.hello = service, out, hello
-        self._reprobe = reprobe  # () -> fresh hello facts; None = the facts are fixed (tests)
+    def __init__(self, service, out, ready: dict):
+        self.service, self.out, self.ready = service, out, ready
         self._out_lock = threading.Lock()
         self._state = threading.Lock()  # guards _thread/_cancel/_current/_seen
         self._thread: threading.Thread | None = None
@@ -177,16 +98,8 @@ class Worker:
             job = KeyJob.from_dict(raw)
         except KeyJobRejected as exc:
             return self._reject(jid, exc.code, exc.message)
-        def problem():
-            if not self.hello["capabilities"]["key"]:
-                return "Key is unavailable on this worker: Keyloom Key model files are missing or incomplete"
-            known = self.hello["models"].get("corridorkey_v2") or {}
-            for name, want in job.require["models"].items():
-                if want is not None and (name != "corridorkey_v2" or known.get("sha256") != want):
-                    return f"Cannot verify model '{name}' hash on this worker; refusing to assume it is identical"
-        why = self._recheck(problem)
-        if why:
-            return self._reject(jid, "invalid", why)
+        if job.model_files is None:
+            return self._reject(jid, "invalid", "no model_files: the app sends the exact model files with every Key job")
         with self._state:
             if self._thread is not None or job.job_id in self._seen:
                 return self._reject(jid, "busy", "Worker is running a job or already ran this job_id")
@@ -202,8 +115,8 @@ class Worker:
             def run():
                 try:
                     done = run_key_job(self.service, job, emit=emit, cancel=cancel, worker={
-                        "host": self.hello["host"], "worker_rev": self.hello["worker_rev"],
-                        "gpu": (self.hello["gpu"] or {}).get("name")})
+                        "host": self.ready["host"], "worker_rev": self.ready["worker_rev"],
+                        "gpu": (self.ready["gpu"] or {}).get("name")})
                     self._release_gpu()
                     self.emit(done)
                 except KeyJobRejected as exc:
@@ -218,26 +131,6 @@ class Worker:
                         self._thread = self._current = None
             self._thread = threading.Thread(target=run, name=f"key-{job.job_id}", daemon=True)
             self._thread.start()
-
-    def _recheck(self, problem):
-        """``problem()`` against the worker's facts; if it complains, re-read what is installed first (models
-        installed or repaired after this worker started are picked up without a restart) and ask again."""
-        found = problem()
-        if found and self._reprobe is not None:
-            self._refresh()
-            found = problem()
-        return found
-
-    def _refresh(self) -> None:
-        """Re-read the installed models and capabilities (the GPU facts stay) and say ``hello`` again."""
-        if self._reprobe is None:
-            return
-        try:
-            fresh = self._reprobe()
-        except Exception as exc:  # noqa: BLE001 - keep the old facts rather than die
-            sys.stderr.write(f"model refresh failed: {exc!r}\n")
-            return
-        self.hello.update(models=fresh["models"], capabilities=fresh["capabilities"])
 
     def _release_gpu(self) -> None:
         """Every job starts on an empty GPU: drop all models and PyTorch's cached memory before the result is
@@ -256,22 +149,8 @@ class Worker:
             job = TaskJob.from_dict(raw)
         except KeyJobRejected as exc:
             return self._reject(jid, exc.code, exc.message, **getattr(exc, "extra", {}))
-        def problem():
-            caps = self.hello["capabilities"].get("tasks") or {}
-            if not caps.get(job.kind):
-                why = "; ".join((self.hello["capabilities"].get("task_unavailable") or {}).values())
-                return ("model_missing", f"'{job.kind}' is unavailable on this worker: its models or tools are "
-                                         f"not installed and verified{': ' + why if why else ''}")
-            if job.kind == "birefnet" and job.params["variant"] not in self.hello["capabilities"].get("birefnet_variants", ()):
-                return "model_missing", f"BiRefNet variant {job.params['variant']!r} is not installed"
-            if job.kind in ("sam_preview", "sam_track") and job.params["tracker_model"] not in self.hello["capabilities"].get("sam_models", ()):
-                return "model_missing", f"SAM2 model {job.params['tracker_model']!r} is not installed"
-            for name, want in job.require["models"].items():
-                if want is not None and (self.hello["models"].get(name) or {}).get("sha256") != want:
-                    return "invalid", f"Cannot verify model '{name}' hash on this worker"
-        bad = self._recheck(problem)
-        if bad:
-            return self._reject(jid, *bad)
+        if job.kind in MODEL_KINDS and job.model_files is None:
+            return self._reject(jid, "invalid", f"no model_files: the app sends the exact model files with every '{job.kind}' job")
         with self._state:
             if self._thread is not None or job.job_id in self._seen:
                 return self._reject(jid, "busy", "Worker is running a job or already ran this job_id")
@@ -302,31 +181,6 @@ class Worker:
             self._thread = threading.Thread(target=run, name=f"task-{job.job_id}", daemon=True)
             self._thread.start()
 
-    def _handle_lock_cmd(self, msg: dict) -> None:
-        """inspect_hint_lock / clear_hint_lock: UI-driven recovery of an orphaned hint lock."""
-        from backend.service.key_job import _clean_abs, _JOB_ID_RE
-        from backend.service.task_job import KeyJobRejected, clear_hint_lock, inspect_hint_lock
-        rid = msg.get("request_id")
-        if not isinstance(rid, str) or not _JOB_ID_RE.match(rid):
-            return self._reject(None, "protocol", "request_id must match [A-Za-z0-9._-]{1,64}")
-        try:
-            root = _clean_abs(msg.get("clip_root"), "clip_root")
-        except KeyJobRejected as exc:
-            return self._reject(None, exc.code, exc.message, request_id=rid)
-        with self._state:
-            if self._thread is not None:  # a running job may be the lock's owner; never race it
-                return self._reject(None, "busy", "Worker is running a job; try again when it ends", request_id=rid)
-            if msg["cmd"] == "inspect_hint_lock":
-                return self.emit({"event": "hint_lock", "request_id": rid, "clip_root": root,
-                                  "lock": inspect_hint_lock(root, self.hello["host"])})
-            res = clear_hint_lock(root, msg.get("expect"), msg.get("reason"), rid, self.hello["host"])
-        if res["cleared"]:
-            self.emit({"event": "hint_lock_cleared", "request_id": rid, "clip_root": root,
-                       "recovered": res["recovered"], "warning": res.get("warning")})
-        else:
-            self.emit({"event": "hint_lock_refused", "request_id": rid, "clip_root": root,
-                       "code": res["code"], "message": res["message"], "lock": res["lock"]})
-
     def _stop_job(self) -> None:
         with self._state:
             t = self._thread
@@ -336,7 +190,7 @@ class Worker:
 
     def serve(self, stdin) -> int:
         """Read commands until EOF/shutdown. ``stdin`` is a binary line stream."""
-        self.emit({"event": "hello", "protocol": PROTOCOL, **self.hello})
+        self.emit({"event": "ready", "protocol": PROTOCOL, **self.ready})
         while True:
             try:
                 line = stdin.readline(MAX_LINE + 1)
@@ -359,13 +213,8 @@ class Worker:
             cmd = msg.get("cmd")
             if cmd == "key":
                 self._handle_key(msg)
-            elif cmd in ("inspect_hint_lock", "clear_hint_lock"):
-                self._handle_lock_cmd(msg)
             elif cmd == "task":
                 self._handle_task(msg)
-            elif cmd == "refresh":  # the app changed the installed models: answer with a fresh hello
-                self._refresh()
-                self.emit({"event": "hello", "protocol": PROTOCOL, **self.hello})
             elif cmd == "cancel":
                 with self._state:
                     if msg.get("job_id") == self._current:
@@ -478,7 +327,7 @@ def _protocol_stream():
     return os.fdopen(proto_fd, "w", encoding="utf-8", newline="\n", buffering=1)
 
 
-def main(argv=None, stdin=None, out=None, service=None, hello=None) -> int:
+def main(argv=None, stdin=None, out=None, service=None, ready=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="python -m backend.worker")
     ap.add_argument("--gpu", type=int, default=None)
@@ -497,6 +346,5 @@ def main(argv=None, stdin=None, out=None, service=None, hello=None) -> int:
         service.detect_device()  # after CUDA_VISIBLE_DEVICES; the default device is 'cpu' until detected
     if hasattr(out, "reconfigure"):  # Windows text mode would turn "\n" into "\r\n"
         out.reconfigure(newline="\n")
-    worker = Worker(service, out, hello if hello is not None else probe_hello(args.gpu),
-                    reprobe=None if hello is not None else lambda: probe_hello(args.gpu))
+    worker = Worker(service, out, ready if ready is not None else probe_ready(args.gpu))
     return worker.serve(stdin or (PolledStdin(0) if sys.platform == "win32" else sys.stdin.buffer))

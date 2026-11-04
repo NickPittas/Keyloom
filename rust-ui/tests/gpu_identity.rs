@@ -1,10 +1,10 @@
-//! The hello's optional GPU identity: old workers parse unchanged, a verified uuid is exposed, anything else is
+//! The ready acknowledgment's optional GPU identity: old workers parse unchanged, a verified uuid is exposed, anything else is
 //! an explained "unavailable" (never an index/name fallback). Pure parsing, no process.
-use ck::worker::{Gpu, Hello};
+use ck::worker::{Gpu, Ready};
 use serde_json::{json, Value};
 
-fn hello(gpu: Value) -> Hello {
-    serde_json::from_value(json!({"protocol":1,"worker_rev":"r","engine":"e","host":"h","gpu":gpu,"models":{},"capabilities":{}})).unwrap()
+fn hello(gpu: Value) -> Ready {
+    serde_json::from_value(json!({"protocol":1,"worker_rev":"r","engine":"e","host":"h","gpu":gpu})).unwrap()
 }
 
 #[test]

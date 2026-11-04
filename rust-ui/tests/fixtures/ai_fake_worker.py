@@ -28,10 +28,8 @@ def png():
 LATE = False
 cmds = queue.Queue()
 threading.Thread(target=lambda: ([cmds.put(json.loads(l)) for l in sys.stdin], cmds.put(None)), daemon=True).start()
-emit({"event": "hello", "protocol": 1, "worker_rev": "fake", "engine": "corridorkey-v2", "host": "fakehost",
-      "gpu": {"index": 0, "name": "Fake GPU", "vram_gb": 24.0},
-      "models": {"corridorkey_v2": {"path": "/m/ck", "bytes": 1, "sha256": "aa"}},
-      "capabilities": {"key": True, "generate_hint": False, "publish_modes": ["final"]}})
+emit({"event": "ready", "protocol": 1, "engine": "corridorkey-v2", "host": "fakehost",
+      "gpu": {"index": 0, "name": "Fake GPU", "vram_gb": 24.0}})
 
 
 def cancelled(jid, wait=0.0):

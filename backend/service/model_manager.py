@@ -153,12 +153,38 @@ class ModelManagerMixin:
 
         self._active_model = needed
 
+    def _supplied(self, *ids: str):
+        """The exact files the app supplied for these dependency ids, in order.
+
+        A missing id or file fails clearly: nothing is discovered, downloaded or substituted here."""
+        from backend.model_runtime import require_model_file
+        if not self._model_files:
+            raise FileNotFoundError("model file missing: the app supplied no model files for this job")
+        absent = [i for i in ids if i not in self._model_files]
+        if absent:
+            raise FileNotFoundError(f"model file missing: no path supplied for {', '.join(absent)}")
+        return tuple(str(require_model_file(self._model_files[i])) for i in ids)
+
+    def _drop_if_other_files(self, attr: str, files) -> None:
+        """Release a loaded model that was built from other files than this job supplies."""
+        obj = getattr(self, attr)
+        if obj is not None and self._loaded_files.get(attr, files) != files:  # unrecorded (injected) = keep
+            self._safe_offload(obj)
+            setattr(self, attr, None)
+        self._loaded_files[attr] = files
+
     def _get_v2_engine(self, on_status=None):
         """Lazy-load the single CorridorKey 2.0 engine. Caller holds ``_gpu_lock``."""
+        from backend.v2_paths import v2_asset_paths_from_files
+        paths = v2_asset_paths_from_files(self._model_files or {})
         self._ensure_model(_ActiveModel.INFERENCE, on_status=on_status)
+        if self._v2_engine is not None and self._v2_engine_files != paths:
+            self._v2_engine.unload()
+            self._v2_engine = None
         if self._v2_engine is None:
             from backend.corridorkey_v2 import CorridorKeyV2Engine
-            self._v2_engine = CorridorKeyV2Engine(device=self._device)
+            self._v2_engine = CorridorKeyV2Engine(asset_paths=paths, device=self._device)
+            self._v2_engine_files = paths
         try:
             self._v2_engine.load(on_status)
         except BaseException:
@@ -169,7 +195,9 @@ class ModelManagerMixin:
 
     def _get_gvm(self):
         """Lazy-load the GVM processor."""
+        files = self._supplied("gvm")
         self._ensure_model(_ActiveModel.GVM)
+        self._drop_if_other_files("_gvm_processor", files)
 
         if self._gvm_processor is not None:
             return self._gvm_processor
@@ -177,7 +205,7 @@ class ModelManagerMixin:
         from gvm_core import GVMProcessor
         logger.info("Loading GVM processor...")
         t0 = time.monotonic()
-        self._gvm_processor = GVMProcessor(device=self._device)
+        self._gvm_processor = GVMProcessor(device=self._device, model_base=files[0])
         logger.info(f"GVM loaded in {time.monotonic() - t0:.1f}s")
         return self._gvm_processor
 
@@ -186,10 +214,13 @@ class ModelManagerMixin:
         *,
         on_progress: Callable[[int, int], None] | None = None,
         on_status: Callable[[str], None] | None = None,
+        artifact_id: str | None = None,
     ):
-        """Lazy-load the optional SAM2 tracker."""
+        """Lazy-load the optional SAM2 tracker; ``artifact_id`` names its checkpoint in the job's bindings."""
+        files = self._supplied(artifact_id)
         self._drop_stale_sam2_tracker()
         self._ensure_model(_ActiveModel.SAM2)
+        self._drop_if_other_files("_sam2_tracker", files)
 
         if self._sam2_tracker is not None:
             return self._sam2_tracker
@@ -204,6 +235,7 @@ class ModelManagerMixin:
             vos_optimized=False,
             offload_video_to_cpu=self._device.startswith("cuda"),
             offload_state_to_cpu=False,
+            checkpoint_path=files[0],
         )
         self._sam2_tracker_model_id = self._sam2_model_id
         if self._sam2_tracker is not None:
@@ -213,7 +245,9 @@ class ModelManagerMixin:
 
     def _get_videomama_pipeline(self):
         """Lazy-load the VideoMaMa inference pipeline."""
+        files = self._supplied("videomama-svd", "videomama")
         self._ensure_model(_ActiveModel.VIDEOMAMA)
+        self._drop_if_other_files("_videomama_pipeline", files)
 
         if self._videomama_pipeline is not None:
             return self._videomama_pipeline
@@ -222,13 +256,17 @@ class ModelManagerMixin:
         from VideoMaMaInferenceModule.inference import load_videomama_model
         logger.info("Loading VideoMaMa pipeline...")
         t0 = time.monotonic()
-        self._videomama_pipeline = load_videomama_model(device=self._device)
+        self._videomama_pipeline = load_videomama_model(
+            base_model_path=files[0], unet_checkpoint_path=files[1],
+            device=self._device)
         logger.info(f"VideoMaMa loaded in {time.monotonic() - t0:.1f}s")
         return self._videomama_pipeline
 
     def _get_matanyone2(self):
         """Lazy-load the MatAnyone2 processor."""
+        files = self._supplied("matanyone2")
         self._ensure_model(_ActiveModel.MATANYONE2)
+        self._drop_if_other_files("_matanyone2_processor", files)
 
         if self._matanyone2_processor is not None:
             return self._matanyone2_processor
@@ -236,13 +274,18 @@ class ModelManagerMixin:
         MatAnyone2Processor = _import_matanyone2_processor_class()
         logger.info("Loading MatAnyone2 processor...")
         t0 = time.monotonic()
-        self._matanyone2_processor = MatAnyone2Processor(device=self._device)
+        self._matanyone2_processor = MatAnyone2Processor(device=self._device, ckpt_path=files[0])
         logger.info(f"MatAnyone2 loaded in {time.monotonic() - t0:.1f}s")
         return self._matanyone2_processor
 
     def _get_birefnet(self, usage: str = "Matting", on_status=None):
         """Lazy-load the BiRefNet processor for a given model variant."""
+        from backend.model_variants import BIREFNET_MODELS
+        if usage not in BIREFNET_MODELS:
+            raise ValueError(f"Unknown BiRefNet model {usage!r}. Available: {list(BIREFNET_MODELS)}")
+        files = self._supplied(f"birefnet-{BIREFNET_MODELS[usage]}")
         self._ensure_model(_ActiveModel.BIREFNET, on_status=on_status)
+        self._drop_if_other_files("_birefnet_processor", files)
 
         # If already loaded with the same usage, reuse
         if (self._birefnet_processor is not None
@@ -258,7 +301,7 @@ class ModelManagerMixin:
         logger.info(f"Loading BiRefNet ({usage})...")
         t0 = time.monotonic()
         self._birefnet_processor = BiRefNetProcessor(
-            device=self._device, usage=usage,
+            device=self._device, usage=usage, model_path=files[0],
         )
         # Trigger actual model download/load now so VRAM is claimed
         self._birefnet_processor._ensure_loaded(on_status=on_status)

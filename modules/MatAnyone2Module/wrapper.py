@@ -36,12 +36,13 @@ def _candidate_checkpoint_dirs(*, roots=None) -> list[str]:
 
 
 def _ensure_checkpoint(ckpt_path: str | None = None) -> str:
-    """Validate an explicit checkpoint; managed loads retain a lease in the processor."""
+    """Validate the checkpoint file the app supplied."""
     if ckpt_path is None:
-        raise ValueError("managed MatAnyone2 loads must keep their ModelArtifactLease")
-    path = Path(ckpt_path).expanduser()
+        raise ValueError("MatAnyone2 ckpt_path was not supplied: the app sends the exact model file")
+    from backend.model_runtime import require_model_file
+    path = require_model_file(ckpt_path)
     if not path.is_file() or path.stat().st_size == 0:
-        raise FileNotFoundError(f"Explicit MatAnyone2 checkpoint is missing or empty: {path}")
+        raise FileNotFoundError(f"model file missing: {path} (empty or not a file)")
     return str(path)
 
 
@@ -86,13 +87,7 @@ class MatAnyone2Processor:
         if module_dir not in sys.path:
             sys.path.insert(0, module_dir)
 
-        lease = None
-        if self._ckpt_path is None:
-            from backend.model_runtime import acquire_model_artifact
-            lease = acquire_model_artifact("matanyone2")
-            ckpt_path = str(lease.path)
-        else:
-            ckpt_path = _ensure_checkpoint(self._ckpt_path)
+        ckpt_path = _ensure_checkpoint(self._ckpt_path)
 
         t0 = time.monotonic()
         try:
@@ -106,14 +101,11 @@ class MatAnyone2Processor:
             self._model = get_matanyone2_model(ckpt_path, device=self._device)
             self._processor = InferenceCore(self._model, cfg=self._model.cfg)
         except Exception as exc:
-            if lease is not None:
-                lease.close()
             raise RuntimeError(
                 f"MatAnyone2 checkpoint or runtime dependencies are incomplete at {ckpt_path}. "
                 "Repair the model/runtime installation; inference does not fetch missing files. "
                 f"Details: {exc}"
             ) from exc
-        self._model_asset_lease = lease
 
         # Override max_internal_size so we don't process at full 4K resolution.
         # Alpha hints are guides — they get resized during CorridorKey inference anyway.

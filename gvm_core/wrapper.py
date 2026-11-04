@@ -67,32 +67,17 @@ class GVMProcessor:
 
         # Defaults must follow the provisioner's catalog root; explicit local
         # model roots remain supported for existing callers.
-        from backend.model_runtime import acquire_model_artifact, validate_local_model_path
-
-        lease = None
-        if lora_base is not None and not osp.isdir(lora_base):
-            raise FileNotFoundError(f"Explicit GVM LoRA directory is missing: {lora_base}")
+        from backend.model_runtime import require_model_file, validate_local_model_path
 
         if model_base is None:
-            if unet_base is not None:
-                unet_base = str(validate_local_model_path(
-                    "gvm", unet_base, components=("unet",)
-                ))
-            lease = acquire_model_artifact(
-                "gvm", exclude_components=("unet",) if unet_base is not None else ()
-            )
-            model_base = str(lease.path)
-        else:
-            model_base = str(validate_local_model_path(
-                "gvm",
-                model_base,
-                components=("vae", "scheduler") if unet_base is not None else None,
-            ))
-
-        if unet_base is not None and model_base is not None and lease is None:
-            unet_base = str(validate_local_model_path(
-                "gvm", unet_base, components=("unet",)
-            ))
+            raise ValueError("GVM model_base was not supplied: the app sends the exact model folder")
+        for supplied in (model_base, unet_base, lora_base):
+            if supplied is not None:
+                require_model_file(supplied)
+        model_base = str(validate_local_model_path(
+            "gvm", model_base, components=("vae", "scheduler") if unet_base is not None else None))
+        if unet_base is not None:
+            unet_base = str(validate_local_model_path("gvm", unet_base, components=("unet",)))
 
         self.model_base = model_base
         self.unet_base = unet_base
@@ -119,8 +104,6 @@ class GVMProcessor:
                 local_files_only=True,
             )
         except Exception as exc:
-            if lease is not None:
-                lease.close()
             raise RuntimeError(
                 f"GVM local model assets or runtime dependencies are incomplete at {model_base}. "
                 f"Repair the model/runtime installation; inference does not fetch missing files. "
@@ -140,11 +123,7 @@ class GVMProcessor:
                 self.unet.set_attn_processor(AttnProcessor())
                 self.vae.set_attn_processor(AttnProcessor())
         except Exception:
-            if lease is not None:
-                lease.close()
             raise
-
-        self._model_asset_lease = lease
 
         logger.info("Models loaded.")
 

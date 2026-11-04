@@ -16,4 +16,6 @@ bash tools/virtual-display-test.sh /usr/bin/timeout 30 target/release/corridorke
 
 These wrappers isolate display sockets, D-Bus, network, input devices and temporary files using bubblewrap. The virtual wrapper starts its own Xvfb and uses software Vulkan. Never bypass a failed wrapper or reconnect it to the host display/session bus. Mock native file pickers for automated interaction tests; never search for buttons by sweeping coordinates.
 
+Live tests (real worker/GPU/models): see `tests/LIVE.md` — one test per command, 60 s (`bash rust-ui/tools/live-test.sh <test_name>`).
+
 Builds and source inspection can run normally. Tests write only temporary fixtures and build artifacts, never existing project data or real user preferences. Virtual-display tests do not establish live Hyprland drag-and-drop compatibility or hardware playback performance.

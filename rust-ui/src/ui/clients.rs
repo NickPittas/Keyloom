@@ -3,7 +3,7 @@
 //! `Automatic`. Nothing here is invented: a machine that has not answered shows "not started".
 use super::viewer::{DIM, WARN};
 use crate::remote::Action;
-use crate::scheduler::{Placement, TargetStatus, TargetView, Trust};
+use crate::scheduler::{Placement, TargetStatus, TargetView};
 use crate::settings::Settings;
 use crate::ui::ai::AiUi;
 use eframe::egui::{self, Color32, RichText, Ui};
@@ -37,16 +37,6 @@ fn state_text(t: &TargetView) -> (&'static str, Color32) {
     }
 }
 
-fn trust_text(t: &TargetView) -> &'static str {
-    match t.trust {
-        Trust::Unknown => "verifying",
-        Trust::Reference => "reference",
-        Trust::Matches => "matches local",
-        Trust::Mismatch => "DIFFERS from local",
-        Trust::Unverified => "unverifiable",
-    }
-}
-
 /// Availability and setup only. Dispatch, progress and load live in the Batch queue. One table holds every client:
 /// this computer's local render client, then each network PC's row with its own connect and assignment controls.
 pub fn ui(
@@ -65,7 +55,6 @@ pub fn ui(
     let mut acts = vec![];
     ui.horizontal(|ui| {
         ui.heading("Clients");
-        if ui.button("Check workers").clicked() { ai.probe_workers(); }
     });
     ui.add_space(8.0);
     let targets = ai.scheduler().targets();
@@ -90,7 +79,7 @@ pub fn ui(
                         acts.extend(net.local_status(ui, s, sp));
                     }
                 });
-                let gpu = t.hello.as_ref().and_then(|h| h.gpu.as_ref()).map(|g| format!("{} · {:.0} GB", g.name, g.vram_gb)).unwrap_or_else(|| "Not reported".into());
+                let gpu = t.ready.as_ref().and_then(|h| h.gpu.as_ref()).map(|g| format!("{} · {:.0} GB", g.name, g.vram_gb)).unwrap_or_else(|| "Not reported".into());
                 ui.label(gpu);
                 if i == 0 {
                     acts.extend(net.local_controls(ui, s, sp));
@@ -98,9 +87,8 @@ pub fn ui(
                     for _ in 0..5 { ui.label(""); }
                 }
                 egui::CollapsingHeader::new("Details").id_salt(("availability", &t.id)).show(ui, |ui| {
-                    ui.label(format!("Model identity: {}", trust_text(t)));
-                    if let Some(h) = &t.hello {
-                        let mut ready: Vec<_> = h.capabilities.tasks.iter().filter(|(_, ready)| **ready).map(|(kind, _)| kind.as_str()).collect();
+                    if let Some(c) = ai.local_caps() {
+                        let mut ready: Vec<_> = c.tasks.iter().filter(|(_, ready)| **ready).map(|(kind, _)| kind.as_str()).collect();
                         ready.sort_unstable();
                         ui.add(egui::Label::new(ready.join(", ")).wrap());
                     }

@@ -166,26 +166,26 @@ def test_peek_other_errors_are_oserror_with_winerror(err):
 # -------- serve() integration
 
 def test_serve_treats_a_stdin_oserror_as_eof_and_cancels(tmp_path):
-    from tests.test_worker_protocol import HELLO, Sink
+    from tests.test_worker_protocol import READY, Sink
     out = Sink()
-    worker = w.Worker(object(), out, HELLO)
+    worker = w.Worker(object(), out, READY)
 
     class Broken:
         def readline(self, n):
             raise OSError(None, "handle invalid", None, 6)
     assert worker.serve(Broken()) == 0
-    assert [e["event"] for e in out.events()] == ["hello"]
+    assert [e["event"] for e in out.events()] == ["ready"]
 
 
 def test_main_uses_polled_stdin_only_on_windows(monkeypatch):
     seen = {}
     monkeypatch.setattr(w.Worker, "serve", lambda self, stdin: seen.setdefault("stdin", stdin) and 0)
     monkeypatch.setattr(w, "PolledStdin", lambda fd: ("polled", fd))
-    from tests.test_worker_protocol import HELLO, Sink
+    from tests.test_worker_protocol import READY, Sink
     monkeypatch.setattr(sys, "platform", "win32")
-    w.main([], out=Sink(), service=object(), hello=HELLO)
+    w.main([], out=Sink(), service=object(), ready=READY)
     assert seen["stdin"] == ("polled", 0)
     seen.clear()
     monkeypatch.setattr(sys, "platform", "linux")
-    w.main([], out=Sink(), service=object(), hello=HELLO)
+    w.main([], out=Sink(), service=object(), ready=READY)
     assert seen["stdin"] is sys.stdin.buffer

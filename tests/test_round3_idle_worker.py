@@ -106,40 +106,16 @@ def test_a_held_lease_really_blocks_an_installer(tmp_path):
     held.close()
 
 
-def _stale_session(svc, now_ready):
-    from tests.test_worker_protocol import HELLO
-    stale = {**HELLO, "capabilities": {**HELLO["capabilities"], "key": False}}
-    probes = []
-
-    def reprobe():
-        probes.append(1)
-        return {"models": HELLO["models"], "capabilities": {**HELLO["capabilities"], "key": now_ready}}
-
-    s = Session(svc, hello=stale)
-    s.worker._reprobe = reprobe
-    return s, probes
-
-
-def test_refresh_command_re_reads_the_models_and_says_hello_again(svc):
-    s, probes = _stale_session(svc, True)
-    s.sink.wait(lambda e: e["event"] == "hello")
+def test_refresh_is_gone_the_worker_has_no_model_state_to_refresh(svc):
+    s = Session(svc)
+    s.sink.wait(lambda e: e["event"] == "ready")
     s.send({"v": 1, "cmd": "refresh"})
-    fresh = s.sink.wait(lambda e: e["event"] == "hello" and e["capabilities"]["key"] is True)
-    assert fresh["models"]["corridorkey_v2"] and probes == [1]
+    assert s.sink.wait(lambda e: e["event"] == "rejected")["code"] == "protocol"
     s.eof()
 
 
-def test_a_job_for_a_model_installed_after_start_runs_without_a_restart(svc, env):
-    s, probes = _stale_session(svc, True)
+def test_a_job_runs_on_the_files_it_carries_without_any_probe(svc, env):
+    s = Session(svc)  # models installed after the worker started need no restart and no re-read
     s.key(env.job())
-    done = s.sink.wait(lambda e: e["event"] == "done")
-    assert done["outcome"] == "complete" and probes == [1]
-    s.eof()
-
-
-def test_a_job_for_a_model_still_missing_is_rejected_after_one_re_read(svc, env):
-    s, probes = _stale_session(svc, False)
-    s.key(env.job())
-    assert s.sink.wait(lambda e: e["event"] == "rejected")["code"] == "invalid"
-    assert probes == [1]
+    assert s.sink.wait(lambda e: e["event"] == "done")["outcome"] == "complete"
     s.eof()

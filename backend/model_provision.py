@@ -524,8 +524,12 @@ class ProvisionManager:
         status = self.checker.status(ids)
         for item in status["artifacts"]:
             self.emit({"event": "status", **item})
-        ok = (all(item["ready"] for item in status["artifacts"]) if targets
-              else status["summary"]["ready_required"])
+        required = {a.id for a in self.catalog.artifacts.values() if a.required_profile}
+        # Present = every file at its location with the catalog size. Hashes are never part of a check.
+        ok = all(item["present"] for item in status["artifacts"] if targets or item["artifact"] in required)
+        # The app's one readiness snapshot (same roots, same stat-only checker: no hashing, no second source).
+        from backend.app_models import AppModels
+        self.emit({"event": "snapshot", **AppModels(roots=self.roots, catalog=self.catalog).document()})
         self.emit({"event": "op-done", "op": "check", "ok": ok,
                    "summary": status["summary"]})
         return status

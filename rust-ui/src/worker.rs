@@ -1,10 +1,10 @@
 //! Worker protocol v1 over stdio (`ai-implementation-brief.md` §3, §7): versioned events, a persistent
 //! local worker process per target and the
 //! identity gate. Bounded line reader: a malformed or oversized line is a fatal `Msg::Protocol`.
-use crate::jobs::{KeyJob, Require};
+use crate::jobs::KeyJob;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -48,30 +48,10 @@ impl Gpu {
         }
     }
 }
+/// The worker's transport-only acknowledgment: protocol and start success, plus the device it opened. It carries no
+/// models and no capabilities (the app owns model state and sends exact files with every job).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct ModelId {
-    pub path: String,
-    pub bytes: u64,
-    #[serde(default)]
-    pub sha256: Option<String>,
-}
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct Capabilities {
-    pub key: bool,
-    pub publish_modes: Vec<String>,
-    /// Key job modes the worker supports (`new`, `resume`, `replace`). Empty = an older worker: new/resume only.
-    pub key_modes: Vec<String>,
-    /// Per task kind (`TaskKind::wire`): truthful readiness of that route on this worker.
-    pub tasks: BTreeMap<String, bool>,
-    /// Installed (verified) BiRefNet display variants and SAM tracker model ids.
-    pub birefnet_variants: Vec<String>,
-    pub sam_models: Vec<String>,
-    /// Why a family is unavailable (`gpu`, `ffmpeg`, `models`): shown, never guessed.
-    pub task_unavailable: BTreeMap<String, String>,
-}
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Hello {
+pub struct Ready {
     pub protocol: u32,
     pub engine: String,
     pub host: String,
@@ -79,9 +59,6 @@ pub struct Hello {
     #[serde(default)]
     pub platform: Option<String>,
     pub gpu: Option<Gpu>,
-    pub models: BTreeMap<String, ModelId>,
-    #[serde(default)]
-    pub capabilities: Capabilities,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -119,7 +96,7 @@ pub struct Done {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
-    Hello(Hello),
+    Ready(Ready),
     Accepted {
         job_id: String,
     },
@@ -128,31 +105,6 @@ pub enum Event {
         job_id: Option<String>,
         code: String,
         message: String,
-        /// Set when the rejected command was a hint-lock request.
-        #[serde(default)]
-        request_id: Option<String>,
-    },
-    /// Answer to `inspect_hint_lock`: `lock` is the worker's facts (or null = no lock).
-    HintLock {
-        request_id: String,
-        clip_root: String,
-        lock: Option<Value>,
-    },
-    HintLockCleared {
-        request_id: String,
-        clip_root: String,
-        #[serde(default)]
-        recovered: Vec<String>,
-        #[serde(default)]
-        warning: Option<String>,
-    },
-    HintLockRefused {
-        request_id: String,
-        clip_root: String,
-        code: String,
-        message: String,
-        #[serde(default)]
-        lock: Option<Value>,
     },
     Status {
         job_id: String,
@@ -194,10 +146,7 @@ pub enum Event {
 impl Event {
     pub fn job_id(&self) -> Option<&str> {
         match self {
-            Event::Hello(_)
-            | Event::HintLock { .. }
-            | Event::HintLockCleared { .. }
-            | Event::HintLockRefused { .. } => None,
+            Event::Ready(_) => None,
             Event::Rejected { job_id, .. } => job_id.as_deref(),
             Event::Accepted { job_id }
             | Event::Status { job_id, .. }
@@ -221,8 +170,8 @@ pub fn parse_line(line: &str) -> Result<Event, String> {
     serde_json::from_value(v).map_err(|e| format!("bad event: {e}"))
 }
 
-/// `inspect_hint_lock` / `clear_hint_lock`: ownership-safe recovery of an orphaned hint lock, done by the
-/// worker (exact job/host/pid, liveness proof, `.prev` restore). Never unlinked from the UI side.
+/// Hint-lock recovery requests. The app runs them through its one-shot helper (`backend/hint_lock_cli.py`), never the
+/// render worker; the writer checks (exact job/host/pid, liveness proof, `.prev` restore) stay in that helper.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LockCmd {
     Inspect {
@@ -244,27 +193,40 @@ pub struct LockReq {
     pub cmd: LockCmd,
 }
 
+/// What the app tells a worker. Model jobs carry the exact model files (`model_files`) taken from the app's snapshot.
 pub enum Cmd<'a> {
-    Lock(&'a LockReq),
-    Key(&'a KeyJob),
-    Task(&'a crate::tasks::TaskJob),
+    Key(&'a KeyJob, &'a crate::models::ModelFiles),
+    Task(&'a crate::tasks::TaskJob, &'a crate::models::ModelFiles),
     Cancel(&'a str),
-    /// Idle worker: re-read what is installed and say `hello` again (no restart).
-    Refresh,
     Shutdown,
 }
+
+fn with_files(job: &impl Serialize, files: &crate::models::ModelFiles) -> Value {
+    let mut v = serde_json::to_value(job).unwrap_or(Value::Null);
+    if let (Some(o), false) = (v.as_object_mut(), files.is_empty()) {
+        o.insert("model_files".into(), json!(files));
+    }
+    v
+}
+
+impl LockReq {
+    /// The helper's JSON request.
+    pub fn helper_request(&self) -> String {
+        match &self.cmd {
+            LockCmd::Inspect { clip_root } => json!({"cmd":"inspect","request_id":self.request_id,"clip_root":clip_root}),
+            LockCmd::Clear { clip_root, job_id, host, pid, reason } => json!({"cmd":"clear","request_id":self.request_id,"clip_root":clip_root,
+                "expect":{"job_id":job_id,"host":host,"pid":pid},"reason":reason}),
+        }
+        .to_string()
+    }
+}
+
 impl Cmd<'_> {
     pub fn line(&self) -> String {
         match self {
-            Cmd::Key(j) => json!({"v":1,"cmd":"key","job":j}),
-            Cmd::Lock(r) => match &r.cmd {
-                LockCmd::Inspect { clip_root } => json!({"v":1,"cmd":"inspect_hint_lock","request_id":r.request_id,"clip_root":clip_root}),
-                LockCmd::Clear { clip_root, job_id, host, pid, reason } => json!({"v":1,"cmd":"clear_hint_lock","request_id":r.request_id,"clip_root":clip_root,
-                    "expect":{"job_id":job_id,"host":host,"pid":pid},"reason":reason}),
-            },
-            Cmd::Task(j) => json!({"v":1,"cmd":"task","job":j}),
+            Cmd::Key(j, f) => json!({"v":1,"cmd":"key","job":with_files(*j, f)}),
+            Cmd::Task(j, f) => json!({"v":1,"cmd":"task","job":with_files(*j, f)}),
             Cmd::Cancel(id) => json!({"v":1,"cmd":"cancel","job_id":id}),
-            Cmd::Refresh => json!({"v":1,"cmd":"refresh"}),
             Cmd::Shutdown => json!({"v":1,"cmd":"shutdown"}),
         }
         .to_string()
@@ -282,40 +244,6 @@ impl Cmd<'_> {
             }
             o
         })
-    }
-}
-
-impl Hello {
-    /// Identity gate for one job. `Ok(true)` = accepted but **unverified**: a model digest is missing on
-    /// one side and name/size are never treated as equivalence, so the UI must say so.
-    pub fn check_identity(&self, req: &Require, allow_unverified: bool) -> Result<bool, String> {
-        if self.protocol != req.protocol {
-            return Err(format!(
-                "worker speaks protocol {}, job needs {}",
-                self.protocol, req.protocol
-            ));
-        }
-        let mut unverified = false;
-        for (name, want) in &req.models {
-            let have = self
-                .models
-                .get(name)
-                .ok_or_else(|| format!("worker has no model {name}"))?;
-            match (want, &have.sha256) {
-                (Some(w), Some(h)) if w.eq_ignore_ascii_case(h) => {}
-                (Some(_), Some(_)) => {
-                    return Err(format!("model {name}: digest differs from the reference"))
-                }
-                (Some(_), None) => return Err(format!("model {name}: worker reports no digest")),
-                (None, _) if allow_unverified => unverified = true,
-                (None, _) => {
-                    return Err(format!(
-                        "model {name}: no reference digest, identity unverifiable"
-                    ))
-                }
-            }
-        }
-        Ok(unverified)
     }
 }
 
@@ -357,6 +285,15 @@ impl Target {
     }
 
     fn command(&self) -> Result<Command, String> {
+        self.python_module(&["backend.worker", "--gpu", &self.gpu.to_string()])
+    }
+
+    /// `python -m <module> <arg>` with this target's interpreter and checkout, for the app's one-shot helpers.
+    pub fn one_shot(&self, module: &str, arg: &str) -> Result<Command, String> {
+        self.python_module(&[module, arg])
+    }
+
+    fn python_module(&self, args: &[&str]) -> Result<Command, String> {
         self.validate()?;
         Ok(match &self.kind {
             TargetKind::Local { repo, python } => {
@@ -366,7 +303,8 @@ impl Target {
                         .clone()
                         .unwrap_or_else(|| crate::import::python(repo)),
                 );
-                c.args(["-m", "backend.worker", "--gpu", &self.gpu.to_string()])
+                c.arg("-m")
+                    .args(args)
                     .current_dir(repo)
                     .env("PYTHONUNBUFFERED", "1");
                 // Installed runs: descriptor handed over, foreign Python variables removed.

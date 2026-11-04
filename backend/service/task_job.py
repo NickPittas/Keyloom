@@ -35,7 +35,7 @@ from ..frame_encoding import EncodingError, FrameEncoder
 from ..frame_io import imread_unicode
 from ..natural_sort import natural_sort_key
 from .key_job import (
-    MANIFEST_NAME, PROTOCOL, KeyJobRejected, PublishError, _clean_abs, _freeze, _inside,
+    MANIFEST_NAME, PROTOCOL, KeyJobRejected, PublishError, _check_model_files, _clean_abs, _freeze, _inside,
     _check_source_map, _is_int, _JOB_ID_RE, _KeyClip, _boot_id, _proc_start_ticks, _link_noclobber, _make_dirs_or_reject, _rm, _rollback,
     _thaw, _write_tmp,
 )
@@ -55,10 +55,11 @@ KINDS = (*HINT_DST, "sam_preview", "export_video", "prepare_source", "import_hin
 RANGED = (*HINT_DST, "sam_preview", "export_video")  # prepare_source/import_hint are whole-movie
 _JOB_KEYS = ("job_id", "kind", "clip_id", "clip_root", "range", "params", "staging_dir",
              "publish_dir", "require")
+_OPTIONAL_KEYS = ("model_files",)
 _RANGE_KEYS = ("in_point", "out_point", "in_stem", "out_stem")
 SAM_IDS = {"small": "facebook/sam2.1-hiera-small", "base_plus": "facebook/sam2.1-hiera-base-plus",
            "large": "facebook/sam2.1-hiera-large"}
-SAM_ARTIFACTS = {"small": "sam2-small", "base_plus": "sam2-base-plus", "large": "sam2-large"}
+from backend.model_variants import SAM_ARTIFACTS  # noqa: E402  (shared with the app-side snapshot)
 CONTAINERS = {"mp4": ".mp4", "mov_prores4444": ".mov", "webm_alpha": ".webm"}
 # container -> (default codec, allowed codecs); the legacy container names can host every codec of their file type
 CODECS = {"mp4": ("h264", ("h264", "hevc")), "mov_prores4444": ("prores4444", ("prores422", "prores4444")),
@@ -89,8 +90,8 @@ def _closure_ready(by_id: dict, aid: str, seen=None) -> bool:
 
 
 def birefnet_repos() -> dict:
-    """Display variant -> repo suffix (imports the wrapper, hence torch; only call where torch is OK)."""
-    from modules.BiRefNetModule.wrapper import BIREFNET_MODELS
+    """Display variant -> repo suffix."""
+    from backend.model_variants import BIREFNET_MODELS
     return dict(BIREFNET_MODELS)
 
 
@@ -292,6 +293,7 @@ class TaskJob:
     publish_dir: str | None
     require: MappingProxyType
     source_map: tuple = ()  # receiver-resolved external source (see key_job._check_source_map)
+    model_files: MappingProxyType | None = None  # exact model files the app resolved (see key_job._check_model_files)
 
     @property
     def frames(self) -> int:
@@ -302,7 +304,7 @@ class TaskJob:
         """Strict structural parse; touches no disk. Raises TaskRejected."""
         if not isinstance(d, dict):
             _rej("protocol", "job must be an object")
-        missing, unknown = set(_JOB_KEYS) - set(d), set(d) - set(_JOB_KEYS)
+        missing, unknown = set(_JOB_KEYS) - set(d), set(d) - set(_JOB_KEYS) - set(_OPTIONAL_KEYS)
         if missing or unknown:
             _rej("protocol", f"job keys: missing {sorted(missing)}, unknown {sorted(unknown)}")
         d = _thaw(d)
@@ -339,7 +341,7 @@ class TaskJob:
                 or not all(isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in req["models"].items())):
             _rej("invalid", f"require must be {{protocol: {PROTOCOL}, models: {{name: sha|null}}}}")
         return cls(d["job_id"], kind, d["clip_id"], root, None if r is None else _freeze(r),
-                   _freeze(params), stg, pub, _freeze(req), smap)
+                   _freeze(params), stg, pub, _freeze(req), smap, _check_model_files(d.get("model_files")))
 
 
 # ---------------------------------------------------------------------- disk helpers
@@ -1226,7 +1228,8 @@ def _sam(svc, job: TaskJob, ctx: _Ctx, view, ev, cancel, prog, status, warn):
             box=tuple(pr["boxes"][0]) if pr["boxes"] else None, mask=pr["mask"]))
     local.sort(key=lambda f: f.frame_index)
     with svc._gpu_lock:
-        tracker = svc._get_sam2_tracker(on_progress=lambda c, t: prog(view.name, c, t), on_status=status)
+        tracker = svc._get_sam2_tracker(on_progress=lambda c, t: prog(view.name, c, t), on_status=status,
+                                        artifact_id=SAM_ARTIFACTS[p["tracker_model"]])
         chk()
         from .prepared_frames import prepare
         # Prepared JPEGs live in the CLIP's staging folder (the parent of this job's folder, so a
@@ -1586,6 +1589,7 @@ def run_task_job(service, job: TaskJob, *, emit: Callable[[dict], None], cancel:
     """Run one task. Raises TaskRejected (nothing written, no ``accepted``) or returns ``done``."""
     ev = lambda event, **kw: emit({"event": event, "job_id": job.job_id, **kw})  # noqa: E731
     ctx = _preflight(job)
+    service._model_files = dict(job.model_files or {})  # one job at a time per worker
     done = {"event": "done", "job_id": job.job_id, "kind": job.kind, "outcome": "failed", "message": None,
             "error_kind": None, "result": None}
     try:

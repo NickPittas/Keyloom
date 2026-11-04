@@ -680,7 +680,7 @@ fn existing_key_result_is_delivered_without_a_new_key_in_sequence_and_never_over
     app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
 
     // Opening a clip no longer starts the worker, so there is no capability reply to wait for: let the clip load.
-    pump(&ctx, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && a.ai().local_worker_unstarted() && !a.deliver_rects().is_empty());
+    pump(&ctx, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && !a.deliver_rects().is_empty());
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, None);
     pump(&ctx, &mut app, "export button drawn", |a| a.deliver_rects().iter().any(|r| r.0 == "export_existing"));
     let r = app.deliver_rects().iter().find(|r| r.0 == "export_existing").unwrap().1;

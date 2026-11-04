@@ -42,6 +42,12 @@ def fixture():
     return root
 
 
+def _key_files():
+    """The exact files the app would send (read-only resolution through the app-side resolver)."""
+    from backend.app_models import AppModels
+    return {k: str(v) for k, v in AppModels().resolve("key").paths.items()}
+
+
 def job(root, jid, out, mode="new", hint="none", comp="piz"):
     outs = {o: [str(out / o.capitalize() / f"{s}.exr") for s in STEMS[A:B + 1]] for o in ("fg", "matte")}
     cfg = dict(fg_enabled=True, fg_format="exr", matte_enabled=True, matte_format="exr",
@@ -54,7 +60,8 @@ def job(root, jid, out, mode="new", hint="none", comp="piz"):
             "range": {"in_point": A, "out_point": B, "in_stem": STEMS[A], "out_stem": STEMS[B]},
             "params": params, "output_config": cfg, "hint_keyframes_abs": None, "outputs": outs,
             "manifest_dir": str(out), "mode": mode, "publish": "final", "path_map": [],
-            "require": {"protocol": 1, "models": {"corridorkey_v2": None}}}
+            "require": {"protocol": 1, "models": {"corridorkey_v2": None}},
+            "model_files": _key_files()}
 
 
 class Worker:
@@ -122,12 +129,10 @@ def main():
     root = fixture()
     report = {}
     w = Worker()
-    hello = w.read()
-    assert hello["event"] == "hello", hello
-    report["hello_s"] = hello["_t"]
-    report["hello"] = {k: hello[k] for k in ("host", "platform", "gpu", "capabilities", "worker_rev")}
-    report["hello"]["model"] = hello["models"]
-    assert hello["capabilities"]["key"], "key not available: " + "".join(w.err[-10:])
+    ready = w.read()
+    assert ready["event"] == "ready", ready
+    report["ready_s"] = ready["_t"]
+    report["ready"] = {k: ready[k] for k in ("host", "platform", "gpu", "worker_rev")}
 
     # 1. fresh job, no hint
     out1 = TMP / "out" / "v001"

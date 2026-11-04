@@ -453,7 +453,7 @@ fn a_clip_client_is_saved_in_the_clip_and_the_queued_job_uses_it() {
     // A job queued for that clip carries the clip's client, even though the session default stays Automatic.
     app.ai_mut().scheduler_mut().probe(Some("l0"));
     pump(&ctx, &mut app, "local ready", |a| {
-        a.ai().scheduler().reference().is_some()
+        a.ai().scheduler().targets().iter().any(|t| t.ready.is_some())
     });
     confirm_batch(&ctx, &mut app);
     let snap = app.ai().scheduler().snapshot();
@@ -1423,7 +1423,7 @@ fn queued_params(app: &App) -> Vec<Value> {
 fn start_local(ctx: &egui::Context, app: &mut App) {
     app.ai_mut().scheduler_mut().probe(Some("l0"));
     pump(ctx, app, "local ready", |a| {
-        a.ai().scheduler().reference().is_some()
+        a.ai().scheduler().targets().iter().any(|t| t.ready.is_some())
     });
 }
 

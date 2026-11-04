@@ -33,8 +33,8 @@ class ModelInUseError(RuntimeError):
 @dataclass(frozen=True)
 class Dependency:
     id: str
-    state: str  # missing | verify_needed | verified | error
-    detail: str | None  # dependency_problem text: what to Verify/Repair
+    state: str  # present | missing
+    detail: str | None  # dependency_problem text: what is missing
     note: str | None  # visible cache failure (unreadable record), if any
     path: Path | None  # what the loader receives (file or directory)
     files: tuple[Path, ...]  # every required file, exact
@@ -48,13 +48,11 @@ class ModelBinding:
 
     @property
     def ready(self) -> bool:
-        return all(d.state == "verified" for d in self.dependencies)
+        return all(d.state == "present" for d in self.dependencies)
 
     @property
     def state(self) -> str:
-        """Worst dependency state: error > missing > verify_needed > verified."""
-        states = {d.state for d in self.dependencies}
-        return next(s for s in ("error", "missing", "verify_needed", "verified") if s in states)
+        return "present" if self.ready else "missing"
 
     @property
     def files(self) -> tuple[Path, ...]:
@@ -120,7 +118,25 @@ class AppModels:
 
     def snapshot(self) -> dict:
         """One readiness snapshot for Models, buttons, scheduler and API: {task: {variant id: binding json}}."""
-        return {t: {v: self.resolve(t, v).to_json() for v in self.variants(t)} for t in TASKS}
+        out = {}
+        for t in TASKS:
+            try:
+                out[t] = {v: self.resolve(t, v).to_json() for v in self.variants(t)}
+            except CatalogError:  # a task the catalog does not offer is simply not available
+                out[t] = {}
+        return out
+
+    def document(self) -> dict:
+        """What the app keeps as THE readiness snapshot: bindings per task and variant, the display-name tables
+        that map a job's variant to its catalog id, and whether FFmpeg is usable. No hashing."""
+        from backend.model_variants import BIREFNET_MODELS, SAM_ARTIFACTS
+        try:
+            from backend.ffmpeg_tools.discovery import validate_ffmpeg_install
+            ffmpeg = bool(validate_ffmpeg_install(require_probe=False).ok)
+        except Exception:  # noqa: BLE001 - unknown means "not ready", never a crash
+            ffmpeg = False
+        return {"models": self.snapshot(), "ffmpeg": ffmpeg, "sam2": dict(SAM_ARTIFACTS),
+                "birefnet": {name: f"birefnet-{repo}" for name, repo in BIREFNET_MODELS.items()}}
 
     def refresh(self) -> None:
         """Re-read the saved verification record after another process changed it (Install/Repair)."""
@@ -133,7 +149,7 @@ class AppModels:
 
     # -- active-job protection -------------------------------------------
     def start_job(self, job_id: str, task: str, variant: str | None = None) -> ModelBinding:
-        """Protect the files before dispatch; raises if not Verified or being changed. Release with finish_job."""
+        """Protect the files before dispatch; raises if a file is missing or being changed. Release with finish_job."""
         binding = self.resolve(task, variant)
         closure = frozenset(self.catalog.closure([binding.artifact_id]))
         with self._lock:

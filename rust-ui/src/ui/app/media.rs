@@ -315,7 +315,7 @@ impl App {
         let mut cancel = false;
         theme::section(ui, "Media preparation", |ui| {
             if let Some(m) = self.media.movie.as_ref().filter(|m| m.folder == clip.folder) {
-                let ready = prepare_source_worker_ok(self.ai.local_worker_unstarted(), self.ai.local_caps().as_ref().is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false)))
+                let ready = prepare_source_worker_ok(self.ai.models_unknown(), self.ai.local_caps().as_ref().is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false)))
                     && (matches!(m.verdict, Some(Ok(true))) || matches!(m.verdict, Some(Ok(false))) && m.confirm);
                 extract = theme::accent(ui, ready, |ui| ui.add(egui::Button::new("Extract frames from this movie"))).clicked();
             }

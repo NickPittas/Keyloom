@@ -445,6 +445,43 @@ fn tool_allowed(p: Producer, sam_overlay: bool, tool: Tool) -> bool {
 }
 
 #[cfg(test)]
+mod missing_model_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_selected_producer_with_a_missing_model_is_named() {
+        let mk = |gvm: bool, ffmpeg: bool| {
+            let b = |ready: bool, id: &str| serde_json::json!({"ready": ready, "state": if ready {"present"} else {"missing"}, "paths": {id: "/m"}});
+            crate::models::Snapshot::from_json(&serde_json::json!({
+                "models": {"key": {"k": b(true, "k")}, "gvm": {"gvm": b(gvm, "gvm")}, "videomama": {"videomama": b(true, "videomama")},
+                           "matanyone2": {"matanyone2": b(true, "matanyone2")}, "sam2": {"sam2-base-plus": b(true, "sam2-base-plus")},
+                           "birefnet": {"birefnet-BiRefNet-matting": b(true, "birefnet-BiRefNet-matting")}},
+                "ffmpeg": ffmpeg, "sam2": {"base_plus": "sam2-base-plus"}, "birefnet": {"Matting": "birefnet-BiRefNet-matting"}})).unwrap()
+        };
+        let snap = |gvm: bool| mk(gvm, true);
+        let mut cfg = HintCfg::default();
+        cfg.guide = Producer::Gvm;
+        let caps = Some(snap(false).capabilities(true));
+        assert_eq!(missing_guide(&caps, false, &cfg).as_deref(), Some("GVM"));
+        assert_eq!(reason(&caps, "GVM"), "GVM is missing — download it on the Models page");
+        assert_eq!(missing_final(&caps, false, Final::Videomama), None, "VideoMaMa is installed");
+        // No FFmpeg on this PC: the hover still names the missing model, and FFmpeg only when asked about FFmpeg.
+        let caps_ff = Some(mk(false, false).capabilities(true));
+        assert_eq!(reason(&caps_ff, "GVM"), "GVM is missing — download it on the Models page");
+        assert_eq!(reason(&caps_ff, "FFmpeg"), "FFmpeg not installed or not usable");
+        cfg.guide = Producer::Birefnet;
+        assert_eq!(missing_guide(&caps, false, &cfg), None, "BiRefNet Matting is installed");
+        cfg.birefnet_variant = "Portrait".into();
+        assert_eq!(missing_guide(&caps, false, &cfg).as_deref(), Some("BiRefNet Portrait"));
+        cfg.guide = Producer::Chroma;
+        assert_eq!(missing_guide(&caps, false, &cfg), None, "Chroma needs no model");
+        cfg.guide = Producer::Gvm;
+        assert_eq!(missing_guide(&caps, true, &cfg), None, "not read yet");
+        assert_eq!(missing_guide(&Some(snap(false).capabilities(false)), false, &cfg), None, "no GPU is its own reason");
+    }
+}
+
+#[cfg(test)]
 mod tool_tests {
     use super::*;
     #[test]
@@ -1567,12 +1604,17 @@ impl App {
     pub(super) fn hint_actions(&mut self, ui: &mut Ui, clip: &Clip) {
         let local = self.ai.local_caps();
         // A worker that was never started reports nothing: actions queue and the worker starts with the job.
-        let lazy = local.is_none() && self.ai.local_worker_unstarted();
+        let lazy = local.is_none() && self.ai.models_unknown();
         let ready = |k: TaskKind| lazy || local.as_ref().is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false));
         let busy = self.ai.task_busy(&clip.folder);
         let (guide, fin) = (self.hint.cfg.guide, self.hint.cfg.finish);
-        let guide_ready = ready(guide.task());
-        let fin_ready = fin.task().map_or(fin == Final::Direct && guide_ready, ready);
+        // A producer whose model the app's check found missing is off, with the model named; the rest keeps working.
+        let miss_guide = missing_guide(&local, lazy, &self.hint.cfg);
+        let miss_fin = missing_final(&local, lazy, fin);
+        let guide_ready = ready(guide.task()) && miss_guide.is_none();
+        let fin_ready = fin.task().map_or(fin == Final::Direct && guide_ready, ready) && miss_fin.is_none();
+        let guide_name = miss_guide.clone().unwrap_or_else(|| guide.label().to_string());
+        let fin_name = miss_fin.clone().unwrap_or_else(|| fin.label().to_string());
         let bypass = self.hint.cfg.bypass;
         let why = |b: bool, what: &str| -> String {
             if bypass {
@@ -1587,7 +1629,7 @@ impl App {
         };
         let sam = guide == Producer::Sam;
         let tool_on = sam && self.viewer.as_ref().is_some_and(|v| v.ann.tool != Tool::None);
-        let sam_ok = ready(TaskKind::SamPreview) && ready(TaskKind::SamTrack);
+        let sam_ok = ready(TaskKind::SamPreview) && ready(TaskKind::SamTrack) && miss_guide.is_none();
         let annotated = self
             .viewer
             .as_ref()
@@ -1615,7 +1657,7 @@ impl App {
                         if sam {
                             // SAM preview/tracking belong to SAM only: Track is the pre-matte run, so no second Generate.
                             let tip = if !sam_ok {
-                                reason(&local, "SAM")
+                                reason(&local, &guide_name)
                             } else if busy {
                                 "A hint job is running for this clip".into()
                             } else if !annotated {
@@ -1624,11 +1666,11 @@ impl App {
                                 "Run SAM on this frame's prompts (nothing is written)".into()
                             };
                             preview = this.action_button(ui, "Preview frame", Node::PreMatte, false, sam_ok && annotated && !busy).on_hover_text(tip.clone()).on_disabled_hover_text(tip).clicked();
-                            let tip = if bypass { "Bypass is on".to_string() } else if busy { "A hint job is running for this clip".to_string() } else { reason(&local, "SAM") };
+                            let tip = if bypass { "Bypass is on".to_string() } else if busy { "A hint job is running for this clip".to_string() } else { reason(&local, &guide_name) };
                             if this.action_button(ui, "Track prompts", Node::PreMatte, true, sam_ok && !busy && !bypass).on_hover_text("Track the saved prompts over In/Out into the pre-matte").on_disabled_hover_text(tip).clicked() {
                                 run = Some(Run::Guide);
                             }
-                        } else if this.action_button(ui, "Generate pre-matte", Node::PreMatte, true, on).on_hover_text("Run the Pre-matte over In/Out into VideoMamaMaskHint").on_disabled_hover_text(why(guide_ready, guide.label())).clicked() {
+                        } else if this.action_button(ui, "Generate pre-matte", Node::PreMatte, true, on).on_hover_text("Run the Pre-matte over In/Out into VideoMamaMaskHint").on_disabled_hover_text(why(guide_ready, &guide_name)).clicked() {
                             run = Some(Run::Guide);
                         }
                     });
@@ -1642,7 +1684,7 @@ impl App {
             let stale = this.stale(&ctx, Node::Hint);
             card(ui, &format!("Hint · {}", fin.label()), stale, |ui| {
                 let on = fin_ready && !busy && !bypass && fin != Final::Import && gate.is_none();
-                let tip = if fin == Final::Import { "Imported alpha has nothing to generate: choose a movie in Properties".to_string() } else if let Some(g) = &gate { g.clone() } else { why(fin_ready, fin.label()) };
+                let tip = if fin == Final::Import { "Imported alpha has nothing to generate: choose a movie in Properties".to_string() } else if let Some(g) = &gate { g.clone() } else { why(fin_ready, &fin_name) };
                 ui.horizontal_wrapped(|ui| {
                     if this.action_button(ui, "Generate hint", Node::Hint, true, on).on_hover_text(if fin.needs_guide() { "Refine the Pre-matte over In/Out into AlphaHint (needs the Pre-matte first)" } else { "Publish the Pre-matte straight into AlphaHint" }).on_disabled_hover_text(tip.clone()).clicked() {
                         run = Some(Run::Hint);
@@ -1786,7 +1828,7 @@ impl App {
 
     pub(super) fn hint_props(&mut self, ui: &mut Ui, clip: &Clip) {
         let caps = self.ai.local_caps();
-        let lazy = caps.is_none() && self.ai.local_worker_unstarted();
+        let lazy = caps.is_none() && self.ai.models_unknown();
         let cfg_before = self.hint.cfg.clone();
         let ctx = ui.ctx().clone();
         let (pre_stale, hint_stale) = (self.stale(&ctx, Node::PreMatte), self.stale(&ctx, Node::Hint));
@@ -1804,6 +1846,9 @@ impl App {
                         }
                     });
                 });
+                if let Some(m) = missing_guide(&caps, lazy, &self.hint.cfg) {
+                    ui.label(RichText::new(format!("{m} is missing — download it on the Models page")).color(theme::FOCUS).size(12.0));
+                }
                 match self.hint.cfg.guide {
                     Producer::Birefnet => {
                         let have = caps.as_ref().map(|c| c.birefnet_variants.clone()).unwrap_or_default();
@@ -1841,6 +1886,9 @@ impl App {
                         }
                     });
                 });
+                if let Some(m) = missing_final(&caps, lazy, self.hint.cfg.finish) {
+                    ui.label(RichText::new(format!("{m} is missing — download it on the Models page")).color(theme::FOCUS).size(12.0));
+                }
                 match self.hint.cfg.finish {
                     Final::Videomama => {
                         let mut c = self.hint.cfg.videomama_chunk as i32;
@@ -2199,7 +2247,7 @@ impl App {
     /// Deliver action when any output is a video: Key, then every video output (core queues the chain).
     pub(super) fn deliver_action(&mut self, ui: &mut Ui, clip: &Clip) {
         self.sync_deliveries(clip);
-        let ffmpeg = self.ai.local_worker_unstarted() || self.ai.local_caps().is_some_and(|c| c.tasks.get("export_video").copied().unwrap_or(false));
+        let ffmpeg = self.ai.models_unknown() || self.ai.local_caps().is_some_and(|c| c.tasks.get("export_video").copied().unwrap_or(false));
         let busy = self.ai.task_busy(&clip.folder);
         let range = self.ai_open_range();
         let pl = self.capture_pipeline(clip);
@@ -2331,18 +2379,40 @@ fn codec_text(c: &crate::presets::VideoCodec) -> String {
     format!("{n} ({})", if c.alpha { "alpha" } else { "no alpha" })
 }
 
-fn reason(caps: &Option<crate::worker::Capabilities>, what: &str) -> String {
-    match caps {
-        None => "The worker is starting or unavailable: see Settings > Clients.".into(),
-        Some(c) if c.task_unavailable.is_empty() => {
-            format!("{what} is not installed or verified on the worker: see Settings > Models.")
-        }
-        Some(c) => c
-            .task_unavailable
-            .values()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("; "),
+/// The model the selected Pre-matte producer needs when the app's one check found it missing ("GVM", "BiRefNet
+/// Matting", "SAM Base+"). `None` = nothing missing, nothing read yet, or the GPU is the reason instead.
+pub(super) fn missing_guide(caps: &Option<crate::models::Capabilities>, lazy: bool, cfg: &HintCfg) -> Option<String> {
+    let c = caps.as_ref().filter(|c| !lazy && !c.task_unavailable.contains_key("gpu"))?;
+    match cfg.guide {
+        Producer::Gvm => (!c.tasks.get(TaskKind::Gvm.wire()).copied().unwrap_or(false)).then(|| "GVM".into()),
+        Producer::Birefnet => (!c.birefnet_variants.contains(&cfg.birefnet_variant)).then(|| format!("BiRefNet {}", cfg.birefnet_variant)),
+        Producer::Sam => (!c.sam_models.contains(&cfg.sam_model))
+            .then(|| format!("SAM {}", SAM_MODELS.iter().find(|m| m.0 == cfg.sam_model).map_or(cfg.sam_model.as_str(), |m| m.1))),
+        Producer::Chroma => None,
+    }
+}
+
+/// Same for the Final hint method (VideoMaMa, MatAnyone2).
+fn missing_final(caps: &Option<crate::models::Capabilities>, lazy: bool, fin: Final) -> Option<String> {
+    let c = caps.as_ref().filter(|c| !lazy && !c.task_unavailable.contains_key("gpu"))?;
+    let (kind, name) = match fin {
+        Final::Videomama => (TaskKind::Videomama, "VideoMaMa"),
+        Final::Matanyone2 => (TaskKind::Matanyone2, "MatAnyone2"),
+        _ => return None,
+    };
+    (!c.tasks.get(kind.wire()).copied().unwrap_or(false)).then(|| name.to_string())
+}
+
+fn reason(caps: &Option<crate::models::Capabilities>, what: &str) -> String {
+    let Some(c) = caps else {
+        return "The worker is starting or unavailable: see Settings > Clients.".into();
+    };
+    // A missing model comes first: FFmpeg is named only when FFmpeg is what the caller asks about.
+    let blockers: Vec<&str> = c.task_unavailable.iter().filter(|(k, _)| what == "FFmpeg" || k.as_str() != "ffmpeg").map(|(_, v)| v.as_str()).collect();
+    if blockers.is_empty() {
+        format!("{what} is missing — download it on the Models page")
+    } else {
+        blockers.join("; ")
     }
 }
 

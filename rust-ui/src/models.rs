@@ -368,9 +368,255 @@ pub fn strings(v: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
+// ---- the app's readiness snapshot ---------------------------------------------------------------------------------
+//
+// ONE record of what is installed, kept by the app: the Models page, the action buttons and the scheduler all read it.
+// It is replaced when a check ends (startup, Check/Verify, root change, finished Install/Repair/Delete) and never hashes.
+// The executor learns nothing from it: every job carries the exact files (`model_files`) taken from here.
+
+/// Exact model files for one job: dependency id -> absolute path (what `backend/app_models.py` resolved).
+pub type ModelFiles = std::collections::BTreeMap<String, String>;
+
+/// What the UI may offer, derived from the snapshot (and the GPU the workers report). Never asks a worker.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Capabilities {
+    pub key: bool,
+    /// Per task kind (`TaskKind::wire`).
+    pub tasks: std::collections::BTreeMap<String, bool>,
+    /// Ready BiRefNet display variants and SAM tracker model ids.
+    pub birefnet_variants: Vec<String>,
+    pub sam_models: Vec<String>,
+    /// Why a family is unavailable (`gpu`, `ffmpeg`, `models`): shown, never guessed.
+    pub task_unavailable: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Binding {
+    pub ready: bool,
+    /// present | missing (a size mismatch is missing); never a hash verdict
+    pub state: String,
+    pub paths: ModelFiles,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Snapshot {
+    /// task -> variant catalog id -> binding.
+    models: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Binding>>,
+    ffmpeg: bool,
+    /// SAM tracker model (`small`...) / BiRefNet display variant -> catalog id.
+    sam2: std::collections::BTreeMap<String, String>,
+    birefnet: std::collections::BTreeMap<String, String>,
+}
+
+impl Snapshot {
+    /// The helper's `snapshot` event (`AppModels.document()`); `None` when it is not that shape.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let map = |k: &str| -> std::collections::BTreeMap<String, String> {
+            v.get(k)
+                .and_then(Value::as_object)
+                .map(|o| o.iter().filter_map(|(a, b)| Some((a.clone(), b.as_str()?.to_owned()))).collect())
+                .unwrap_or_default()
+        };
+        let mut models = std::collections::BTreeMap::new();
+        for (task, variants) in v.get("models")?.as_object()? {
+            let mut by_id = std::collections::BTreeMap::new();
+            for (id, b) in variants.as_object()? {
+                let paths = b.get("paths").and_then(Value::as_object)?;
+                by_id.insert(
+                    id.clone(),
+                    Binding {
+                        ready: b.get("ready").and_then(Value::as_bool)?,
+                        state: string(b, "state").unwrap_or_default(),
+                        paths: paths.iter().filter_map(|(k, p)| Some((k.clone(), p.as_str()?.to_owned()))).collect(),
+                    },
+                );
+            }
+            models.insert(task.clone(), by_id);
+        }
+        Some(Self { models, ffmpeg: flag(v, "ffmpeg").unwrap_or(false), sam2: map("sam2"), birefnet: map("birefnet") })
+    }
+
+    fn binding(&self, task: &str, id: &str) -> Option<&Binding> {
+        self.models.get(task)?.get(id)
+    }
+
+    /// Default variant of a one-entry task (`key`, `gvm`, `matanyone2`, `videomama`).
+    fn fixed(&self, task: &str) -> Option<&Binding> {
+        self.models.get(task)?.values().next()
+    }
+
+    fn files_of(b: Option<&Binding>, what: &str) -> Result<ModelFiles, String> {
+        match b {
+            Some(b) if b.ready && !b.paths.is_empty() => Ok(b.paths.clone()),
+            Some(_) => Err(format!("{what} is missing — download it on the Models page")),
+            None => Err(format!("{what} is not in the model catalog")),
+        }
+    }
+
+    /// The exact files a Key job needs, or why it cannot start.
+    pub fn key_files(&self) -> Result<ModelFiles, String> {
+        Self::files_of(self.fixed("key"), "The Key model")
+    }
+
+    /// The exact files a task needs (empty for kinds that load no model), or why it cannot start.
+    pub fn task_files(&self, kind: crate::tasks::TaskKind, params: &Value) -> Result<ModelFiles, String> {
+        use crate::tasks::TaskKind as K;
+        let want = |k: &str| params.get(k).and_then(Value::as_str).unwrap_or_default();
+        match kind {
+            K::Gvm => Self::files_of(self.fixed("gvm"), "GVM"),
+            K::Matanyone2 => Self::files_of(self.fixed("matanyone2"), "MatAnyone2"),
+            K::Videomama => Self::files_of(self.fixed("videomama"), "VideoMaMa"),
+            K::Birefnet => {
+                let id = self.birefnet.get(want("variant")).ok_or_else(|| format!("BiRefNet variant {:?} is unknown", want("variant")))?;
+                Self::files_of(self.binding("birefnet", id), &format!("BiRefNet {}", want("variant")))
+            }
+            K::SamPreview | K::SamTrack => {
+                let id = self.sam2.get(want("tracker_model")).ok_or_else(|| format!("SAM model {:?} is unknown", want("tracker_model")))?;
+                Self::files_of(self.binding("sam2", id), &format!("SAM {}", want("tracker_model")))
+            }
+            K::Chroma | K::PrematteHint | K::ExportVideo | K::PrepareSource | K::ImportHint => Ok(ModelFiles::new()),
+        }
+    }
+
+    /// What the UI may offer. `gpu` = a usable GPU is (or may still turn out to be) present.
+    pub fn capabilities(&self, gpu: bool) -> Capabilities {
+        use crate::tasks::TaskKind as K;
+        let empty = serde_json::json!({});
+        let mut c = Capabilities { key: gpu && self.key_files().is_ok(), ..Default::default() };
+        for (name, id) in &self.birefnet {
+            if self.binding("birefnet", id).is_some_and(|b| b.ready) {
+                c.birefnet_variants.push(name.clone());
+            }
+        }
+        for (name, id) in &self.sam2 {
+            if self.binding("sam2", id).is_some_and(|b| b.ready) {
+                c.sam_models.push(name.clone());
+            }
+        }
+        for k in K::ALL {
+            let needs_gpu = matches!(k, K::Gvm | K::Birefnet | K::SamPreview | K::SamTrack | K::Matanyone2 | K::Videomama);
+            let params = match k {
+                K::Birefnet => c.birefnet_variants.first().map_or(empty.clone(), |v| serde_json::json!({"variant": v})),
+                K::SamPreview | K::SamTrack => c.sam_models.first().map_or(empty.clone(), |v| serde_json::json!({"tracker_model": v})),
+                _ => empty.clone(),
+            };
+            let models_ok = match k {
+                K::Birefnet => !c.birefnet_variants.is_empty(),
+                K::SamPreview | K::SamTrack => !c.sam_models.is_empty(),
+                K::ExportVideo | K::PrepareSource | K::ImportHint => self.ffmpeg,
+                _ => self.task_files(k, &params).is_ok(),
+            };
+            c.tasks.insert(k.wire().into(), models_ok && (gpu || !needs_gpu));
+        }
+        if !gpu {
+            c.task_unavailable.insert("gpu".into(), "no usable CUDA GPU".into());
+        }
+        if !self.ffmpeg {
+            c.task_unavailable.insert("ffmpeg".into(), "FFmpeg not installed or not usable".into());
+        }
+        c
+    }
+
+    /// Every model ready with made-up paths: for tests that need jobs to dispatch.
+    #[doc(hidden)]
+    pub fn for_tests() -> Self {
+        let b = |id: &str| Binding { ready: true, state: "present".into(), paths: [(id.to_owned(), format!("/models/{id}"))].into() };
+        let one = |task: &str, ids: &[&str]| (task.to_owned(), ids.iter().map(|i| (i.to_string(), b(i))).collect());
+        Self {
+            models: [
+                one("key", &["corridorkey-weights"]),
+                one("gvm", &["gvm"]),
+                one("matanyone2", &["matanyone2"]),
+                one("videomama", &["videomama"]),
+                one("sam2", &["sam2-small", "sam2-base-plus", "sam2-large"]),
+                one("birefnet", &["birefnet-BiRefNet-matting"]),
+            ]
+            .into(),
+            ffmpeg: true,
+            sam2: [("small", "sam2-small"), ("base_plus", "sam2-base-plus"), ("large", "sam2-large")]
+                .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                .into(),
+            birefnet: [("Matting".to_owned(), "birefnet-BiRefNet-matting".to_owned())].into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doc(ready: bool) -> Value {
+        let b = |id: &str| serde_json::json!({"ready": ready, "state": if ready { "present" } else { "missing" }, "paths": {id: format!("/m/{id}")}});
+        serde_json::json!({
+            "models": {"key": {"corridorkey-weights": b("corridorkey-weights")}, "gvm": {"gvm": b("gvm")},
+                       "matanyone2": {"matanyone2": b("matanyone2")}, "videomama": {"videomama": b("videomama")},
+                       "sam2": {"sam2-small": b("sam2-small")}, "birefnet": {"birefnet-BiRefNet-matting": b("birefnet-BiRefNet-matting")}},
+            "ffmpeg": true, "sam2": {"small": "sam2-small"}, "birefnet": {"Matting": "birefnet-BiRefNet-matting"}})
+    }
+
+    #[test]
+    fn the_snapshot_maps_every_task_and_variant_to_its_exact_files() {
+        use crate::tasks::TaskKind as K;
+        let s = Snapshot::from_json(&doc(true)).unwrap();
+        let p = |k: &str, v: &str| serde_json::json!({k: v});
+        assert_eq!(s.key_files().unwrap()["corridorkey-weights"], "/m/corridorkey-weights");
+        assert_eq!(s.task_files(K::Gvm, &Value::Null).unwrap()["gvm"], "/m/gvm");
+        assert_eq!(s.task_files(K::Matanyone2, &Value::Null).unwrap()["matanyone2"], "/m/matanyone2");
+        assert_eq!(s.task_files(K::Videomama, &Value::Null).unwrap()["videomama"], "/m/videomama");
+        assert_eq!(s.task_files(K::SamTrack, &p("tracker_model", "small")).unwrap()["sam2-small"], "/m/sam2-small");
+        assert_eq!(s.task_files(K::SamPreview, &p("tracker_model", "small")).unwrap()["sam2-small"], "/m/sam2-small");
+        assert_eq!(s.task_files(K::Birefnet, &p("variant", "Matting")).unwrap()["birefnet-BiRefNet-matting"], "/m/birefnet-BiRefNet-matting");
+        assert!(s.task_files(K::Birefnet, &p("variant", "Nope")).is_err());
+        assert!(s.task_files(K::SamTrack, &p("tracker_model", "large")).is_err(), "a variant the snapshot does not know");
+        for k in [K::Chroma, K::PrematteHint, K::ExportVideo, K::PrepareSource, K::ImportHint] {
+            assert!(s.task_files(k, &Value::Null).unwrap().is_empty(), "{k:?} loads no model");
+        }
+    }
+
+    #[test]
+    fn a_missing_model_is_refused_with_the_apps_reason_and_buttons_follow() {
+        use crate::tasks::TaskKind as K;
+        let s = Snapshot::from_json(&doc(false)).unwrap();
+        let why = s.task_files(K::Gvm, &Value::Null).unwrap_err();
+        assert_eq!(why, "GVM is missing — download it on the Models page");
+        assert!(s.key_files().is_err());
+        let c = s.capabilities(true);
+        assert!(!c.key && !c.tasks["gvm"] && !c.tasks["birefnet"] && c.birefnet_variants.is_empty() && c.sam_models.is_empty());
+        assert!(c.tasks["chroma"] && c.tasks["prematte_hint"] && c.tasks["export_video"], "no model needed");
+        let ready = Snapshot::from_json(&doc(true)).unwrap().capabilities(true);
+        assert!(ready.key && ready.tasks["gvm"] && ready.tasks["sam_track"] && ready.birefnet_variants == ["Matting"]);
+        // No GPU: GPU routes are off with the reason, CPU/FFmpeg routes stay.
+        let nogpu = Snapshot::from_json(&doc(true)).unwrap().capabilities(false);
+        assert!(!nogpu.key && !nogpu.tasks["gvm"] && nogpu.tasks["export_video"] && nogpu.task_unavailable.contains_key("gpu"));
+    }
+
+    #[test]
+    fn key_runs_with_every_hint_model_missing_and_a_missing_gvm_disables_only_gvm() {
+        use crate::tasks::TaskKind as K;
+        let mut d = doc(true);
+        for t in ["gvm", "matanyone2", "videomama", "sam2", "birefnet"] {
+            for b in d["models"][t].as_object_mut().unwrap().values_mut() {
+                b["ready"] = false.into();
+                b["state"] = "missing".into();
+            }
+        }
+        let c = Snapshot::from_json(&d).unwrap().capabilities(true);
+        assert!(c.key && c.tasks["chroma"] && c.tasks["export_video"]);
+        assert!(!c.tasks["gvm"] && !c.tasks["matanyone2"] && !c.tasks["videomama"] && !c.tasks["sam_track"] && !c.tasks["birefnet"]);
+        let mut d = doc(true);
+        d["models"]["gvm"]["gvm"]["ready"] = false.into();
+        let s = Snapshot::from_json(&d).unwrap();
+        assert_eq!(s.task_files(K::Gvm, &Value::Null).unwrap_err(), "GVM is missing \u{2014} download it on the Models page");
+        let c = s.capabilities(true);
+        assert!(c.key && !c.tasks["gvm"] && c.tasks["matanyone2"] && c.tasks["videomama"] && c.tasks["sam_track"] && c.tasks["birefnet"]);
+    }
+
+    #[test]
+    fn a_malformed_snapshot_is_not_taken() {
+        assert!(Snapshot::from_json(&serde_json::json!({"models": 5})).is_none());
+        assert!(Snapshot::from_json(&serde_json::json!({"models": {"key": {"x": {"state": "missing"}}}})).is_none());
+    }
+
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("ck-models-{name}-{}", std::process::id()));
