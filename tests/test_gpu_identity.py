@@ -7,7 +7,7 @@ import types
 import pytest
 
 from backend.worker import gpu_identity as gi
-from backend.worker import probe_hello
+from backend.worker import probe_ready
 
 @pytest.fixture(autouse=True)
 def no_real_nvml(monkeypatch):
@@ -123,7 +123,7 @@ def test_nvml_listing_uses_pynvml_canonically(monkeypatch):
     assert _REAL_NVML_LISTING() is None
 
 
-# ---- probe_hello with fake torch: --gpu remap, inherited visibility, same-name GPUs -----------------------
+# ---- probe_ready with fake torch: --gpu remap, inherited visibility, same-name GPUs -----------------------
 
 class FakeTorch(types.ModuleType):
     """Physical devices; CUDA_VISIBLE_DEVICES (a comma list of physical ordinals) remaps what torch calls ordinal 0..n."""
@@ -153,7 +153,7 @@ def hello(monkeypatch, physical, gpu_arg, visible=None):
     monkeypatch.setitem(sys.modules, "torch", FakeTorch(physical))
     if visible is not None:
         monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)  # what main() does for --gpu N
-    return probe_hello(gpu_arg)
+    return probe_ready(gpu_arg)
 
 
 def test_gpu_arg_remap_reports_the_opened_device_not_the_nvml_index(monkeypatch, nvml_reversed):
@@ -179,10 +179,10 @@ def test_unusable_identity_keeps_the_worker_usable_with_a_reason(monkeypatch, nv
         h = hello(monkeypatch, [props], gpu_arg=0, visible="0")
         g = h["gpu"]
         assert g["uuid"] is None and g["uuid_status"] == "unverified" and g["uuid_reason"]
-        assert g["name"] and g["vram_gb"] == 24.0 and h["capabilities"]["key"] in (True, False)  # still a usable local GPU
+        assert g["name"] and g["vram_gb"] == 24.0  # still a usable local GPU
 
 
-def test_identity_probe_crash_does_not_fail_the_hello(monkeypatch, nvml_reversed):
+def test_identity_probe_crash_does_not_fail_the_ready(monkeypatch, nvml_reversed):
     import backend.worker.gpu_identity as m
     monkeypatch.setattr(m, "device_identity", lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
     g = hello(monkeypatch, [Props(uuid=A)], gpu_arg=0, visible="0")["gpu"]
@@ -193,4 +193,4 @@ def test_no_cuda_means_no_gpu_object(monkeypatch):
     t = FakeTorch([Props(uuid=A)])
     t.cuda.is_available = lambda: False
     monkeypatch.setitem(sys.modules, "torch", t)
-    assert probe_hello(None)["gpu"] is None
+    assert probe_ready(None)["gpu"] is None

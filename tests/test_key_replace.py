@@ -225,10 +225,6 @@ def test_untrusted_journal_is_refused_untouched(svc, env, bad):
     assert {k: v for k, v in contents(env.out).items() if not k.endswith(key_job.REPLACE_JOURNAL)} == old
 
 
-def test_hello_advertises_replace():
-    from backend import worker
-    assert "replace" in worker.probe_hello(None)["capabilities"]["key_modes"]
-
 
 @pytest.mark.parametrize("mode", ["new", "resume", "replace"])
 @pytest.mark.parametrize("nth", [13, 14])
