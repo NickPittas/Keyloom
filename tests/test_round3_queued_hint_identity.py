@@ -162,3 +162,56 @@ def test_a_hint_made_in_a_chain_records_what_key_read_and_resume_rechecks_it(svc
     cv2.imwrite(str(d / f"{STEMS[B]}.png"), np.full((4, 4), 3, np.uint8))  # re-rendered afterwards
     e = rejected(svc, env.job(params={"hint_mode": "full"}, mode="resume"))
     assert "hint changed" in str(e)
+
+
+# --- one render, two routes: the producer writing AlphaHint directly vs promoting its pre-matte ------------------
+CLEAN = {"grow": 0, "fill_holes": False, "feather": 0}
+SRC = {s: [10, i] for i, s in enumerate(S)}
+
+
+def _chroma_pair(tmp_path, hint_record, guide_value=10):
+    guide, hint = tmp_path / "VideoMamaMaskHint", tmp_path / "AlphaHint"
+    producer = {"kind": "chroma", "params": {"key_color": "green", "mask_cleanup": CLEAN}, "source": SRC}
+    _put(guide, S, guide_value, "g", producer)
+    _put(hint, S, 10, "h", hint_record(producer, guide))
+    return guide, hint
+
+
+def _promote(guide):
+    digests = task_job.certified_stems(str(guide))[S[0]]["digests"]
+    return {"kind": "prematte_hint", "params": {"mask_cleanup": CLEAN}, "source": SRC, "upstream": dict(digests)}
+
+
+def _plan_promotion(guide):
+    return {"kind": "prematte_hint", "params": {"mask_cleanup": CLEAN}, "source": SRC,
+            "upstream": dict(task_job.certified_stems(str(guide))[S[0]]["digests"]), "guide_folder": str(guide)}
+
+
+def test_a_direct_hint_is_reused_by_the_prematte_plan(tmp_path):
+    guide, hint = _chroma_pair(tmp_path, lambda producer, guide: producer)
+    assert hc.check(str(hint), S, {**_plan_promotion(guide), "guide_folder": None})[0] == hc.MISMATCH  # old rule
+    assert hc.check(str(hint), S, _plan_promotion(guide))[0] == hc.COMPATIBLE
+
+
+def test_a_prematte_hint_is_reused_by_the_direct_route(tmp_path):
+    guide, hint = _chroma_pair(tmp_path, lambda producer, guide: _promote(guide))
+    direct = {"kind": "chroma", "params": {"key_color": "green", "mask_cleanup": CLEAN}, "source": SRC,
+              "guide_folder": str(guide)}
+    assert hc.check(str(hint), S, direct)[0] == hc.COMPATIBLE
+    assert hc.check(str(hint), S, {**direct, "params": {"key_color": "blue", "mask_cleanup": CLEAN}})[0] == hc.MISMATCH
+    assert hc.check(str(hint), S, {**direct, "kind": "birefnet"})[0] == hc.MISMATCH
+
+
+def test_a_changed_prematte_frame_or_producer_still_asks(tmp_path):
+    guide, hint = _chroma_pair(tmp_path, lambda producer, guide: producer)
+    plan = _plan_promotion(guide)
+    assert hc.check(str(hint), S, {**plan, "params": {"mask_cleanup": {**CLEAN, "feather": 4}}})[0] == hc.MISMATCH
+    assert hc.check(str(hint), S, {**plan, "source": {**SRC, S[1]: [10, 99]}})[0] == hc.MISMATCH
+    assert cv2.imwrite(str(guide / f"{S[2]}.png"), np.full((4, 4), 200, np.uint8))  # pre-matte edited since
+    status, _ = hc.check(str(hint), S, plan)
+    assert status == hc.MISMATCH
+
+
+def test_a_hint_from_another_producer_than_the_prematte_still_asks(tmp_path):
+    guide, hint = _chroma_pair(tmp_path, lambda producer, guide: {**producer, "kind": "birefnet"})
+    assert hc.check(str(hint), S, _plan_promotion(guide))[0] == hc.MISMATCH

@@ -882,7 +882,7 @@ impl Page {
                 self.startup_error.is_some() || self.required_ready == Some(false);
             ui.label(
                 RichText::new(if error_or_missing { "Models need attention" } else if self.required_ready == Some(true) { "Models ready" } else { "Checking models…" }).size(12.0).color(if error_or_missing {
-                    BAD
+                    theme::error(ui)
                 } else {
                     Color32::from_rgb(150, 190, 150)
                 }),

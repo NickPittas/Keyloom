@@ -12,6 +12,7 @@ use crate::ui::ai::{card, fill_slider, pair, sig_of};
 use crate::ui::annotate::{self, Ann, Tool};
 use crate::workflow::new_id;
 use crate::shot_domains::{self, Domain, Field};
+use crate::ui::viewer::{MarkReq, Overlay};
 use eframe::egui::Sense;
 use std::path::Path;
 
@@ -21,9 +22,9 @@ pub struct State {
     cfg: HintCfg,
     ann: Annotations,
     undo: Vec<Annotations>,
-    /// Which generated mask is tinted over the Input frame.
-    overlay: Overlay,
     note: Option<String>,
+    /// The marked-frame choice could not be saved: new requests wait until it is (or is changed back).
+    marks_err: Option<String>,
     /// Picked companion movie waiting for its kind/channel to be confirmed.
     movie: Option<PathBuf>,
     movie_mask: bool,
@@ -421,14 +422,6 @@ fn prov_base(clip: &Clip, cur: &Snap) -> (Snap, Snap) {
     (pre, hint)
 }
 
-#[derive(Default, Clone, Copy, PartialEq)]
-enum Overlay {
-    #[default]
-    Off,
-    Guide,
-    Hint,
-}
-
 /// Tools the guide producer can use: SAM takes prompts, Chroma a screen colour, the others are automatic.
 fn tools_for(p: Producer) -> &'static [(Tool, &'static str, &'static str)] {
     match p {
@@ -445,12 +438,28 @@ fn tools_for(p: Producer) -> &'static [(Tool, &'static str, &'static str)] {
     }
 }
 
+/// A tool stays selected when the producer offers it; only SAM prompt tools also need the SAM overlay on
+/// (Chroma's colour pick must work with the overlay off, its chip is greyed out then).
+fn tool_allowed(p: Producer, sam_overlay: bool, tool: Tool) -> bool {
+    (sam_overlay || p != Producer::Sam) && tools_for(p).iter().any(|t| t.0 == tool)
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    #[test]
+    fn chroma_pick_survives_overlay_off_but_sam_tools_do_not() {
+        assert!(tool_allowed(Producer::Chroma, false, Tool::Pick));
+        assert!(!tool_allowed(Producer::Sam, false, Tool::FgPoint));
+        assert!(tool_allowed(Producer::Sam, true, Tool::FgPoint));
+        assert!(!tool_allowed(Producer::Chroma, true, Tool::FgPoint));
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Run {
     Guide,
     Hint,
-    GuideMarks,
-    HintMarks,
 }
 
 /// What a preview depends on: the frame, its prompts, the tracker model, mask cleanup and the colour reading.
@@ -624,6 +633,13 @@ impl App {
 
     /// Called once per frame: loads this clip's saved hint state, applies viewer edits and feeds the overlay.
     pub(super) fn hint_sync(&mut self) {
+        if let Some(r) = self.viewer.as_mut().and_then(|v| v.mark_req.take()) {
+            self.hint_marks(match r {
+                MarkReq::Mark => Some(true),
+                MarkReq::Unmark => Some(false),
+                MarkReq::Clear => None,
+            });
+        }
         let (Some(p), Some(i), Some(v)) = (self.project.as_ref(), self.open, self.viewer.as_mut())
         else {
             self.hint.folder = None;
@@ -631,7 +647,7 @@ impl App {
         };
         let clip = &p.clips[i];
         if self.tab != Tab::Hint
-            || !tools_for(self.hint.cfg.guide).iter().any(|t| t.0 == v.ann.tool)
+            || !tool_allowed(self.hint.cfg.guide, v.sam_overlay, v.ann.tool)
         {
             v.ann.tool = Tool::None;
         }
@@ -693,6 +709,7 @@ impl App {
             .iter()
             .filter_map(|k| src.get(*k).and_then(|s| v.index.index_of(s)))
             .collect();
+        v.marks.sort_unstable();
         let events = std::mem::take(&mut v.ann.events);
         if !events.is_empty() {
             let Some(stem) = stem.clone() else {
@@ -746,7 +763,11 @@ impl App {
             }
         }
         v.ann.holdout.clear();
-        let want = match self.hint.overlay {
+        // The SAM layer (prompts and preview) exists only while SAM is the pre-matte producer and its toggle is on.
+        let sam = self.hint.cfg.guide == Producer::Sam;
+        v.sam_available = sam;
+        let sam_on = sam && v.sam_overlay;
+        let want = match v.overlay {
             Overlay::Off => None,
             Overlay::Guide => Some((View::Guide, [40, 200, 255])),
             Overlay::Hint => Some((View::Hint, [255, 80, 200])),
@@ -759,9 +780,10 @@ impl App {
         });
         v.ann.overlay = stem
             .as_ref()
+            .filter(|_| sam_on)
             .and_then(|s| self.hint.ann.frames.get(s).cloned())
             .unwrap_or_default();
-        v.ann.preview = stem.as_ref().and_then(|s| {
+        v.ann.preview = stem.as_ref().filter(|_| sam_on).and_then(|s| {
             let sig = psig(&self.hint, s, v.linear);
             self.ai
                 .current_preview(&clip.folder, s, sig)
@@ -1044,7 +1066,7 @@ impl App {
         let names: Vec<String> = self.hint.route_ov.keys().cloned().collect();
         let label = Self::reset_label("these route fields", &self.hint.route_ov);
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(format!("Hint route, this shot's own (win over a Batch preset): {}", names.join(", "))).color(DIM).size(12.0));
+            ui.label(RichText::new(format!("Hint route, this shot's own (win over a Batch preset): {}", names.join(", "))).color(theme::text_dim(ui)).size(12.0));
             if ui.small_button(label).clicked() {
                 self.reset_route(clip);
             }
@@ -1230,14 +1252,9 @@ impl App {
 
     /// A processing button for `stage`: `primary` fills it with the accent; a stale stage gets the amber outline.
     pub(super) fn action_button(&self, ui: &mut Ui, label: &str, stage: Node, primary: bool, enabled: bool) -> egui::Response {
-        let b = if primary {
-            egui::Button::new(RichText::new(label).color(Color32::from_rgb(21, 36, 26))).fill(theme::ACCENT)
-        } else {
-            egui::Button::new(label).fill(theme::BUTTON)
-        };
-        let r = ui.add_enabled(enabled, b);
+        let r = if primary { theme::accent(ui, enabled, |ui| ui.add(egui::Button::new(label))) } else { ui.add_enabled(enabled, egui::Button::new(label)) };
         if let Some(p) = self.stale(ui.ctx(), stage) {
-            ui.painter().rect_stroke(r.rect.expand(1.0), 4.0, egui::Stroke::new(2.0 + p * 1.5, theme::FOCUS), egui::StrokeKind::Outside);
+            ui.painter().rect_stroke(r.rect.expand(1.0), 4.0, egui::Stroke::new(2.0 + p * 1.5, theme::warn(ui)), egui::StrokeKind::Outside);
         }
         r
     }
@@ -1265,6 +1282,9 @@ impl App {
         let (Some(clip), Ok(range)) = (self.open_clip_snapshot(), self.ai_open_range()) else {
             return self.hint_note("Open a clip with source frames first.");
         };
+        if let Some(e) = self.hint.marks_err.clone() {
+            return self.hint_note(format!("Marked-frame choice not saved: {e}. Fix that (or change the checkbox back) first."));
+        }
         let Some(stem) = self
             .viewer
             .as_ref()
@@ -1293,16 +1313,9 @@ impl App {
     }
 
     /// Queue a hint/pre-matte run from outside this page (the node graph's context menu), by node meaning:
-    /// `pre_matte` = the guide producer, otherwise the final hint (`marks` = only the marked frames).
-    pub(super) fn hint_run_from_graph(&mut self, pre_matte: bool, marks: bool) {
-        let what = if pre_matte {
-            if marks { Run::GuideMarks } else { Run::Guide }
-        } else if marks {
-            Run::HintMarks
-        } else {
-            Run::Hint
-        };
-        self.hint_run(what);
+    /// `pre_matte` = the guide producer, otherwise the final hint; the marked-frame checkboxes decide the frames.
+    pub(super) fn hint_run_from_graph(&mut self, pre_matte: bool) {
+        self.hint_run(if pre_matte { Run::Guide } else { Run::Hint });
     }
 
     /// Which hint step to queue.
@@ -1338,26 +1351,17 @@ impl App {
             .filter(|k| (range.0..=range.1).contains(k))
             .collect();
         let mut id = new_id;
+        let (pre_marks, hint_marks) = (self.hint.cfg.pre_on_marks(), self.hint.cfg.hint_on_marks());
         let (steps, label) = match what {
+            Run::Guide if pre_marks => (g.guide_marks(&marks, &mut id), "Pre-matte on marked frames"),
             Run::Guide => (g.guide(range, &mut id).map(|j| vec![j]), "Pre-matte"),
-            Run::Hint => (g.hint(range, false, &mut id), "Hint"),
-            Run::GuideMarks => (
-                marks
-                    .iter()
-                    .map(|k| g.guide((*k, *k), &mut id))
-                    .collect::<Result<Vec<_>, _>>()
-                    .and_then(|v| {
-                        if v.is_empty() {
-                            Err("no keyframe marks inside In/Out: mark frames first".into())
-                        } else {
-                            Ok(v)
-                        }
-                    }),
-                "Pre-matte on marked frames",
-            ),
-            Run::HintMarks => (g.keyframes(&marks, true, &mut id), "Hint on marked frames"),
+            Run::Hint if hint_marks => (g.hint_run(range, &marks, &mut id), "Hint on marked frames"),
+            Run::Hint => (g.hint_run(range, &marks, &mut id), "Hint"),
         };
-        let marks_only = matches!(what, Run::GuideMarks | Run::HintMarks);
+        let marks_only = match what {
+            Run::Guide => pre_marks,
+            Run::Hint => hint_marks,
+        };
         let before = self.ai.task_ids(&clip.folder);
         match steps.and_then(|s| self.ai.submit_chain(&clip, s, None)) {
             Ok(_) => {
@@ -1374,6 +1378,42 @@ impl App {
                 self.hint.note = Some(format!("{label} queued."));
             }
             Err(e) => self.hint_note(format!("Not queued: {e}")),
+        }
+    }
+
+    /// The marked-frame checkboxes changed. Turning marked hints on saves Key's consumption as keyframes, turning
+    /// them off saves full; the settings and the mode are written together (both or neither), and the Key draft
+    /// follows at once. A failed write puts the checkboxes back, keeps the reason visible and holds new requests
+    /// until a choice is saved. Never called by merely loading a clip.
+    fn set_marked(&mut self, clip: &Clip, pre: bool, hint: bool) {
+        let before = self.hint.cfg.clone();
+        let mut cfg = before.clone();
+        (cfg.marks_pre, cfg.marks_hint) = (pre, hint);
+        let (was, now) = (before.hint_on_marks(), cfg.hint_on_marks());
+        self.hint.cfg = cfg.clone();
+        if was == now {
+            self.hint.marks_err = None; // plain settings: saved with the others
+            return;
+        }
+        let Some(pr) = self.project.as_ref() else { return };
+        let cur = self.ai.draft(clip, pr, self.settings.saved()).params.hint_mode.clone();
+        let from_preset = clip.native.get("hint_mode_src").and_then(Value::as_str) == Some("preset");
+        let mode = if now { "keyframes" } else { "full" };
+        match crate::persist::save_marked_hints(clip, &cfg, mode, (&cur, from_preset)) {
+            Ok(()) => {
+                self.hint.route_saved = cfg;
+                self.hint.marks_err = None;
+                self.hint.note = None;
+                if let Some(pr) = self.project.as_ref() {
+                    self.ai.follow_marked_mode(clip, pr, self.settings.saved(), mode);
+                }
+                self.refresh_after_save(&clip.folder);
+            }
+            Err(e) => {
+                self.hint.cfg = before;
+                self.hint_note(format!("Marked-frame choice not saved: {e}"));
+                self.hint.marks_err = Some(e);
+            }
         }
     }
 
@@ -1561,6 +1601,11 @@ impl App {
         let import_ok = ready(TaskKind::ImportHint) && src.is_some();
         let ctx = ui.ctx().clone();
         let (mut run, mut preview, mut extract, mut import, mut cancel_import) = (None, false, false, false, false);
+        let marks_in: Vec<usize> = match self.ai_open_range() {
+            Ok(r) => clip.keyframes.iter().copied().filter(|k| (r.0..=r.1).contains(k)).collect(),
+            Err(_) => vec![],
+        };
+        let gate = self.ai_open_range().ok().and_then(|r| hints::in_frame_gate(clip, &self.hint.cfg, r, &marks_in).err());
         let this = &*self;
         ui.columns(2, |cols| {
             let ui = &mut cols[0];
@@ -1588,47 +1633,68 @@ impl App {
                         } else if this.action_button(ui, "Generate pre-matte", Node::PreMatte, true, on).on_hover_text("Run the Pre-matte over In/Out into VideoMamaMaskHint").on_disabled_hover_text(why(guide_ready, guide.label())).clicked() {
                             run = Some(Run::Guide);
                         }
-                        ui.menu_button("More…", |ui| {
-                            if ui.add_enabled(on, egui::Button::new("On marked frames")).on_hover_text("One single-frame Pre-matte per keyframe mark").on_disabled_hover_text(why(guide_ready, guide.label())).clicked() {
-                                run = Some(Run::GuideMarks);
-                                ui.close();
-                            }
-                        });
                     });
-                    ui.label(RichText::new(format!("{} frames on disk", clip.mask_frames)).color(DIM).size(12.0));
+                    ui.label(RichText::new(format!("{} frames on disk", clip.mask_frames)).color(theme::text_dim(ui)).size(12.0));
                 });
             });
             if tool_on {
-                ui.painter().rect_stroke(r.response.rect, 6.0, egui::Stroke::new(2.0, theme::CHECKED), egui::StrokeKind::Outside);
+                ui.painter().rect_stroke(r.response.rect, 6.0, egui::Stroke::new(2.0, theme::accent_mark(ui)), egui::StrokeKind::Outside);
             }
             let ui = &mut cols[1];
             let stale = this.stale(&ctx, Node::Hint);
             card(ui, &format!("Hint · {}", fin.label()), stale, |ui| {
-                let on = fin_ready && !busy && !bypass && fin != Final::Import;
-                let tip = if fin == Final::Import { "Imported alpha has nothing to generate: choose a movie in Properties".to_string() } else { why(fin_ready, fin.label()) };
+                let on = fin_ready && !busy && !bypass && fin != Final::Import && gate.is_none();
+                let tip = if fin == Final::Import { "Imported alpha has nothing to generate: choose a movie in Properties".to_string() } else if let Some(g) = &gate { g.clone() } else { why(fin_ready, fin.label()) };
                 ui.horizontal_wrapped(|ui| {
                     if this.action_button(ui, "Generate hint", Node::Hint, true, on).on_hover_text(if fin.needs_guide() { "Refine the Pre-matte over In/Out into AlphaHint (needs the Pre-matte first)" } else { "Publish the Pre-matte straight into AlphaHint" }).on_disabled_hover_text(tip.clone()).clicked() {
                         run = Some(Run::Hint);
                     }
-                    ui.menu_button("More…", |ui| {
-                        if ui.add_enabled(on, egui::Button::new("On marked frames")).on_hover_text("Real hints on each keyframe mark, for Key's keyframe mode").on_disabled_hover_text(tip).clicked() {
-                            run = Some(Run::HintMarks);
-                            ui.close();
-                        }
-                    });
                 });
-                ui.label(RichText::new(format!("{} frames on disk", clip.alpha_frames)).color(DIM).size(12.0));
+                ui.label(RichText::new(format!("{} frames on disk", clip.alpha_frames)).color(theme::text_dim(ui)).size(12.0));
             });
         });
+        let mut marked = None;
+        if fin != Final::Import {
+            let (mut p, mut h) = (self.hint.cfg.marks_pre, self.hint.cfg.marks_hint);
+            ui.add_enabled_ui(!bypass, |ui| {
+                if fin == Final::Matanyone2 {
+                    theme::checkbox(ui, &mut p, "Pre-matte on marked frames");
+                    if p {
+                        theme::checkbox(ui, &mut h, "Use the same marked frames as hints");
+                        if !h {
+                            ui.label(RichText::new("Full-range hints use In-frame pre-matte.").color(theme::text_dim(ui)).size(12.0));
+                        }
+                    }
+                } else {
+                    let mut c = p;
+                    theme::checkbox(ui, &mut c, "Pre-matte and hint on marked frames");
+                    if c != p {
+                        (p, h) = (c, true);
+                    }
+                }
+            });
+            if let Some(g) = &gate {
+                ui.label(RichText::new(g.as_str()).color(theme::warn(ui)).size(12.0));
+            }
+            if self.hint.cfg.hint_on_marks() && self.hint.marks_err.is_none() {
+                ui.label(RichText::new("Key will use marked hints.").color(theme::text_dim(ui)).size(12.0));
+            }
+            if (p, h) != (self.hint.cfg.marks_pre, self.hint.cfg.marks_hint) {
+                marked = Some((p, h));
+            }
+        }
+        if let Some((p, h)) = marked {
+            self.set_marked(clip, p, h);
+        }
         if src.is_some() || movie.is_some() {
             card(ui, "Source / Import", None, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if movie.is_some() {
                         let tip = if src.is_none() { "Companion movies need a movie source (Source/); import PNG/EXR sequences by placing them in AlphaHint" } else { "the worker cannot import movies (FFmpeg)" };
-                        import = ui.add_enabled(import_ok && !busy, egui::Button::new(RichText::new("Import movie").color(Color32::from_rgb(21, 36, 26))).fill(theme::ACCENT)).on_disabled_hover_text(tip).clicked();
+                        import = theme::accent(ui, import_ok && !busy, |ui| ui.add(egui::Button::new("Import movie"))).on_disabled_hover_text(tip).clicked();
                         cancel_import = ui.button("Cancel").clicked();
                         if let Some(m) = &movie {
-                            ui.label(RichText::new(m.display().to_string()).monospace().size(11.0).color(DIM));
+                            ui.label(RichText::new(m.display().to_string()).monospace().size(11.0).color(theme::text_dim(ui)));
                         }
                     }
                     if src.is_some() {
@@ -1667,7 +1733,6 @@ impl App {
     /// live in the action region (`hint_actions`).
     pub(super) fn hint_tools(&mut self, ui: &mut Ui, clip: &Clip) {
         let guide = self.hint.cfg.guide;
-        let mut marks = None;
         // A job shows once: the Pre-matte route lists the guide's task plus SAM tracking, which is the same
         // kind when the guide is SAM, and a job never appears under both headings.
         let mut seen = vec![];
@@ -1691,37 +1756,16 @@ impl App {
         );
         ui.label(
             RichText::new("Pre-matte and hint generation run on this computer (the local worker). Key then runs on the client assigned to this clip.")
-                .color(DIM)
+                .color(theme::text_dim(ui))
                 .size(11.5),
         );
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Mark frame").on_hover_text("Add a sparse keyframe mark here").clicked() {
-                marks = Some(Some(true));
-            }
-            if ui.button("Unmark").clicked() {
-                marks = Some(Some(false));
-            }
-            if ui.button("Clear marks").on_hover_text("Removes only the keyframe marks, never hint frames").clicked() {
-                marks = Some(None);
-            }
-            ui.label(RichText::new(if clip.keyframes.is_empty() { "marks: none".into() } else { format!("marks {:?}", clip.keyframes) }).color(DIM).size(12.0));
-            ui.separator();
-            ui.label("Overlay");
-            for (o, l) in [(Overlay::Off, "Off"), (Overlay::Guide, "Pre-matte"), (Overlay::Hint, "Hint")] {
-                ui.selectable_value(&mut self.hint.overlay, o, l);
-            }
-            ui.label(RichText::new("grayscale: Guide/Hint view chips").color(DIM).size(12.0));
-        });
-        if let Some(m) = marks {
-            self.hint_marks(m);
-        }
         self.ai.hint_lock_ui(ui, clip);
         if let Some(r) = self.ai.latest_task(&clip.folder, TaskKind::SamPreview) {
-            ui.label(RichText::new("Last preview:").color(DIM).size(12.0));
+            ui.label(RichText::new("Last preview:").color(theme::text_dim(ui)).size(12.0));
             self.ai.task_status_row(ui, &r);
         }
         if let Some(n) = &self.hint.note {
-            ui.label(RichText::new(n).color(WARN).size(12.0));
+            ui.label(RichText::new(n).color(theme::warn(ui)).size(12.0));
         }
     }
 
@@ -1807,10 +1851,10 @@ impl App {
                             ui.add(egui::Slider::new(&mut c, 1..=64));
                         });
                         self.hint.cfg.videomama_chunk = c as u32;
-                        ui.label(RichText::new("Refines the Pre-matte: generate it over In/Out first.").color(DIM).size(12.0));
+                        ui.label(RichText::new("Refines the Pre-matte: generate it over In/Out first.").color(theme::text_dim(ui)).size(12.0));
                     }
                     Final::Matanyone2 => {
-                        ui.label(RichText::new("Refines the Pre-matte, seeded from its In frame.").color(DIM).size(12.0));
+                        ui.label(RichText::new("Refines the Pre-matte, seeded from its In frame.").color(theme::text_dim(ui)).size(12.0));
                     }
                     Final::Direct | Final::Import => {}
                 }
@@ -1837,12 +1881,12 @@ impl App {
                 pair(ui, "Matte channel", |ui| {
                     theme::checkbox(ui, &mut self.hint.movie_alpha_channel, "In the alpha channel (else gray)");
                 });
-                ui.label(RichText::new("Run Import from the Source / Import group in the action area.").color(DIM).size(12.0));
+                ui.label(RichText::new("Run Import from the Source / Import group in the action area.").color(theme::text_dim(ui)).size(12.0));
             }
         });
         if !self.hint.cfg.bypass {
             ui.add_space(4.0);
-            ui.label(RichText::new("Consumption mode and quality are below (applied by Key).").color(DIM).size(12.0));
+            ui.label(RichText::new("Consumption mode and quality are below (applied by Key).").color(theme::text_dim(ui)).size(12.0));
         }
     }
 
@@ -1870,7 +1914,7 @@ impl App {
             "Regenerate to apply changes. Feather softens the final hint; guides stay binary."
         };
         card(ui, "Mask cleanup", stale, |ui| {
-            ui.label(RichText::new(cleanup_note).color(DIM).size(12.0));
+            ui.label(RichText::new(cleanup_note).color(theme::text_dim(ui)).size(12.0));
             let mc = &mut self.hint.cfg.mask_cleanup;
             pair(ui, "Grow / shrink", |ui| {
                 fill_slider(ui);
@@ -1905,7 +1949,7 @@ impl App {
                 });
             }
             None => {
-                ui.label(RichText::new("Screen colour: automatic. Use the “Pick colour” tool on the frame to sample one.").color(DIM).size(12.0));
+                ui.label(RichText::new("Screen colour: automatic. Use the “Pick colour” tool on the frame to sample one.").color(theme::text_dim(ui)).size(12.0));
             }
         }
         pair(ui, "Strength", |ui| {
@@ -1942,7 +1986,7 @@ impl App {
                         "Existing chroma holdout: {fg} foreground, {bg} background stroke(s) from the old editor ({})",
                         crate::hints::HOLDOUT_FILE
                     ))
-                    .color(DIM)
+                    .color(theme::text_dim(ui))
                     .size(11.5),
                 );
                 if ui
@@ -1961,7 +2005,7 @@ impl App {
             Ok(_) => {}
             Err(e) => {
                 ui.colored_label(
-                    WARN,
+                    theme::warn(ui),
                     RichText::new(format!("Existing chroma holdout unreadable: {e}"))
                         .size(11.5),
                 );
@@ -1990,7 +2034,7 @@ impl App {
         let snap = dr.snapshot();
         let o = &mut dr.out;
         if self.hint.deliveries.is_empty() {
-            ui.label(RichText::new("No output is enabled in the Key outputs.").color(DIM));
+            ui.label(RichText::new("No output is enabled in the Key outputs.").color(theme::text_dim(ui)));
             return;
         }
         self.hint.deliver_rects.clear();
@@ -2063,9 +2107,9 @@ impl App {
                             ui.spacing_mut().slider_width = (ui.available_width() - 100.0).max(40.0);
                             ui.add(egui::Slider::new(&mut v.quality, cur.min..=cur.max).text(name)).on_hover_text(&note);
                         });
-                        ui.label(RichText::new(note).color(DIM).size(11.5));
+                        ui.label(RichText::new(note).color(theme::text_dim(ui)).size(11.5));
                         if key == "processed" && !cur.alpha {
-                            ui.colored_label(WARN, "This codec has no alpha: transparency is not retained. Use MOV ProRes 4444 or WebM VP9 to keep it.");
+                            ui.colored_label(theme::warn(ui), "This codec has no alpha: transparency is not retained. Use MOV ProRes 4444 or WebM VP9 to keep it.");
                         }
                     }
                 }
@@ -2083,9 +2127,9 @@ impl App {
                         }
                     });
             });
-            ui.label(RichText::new("Applies to every EXR sequence (shared).").color(DIM).size(12.0));
+            ui.label(RichText::new("Applies to every EXR sequence (shared).").color(theme::text_dim(ui)).size(12.0));
             if o.exr_compression == "dwab" {
-                ui.colored_label(WARN, "DWAB is lossy: HDR values are not bit-exact.");
+                ui.colored_label(theme::warn(ui), "DWAB is lossy: HDR values are not bit-exact.");
             }
         });
         self.hint.deliver_fmt_rects = fmt_rects;
@@ -2125,7 +2169,7 @@ impl App {
                         });
                     });
                 });
-                ui.label(RichText::new("Audio is not included. Files: <clip>_<output>_<in>-<out>.<mp4|mov|webm>; an existing file is never replaced.").color(DIM).size(12.0));
+                ui.label(RichText::new("Audio is not included. Files: <clip>_<output>_<in>-<out>.<mp4|mov|webm>; an existing file is never replaced.").color(theme::text_dim(ui)).size(12.0));
             });
         }
         // Each field the user really changed (one output's delivery, fps, partial flag, folder) is the shot's own and
@@ -2143,14 +2187,14 @@ impl App {
             let names: Vec<String> = self.hint.delivery_ov.keys().cloned().collect();
             let label = Self::reset_label("these delivery fields", &self.hint.delivery_ov);
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("Delivery, this shot's own (win over a Batch preset): {}", names.join(", "))).color(DIM).size(12.0));
+                ui.label(RichText::new(format!("Delivery, this shot's own (win over a Batch preset): {}", names.join(", "))).color(theme::text_dim(ui)).size(12.0));
                 if ui.small_button(label).clicked() {
                     self.reset_delivery(clip);
                 }
             });
         }
         if let Some(n) = &self.hint.note {
-            ui.label(RichText::new(n).color(WARN).size(12.0));
+            ui.label(RichText::new(n).color(theme::warn(ui)).size(12.0));
         }
     }
 
@@ -2180,7 +2224,7 @@ impl App {
         let go = ui.vertical_centered(|ui| ui.add_enabled(why.is_empty() && !confirming, egui::Button::new("Run full workflow").min_size(egui::vec2(220.0, 30.0)))).inner;
         self.hint.deliver_rects.push(("render".into(), go.rect));
         let go = go.on_hover_text("Runs this shot's whole workflow: pre-matte, hint, Key, then every enabled video output. To encode from an existing Key result without running Key again, use “Export existing Key result”.").on_disabled_hover_text(why.clone());
-        ui.vertical_centered(|ui| ui.label(RichText::new("Full workflow: pre-matte → hint → Key → export").color(DIM).size(11.5)));
+        ui.vertical_centered(|ui| ui.label(RichText::new("Full workflow: pre-matte → hint → Key → export").color(theme::text_dim(ui)).size(11.5)));
         if go.clicked() {
             if let (Ok(pl), Some(i), Some(p)) = (&pl, self.open, self.project.as_ref()) {
                 let existing = existing_stage_results(clip);
@@ -2199,7 +2243,7 @@ impl App {
             let (mut run, mut cancel) = (false, false);
             egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.colored_label(WARN, format!("This shot already has {existing}."));
+                ui.colored_label(theme::warn(ui), format!("This shot already has {existing}."));
                 ui.label(RichText::new("Running the full workflow means pre-matte, hint and Key may run again, not only the video encoding. To encode the selected video outputs from the existing Key result, choose “Export existing Key result”.").size(12.0));
                 ui.horizontal_wrapped(|ui| {
                     let a = ui.button("Cancel");
@@ -2245,21 +2289,21 @@ impl App {
             }
         }
         if !why.is_empty() {
-            ui.label(RichText::new(&why).color(DIM).size(12.0));
+            ui.label(RichText::new(&why).color(theme::text_dim(ui)).size(12.0));
         }
         // Why the Deliver cue is on: each reason separately, never blended into one claim.
         let rc = &self.hint.rc;
         if rc.deliver {
-            ui.label(RichText::new(format!("Needs encoding: {}.", rc.deliver_why.join("; "))).color(DIM).size(12.0));
+            ui.label(RichText::new(format!("Needs encoding: {}.", rc.deliver_why.join("; "))).color(theme::text_dim(ui)).size(12.0));
         }
         if !rc.deliver_unverified.is_empty() {
-            ui.label(RichText::new(format!("Not verified as encoded (no export seen in this session): {}.", rc.deliver_unverified.join(", "))).color(DIM).size(12.0));
+            ui.label(RichText::new(format!("Not verified as encoded (no export seen in this session): {}.", rc.deliver_unverified.join(", "))).color(theme::text_dim(ui)).size(12.0));
         }
         if rc.key {
-            ui.label(RichText::new("The Key result is older than the current pre-matte/hint/Key settings (or missing): outputs encoded from it would be outdated.").color(DIM).size(12.0));
+            ui.label(RichText::new("The Key result is older than the current pre-matte/hint/Key settings (or missing): outputs encoded from it would be outdated.").color(theme::text_dim(ui)).size(12.0));
         }
         if let Some(b) = self.ai.pipeline_block_reason() {
-            ui.colored_label(WARN, b);
+            ui.colored_label(theme::warn(ui), b);
         }
         // Real pipeline progress: the Key job, then whichever pre-matte/hint step and export is queued or running.
         self.ai.job_status(ui, &clip.folder);
@@ -2533,7 +2577,7 @@ impl App {
             }
         });
         if let Some(n) = &self.hint.note {
-            ui.label(RichText::new(n).color(DIM).size(12.0));
+            ui.label(RichText::new(n).color(theme::text_dim(ui)).size(12.0));
         }
     }
 }
@@ -2616,6 +2660,7 @@ fn strip_button_disabled(
         ui.painter().rect_filled(rect, 4.0, bg);
     }
     paint_icon(ui.painter(), rect.shrink(5.0), icon, fg);
+    let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
     resp.on_hover_text(tip)
 }
 

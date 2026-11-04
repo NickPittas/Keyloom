@@ -39,10 +39,13 @@ impl PortType {
             PortType::Matte => "Matte",
         }
     }
-    fn color(self) -> Color32 {
-        match self {
-            PortType::Image => Color32::from_rgb(0x5E, 0xC8, 0xD8),
-            PortType::Matte => Color32::from_rgb(214, 214, 218),
+    /// Socket/edge colour; the light variants hold >= 3:1 on the light canvas.
+    fn color(self, dark: bool) -> Color32 {
+        match (self, dark) {
+            (PortType::Image, true) => Color32::from_rgb(0x5E, 0xC8, 0xD8),
+            (PortType::Matte, true) => Color32::from_rgb(214, 214, 218),
+            (PortType::Image, false) => Color32::from_rgb(0, 110, 130),
+            (PortType::Matte, false) => Color32::from_rgb(90, 92, 100),
         }
     }
 }
@@ -505,6 +508,42 @@ pub enum Event {
     Menu(NodeKind, Action),
 }
 
+/// Colours of the node graph for the current palette (Dark/Light); text holds >= 4.5:1 on its fill.
+pub struct Pal {
+    pub dark: bool,
+    pub canvas: Color32,
+    pub card: Color32,
+    pub card_hover: Color32,
+    pub header: Color32,
+    pub header_sel: Color32,
+    pub edge: Color32,
+    pub edge_hover: Color32,
+    pub selected: Color32,
+    pub text: Color32,
+    pub dim: Color32,
+    pub focus: Color32,
+}
+impl Pal {
+    pub fn of(ui: &Ui) -> Self {
+        let (v, dark) = (ui.visuals(), ui.visuals().dark_mode);
+        let card = th::card_fill(ui);
+        Pal {
+            dark,
+            canvas: th::canvas_fill(ui),
+            card,
+            card_hover: card.lerp_to_gamma(v.widgets.hovered.weak_bg_fill, 0.5),
+            header: if dark { th::CARD_HEADER } else { Color32::from_rgb(214, 228, 217) },
+            header_sel: if dark { Color32::from_rgb(65, 88, 74) } else { Color32::from_rgb(168, 202, 177) },
+            edge: v.widgets.inactive.bg_stroke.color,
+            edge_hover: v.widgets.hovered.bg_stroke.color,
+            selected: if dark { th::CHECKED } else { Color32::from_rgb(20, 80, 40) },
+            text: v.widgets.noninteractive.fg_stroke.color,
+            dim: th::text_dim(ui),
+            focus: th::warn(ui),
+        }
+    }
+}
+
 fn text(p: &Painter, pos: Pos2, align: Align2, s: &str, px: f32, color: Color32, max_w: f32) {
     let mut job = LayoutJob::simple_singleline(s.into(), FontId::proportional(px), color);
     job.wrap.max_width = max_w.max(1.0);
@@ -527,11 +566,12 @@ pub fn show(
     let size = Vec2::new(ui.available_width().max(1.0), height.max(40.0));
     let (canvas, bg) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let painter = ui.painter_at(canvas);
-    painter.rect_filled(canvas, 0.0, th::CANVAS);
+    let pal = Pal::of(ui);
+    painter.rect_filled(canvas, 0.0, pal.canvas);
     painter.rect_stroke(
         canvas,
         0.0,
-        Stroke::new(1.0, th::BORDER),
+        Stroke::new(1.0, pal.edge),
         StrokeKind::Inside,
     );
 
@@ -590,6 +630,7 @@ pub fn show(
         }
         if rh.hovered() || rb.hovered() {
             hovered = Some(i);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         if rh.has_focus() || rb.has_focus() {
             focused = Some(i);
@@ -631,7 +672,7 @@ pub fn show(
             }
             if let Some(note) = &l.note {
                 ui.separator();
-                ui.label(RichText::new(note.clone()).size(10.5).color(th::TEXT_DIM));
+                ui.label(RichText::new(note.clone()).size(10.5).color(th::text_dim(ui)));
             }
         };
         rh.context_menu(&mut draw_menu);
@@ -702,7 +743,7 @@ pub fn show(
         );
         let dx = ((p3.x - p0.x) * 0.5).abs().max(40.0 * v.zoom);
         let hot = sel_id == Some(e.to.0) || sel_id == Some(e.from.0);
-        let mut c = a.outputs[e.from.1].ty.color();
+        let mut c = a.outputs[e.from.1].ty.color(pal.dark);
         if !hot {
             c = c.gamma_multiply(0.7);
         }
@@ -730,10 +771,11 @@ pub fn show(
     for (i, n) in g.nodes.iter().enumerate() {
         let r = v.node_rects[i];
         let lk = &looks[i];
-        let dim = |c: Color32| if lk.dimmed { c.gamma_multiply(0.55) } else { c };
+        // Light needs a gentler fade to keep faded text >= 3:1 on white.
+        let dim = |c: Color32| if lk.dimmed { c.gamma_multiply(if pal.dark { 0.55 } else { 0.7 }) } else { c };
         let is_sel = selected == Some(n.kind);
         let rounding = 5.0 * v.zoom;
-        painter.rect_filled(r, rounding, dim(th::CARD));
+        painter.rect_filled(r, rounding, dim(if hovered == Some(i) { pal.card_hover } else { pal.card }));
         let hdr = Rect::from_min_size(r.min, Vec2::new(r.width(), HEADER_H * v.zoom));
         painter.rect_filled(
             hdr,
@@ -743,23 +785,23 @@ pub fn show(
                 sw: 0,
                 se: 0,
             },
-            dim(if is_sel { Color32::from_rgb(65, 88, 74) } else { th::CARD_HEADER }),
+            dim(if is_sel { pal.header_sel } else { pal.header }),
         );
         let border = if lk.badge == "Update required" {
-            Stroke::new(2.0, th::FOCUS)
+            Stroke::new(2.0, pal.focus)
         } else if is_sel {
-            Stroke::new(2.0, th::CHECKED)
+            Stroke::new(2.0, pal.selected)
         } else if hovered == Some(i) {
-            Stroke::new(1.5, th::BORDER_HOVER)
+            Stroke::new(2.0, pal.edge_hover)
         } else {
-            Stroke::new(1.0, th::BORDER)
+            Stroke::new(1.0, pal.edge)
         };
         painter.rect_stroke(r, rounding, border, StrokeKind::Inside);
         if focused == Some(i) {
             painter.rect_stroke(
                 r.expand(3.0),
                 rounding + 3.0,
-                Stroke::new(2.0, th::FOCUS),
+                Stroke::new(2.0, pal.focus),
                 StrokeKind::Outside,
             );
         }
@@ -769,12 +811,12 @@ pub fn show(
             Align2::LEFT_CENTER,
             &n.title,
             px,
-            dim(Color32::WHITE),
+            dim(pal.text),
             r.width() - 16.0 * v.zoom,
         );
         for (idx, p) in n.inputs.iter().enumerate() {
             let c = v.to_screen(n.socket(false, idx), canvas);
-            socket(&painter, c, p, v.zoom, dim(p.ty.color()));
+            socket(&painter, c, p, v.zoom, dim(p.ty.color(pal.dark)), pal.canvas);
             if show_text {
                 let label = if p.optional {
                     format!("{} (opt)", p.name)
@@ -787,14 +829,14 @@ pub fn show(
                     Align2::LEFT_CENTER,
                     &label,
                     px,
-                    dim(th::TEXT),
+                    dim(pal.text),
                     r.width() * 0.5,
                 );
             }
         }
         for (idx, p) in n.outputs.iter().enumerate() {
             let c = v.to_screen(n.socket(true, idx), canvas);
-            socket(&painter, c, p, v.zoom, dim(p.ty.color()));
+            socket(&painter, c, p, v.zoom, dim(p.ty.color(pal.dark)), pal.canvas);
             if show_text {
                 text(
                     &painter,
@@ -802,13 +844,13 @@ pub fn show(
                     Align2::RIGHT_CENTER,
                     p.name,
                     px,
-                    dim(th::TEXT),
+                    dim(pal.text),
                     r.width() * 0.5,
                 );
             }
         }
         if show_text {
-            let col = dim(th::TEXT_DIM);
+            let col = dim(pal.dim);
             if n.badge_inline() {
                 let y = v.to_screen(n.socket(false, 0), canvas).y;
                 text(
@@ -861,12 +903,12 @@ pub fn show(
     }
 
     if let Some((from, to, kind)) = ghost {
-        let col = PortType::Matte.color();
+        let col = PortType::Matte.color(pal.dark);
         for t in &g.nodes {
             for port in 0..t.inputs.len() {
                 if Graph::accepts(Connection { from: kind, to: t.kind, port }) {
                     let c = v.to_screen(t.socket(false, port), canvas);
-                    painter.circle_stroke(c, 8.0 * zs, Stroke::new(2.0, th::CHECKED));
+                    painter.circle_stroke(c, 8.0 * zs, Stroke::new(2.0, pal.selected));
                 }
             }
         }
@@ -883,6 +925,7 @@ pub fn show(
     let fit_rect = fit_button_rect(canvas);
     if ui
         .put(fit_rect, egui::Button::new("Fit"))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text("Fit all nodes (or double-click empty canvas)")
         .clicked()
     {
@@ -899,14 +942,14 @@ pub fn fit_button_rect(canvas: Rect) -> Rect {
     )
 }
 
-fn socket(p: &Painter, c: Pos2, port: &Port, zoom: f32, col: Color32) {
+fn socket(p: &Painter, c: Pos2, port: &Port, zoom: f32, col: Color32, ring: Color32) {
     let r = 4.5 * zoom.max(0.8);
     if port.optional {
         p.circle_stroke(c, r, Stroke::new(1.5, col));
     } else {
         p.circle_filled(c, r, col);
     }
-    p.circle_stroke(c, r + 0.5, Stroke::new(1.0, th::CANVAS));
+    p.circle_stroke(c, r + 0.5, Stroke::new(1.0, ring));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -931,6 +974,8 @@ mod tests {
         sel: Option<NodeKind>,
         dashed: Option<NodeKind>,
         screen: Vec2,
+        cursor: egui::CursorIcon,
+        shapes: Vec<egui::epaint::ClippedShape>,
     }
     impl H {
         fn new() -> Self {
@@ -944,7 +989,14 @@ mod tests {
                 sel: None,
                 dashed: None,
                 screen: Vec2::new(728.0, 300.0),
+                cursor: egui::CursorIcon::Default,
+                shapes: vec![],
             }
+        }
+        fn themed(pref: &str) -> Self {
+            let h = Self::new();
+            th::apply_preference(&h.ctx, pref);
+            h
         }
         fn step(&mut self, events: Vec<E>) -> Option<Event> {
             self.t += 0.05;
@@ -979,6 +1031,8 @@ mod tests {
                 );
             });
             full.textures_delta.clear();
+            self.cursor = full.platform_output.cursor_icon;
+            self.shapes = std::mem::take(&mut full.shapes);
             out
         }
         fn rect(&self, k: NodeKind) -> Rect {
@@ -1411,5 +1465,58 @@ mod tests {
             matches!(ev, Some(Event::Open(_))),
             "Enter on focused card gave {ev:?} (focus {focused:?})"
         );
+    }
+
+    fn walk(s: &egui::Shape, f: &mut impl FnMut(&egui::Shape)) {
+        f(s);
+        if let egui::Shape::Vec(v) = s {
+            v.iter().for_each(|x| walk(x, f));
+        }
+    }
+
+    /// Cards give a clear hover (fill + 2 px outline + hand cursor) in both palettes; empty canvas does not.
+    #[test]
+    fn hovered_card_changes_look_and_shows_the_hand_in_both_themes() {
+        for pref in ["Dark", "Light"] {
+            let mut h = H::themed(pref);
+            h.step(vec![]);
+            h.step(vec![]);
+            let cards: Vec<Color32> = {
+                let mut v = vec![];
+                for cs in &h.shapes {
+                    walk(&cs.shape, &mut |s| if let egui::Shape::Rect(r) = s { v.push(r.fill) });
+                }
+                v
+            };
+            let k = h.rect(NodeKind::Key).center();
+            h.step(vec![E::PointerMoved(k)]);
+            h.step(vec![E::PointerMoved(k)]);
+            assert_eq!(h.cursor, egui::CursorIcon::PointingHand, "{pref} card cursor");
+            let mut hov = vec![];
+            for cs in &h.shapes {
+                walk(&cs.shape, &mut |s| if let egui::Shape::Rect(r) = s { hov.push(r.fill) });
+            }
+            assert_ne!(cards, hov, "{pref}: hover paints the same as idle");
+            h.step(vec![E::PointerMoved(Pos2::new(2.0, h.screen.y - 2.0))]);
+            h.step(vec![E::PointerMoved(Pos2::new(3.0, h.screen.y - 3.0))]);
+            assert_eq!(h.cursor, egui::CursorIcon::Default, "{pref} empty canvas");
+        }
+    }
+
+    /// Light and Dark: graph text holds 4.5:1 on its card/header/canvas, selected and hovered cards included.
+    #[test]
+    fn graph_text_is_readable_in_both_themes() {
+        for pref in ["Dark", "Light"] {
+            let mut h = H::themed(pref);
+            h.sel = Some(NodeKind::Key);
+            h.step(vec![]);
+            let k = h.rect(NodeKind::PreMatte).center();
+            h.step(vec![E::PointerMoved(k)]);
+            h.step(vec![E::PointerMoved(k)]);
+            let base = h.ctx.global_style().visuals.panel_fill;
+            let (n, bad) = th::text_contrast_report(&h.shapes, base, 4.5);
+            assert!(n > 8, "{pref}: graph drew only {n} texts");
+            assert!(bad.is_empty(), "{pref}: {bad:?}");
+        }
     }
 }

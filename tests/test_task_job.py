@@ -1037,7 +1037,7 @@ def test_export_failure_reports_ffmpeg_error_and_keeps_nothing(env, svc, monkeyp
     real = subprocess.Popen
 
     def bad(cmd, *a, **k):  # an invalid filter makes FFmpeg print a real error
-        cmd = [x if not str(x).startswith("scale=in_range") else "nosuchfilter" for x in cmd]
+        cmd = [x if "scale=in_range" not in str(x) else "nosuchfilter" for x in cmd]
         return real(cmd, *a, **k)
     monkeypatch.setattr(task_job.subprocess, "Popen", bad)
     _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "x.mp4")))
@@ -1116,7 +1116,7 @@ def test_export_bad_second_frame_names_it_and_reaps_child(env, svc, monkeypatch)
     procs = fake_ffmpeg(env.tmp, monkeypatch)
     _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "b.mp4")))
     assert done["outcome"] == "failed" and "frame 2/3" in done["message"] and STEMS[A + 1] in done["message"], done
-    assert_cleaned(env, procs, "b.mp4")
+    assert not procs and not export_threads() and not list((env.tmp / "deliver").glob("b.mp4*"))  # rejected up front
 
 
 def test_export_wrong_size_frame_is_named(env, svc, monkeypatch):
@@ -1127,12 +1127,12 @@ def test_export_wrong_size_frame_is_named(env, svc, monkeypatch):
     procs = fake_ffmpeg(env.tmp, monkeypatch)
     _, done = run(svc, export_job(env, out, dest=str(env.tmp / "deliver" / "s.mp4")))
     assert done["outcome"] == "failed" and "frame 3/3" in done["message"].lower(), done
-    assert_cleaned(env, procs, "s.mp4")
+    assert not procs and not export_threads() and not list((env.tmp / "deliver").glob("s.mp4*"))  # rejected up front
 
 
 def test_export_progress_callback_failure_is_reported_and_cleaned(env, svc, monkeypatch):
     out = key_style_result(env)
-    procs = fake_ffmpeg(env.tmp, monkeypatch)
+    procs = fake_ffmpeg(env.tmp, monkeypatch, body="echo frame=1; exec sleep 300")  # FFmpeg reports progress itself
     events = []
 
     def emit(m):

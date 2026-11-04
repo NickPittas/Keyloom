@@ -222,8 +222,10 @@ fn narrow_728_header_controls_do_not_overlap_and_graph_clears_fit_button_and_hin
                 "{w}: node {n:?} under the Fit button {fit:?}"
             );
         }
+        // 250: the Mark / Unmark / Clear marks row now sits under the timeline (it used to live in the status
+        // panel), which costs a narrow viewer one 28 px row.
         assert!(
-            app.viewer_height_hint().unwrap() >= 280.0,
+            app.viewer_height_hint().unwrap() >= 250.0,
             "{w}: Hint viewer too short: {:?}",
             app.viewer_height_hint()
         );

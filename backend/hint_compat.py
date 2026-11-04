@@ -61,9 +61,41 @@ def _same(want, have) -> bool:
     return want == have
 
 
-def _why(r: dict, stem: str, want: dict) -> str | None:
+def _via_guide(r: dict, stem: str, want: dict, guide: dict) -> bool:
+    """Rust ``hints::via_guide``: the producer writing the hint directly and the promotion of that producer's
+    pre-matte (``prematte_hint``) are the same render. ``guide`` = ``certified_stems`` of the pre-matte folder."""
+    g = guide.get(stem)
+    if g is None:
+        return False
+    pm = "prematte_hint"
+
+    def params(v):
+        return {k: x for k, x in (v.get("params") or {}).items() if k != "source_map"}
+
+    def src(v):
+        return (v.get("source") or {}).get(stem)
+
+    def cleanup_ok(w, h):
+        return "mask_cleanup" in w and "mask_cleanup" in h and _same(w["mask_cleanup"], h["mask_cleanup"])
+
+    rk, rp, gp = r.get("kind"), params(r), params(g)
+    if want["kind"] == pm and rk != pm:
+        w = (want.get("source") or {}).get(stem)
+        return (rk == g.get("kind") and _same(gp, rp) and _same(rp, gp) and src(r) is not None and src(r) == src(g)
+                and (w is None or w == src(r)) and cleanup_ok(want.get("params") or {}, rp))
+    if rk == pm and want["kind"] != pm:
+        wp = params(want)
+        return (want["kind"] == g.get("kind") and _same(wp, gp) and src(g) is not None
+                and src(g) == (want.get("source") or {}).get(stem)
+                and (r.get("upstream") or {}).get(stem) == g["digests"].get(stem) and cleanup_ok(wp, rp))
+    return False
+
+
+def _why(r: dict, stem: str, want: dict, guide: dict | None = None) -> str | None:
     """None = this record proves ``stem`` was made as ``want`` says; else the first difference."""
     if r.get("kind") != want["kind"]:
+        if guide and _via_guide(r, stem, want, guide):
+            return None
         return f"made by {r.get('kind')}, not {want['kind']}"
     if not _same({k: v for k, v in (want.get("params") or {}).items() if k != "source_map"}, r.get("params") or {}):
         return "generation settings differ"
@@ -78,7 +110,7 @@ def _why(r: dict, stem: str, want: dict) -> str | None:
 
 
 def check(folder: str, stems, want: dict) -> tuple:
-    """(status, reason) for rendering ``want`` ({kind, params, source, upstream, prompt_fp}) into ``folder``.
+    """(status, reason) for rendering ``want`` ({kind, params, source, upstream, prompt_fp, guide_folder}) into ``folder``.
 
     missing: a requested frame is absent. mismatch: a record proves it was made differently or the file changed.
     unrecorded: no record certifies a frame (legacy/imported); the caller lets the user decide.
@@ -90,13 +122,14 @@ def check(folder: str, stems, want: dict) -> tuple:
     if absent:
         return MISSING, f"{len(absent)} frame(s) missing, e.g. {absent[0]}"
     certified = certified_stems(folder)
+    guide = certified_stems(want["guide_folder"]) if want.get("guide_folder") else None
     unrecorded = []
     for s in stems:
         r = certified.get(s)
         if r is None:
             unrecorded.append(s)
             continue
-        why = _why(r, s, want)
+        why = _why(r, s, want, guide)
         if why:
             return MISMATCH, why
     # A frame that has a digest but no longer matches it was edited or replaced after it was made.

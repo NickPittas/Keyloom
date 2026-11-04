@@ -240,7 +240,7 @@ class BiRefNetProcessor:
 
         # Unicode-safe write (issue #184): raw cv2.imwrite fails on
         # non-ASCII paths on Windows.
-        from backend.frame_io import imwrite_unicode  # Lazy import: avoid cycles
+        from backend.frame_encoding import FrameEncoder  # Lazy import: avoid cycles
 
         if num_frames is None:
             try:
@@ -262,6 +262,7 @@ class BiRefNetProcessor:
 
         frames_written = 0
         _t_start = time.monotonic()
+        enc = FrameEncoder()  # PNG writes overlap the next inference step; joined before the commit
 
         try:
             for i, frame_rgb in enumerate(input_frames):
@@ -313,8 +314,7 @@ class BiRefNetProcessor:
                     out_name = f"frame_{i:06d}.png"
 
                 out_path = os.path.join(tmp_dir, out_name)
-                if not imwrite_unicode(out_path, mask_np):
-                    raise RuntimeError(f"Failed to write alpha frame: {out_path}")
+                enc.submit_image(out_path, mask_np)
 
                 frames_written += 1
 
@@ -330,6 +330,7 @@ class BiRefNetProcessor:
                 if progress_callback:
                     progress_callback(clip_name, frames_written, num_frames)
 
+            enc.join()  # every frame must be on disk (first write error raises) before the commit
             # Atomic commit: move temp files to final output dir
             if on_status:
                 on_status("Finalizing alpha hints...")
@@ -350,6 +351,7 @@ class BiRefNetProcessor:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
         finally:
+            enc.cancel()  # no-op after join; otherwise stops in-flight writes before the temp dir is removed
             if os.path.isdir(tmp_dir):
                 import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=True)

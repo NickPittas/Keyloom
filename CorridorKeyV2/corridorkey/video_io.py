@@ -818,6 +818,52 @@ class ThreadedVideoWriter:
             raise self.err
 
 
+def _available_memory_bytes() -> int | None:
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    try:  # POSIX without psutil
+        return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+class FrameByteBudget:
+    """Byte budget shared by every ExrSequenceWriter of one run: min(16 GiB, 25% of available RAM).
+
+    Frames count from queueing until written. A single frame larger than the whole budget is
+    still admitted when nothing else is queued (and logged), so a run never deadlocks."""
+
+    def __init__(self, total: int | None = None):
+        if total is None:
+            avail = _available_memory_bytes()
+            total = 16 << 30 if avail is None else min(16 << 30, int(avail * 0.25))
+        self.total = max(1, int(total))
+        self.used = 0
+        self._cond = threading.Condition()
+
+    def acquire(self, n: int, timeout: float = 0.1) -> bool:
+        """Reserve ``n`` bytes; False if still unavailable after ``timeout`` (caller re-checks errors)."""
+        with self._cond:
+            if self.used and self.used + n > self.total:
+                self._cond.wait(timeout)
+                if self.used and self.used + n > self.total:
+                    return False
+            if n > self.total and not self.used:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "one EXR frame needs %d bytes but the writer budget is %d", n, self.total)
+            self.used += n
+            return True
+
+    def release(self, n: int) -> None:
+        with self._cond:
+            self.used -= n
+            self._cond.notify_all()
+
+
 class ExrSequenceWriter:
     """Writes float frames as an OpenEXR image sequence (scene-referred, unclamped).
 
@@ -831,7 +877,8 @@ class ExrSequenceWriter:
 
     def __init__(self, dir_path: str, fps: float, size: tuple[int, int], *,
                  channels: int = 3, dtype: str = "half", maxsize: int | None = None,
-                 frame_name: str = "frame", workers: int | None = None):
+                 frame_name: str = "frame", workers: int | None = None,
+                 budget: FrameByteBudget | None = None):
         if dtype not in ("half", "float"):
             raise ValueError(f"exr dtype must be 'half' or 'float', got {dtype!r}")
         if workers is None:
@@ -841,6 +888,7 @@ class ExrSequenceWriter:
         if maxsize is None:
             maxsize = workers
         self.workers = workers
+        self.budget = budget if budget is not None else FrameByteBudget()
         self.dir_path = str(dir_path)
         self.path = self.dir_path  # for logging parity with ThreadedVideoWriter
         self.size = size
@@ -872,7 +920,13 @@ class ExrSequenceWriter:
             frame = np.ascontiguousarray(arr[j])
             if frame.shape[-1] == 1:
                 frame = frame[..., 0]
-            if not cv2.imwrite(out_path, frame, self.imwrite_params):
+            if out_path.isascii():
+                ok = cv2.imwrite(out_path, frame, self.imwrite_params)
+            else:  # cv2.imwrite cannot open non-ASCII paths on Windows: encode, then write via Python
+                ok, buf = cv2.imencode(".exr", frame, self.imwrite_params)
+                if ok:
+                    buf.tofile(out_path)
+            if not ok:
                 raise RuntimeError(f"cv2.imwrite failed: {out_path}")
 
     def _worker(self):
@@ -884,11 +938,14 @@ class ExrSequenceWriter:
             try:
                 if item is None:
                     return
-                if self.err is None:
-                    try:
-                        self._write_item(*item)
-                    except BaseException as exc:
-                        self.err = exc
+                try:
+                    if self.err is None:
+                        try:
+                            self._write_item(item[0], item[1])
+                        except BaseException as exc:
+                            self.err = exc
+                finally:
+                    self.budget.release(item[2])
             finally:
                 self.q.task_done()
 
@@ -915,8 +972,18 @@ class ExrSequenceWriter:
                 f"{self.channels} channels, got {arr.shape}")
         if arr.dtype != np.float32:
             raise ValueError(f"expected float32 frames, got {arr.dtype}")
+        per_frame = int(arr[0].nbytes) if arr.shape[0] else 0
         for j in range(arr.shape[0]):
-            self._put((self.frame_idx + j, arr[j:j + 1]))
+            while not self.budget.acquire(per_frame):
+                if self.err is not None:
+                    raise self.err
+                if not any(t.is_alive() for t in self.threads):
+                    raise RuntimeError(f"EXR writer threads died: {self.dir_path}")
+            try:
+                self._put((self.frame_idx + j, arr[j:j + 1], per_frame))
+            except BaseException:
+                self.budget.release(per_frame)
+                raise
         self.frame_idx += arr.shape[0]
 
     def write(self, frame: np.ndarray):

@@ -25,7 +25,7 @@ const DISABLED_BORDER: Color32 = Color32::from_rgb(84, 84, 88);
 /// A processing action, distinct from settings and secondary controls.
 pub fn primary_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
     let edge = if ui.visuals().dark_mode { Color32::from_rgb(174, 204, 183) } else { Color32::from_rgb(45, 103, 61) };
-    ui.add(egui::Button::new(text.into().color(Color32::from_rgb(21, 36, 26))).fill(ACCENT).stroke(Stroke::new(1.0, edge)))
+    accent(ui, ui.is_enabled(), |ui| ui.add(egui::Button::new(text.into()).stroke(Stroke::new(1.0, edge))))
 }
 
 /// Raised card fill/outline for the current palette (the dark `CARD` constants are dark-mode only).
@@ -39,7 +39,32 @@ pub fn canvas_fill(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { CANVA
 pub fn text_dim(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { TEXT_DIM } else { Color32::from_rgb(66, 82, 70) } }
 /// Warning (amber) and error (red) text for the current palette.
 pub fn warn(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { FOCUS } else { Color32::from_rgb(145, 91, 0) } }
-pub fn error(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::from_rgb(240, 120, 110) } else { Color32::from_rgb(170, 30, 25) } }
+pub fn error(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::from_rgb(250, 130, 120) } else { Color32::from_rgb(170, 30, 25) } }
+
+/// Success (green) text for the current palette.
+pub fn ok(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::from_rgb(150, 190, 150) } else { Color32::from_rgb(25, 100, 45) } }
+/// Green status dot / accent mark that holds >= 3:1 on the panel and canvas of the current palette.
+pub fn accent_mark(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { ACCENT } else { Color32::from_rgb(45, 103, 61) } }
+/// Outline of big panel frames (>= 3:1 on the panel of the current palette).
+pub fn panel_edge(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::from_rgb(110, 134, 118) } else { Color32::from_rgb(120, 140, 125) } }
+
+/// Runs `add` with the accent fill on stock buttons: the fill steps lighter on hover and darker when pressed
+/// (a plain `.fill(ACCENT)` would paint every state the same). Dark text, so disabled fading and focus stay egui's own.
+/// A disabled button keeps the stock (tested) disabled look: dark ink on a faded light fill would drop under 3:1.
+pub fn accent<R>(ui: &mut egui::Ui, enabled: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        if enabled {
+            let w = &mut ui.visuals_mut().widgets;
+            for (s, fill) in [(&mut w.inactive, ACCENT), (&mut w.hovered, Color32::from_rgb(176, 208, 186)), (&mut w.active, Color32::from_rgb(126, 160, 136))] {
+                s.weak_bg_fill = fill;
+                s.fg_stroke = Stroke::new(1.0, ACCENT_TEXT);
+            }
+        }
+        // Already-disabled parents are not faded a second time.
+        if enabled || !ui.is_enabled() { add(ui) } else { ui.add_enabled_ui(false, add).inner }
+    }).inner
+}
+pub const ACCENT_TEXT: Color32 = Color32::from_rgb(21, 36, 26);
 
 /// Shared raised parameter group; every pane uses the same padding and title alignment.
 pub fn section<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -114,7 +139,8 @@ fn palette(light: bool) -> egui::Visuals {
     w.noninteractive.bg_fill = panel; w.noninteractive.weak_bg_fill = panel;
     w.noninteractive.bg_stroke = Stroke::new(1.0, if light { border } else { DISABLED_BORDER });
     w.noninteractive.fg_stroke = Stroke::new(1.0, text);
-    w.inactive.weak_bg_fill = button; w.inactive.bg_fill = field;
+    // bg_fill is also the slider rail: white on a white card hid it in Light.
+    w.inactive.weak_bg_fill = button; w.inactive.bg_fill = if light { Color32::from_rgb(196,208,199) } else { field };
     w.inactive.bg_stroke = Stroke::new(1.0, border); w.inactive.fg_stroke = Stroke::new(1.0, text);
     w.hovered.weak_bg_fill = hover; w.hovered.bg_fill = hover;
     w.hovered.bg_stroke = Stroke::new(2.0, hover_border); w.hovered.fg_stroke = Stroke::new(1.0, text);
@@ -140,6 +166,55 @@ pub fn apply_preference(ctx: &egui::Context, preference: &str) {
         s.spacing.button_padding = egui::vec2(9.0, 4.0);
     });
     ctx.set_theme(pref);
+}
+
+/// Test support: every text painted in `shapes` against the fills painted before it (over `base`).
+/// Text over images is skipped (image pixels are not ours); disabled/faded text needs 3:1, the rest `min`.
+#[doc(hidden)]
+pub fn text_contrast_report(shapes: &[egui::epaint::ClippedShape], base: Color32, min: f32) -> (usize, Vec<String>) {
+    use egui::Shape;
+    enum Ev { Fill(egui::Rect, Color32), Image(egui::Rect), Text(egui::Rect, Vec<Color32>, f32, String) }
+    fn flat(s: &Shape, clip: egui::Rect, out: &mut Vec<Ev>) {
+        match s {
+            Shape::Vec(v) => v.iter().for_each(|x| flat(x, clip, out)),
+            Shape::Rect(r) if r.fill.a() > 0 => out.push(Ev::Fill(r.rect.intersect(clip), r.fill)),
+            Shape::Mesh(m) if !m.vertices.is_empty() => out.push(Ev::Image(m.calc_bounds().intersect(clip))),
+            Shape::Text(t) => {
+                let cols = t.galley.job.sections.iter().map(|sec| {
+                    let c = sec.format.color;
+                    if c == Color32::PLACEHOLDER { t.override_text_color.unwrap_or(t.fallback_color) } else { t.override_text_color.unwrap_or(c) }
+                }).collect();
+                out.push(Ev::Text(t.galley.rect.translate(t.pos.to_vec2()).intersect(clip), cols, t.opacity_factor, t.galley.job.text.clone()));
+            }
+            _ => {}
+        }
+    }
+    // Colour32 is premultiplied: result = fg + bg * (1 - alpha), with `k` the extra opacity.
+    let over = |fg: Color32, bg: Color32, k: f32| {
+        let a = fg.a() as f32 / 255.0 * k;
+        let ch = |f: u8, b: u8| (f as f32 * k + b as f32 * (1.0 - a)).round().min(255.0) as u8;
+        Color32::from_rgb(ch(fg.r(), bg.r()), ch(fg.g(), bg.g()), ch(fg.b(), bg.b()))
+    };
+    let mut evs = vec![];
+    for cs in shapes { flat(&cs.shape, cs.clip_rect, &mut evs); }
+    let (mut seen, mut bad, mut checked) = (Vec::<&Ev>::new(), vec![], 0);
+    for e in &evs {
+        if let Ev::Text(r, cols, k, text) = e {
+            let at = r.center();
+            if r.is_positive() && !seen.iter().any(|s| matches!(s, Ev::Image(i) if i.contains(at))) {
+                let mut bg = base;
+                for s in &seen { if let Ev::Fill(f, c) = s { if f.contains(at) { bg = over(*c, bg, 1.0); } } }
+                for c in cols.iter().filter(|c| c.a() > 0) {
+                    checked += 1;
+                    let want = if *k < 1.0 || c.a() < 255 { 3.0 } else { min };
+                    let got = contrast(over(*c, bg, *k), bg);
+                    if got < want { bad.push(format!("{text:?} {c:?} on {bg:?}: {got:.2} < {want}")); }
+                }
+            }
+        }
+        seen.push(e);
+    }
+    (checked, bad)
 }
 
 #[cfg(test)]

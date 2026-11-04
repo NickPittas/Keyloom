@@ -180,7 +180,7 @@ class MatAnyone2Processor:
 
         # Unicode-safe write (issue #184): raw cv2.imwrite fails on
         # non-ASCII paths on Windows.
-        from backend.frame_io import imwrite_unicode  # Lazy import: avoid cycles
+        from backend.frame_encoding import FrameEncoder  # Lazy import: avoid cycles
 
         # Clear memory from any previous sequence to prevent state bleed
         self.clear()
@@ -229,6 +229,7 @@ class MatAnyone2Processor:
         objects = [1]
         frames_written = 0
         _t_frame = time.monotonic()
+        enc = FrameEncoder()  # PNG writes overlap the next inference step; joined before the commit
 
         try:
             for ti in range(total_length):
@@ -270,8 +271,7 @@ class MatAnyone2Processor:
                         out_name = f"frame_{frame_idx:06d}.png"
 
                     out_path = os.path.join(tmp_dir, out_name)
-                    if not imwrite_unicode(out_path, pha_u8):
-                        raise RuntimeError(f"Failed to write alpha frame: {out_path}")
+                    enc.submit_image(out_path, pha_u8)
 
                     frames_written += 1
 
@@ -292,6 +292,7 @@ class MatAnyone2Processor:
                     if progress_callback:
                         progress_callback(clip_name, frames_written, num_frames)
 
+            enc.join()  # every frame must be on disk (first write error raises) before the commit
             # Atomic commit: move temp files to final output dir
             if on_status:
                 on_status("Finalizing alpha hints...")
@@ -314,6 +315,7 @@ class MatAnyone2Processor:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
         finally:
+            enc.cancel()  # no-op after join; otherwise stops in-flight writes before the temp dir is removed
             # Always try to clean up temp dir
             if os.path.isdir(tmp_dir):
                 import shutil

@@ -10,15 +10,15 @@ const RAM_W: f32 = 196.0;
 const STATUS_W: f32 = 170.0;
 const GAP: f32 = 14.0;
 
-fn txt(s: &str, dim: bool) -> RichText {
-    RichText::new(s).monospace().size(11.5).color(if dim { theme::TEXT_DIM } else { Color32::from_rgb(214, 226, 217) })
+fn txt(ui: &Ui, s: &str, dim: bool) -> RichText {
+    RichText::new(s).monospace().size(11.5).color(if dim { theme::text_dim(ui) } else { ui.visuals().strong_text_color() })
 }
 
 /// A fixed-width cell holding one truncated label (hover shows the full text and `tip`).
 fn cell(ui: &mut Ui, w: f32, text: &str, dim: bool, tip: &str) {
     ui.allocate_ui_with_layout(egui::vec2(w, FOOTER_H - 4.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
         ui.set_width(w);
-        let r = ui.add(egui::Label::new(txt(text, dim)).truncate());
+        let r = ui.add(egui::Label::new(txt(ui, text, dim)).truncate());
         r.on_hover_text(if tip.is_empty() { text.to_string() } else { format!("{text}\n{tip}") });
     });
 }
@@ -62,13 +62,14 @@ fn ratio(used: Option<u64>, total: Option<u64>) -> Option<f32> {
 fn meter(ui: &mut Ui, w: f32, label: &str, frac: Option<f32>, value: &str, dim: bool, tip: &str) {
     let (rect, r) = ui.allocate_exact_size(egui::vec2(w, 16.0), egui::Sense::hover());
     let p = ui.painter();
-    p.rect_filled(rect, 2.0, theme::FIELD);
+    p.rect_filled(rect, 2.0, theme::canvas_fill(ui));
     if let Some(f) = frac {
         let mut fill = rect;
         fill.set_right(rect.left() + rect.width() * f);
-        p.rect_filled(fill, 2.0, if dim { theme::ACCENT.gamma_multiply(0.3) } else { theme::ACCENT.gamma_multiply(0.7) });
+        let strong = if ui.visuals().dark_mode { 0.7 } else { 0.35 };
+        p.rect_filled(fill, 2.0, theme::accent_mark(ui).gamma_multiply(if dim { 0.3 } else { strong }));
     }
-    let col = if dim || frac.is_none() { theme::TEXT_DIM } else { theme::TEXT };
+    let col = if dim || frac.is_none() { theme::text_dim(ui) } else { ui.visuals().text_color() };
     let font = egui::FontId::monospace(10.5);
     p.text(rect.left_center() + egui::vec2(4.0, 0.0), egui::Align2::LEFT_CENTER, label, font.clone(), col);
     p.text(rect.right_center() - egui::vec2(4.0, 0.0), egui::Align2::RIGHT_CENTER, value, font, col);
@@ -111,6 +112,6 @@ pub fn machine_meters(ui: &mut Ui, telemetry: &crate::metrics::ClientTelemetry, 
         }
     });
     if let Some(st) = &c.status {
-        ui.label(RichText::new(st).color(theme::TEXT_DIM).size(10.5));
+        ui.label(RichText::new(st).color(theme::text_dim(ui)).size(10.5));
     }
 }

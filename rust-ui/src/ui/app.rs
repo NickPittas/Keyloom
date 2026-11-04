@@ -5,7 +5,7 @@ use super::import::{CardState, Dest, ImportUi};
 use super::picker::{rfd_backend, Backend, PickKind, Picker};
 use super::settings::Page as SettingsPage;
 use super::theme;
-use super::viewer::{Viewer, DIM, WARN};
+use super::viewer::{Viewer, DIM, WARN}; // DIM/WARN: still used by app/project_shell.rs
 use crate::contracts::*;
 use crate::decode::exr_header_summary;
 use crate::frames::{Availability, FrameIndex};
@@ -30,7 +30,7 @@ const GRAPH_MIN: f32 = 120.0;
 /// Narrow windows: the graph shrinks to this before the viewer does (the graph pans, the Hint image stays large).
 const GRAPH_MIN_NARROW: f32 = 88.0;
 /// Narrow windows open the graph short, so the viewer keeps its height (the graph pans; Fit keeps it clear of its button).
-const GRAPH_DEFAULT_NARROW: f32 = 148.0;
+const GRAPH_DEFAULT_NARROW: f32 = 100.0;
 /// Hint page bar: progress, marks and overlay on the left; the generate actions sit in the same panel on the right.
 const HINT_TOOLS_H: f32 = 160.0;
 const GRAPH_HEADER: f32 = 32.0;
@@ -171,6 +171,9 @@ pub struct App {
     /// Per-clip (by folder) graph layout and view; kept across Back/open, not persisted.
     graphs: std::collections::BTreeMap<String, (graph::Graph, graph::View)>,
     graph_collapsed: bool,
+    /// Short windows (< 560 px of workspace) keep the node graph as its header bar until opened there.
+    graph_short_open: bool,
+    graph_short: bool,
     loc: OutputLocation,
     started: Instant,
     shot_requested: bool,
@@ -326,6 +329,8 @@ impl App {
             props_sheet: false,
             graphs: Default::default(),
             graph_collapsed: false,
+            graph_short_open: false,
+            graph_short: false,
             // Never a machine-specific example path: `open_clip` fills in the clip's own default.
             loc: OutputLocation {
                 root: PathBuf::new(),
@@ -653,7 +658,7 @@ impl App {
             self.props_sheet = !self.props_sheet;
         }
         if pressed(Key::G) {
-            self.graph_collapsed = !self.graph_collapsed;
+            if self.graph_short { self.graph_short_open = !self.graph_short_open } else { self.graph_collapsed = !self.graph_collapsed }
         }
         if pressed(Key::F) {
             self.focus_mode = !self.focus_mode;
@@ -765,11 +770,11 @@ impl App {
                     p.clips.len(),
                     p.root.display()
                 ))
-                .color(DIM),
+                .color(theme::text_dim(ui)),
             );
         });
         for n in &p.notes {
-            ui.colored_label(WARN, n);
+            ui.colored_label(theme::warn(ui), n);
         }
         let picks: Vec<usize> = sel.iter().copied().collect();
         let chosen: Vec<&Clip> = picks.iter().filter_map(|i| p.clips.get(*i)).collect();
@@ -789,10 +794,10 @@ impl App {
             self.ai.assign_selected_ui(ui, &chosen, every);
         });
         if let Some(n) = self.ai.notice.clone() {
-            ui.colored_label(WARN, n);
+            ui.colored_label(theme::warn(ui), n);
         }
         if let Some(n) = self.ai.pending_note() {
-            ui.colored_label(WARN, n);
+            ui.colored_label(theme::warn(ui), n);
         }
         self.ai.batch_review(ui);
         self.ai.unresolved_ui(ui);
@@ -892,8 +897,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.heading("Queue");
             ui.add_space(8.0);
-            if ui.selectable_label(!waiting, "Machines").clicked() { waiting = false; }
-            if ui.selectable_label(waiting, format!("Waiting ({})", ai.waiting_count())).clicked() { waiting = true; }
+            if ui.selectable_label(!waiting, "Machines").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() { waiting = false; }
+            if ui.selectable_label(waiting, format!("Waiting ({})", ai.waiting_count())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() { waiting = true; }
             if !waiting && ui.small_button("Clear finished").on_hover_text("Removes finished, failed and cancelled jobs from the queue and its logs. Running jobs stay.").clicked() {
                 ai.clear_finished();
                 remote.clear_finished();
@@ -925,9 +930,9 @@ impl App {
         }
 
         let mut hr: Vec<egui::Rect> = vec![];
-        Panel::top("header").frame(egui::Frame::new().fill(theme::CARD).inner_margin(8)).show(ui, |ui| {
+        Panel::top("header").frame(egui::Frame::new().fill(theme::card_fill(ui)).inner_margin(8)).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                let back = ui.button("‹ Back to batch").on_hover_text("B");
+                let back = ui.button("‹ Back to batch").on_hover_text("B").on_hover_cursor(egui::CursorIcon::PointingHand);
                 hr.push(back.rect);
                 self.back_rect = Some(back.rect);
                 if back.clicked() {
@@ -935,14 +940,14 @@ impl App {
                 }
                 if let Some(c) = self.clip() {
                     ui.label(RichText::new(&c.display_name).strong());
-                    ui.label(RichText::new(format!("· {}", c.state.label())).color(DIM));
+                    ui.label(RichText::new(format!("· {}", c.state.label())).color(theme::text_dim(ui)));
                 }
                 ui.add_space(12.0);
                 for t in Tab::ALL {
                     let r = ui.selectable_label(
                         self.tab == t,
                         format!("{} {}", t as usize + 1, t.label()),
-                    );
+                    ).on_hover_cursor(egui::CursorIcon::PointingHand);
                     hr.push(r.rect);
                     if r.clicked() {
                         self.switch_tab(t);
@@ -951,13 +956,13 @@ impl App {
                 // One wrapped flow (no right-to-left sub-layout, which cannot wrap): controls drop to a second row
                 // instead of overlapping the tabs on narrow windows.
                 if narrow {
-                    let r = ui.selectable_label(self.props_sheet, "Properties");
+                    let r = ui.selectable_label(self.props_sheet, "Properties").on_hover_cursor(egui::CursorIcon::PointingHand);
                     hr.push(r.rect);
                     if r.clicked() {
                         self.props_sheet = !self.props_sheet;
                     }
                 }
-                let r = ui.selectable_label(focus, "Focus (F)");
+                let r = ui.selectable_label(focus, "Focus (F)").on_hover_cursor(egui::CursorIcon::PointingHand);
                 hr.push(r.rect);
                 if r.clicked() {
                     self.focus_mode = !self.focus_mode;
@@ -968,7 +973,7 @@ impl App {
         if let Some(t) = self.imp.notice_text().map(str::to_owned) {
             Panel::top("notice").show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(WARN, t);
+                    ui.colored_label(theme::warn(ui), t);
                     if ui.button("Dismiss").clicked() {
                         self.imp.dismiss_notice();
                     }
@@ -987,7 +992,7 @@ impl App {
                 });
             if !narrow || self.props_sheet {
                 Panel::right("props")
-                    .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(14).stroke(egui::Stroke::new(1.0, Color32::from_rgb(96, 120, 104))))
+                    .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(14).stroke(egui::Stroke::new(1.0, theme::panel_edge(ui))))
                     .default_size(380.0)
                     .min_size(300.0)
                     .max_size(520.0)
@@ -1000,22 +1005,25 @@ impl App {
             let tools_h = match (actions, narrow) {
                 (true, false) => HINT_TOOLS_H,
                 // Narrow: the viewer keeps its height; the action group is first, the status scrolls below it.
-                (true, true) => 96.0,
+                (true, true) => if ui.available_height() < 560.0 { 150.0 } else { 96.0 },
                 _ => 78.0,
             };
-            let graph_min = if narrow { GRAPH_MIN_NARROW } else { GRAPH_MIN };
-            let max_h = (ui.available_height() - 34.0 - 26.0 - tools_h - MIN_VIEWER).max(graph_min);
-            if self.graph_collapsed {
+            let graph_min = if narrow || ui.available_height() < 560.0 { GRAPH_MIN_NARROW } else { GRAPH_MIN };
+            let short = ui.available_height() < 560.0;
+            self.graph_short = short;
+            let min_viewer = if narrow || short { 290.0 } else { MIN_VIEWER }; // 900x640: the action cards must keep their buttons visible
+            let max_h = (ui.available_height() - 34.0 - 26.0 - tools_h - min_viewer).max(graph_min);
+            if if short { !self.graph_short_open } else { self.graph_collapsed } {
                 Panel::bottom("graph_collapsed")
-                    .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(8))
+                    .frame(egui::Frame::new().fill(theme::canvas_fill(ui)).inner_margin(8))
                     .exact_size(GRAPH_HEADER)
                     .show(ui, |ui| self.graph_header(ui));
             } else {
                 // Separate ids: each mode keeps its own dragged height (a narrow window must not inherit a wide one's).
                 Panel::bottom(if narrow { "graph_narrow" } else { "graph" })
-                    .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(10).stroke(egui::Stroke::new(1.0, Color32::from_rgb(69, 91, 76))))
+                    .frame(egui::Frame::new().fill(theme::canvas_fill(ui)).inner_margin(10).stroke(egui::Stroke::new(1.0, theme::panel_edge(ui))))
                     .resizable(true)
-                    .default_size(if narrow { GRAPH_DEFAULT_NARROW } else { GRAPH_DEFAULT })
+                    .default_size(if narrow || short { GRAPH_DEFAULT_NARROW } else { GRAPH_DEFAULT })
                     .min_size(graph_min)
                     .max_size(max_h)
                     .show(ui, |ui| {
@@ -1025,11 +1033,11 @@ impl App {
                     });
             }
             Panel::bottom(if narrow { "pagetools_narrow" } else { "pagetools" })
-                .frame(egui::Frame::new().fill(theme::CARD).inner_margin(12).stroke(egui::Stroke::new(1.0, Color32::from_rgb(83, 103, 90))))
+                .frame(egui::Frame::new().fill(theme::card_fill(ui)).inner_margin(12).stroke(egui::Stroke::new(1.0, theme::panel_edge(ui))))
                 .resizable(true)
                 .default_size(tools_h)
                 .min_size(64.0)
-                .max_size((ui.available_height() - MIN_VIEWER).max(64.0))
+                .max_size((ui.available_height() - min_viewer).max(64.0))
                 .show_separator_line(true)
                 .show(ui, |ui| self.tools_row(ui, actions, narrow));
         }
@@ -1099,6 +1107,8 @@ impl App {
                         egui::ScrollArea::vertical()
                             .id_salt("action_scroll")
                             .auto_shrink([false; 2])
+                            // Short windows: the rows below the cards are reached by scrolling, so show the bar.
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                             .show(ui, |ui| self.action_body(ui, &clip));
                     } else {
                         self.action_body(ui, &clip);
@@ -1124,15 +1134,15 @@ impl App {
             ui.set_height(GRAPH_HEADER - 8.0);
             ui.label(RichText::new("Node graph").strong());
             if ui
-                .button(if self.graph_collapsed { "Show" } else { "Hide" })
+                .button(if if self.graph_short { !self.graph_short_open } else { self.graph_collapsed } { "Show" } else { "Hide" })
                 .on_hover_text("G")
                 .clicked()
             {
-                self.graph_collapsed = !self.graph_collapsed;
+                if self.graph_short { self.graph_short_open = !self.graph_short_open } else { self.graph_collapsed = !self.graph_collapsed }
             }
             ui.label(
                 RichText::new("drag to pan · wheel to zoom · double-click background to fit")
-                    .color(DIM)
+                    .color(theme::text_dim(ui))
                     .size(12.0),
             );
         });
@@ -1291,12 +1301,7 @@ impl App {
                         (graph::Action::Open, "Open Pre-matte".into(), true),
                         (
                             graph::Action::GenerateRange,
-                            format!("Generate {} over In/Out", cfg.guide.label()),
-                            guide_ok,
-                        ),
-                        (
-                            graph::Action::GenerateMarks,
-                            "Generate on marked frames".into(),
+                            format!("Generate {} {}", cfg.guide.label(), if cfg.pre_on_marks() { "on marked frames" } else { "over In/Out" }),
                             guide_ok,
                         ),
                     ],
@@ -1310,12 +1315,7 @@ impl App {
                         (graph::Action::Open, "Open Hint".into(), true),
                         (
                             graph::Action::GenerateRange,
-                            format!("Generate {} hint over In/Out", cfg.finish.label()),
-                            fin_ok,
-                        ),
-                        (
-                            graph::Action::GenerateMarks,
-                            "Generate on marked frames".into(),
+                            format!("Generate {} hint {}", cfg.finish.label(), if cfg.hint_on_marks() { "on marked frames" } else { "over In/Out" }),
                             fin_ok,
                         ),
                     ],
@@ -1350,11 +1350,10 @@ impl App {
             graph::Action::GenerateRange | graph::Action::GenerateMarks => {
                 // The same validated path the Hint page uses: settings are saved, In/Out is respected, and a
                 // refusal is reported instead of silently starting nothing.
-                let marks = action == graph::Action::GenerateMarks;
                 self.node = node;
                 self.tab = Tab::Hint;
                 let pre_matte = node == Node::PreMatte;
-                self.hint_run_from_graph(pre_matte, marks);
+                self.hint_run_from_graph(pre_matte);
                 let _ = clip;
             }
         }
@@ -1382,7 +1381,7 @@ impl App {
                         let ctx = ui.ctx().clone();
                         self.request_pick(&ctx, PickKind::Relink);
                     }
-                    ui.label(RichText::new("Input colour and companion imports are in Properties (right).").color(DIM).size(11.5));
+                    ui.label(RichText::new("Input colour and companion imports are in Properties (right).").color(theme::text_dim(ui)).size(11.5));
                 });
             }
             Tab::Hint => {
@@ -1394,7 +1393,7 @@ impl App {
                     "Key will process {} of {} frames. {}",
                     n, v_len, v_range_text
                 ));
-                ui.label(RichText::new("Set options in Properties (right). Key clip, Resume and Replace are in the action area on the right; drag the panel edge to resize.").color(DIM).size(12.0));
+                ui.label(RichText::new("Set options in Properties (right). Key clip, Resume and Replace are in the action area on the right; drag the panel edge to resize.").color(theme::text_dim(ui)).size(12.0));
             }
             Tab::Review => {
                 ui.label("Playback of files already on disk. Missing frames show “No file on disk”; frames outside In/Out show “Outside In/Out”.");
@@ -1411,8 +1410,8 @@ impl App {
                         .as_ref()
                         .map_or("unknown".into(), |p| p.display().to_string())
                 ));
-                ui.label(RichText::new("Choose image sequence or video settings in Properties (right); render or export in the action area on the right.").color(DIM).size(12.0));
-                ui.label(RichText::new(format!("Resolved from: {} · Legacy layout <output>/FG|Matte|Comp|Processed/<stem>.<ext>", clip.output_dir_note)).color(DIM).size(12.0));
+                ui.label(RichText::new("Choose image sequence or video settings in Properties (right); render or export in the action area on the right.").color(theme::text_dim(ui)).size(12.0));
+                ui.label(RichText::new(format!("Resolved from: {} · Legacy layout <output>/FG|Matte|Comp|Processed/<stem>.<ext>", clip.output_dir_note)).color(theme::text_dim(ui)).size(12.0));
             }
         }
     }
@@ -1481,9 +1480,9 @@ impl App {
                 if lin != v.linear {
                     v.linear = lin;
                 }
-                ui.label(RichText::new(format!("Stored: {} ({})", if stored { "Linear" } else { "sRGB" }, color_origin_text(&clip))).color(DIM).size(12.0));
+                ui.label(RichText::new(format!("Stored: {} ({})", if stored { "Linear" } else { "sRGB" }, color_origin_text(&clip))).color(theme::text_dim(ui)).size(12.0));
                 if v.linear != stored {
-                    ui.colored_label(WARN, "Saving the new colour interpretation…");
+                    ui.colored_label(theme::warn(ui), "Saving the new colour interpretation…");
                 }
                 self.media_props(ui, &clip);
                 self.media_paths(ui, &clip);
@@ -1557,7 +1556,7 @@ impl App {
                 }
                 let comp = session_o.as_ref().and_then(|o| o.get("exr_compression")).and_then(Value::as_str);
                 kv(ui, "EXR compression", &format!("{} — shared by all EXR exports (session)", comp.unwrap_or("?")));
-                ui.label(RichText::new("The compression in each file's header (above) is authoritative for that file.").color(DIM).size(12.0));
+                ui.label(RichText::new("The compression in each file's header (above) is authoritative for that file.").color(theme::text_dim(ui)).size(12.0));
                 if let Some(p) = &self.project {
                     ui.separator();
                     ui.label(RichText::new("Next run").strong());
@@ -1576,7 +1575,7 @@ impl App {
     fn output_details(&mut self, ui: &mut Ui, clip: &Clip) {
         ui.label(
             RichText::new("Key writes each product as its own EXR/PNG sequence into the output folder. Existing results are kept unless you explicitly confirm Replace.")
-                .color(DIM)
+                .color(theme::text_dim(ui))
                 .size(12.0),
         );
         if let Some(m) = &clip.manifest {
@@ -1619,7 +1618,7 @@ impl App {
             .is_some_and(|p| p.output_location.as_ref().is_some_and(|v| !v.is_null()));
         ui.label(
             RichText::new(if saved { "Saved in project.json: new jobs use it." } else { "Default (not saved): <this clip's output folder>/{name}_{version}/{output}/{name}_####. Earlier results stay where they are." })
-                .color(DIM)
+                .color(theme::text_dim(ui))
                 .size(12.0),
         );
         let mut root = self.loc.root.display().to_string();
@@ -1670,7 +1669,7 @@ impl App {
             Some(Ok(p)) => {
                 let text = display(&p);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Resolves to").color(DIM).size(11.5));
+                    ui.label(RichText::new("Resolves to").color(theme::text_dim(ui)).size(11.5));
                     ui.add(
                         egui::Label::new(RichText::new(&text).monospace().size(11.0))
                             .truncate(),
@@ -1683,13 +1682,13 @@ impl App {
             }
 
             Some(Err(e)) => {
-                ui.colored_label(Color32::from_rgb(225, 110, 110), format!("{e:?}"));
+                ui.colored_label(theme::error(ui), format!("{e:?}"));
             }
             None => {
-                ui.colored_label(WARN, "No output enabled");
+                ui.colored_label(theme::warn(ui), "No output enabled");
             }
         }
-        ui.label(RichText::new("{resolution} is a label only; nothing is resized. All machines write to this same storage.").color(DIM).size(12.0));
+        ui.label(RichText::new("{resolution} is a label only; nothing is resized. All machines write to this same storage.").color(theme::text_dim(ui)).size(12.0));
         let root_dir = self.project.as_ref().map(|p| p.root.clone());
         ui.horizontal_wrapped(|ui| {
             if ui.button("Save output location").clicked() {
@@ -1723,7 +1722,7 @@ impl App {
             }
         });
         if let Some(n) = &self.loc_note {
-            ui.label(RichText::new(n).color(DIM).size(12.0));
+            ui.label(RichText::new(n).color(theme::text_dim(ui)).size(12.0));
         }
     }
 
@@ -1779,7 +1778,7 @@ impl App {
         let folder = self.clip().map(|c| c.folder.clone());
         match (&self.ai.notice, folder) {
             (Some(n), _) => {
-                ui.label(RichText::new(n).color(WARN).size(12.0));
+                ui.label(RichText::new(n).color(theme::warn(ui)).size(12.0));
             }
             (None, Some(f)) => self.ai.job_status(ui, &f),
             _ => {}
@@ -1924,19 +1923,19 @@ impl App {
                         }
                         quit = c.clicked();
                     });
-                    ui.label(RichText::new("Quit anyway may leave workers or the model helper running; the UI will no longer show their final result.").color(DIM).size(12.0));
+                    ui.label(RichText::new("Quit anyway may leave workers or the model helper running; the UI will no longer show their final result.").color(theme::text_dim(ui)).size(12.0));
                 }
                 _ => {
                     let lines = self.ai.stopping_lines();
                     ui.label(format!("Stopping work… ({} target(s))", lines.len()));
                     for l in lines {
-                        ui.label(RichText::new(l).color(DIM).size(12.0));
+                        ui.label(RichText::new(l).color(theme::text_dim(ui)).size(12.0));
                     }
                     if self.models.busy() { ui.label(self.models.close_status()); }
                     let c = ui.button("Quit anyway");
                     rects.push(c.rect);
                     quit = c.clicked();
-                    ui.label(RichText::new("The window closes when workers and the helper have exited. Quit anyway may leave the helper running and hide its final result.").color(DIM).size(12.0));
+                    ui.label(RichText::new("The window closes when workers and the helper have exited. Quit anyway may leave the helper running and hide its final result.").color(theme::text_dim(ui)).size(12.0));
                 }
             });
         self.close_rects = rects;
@@ -2011,7 +2010,7 @@ fn color_origin_text(c: &Clip) -> &'static str {
 
 fn kv(ui: &mut Ui, k: &str, v: &str) {
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(format!("{k}:")).color(DIM));
+        ui.label(RichText::new(format!("{k}:")).color(theme::text_dim(ui)));
         ui.label(v);
     });
 }
@@ -2106,8 +2105,11 @@ fn board_card(
                     egui::Align2::CENTER_CENTER,
                     why,
                     egui::FontId::proportional(11.0),
-                    DIM,
+                    theme::text_dim(ui),
                 );
+            }
+            if idle && resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             if idle && resp.double_clicked() {
                 *open = Some(i);
@@ -2127,7 +2129,7 @@ fn board_card(
             .on_hover_text(&c.display_name);
         ui.label(
             RichText::new(c.state.label())
-                .color(Color32::from_rgb(150, 190, 150))
+                .color(theme::ok(ui))
                 .size(11.0),
         );
     });
@@ -2136,16 +2138,16 @@ fn board_card(
             ui.add(egui::ProgressBar::new(*f).text(t.as_str()));
         }
         CardState::Waiting => {
-            ui.label(RichText::new("Waiting for its turn to extract…").size(11.0).color(WARN));
+            ui.label(RichText::new("Waiting for its turn to extract…").size(11.0).color(theme::warn(ui)));
         }
         CardState::Failed(m) => {
             ui.colored_label(
-                Color32::from_rgb(235, 120, 120),
+                theme::error(ui),
                 RichText::new(format!("Extraction failed: {m}")).size(11.0),
             );
         }
         CardState::NeedsFrames => {
-            ui.label(RichText::new("Frames not extracted yet. The source movie is safe in this clip's Source folder.").size(11.0).color(WARN));
+            ui.label(RichText::new("Frames not extracted yet. The source movie is safe in this clip's Source folder.").size(11.0).color(theme::warn(ui)));
         }
         CardState::Idle => {}
     }
@@ -2154,8 +2156,8 @@ fn board_card(
             Some((w, h)) => format!("{}×{} · {:.0} fps · {} fr", w, h, c.fps, c.input_files.len()),
             None => format!("{:.0} fps · {} fr", c.fps, c.input_files.len()),
         };
-        ui.label(RichText::new(facts).color(DIM).size(10.5));
-        ui.label(RichText::new(board_status(c)).color(DIM).size(10.5));
+        ui.label(RichText::new(facts).color(theme::text_dim(ui)).size(10.5));
+        ui.label(RichText::new(board_status(c)).color(theme::text_dim(ui)).size(10.5));
     }
     // One Open affordance (the thumbnail also opens on double-click) and the clip's client on the same row.
     ui.horizontal_wrapped(|ui| {
@@ -3046,7 +3048,7 @@ impl App {
         // Outermost bottom panel: on every page (Board, clip, Settings, Clients, Models), fixed height.
         let metrics_panel = Panel::bottom("system_metrics")
             .exact_size(super::metrics_bar::FOOTER_H)
-            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(egui::Margin::symmetric(8, 0)))
+            .frame(egui::Frame::new().fill(theme::canvas_fill(ui)).inner_margin(egui::Margin::symmetric(8, 0)))
             .show(ui, |ui| super::metrics_bar::footer(ui, &cells));
         self.metrics_rect = Some(metrics_panel.response.rect);
         let mut open_models = false;

@@ -18,6 +18,7 @@ from . import color_utils as cu
 from .model import CorridorKeyV3
 from .video_io import (
     ExrSequenceWriter,
+    FrameByteBudget,
     ThreadedVideoWriter,
     WriterConfig,
     apply_linear_adjust,
@@ -876,6 +877,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     checker = make_checker(H_out, W_out)
     checker_t = torch.from_numpy(checker)
     writers = {}
+    exr_budget = FrameByteBudget()  # one byte budget for all EXR products of this run
     suffix = {
         "alpha": "alpha",
         "fg": "fg",
@@ -895,7 +897,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 writers[name] = ExrSequenceWriter(
                     os.path.join(output_dir, f"{clip_name}_{suffix[name]}_exr"),
                     fps, (W_out, H_out), channels=channels,
-                    dtype=cfg.exr_dtype, frame_name=suffix[name])
+                    dtype=cfg.exr_dtype, frame_name=suffix[name], budget=exr_budget)
             else:
                 ext = ".mov" if name == "cutout" else ".mp4"
                 channels = 4 if name == "cutout" else 3

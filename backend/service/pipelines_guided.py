@@ -22,7 +22,8 @@ from ..errors import (
     JobCancelledError,
     WriteFailureError,
 )
-from ..frame_io import imread_unicode, imwrite_unicode
+from ..frame_encoding import EncodingError, FrameEncoder
+from ..frame_io import imread_unicode
 from .helpers import BASE_DIR
 from .model_manager import _ActiveModel
 from .pipelines_auto import _holds_gpu_lock
@@ -157,42 +158,49 @@ class GuidedPipelinesMixin:
         total_chunks = (num_frames + chunk_size - 1) // chunk_size
         _status(f"Running inference (chunk 1/{total_chunks})...")
         frames_written = start_frame
-        for chunk_idx, chunk_output in enumerate(
-            run_inference(pipeline, input_frames, mask_frames,
-                          chunk_size=chunk_size, on_status=on_status)
-        ):
-            _check_cancel("inference")
+        enc = FrameEncoder()  # PNG writes overlap the next chunk; joined before the asset is published
+        try:
+            for chunk_idx, chunk_output in enumerate(
+                run_inference(pipeline, input_frames, mask_frames,
+                              chunk_size=chunk_size, on_status=on_status)
+            ):
+                _check_cancel("inference")
 
-            # Skip already-completed chunks (resume)
-            if chunk_idx < start_chunk:
-                frames_written += len(chunk_output)
+                # Skip already-completed chunks (resume)
+                if chunk_idx < start_chunk:
+                    frames_written += len(chunk_output)
+                    if on_progress:
+                        on_progress(clip.name, frames_written, num_frames)
+                    continue
+
+                _status(f"Processing chunk {chunk_idx + 1}/{total_chunks}...")
+
+                # Write chunk frames
+                t_chunk = time.monotonic()
+                for frame in chunk_output:
+                    if frame.dtype == np.uint8:
+                        frame_u8 = frame
+                    else:
+                        frame_u8 = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    out_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_RGB2BGR)
+                    if frames_written < len(input_names):
+                        stem = os.path.splitext(input_names[frames_written])[0]
+                        out_name = f"{stem}.png"
+                    else:
+                        out_name = f"frame_{frames_written:06d}.png"
+                    enc.submit_image(os.path.join(alpha_dir, out_name), out_bgr)
+                    frames_written += 1
+                logger.debug(f"Clip '{clip.name}' chunk {chunk_idx}: {len(chunk_output)} frames in {time.monotonic() - t_chunk:.3f}s")
+
                 if on_progress:
                     on_progress(clip.name, frames_written, num_frames)
-                continue
-
-            _status(f"Processing chunk {chunk_idx + 1}/{total_chunks}...")
-
-            # Write chunk frames
-            t_chunk = time.monotonic()
-            for frame in chunk_output:
-                if frame.dtype == np.uint8:
-                    frame_u8 = frame
-                else:
-                    frame_u8 = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
-                out_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_RGB2BGR)
-                if frames_written < len(input_names):
-                    stem = os.path.splitext(input_names[frames_written])[0]
-                    out_name = f"{stem}.png"
-                else:
-                    out_name = f"frame_{frames_written:06d}.png"
-                out_path = os.path.join(alpha_dir, out_name)
-                if not imwrite_unicode(out_path, out_bgr):
-                    raise WriteFailureError(clip.name, frames_written, out_path)
-                frames_written += 1
-            logger.debug(f"Clip '{clip.name}' chunk {chunk_idx}: {len(chunk_output)} frames in {time.monotonic() - t_chunk:.3f}s")
-
-            if on_progress:
-                on_progress(clip.name, frames_written, num_frames)
+            enc.join()  # every frame is on disk before the asset is published
+        except EncodingError as e:
+            enc.cancel()
+            raise WriteFailureError(clip.name, len(enc.completed), alpha_dir) from e  # e names the exact file
+        except BaseException:
+            enc.cancel()
+            raise
 
         # Refresh alpha asset
         clip.alpha_asset = ClipAsset(alpha_dir, 'sequence')

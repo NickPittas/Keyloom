@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from backend.frame_io import imwrite_unicode
+from backend.frame_encoding import FrameEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -169,17 +169,17 @@ class AnnotationModel:
         mask_dir = os.path.join(clip_root, "VideoMamaMaskHint")
         os.makedirs(mask_dir, exist_ok=True)
 
-        for i, stem in enumerate(frame_stems):
-            abs_idx = start_index + i
-            strokes = self._strokes.get(abs_idx, [])
-            if strokes:
-                mask = rasterize_annotation_strokes(strokes, width=width, height=height)
-            else:
-                # Unannotated frame: all-black (user chose "everything is background")
-                mask = np.zeros((height, width), dtype=np.uint8)
+        with FrameEncoder() as enc:  # raises if any frame could not be written
+            for i, stem in enumerate(frame_stems):
+                abs_idx = start_index + i
+                strokes = self._strokes.get(abs_idx, [])
+                if strokes:
+                    mask = rasterize_annotation_strokes(strokes, width=width, height=height)
+                else:
+                    # Unannotated frame: all-black (user chose "everything is background")
+                    mask = np.zeros((height, width), dtype=np.uint8)
 
-            out_path = os.path.join(mask_dir, f"{stem}.png")
-            imwrite_unicode(out_path, mask)
+                enc.submit_image(os.path.join(mask_dir, f"{stem}.png"), mask)
 
         logger.info(
             f"Exported {len(frame_stems)} mask frames to {mask_dir} "

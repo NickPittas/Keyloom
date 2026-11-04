@@ -101,13 +101,28 @@ pub fn save_hint_pick(clip: &Clip, mode: &str, base: (&str, bool)) -> Result<(),
     if !crate::settings::HINT_MODES.contains(&mode) {
         return Err(format!("{mode} is not a hint mode"));
     }
+    update_native(&clip.meta_path, |n| write_pick(n, mode, base))
+}
+
+fn write_pick(n: &mut Map<String, Value>, mode: &str, base: (&str, bool)) {
+    let picked = n.contains_key("hint_mode") && n.get("hint_mode_src").and_then(Value::as_str) != Some("preset");
+    n.insert("hint_mode".into(), json!(mode));
+    n.remove("hint_mode_src");
+    if !picked {
+        n.insert("hint_mode_base".into(), json!({"value": base.0, "preset": base.1}));
+    }
+}
+
+/// The marked-frame checkboxes: the hint settings and the consumption mode they imply in ONE write, so a failure
+/// leaves neither changed. Only called by a user action; loading a clip never rewrites its mode.
+pub fn save_marked_hints(clip: &Clip, cfg: &crate::hints::HintCfg, mode: &str, base: (&str, bool)) -> Result<(), String> {
+    if !crate::settings::HINT_MODES.contains(&mode) {
+        return Err(format!("{mode} is not a hint mode"));
+    }
+    cfg.validate()?;
     update_native(&clip.meta_path, |n| {
-        let picked = n.contains_key("hint_mode") && n.get("hint_mode_src").and_then(Value::as_str) != Some("preset");
-        n.insert("hint_mode".into(), json!(mode));
-        n.remove("hint_mode_src");
-        if !picked {
-            n.insert("hint_mode_base".into(), json!({"value": base.0, "preset": base.1}));
-        }
+        cfg.write_into(n);
+        write_pick(n, mode, base);
     })
 }
 

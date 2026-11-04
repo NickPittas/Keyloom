@@ -6,6 +6,7 @@ replaces a file it did not write in this job. See docs/design/rust-ui/ai-impleme
 """
 from __future__ import annotations
 
+import collections
 import errno
 import glob
 import hashlib
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -805,22 +807,100 @@ def _write_exr_float32(path: str, img: np.ndarray, compression: str) -> None:
         out.close()
 
 
+ENCODE_WORKERS: int | None = None  # None = min(4, CPUs); tests and timing runs override it
+
+
+def _exr_job(tmp: str, img: np.ndarray, compression: str) -> None:
+    """Spawned child (CPU only, importable): OpenEXR holds the GIL, so EXR needs processes."""
+    folder, name = os.path.split(os.path.abspath(tmp))
+    os.chdir(folder)  # OpenEXR takes narrow paths on Windows: our ASCII temp name works in any folder
+    _write_exr_float32(name, img, compression)
+
+
+class _Renderer:
+    """Bounded parallel ``_render``: threads decode/convert/encode PNG and fsync; EXR goes to
+    spawned processes. Memory in flight is capped by the frame_encoding byte budget. Callers
+    keep names, manifests, links and publishing, in frame order."""
+
+    def __init__(self, service, cfg: OutputConfig, *, processes: bool):
+        from ..frame_encoding import default_budget_bytes, default_workers
+        self.service, self.cfg = service, cfg
+        self.workers = max(1, ENCODE_WORKERS or default_workers())
+        self.budget = default_budget_bytes()
+        self.window = self.workers  # frames submitted ahead of the oldest unpublished one
+        self._used, self._cond = 0, threading.Condition()
+        self._threads = ThreadPoolExecutor(self.workers, thread_name_prefix="key-enc")
+        self._procs = None
+        self._want_procs, self._lock = processes, threading.Lock()
+
+    def submit(self, product: str, fmt: str, src: str, tmp: str, owned: list):
+        return self._threads.submit(_render, self.service, product, fmt, src, tmp, self.cfg, owned, self)
+
+    def write_exr(self, tmp: str, img: np.ndarray, compression: str) -> None:
+        if not self._want_procs:
+            return _write_exr_float32(tmp, img, compression)
+        with self._lock:
+            if self._procs is None:
+                import multiprocessing
+                self._procs = ProcessPoolExecutor(
+                    self.workers, mp_context=multiprocessing.get_context("spawn"))
+        self._procs.submit(_exr_job, tmp, img, compression).result()
+
+    def reserve(self, nbytes: int) -> None:
+        if nbytes > self.budget:
+            raise CorridorKeyError(f"One frame needs {nbytes} bytes of encoder memory but only "
+                                   f"{self.budget} are allowed; free memory and run again.")
+        with self._cond:
+            while self._used and self._used + nbytes > self.budget:
+                self._cond.wait(0.1)
+            self._used += nbytes
+
+    def release(self, nbytes: int) -> None:
+        with self._cond:
+            self._used -= nbytes
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        """Drop queued frames and join everything owned (a running frame takes seconds)."""
+        self._threads.shutdown(wait=True, cancel_futures=True)
+        if self._procs is not None:
+            self._procs.shutdown(wait=True, cancel_futures=True)
+
+
 def _render(svc, product: str, fmt: str, src: str, tmp: str, cfg: OutputConfig,
-            owned: list) -> None:
+            owned: list, enc: "_Renderer | None" = None) -> None:
     img = svc._v2_read(product, src)  # float32, finite, cv2 channel order
-    if fmt == "exr":
-        _write_tmp(tmp, b"", owned)  # exclusive, no-follow creation; the EXR library then fills it
-        _write_exr_float32(tmp, img, cfg.exr_compression)
-        return
-    if product == "cutout":
-        img = np.concatenate([_linear_to_srgb(np.clip(img[:, :, :3], 0.0, None)),
-                              img[:, :, 3:4]], axis=-1)
-    elif product != "alpha":
-        img = _linear_to_srgb(np.clip(img, 0.0, None))
-    ok, buf = cv2.imencode(".png", (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8))
-    if not ok:
-        raise CorridorKeyError(f"PNG encoding failed for {src}")
-    _write_tmp(tmp, buf.tobytes(), owned)
+    cost = int(img.nbytes) * 3 if enc is not None else 0  # decoded + converted + encoded/pickled copy
+    if enc is not None:
+        enc.reserve(cost)
+    try:
+        if fmt == "exr":
+            _write_tmp(tmp, b"", owned)  # exclusive, no-follow creation; the EXR library then fills it
+            if enc is not None:
+                enc.write_exr(tmp, img, cfg.exr_compression)
+            else:
+                _write_exr_float32(tmp, img, cfg.exr_compression)
+            return
+        if product == "cutout":
+            img = np.concatenate([_linear_to_srgb(np.clip(img[:, :, :3], 0.0, None)),
+                                  img[:, :, 3:4]], axis=-1)
+        elif product != "alpha":
+            img = _linear_to_srgb(np.clip(img, 0.0, None))
+        ok, buf = cv2.imencode(".png", (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8))
+        if not ok:
+            raise CorridorKeyError(f"PNG encoding failed for {src}")
+        _write_tmp(tmp, buf.tobytes(), owned)
+    finally:
+        if enc is not None:
+            enc.release(cost)
+
+
+def _use_processes(job: KeyJob, cfg: OutputConfig) -> bool:
+    """A process pool costs about a second to start: only for several EXR frames, or when the
+    output folder is not ASCII (then only the child's chdir makes the EXR write safe on Windows)."""
+    if "exr" not in _formats(cfg).values():
+        return False
+    return job.frames > 1 or any(not p.isascii() for ps in job.outputs.values() for p in ps)
 
 
 def _error_kind(exc: BaseException) -> str:
@@ -987,17 +1067,28 @@ def _replace_publish(service, job: KeyJob, cfg: OutputConfig, result, manifest: 
     manifest_path = os.path.join(job.manifest_dir, MANIFEST_NAME)
     try:
         ev("status", message="Writing outputs...")
-        for i in range(n):
-            check_cancel()
-            lease.verify()
-            for product in service._v2_required_products(cfg):
-                final = job.outputs[ez_of[product]][i]
-                new = _tmp_path(final, job)
-                os.makedirs(os.path.dirname(final), exist_ok=True)
-                _render(service, product, fmts[ez_of[product]], service._v2_runtime_file(
-                    product, result.product_dirs[product], i), new, cfg, mine)
-                items.append((final, new))
-            ev("progress", phase="publish", done=i + 1, total=n)
+        enc, pending = _Renderer(service, cfg, processes=_use_processes(job, cfg)), collections.deque()
+        try:
+            for i in range(n):
+                check_cancel()
+                lease.verify()
+                futs = []
+                for product in service._v2_required_products(cfg):
+                    final = job.outputs[ez_of[product]][i]
+                    new = _tmp_path(final, job)
+                    os.makedirs(os.path.dirname(final), exist_ok=True)
+                    futs.append(enc.submit(product, fmts[ez_of[product]], service._v2_runtime_file(
+                        product, result.product_dirs[product], i), new, mine))
+                    items.append((final, new))
+                pending.append((i, futs))
+                while len(pending) > enc.window or (i == n - 1 and pending):
+                    check_cancel()
+                    j, fs = pending.popleft()
+                    for f in fs:
+                        f.result()  # the first failed frame ends the job; the old result is untouched
+                    ev("progress", phase="publish", done=j + 1, total=n)
+        finally:
+            enc.close()  # joins running frames before any temp file is removed
         bad = [new for _, new in items if not _valid_image(new)]
         if bad:
             raise PublishError(f"{len(bad)} new file(s) failed validation (e.g. {bad[0]}); "
@@ -1142,33 +1233,52 @@ def run_key_job(service, job: KeyJob, *, emit: Callable[[dict], None],
             ez_of = FrameOpsMixin.V2_PRODUCT_TO_EZ
             products = service._v2_required_products(cfg)
             fmts = _formats(cfg)
-            for i in range(n):
-                check_cancel()
-                lease.verify()
-                wrote = False
-                for product in products:
-                    ez = ez_of[product]
-                    final = job.outputs[ez][i]
-                    if job.mode == "resume" and os.path.lexists(final):
-                        if os.path.islink(final) or not os.path.isfile(final):
-                            raise PublishError(f"{final} is not a regular file; left untouched")
-                        continue  # written by the job being resumed (manifest verified)
-                    os.makedirs(os.path.dirname(final), exist_ok=True)
-                    tmp, mine = _tmp_path(final, job), []
+            enc, pending, all_mine = (_Renderer(service, cfg, processes=_use_processes(job, cfg)),
+                                      collections.deque(), [])
+
+            def publish_oldest():  # frames are linked and reported strictly in order
+                check_cancel()  # between frames, as before: published frames stay, the rest stops
+                lease.verify()  # nothing is linked once the lock is lost
+                j, tasks = pending.popleft()
+                for final, tmp, mine, fut in tasks:
                     try:
-                        src = service._v2_runtime_file(product, result.product_dirs[product], i)
-                        _render(service, product, fmts[ez], src, tmp, cfg, mine)
+                        fut.result()
                         _link_noclobber(tmp, final)
                     finally:
                         _rm_owned(mine)  # never a pre-existing file that blocked our create
-                    wrote = True
-                if wrote:
+                if tasks:
                     done["published"] += 1
-                    sent_stems.append(prepared.source_stems[i])
+                    sent_stems.append(prepared.source_stems[j])
                 else:
                     done["skipped"] += 1
-                ev("progress", phase="publish", done=i + 1, total=n)
+                ev("progress", phase="publish", done=j + 1, total=n)
                 flush()
+            try:
+                for i in range(n):
+                    check_cancel()
+                    lease.verify()
+                    tasks = []
+                    for product in products:
+                        ez = ez_of[product]
+                        final = job.outputs[ez][i]
+                        if job.mode == "resume" and os.path.lexists(final):
+                            if os.path.islink(final) or not os.path.isfile(final):
+                                raise PublishError(f"{final} is not a regular file; left untouched")
+                            continue  # written by the job being resumed (manifest verified)
+                        os.makedirs(os.path.dirname(final), exist_ok=True)
+                        tmp, mine = _tmp_path(final, job), []
+                        all_mine.append(mine)
+                        src = service._v2_runtime_file(product, result.product_dirs[product], i)
+                        tasks.append((final, tmp, mine, enc.submit(product, fmts[ez], src, tmp, mine)))
+                    pending.append((i, tasks))
+                    while len(pending) > enc.window:
+                        publish_oldest()
+                while pending:
+                    publish_oldest()
+            finally:
+                enc.close()  # joins running frames, then drop every temp this job created
+                for mine in all_mine:
+                    _rm_owned(mine)
             flush(True)
             if all(os.path.isfile(p) for ps in job.outputs.values() for p in ps):
                 if result.settings_path and os.path.isfile(result.settings_path):

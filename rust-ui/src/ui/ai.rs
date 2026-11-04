@@ -3,7 +3,6 @@
 //! this module only edits, asks, submits and reports. Nothing here fabricates results: files appear only
 //! when a worker publishes them and the manifest says so.
 use super::theme;
-use super::viewer::{DIM, WARN};
 use crate::contracts::OutputKind;
 use crate::hints::HintCfg;
 use crate::presets::{self, Pipeline, Preset, PresetClass};
@@ -22,7 +21,6 @@ use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const BAD: Color32 = Color32::from_rgb(225, 110, 110);
 const STALL: Duration = Duration::from_secs(120);
 
 pub struct Draft {
@@ -1583,7 +1581,7 @@ impl AiUi {
                 let label = self.placement_text(&Placement::Target(id.clone()));
                 ui.label(
                     RichText::new(format!("This clip · {label} · {live}"))
-                        .color(DIM)
+                        .color(theme::text_dim(ui))
                         .size(11.5),
                 );
             }
@@ -1600,7 +1598,7 @@ impl AiUi {
                 };
                 ui.label(
                     RichText::new(format!("No assignment on this clip. {live}"))
-                        .color(DIM)
+                        .color(theme::text_dim(ui))
                         .size(11.5),
                 );
             }
@@ -1694,6 +1692,18 @@ impl AiUi {
         }
     }
 
+    /// A marked-frame checkbox saved hint mode `mode` for `clip`: the Key draft follows it at once and says so.
+    pub fn follow_marked_mode(&mut self, clip: &Clip, project: &Project, st: &Settings, mode: &str) {
+        const NOTE: &str = "Key will use marked hints.";
+        let d = self.draft(clip, project, st);
+        d.params.hint_mode = mode.to_string();
+        d.notes.retain(|n| n != NOTE);
+        if mode == "keyframes" {
+            d.notes.push(NOTE.to_string());
+        }
+        self.disk_gen += 1;
+    }
+
     /// Board "Assign to": one client for every chosen clip, saved per clip. `all` = every clip in the project is chosen.
     pub fn assign_selected_ui(&mut self, ui: &mut Ui, clips: &[&Clip], all: bool) {
         let tv = self.sched.targets();
@@ -1701,7 +1711,7 @@ impl AiUi {
         let mut want: Option<Option<String>> = None;
         let n = clips.len();
         let label = if all { format!("Assign all {n} clips to") } else { format!("Assign {n} selected to") };
-        ui.label(RichText::new(label).color(DIM).size(12.0));
+        ui.label(RichText::new(label).color(theme::text_dim(ui)).size(12.0));
         let session = self.placement.clone();
         client_picker(ui, "assign_selected", &session, &cur, &tv, &self.net_targets, |_, w| want = Some(w));
         if let Some(w) = want {
@@ -1780,7 +1790,7 @@ impl AiUi {
                 "full" => "Key reads AlphaHint over the whole range.",
                 _ => "Key reads AlphaHint on the marked frames and propagates between them.",
             })
-            .color(DIM)
+            .color(theme::text_dim(ui))
             .size(11.5),
         );
         let r = |ui: &mut Ui, l: &str, v: &mut f64| {
@@ -1836,7 +1846,7 @@ impl AiUi {
                     &p.temporal_window,
                     range_frames,
                 ))
-                .color(DIM)
+                .color(theme::text_dim(ui))
                 .size(12.0),
             );
             pair(ui, "VRAM profile", |ui| choice(ui, "vram_profile", &mut p.vram_profile, &VRAM_PROFILES));
@@ -1854,7 +1864,7 @@ impl AiUi {
                     "Input interpretation: {} (from Media; the job freezes it)",
                     if linear { "Linear" } else { "sRGB" }
                 ))
-                .color(DIM)
+                .color(theme::text_dim(ui))
                 .size(12.0),
             );
         });
@@ -1864,7 +1874,7 @@ impl AiUi {
         let marked = self.shot_overrides(clip);
         if !marked.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("Shot overrides (win over any Batch preset): {}", marked.join(", "))).color(DIM).size(12.0));
+                ui.label(RichText::new(format!("Shot overrides (win over any Batch preset): {}", marked.join(", "))).color(theme::text_dim(ui)).size(12.0));
                 if ui.small_button(self.reset_label(clip)).clicked() {
                     self.reset_overrides(clip, project, st);
                 }
@@ -2055,9 +2065,9 @@ impl AiUi {
                     });
             });
             if o.exr_compression == "dwab" {
-                ui.colored_label(WARN, "DWAB is lossy: HDR values are not bit-exact. Choose piz, zip or none for exact data.");
+                ui.colored_label(theme::warn(ui), "DWAB is lossy: HDR values are not bit-exact. Choose piz, zip or none for exact data.");
             }
-            ui.label(RichText::new("Shared by all EXR exports. The engine writes ZIP EXRs; other compressions are re-encoded and the real value is recorded in the manifest.").color(DIM).size(12.0));
+            ui.label(RichText::new("Shared by all EXR exports. The engine writes ZIP EXRs; other compressions are re-encoded and the real value is recorded in the manifest.").color(theme::text_dim(ui)).size(12.0));
         });
         d.mark_edits(&snap);
     }
@@ -2235,7 +2245,7 @@ impl AiUi {
             ui.vertical(|ui| {
                 // The client this clip renders on is its own setting (above); the machine list and the
                 // session default live on the Clients page.
-                ui.label(RichText::new("Clients").color(DIM).size(11.5));
+                ui.label(RichText::new("Clients").color(theme::text_dim(ui)).size(11.5));
                 if ui.add_enabled(
                     !self.model_mutation_active,
                     egui::Button::new("Check workers"),
@@ -2245,7 +2255,7 @@ impl AiUi {
             });
             for t in self.sched.targets() {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(RichText::new(target_line(&t)).color(DIM).size(12.0)).truncate()).on_hover_text(target_line(&t));
+                    ui.add(egui::Label::new(RichText::new(target_line(&t)).color(theme::text_dim(ui)).size(12.0)).truncate()).on_hover_text(target_line(&t));
                     let failed = matches!(t.status, TargetStatus::Down(_) | TargetStatus::Refused(_) | TargetStatus::Stopped);
                     if failed && t.busy_with.is_none() && ui.add_enabled(
                         !self.model_mutation_active,
@@ -2339,21 +2349,18 @@ impl AiUi {
         let primary_label = new_version.map_or_else(|| action.to_string(), |v| format!("Key as v{v:03}"));
         ui.label(
             RichText::new(why)
-                .color(if can { DIM } else { BAD })
+                .color(if can { theme::text_dim(ui) } else { theme::error(ui) })
                 .size(12.0),
         );
         // Centered in the action group, like the Deliver buttons.
         let go = ui
             .vertical_centered(|ui| {
-                ui.add_enabled(
-                    can,
-                    egui::Button::new(RichText::new(primary_label).color(Color32::from_rgb(21, 36, 26))).fill(theme::ACCENT).min_size(egui::Vec2::new(180.0, 34.0)),
-                )
+                theme::accent(ui, can, |ui| ui.add(egui::Button::new(primary_label).min_size(egui::Vec2::new(180.0, 34.0))))
             })
             .inner;
         self.key_rect = Some(go.rect);
         if let Some(pulse) = self.stale_key {
-            ui.painter().rect_stroke(go.rect.expand(1.0), 4.0, egui::Stroke::new(2.0 + pulse * 1.5, theme::FOCUS), egui::StrokeKind::Outside);
+            ui.painter().rect_stroke(go.rect.expand(1.0), 4.0, egui::Stroke::new(2.0 + pulse * 1.5, theme::warn(ui)), egui::StrokeKind::Outside);
         }
         if go.clicked() { intent = Some(if new_version.is_some() { Intent::NewVersion } else { Intent::New }); }
 
@@ -2362,7 +2369,7 @@ impl AiUi {
         egui::CollapsingHeader::new("Output & result actions").default_open(needs_fix).show(ui, |ui| {
             match &g {
                 None => {
-                    ui.label(RichText::new("Checking the output folder…").color(DIM));
+                    ui.label(RichText::new("Checking the output folder…").color(theme::text_dim(ui)));
                 }
                 Some(g) => {
                     if let Ok(p) = &g.main {
@@ -2376,23 +2383,23 @@ impl AiUi {
                     }
                     if let Err(b) = &g.main {
                         for r in &b.reasons {
-                            ui.colored_label(WARN, format!("• {r}"));
+                            ui.colored_label(theme::warn(ui), format!("• {r}"));
                         }
                         if let (Some(l), Some(dir)) = (&b.lock, &b.lock_dir) {
                             if let Some(id) = &l.job_id {
                                 match self.lock_owner(id) {
                                     LockOwner::Session => {
-                                        ui.label(RichText::new("This lock belongs to a job of this session whose worker may still be running. Use that job's own controls (Cancel, Force stop, or Confirm writer stopped); it cannot be released from here.").color(DIM).size(12.0));
+                                        ui.label(RichText::new("This lock belongs to a job of this session whose worker may still be running. Use that job's own controls (Cancel, Force stop, or Confirm writer stopped); it cannot be released from here.").color(theme::text_dim(ui)).size(12.0));
                                     }
                                     LockOwner::Ended => {
-                                        ui.label(RichText::new("This lock belongs to a finished job of this session; the cleanup result is shown with that job. It is not released from here.").color(DIM).size(12.0));
+                                        ui.label(RichText::new("This lock belongs to a finished job of this session; the cleanup result is shown with that job. It is not released from here.").color(theme::text_dim(ui)).size(12.0));
                                     }
                                     LockOwner::Unknown => {
-                                        ui.label(RichText::new("The lock names a run from before this session. Releasing it is only safe if that process is really gone.").color(DIM).size(12.0));
+                                        ui.label(RichText::new("The lock names a run from before this session. Releasing it is only safe if that process is really gone.").color(theme::text_dim(ui)).size(12.0));
                                         if !b.leftovers.is_empty() {
                                             ui.label(RichText::new(format!("That run left {} temp file(s) in the folder:", b.leftovers.len())).size(12.0));
                                             for t in b.leftovers.iter().take(5) {
-                                                ui.label(RichText::new(t.display().to_string()).monospace().size(11.0).color(DIM));
+                                                ui.label(RichText::new(t.display().to_string()).monospace().size(11.0).color(theme::text_dim(ui)));
                                             }
                                             theme::checkbox(ui, &mut self.lock_remove_temps, "Also delete these temp files (otherwise they are kept)");
                                         }
@@ -2405,15 +2412,15 @@ impl AiUi {
                         }
                         if let Some(e) = &b.existing {
                             if let Some((message, path)) = e.reason.split_once(" exists in ") {
-                                ui.colored_label(WARN, format!("{message} exists."));
+                                ui.colored_label(theme::warn(ui), format!("{message} exists."));
                                 ui.horizontal(|ui| {
                                     if ui.small_button("Copy path").clicked() { ui.ctx().copy_text(path.to_owned()); }
                                     ui.add(egui::Label::new(path).truncate()).on_hover_text(path);
                                 });
                             } else {
-                                ui.colored_label(WARN, &e.reason);
+                                ui.colored_label(theme::warn(ui), &e.reason);
                             }
-                            ui.label(RichText::new("Nothing is replaced unless you choose Replace and confirm it.").color(DIM).size(12.0));
+                            ui.label(RichText::new("Nothing is replaced unless you choose Replace and confirm it.").color(theme::text_dim(ui)).size(12.0));
                             if self.replace_confirm && g.replace.is_some() {
                                 // Buttons first (always visible); the folder is already shown in the line above.
                                 ui.horizontal(|ui| {
@@ -2424,7 +2431,7 @@ impl AiUi {
                                         self.replace_confirm = false;
                                     }
                                 });
-                                ui.colored_label(WARN, format!("Replace {} owned file(s)? Old files stay until the new ones are verified; unknown files are never touched; cancel or failure keeps the previous result.", e.replace_files));
+                                ui.colored_label(theme::warn(ui), format!("Replace {} owned file(s)? Old files stay until the new ones are verified; unknown files are never touched; cancel or failure keeps the previous result.", e.replace_files));
                             }
                             ui.horizontal_wrapped(|ui| {
                                 if g.resume.is_some()
@@ -2471,13 +2478,13 @@ impl AiUi {
                 }
             }
             for w in &setup {
-                ui.colored_label(BAD, format!("• {w}"));
+                ui.colored_label(theme::error(ui), format!("• {w}"));
             }
             if let Some(n) = self.notice.clone() {
-                ui.colored_label(WARN, n);
+                ui.colored_label(theme::warn(ui), n);
             }
             if let Some(n) = self.pending_note() {
-                ui.colored_label(WARN, n);
+                ui.colored_label(theme::warn(ui), n);
             }
             self.unresolved_ui(ui);
             self.job_status(ui, &clip.folder);
@@ -2539,7 +2546,7 @@ impl AiUi {
                 .map(|t| t.label.clone())
                 .filter(|l| !l.is_empty())
                 .unwrap_or_else(|| "Key".to_string());
-            ui.label(RichText::new(format!("· {stage}")).color(DIM).size(11.0));
+            ui.label(RichText::new(format!("· {stage}")).color(theme::text_dim(ui)).size(11.0));
             match &e.state {
                 JobState::Queued => {
                     let client = match &e.placement {
@@ -2560,7 +2567,7 @@ impl AiUi {
                         ui.add(egui::ProgressBar::new(f).desired_width(120.0).text(format!("{}/{}", (*done).min(*total), total)));
                     }
                     if e.cancel_requested {
-                        ui.label(RichText::new("cancel requested; waiting for the worker").color(WARN));
+                        ui.label(RichText::new("cancel requested; waiting for the worker").color(theme::warn(ui)));
                     } else {
                         cancel = ui.small_button("Cancel").clicked();
                     }
@@ -2580,26 +2587,26 @@ impl AiUi {
                     };
                     ui.label(format!("{word} on {target}: {} of {} published{}", info.published, info.expected, if info.skipped > 0 { format!(", {} skipped", info.skipped) } else { String::new() }));
                     if let Some(m) = info.message.as_ref().filter(|_| info.outcome == crate::worker::Outcome::Failed) {
-                        ui.colored_label(BAD, trunc(m));
+                        ui.colored_label(theme::error(ui), trunc(m));
                     }
                 }
                 JobState::Rejected { target, code, message } => {
-                    ui.colored_label(BAD, format!("Failed (not started) on {target}: {code}: {}", trunc(message)));
+                    ui.colored_label(theme::error(ui), format!("Failed (not started) on {target}: {code}: {}", trunc(message)));
                 }
                 JobState::Failed { reason } => {
-                    ui.colored_label(BAD, format!("Failed (not started): {}", trunc(reason)));
+                    ui.colored_label(theme::error(ui), format!("Failed (not started): {}", trunc(reason)));
                 }
                 JobState::Cancelled => {
                     ui.label("Cancelled before it started");
                 }
                 JobState::Lost { target, reason, writer_stopped, recovery } => {
-                    ui.colored_label(BAD, format!("Lost ({target}): {}", trunc(reason)));
+                    ui.colored_label(theme::error(ui), format!("Lost ({target}): {}", trunc(reason)));
                     if *writer_stopped {
                         ui.label(format!("Writer stopped{}. Files already written stay; re-run to resume.", recovery.as_ref().map_or(String::new(), |r| if r.errors.is_empty() { " and cleaned up".into() } else { format!(" (cleanup problems: {})", trunc(&r.errors.join("; "))) })));
                     } else {
                         // Only a reaped local non-Windows child is proof; that arrives on a later tick.
                         let waiting = !cfg!(windows) && self.sched.targets().iter().any(|t| &t.id == target && t.local);
-                        ui.colored_label(WARN, if waiting { "Waiting for the local worker process to exit; the folder stays locked until it is proven stopped." } else { "The worker is not proven stopped and may still be writing: the folder stays locked." });
+                        ui.colored_label(theme::warn(ui), if waiting { "Waiting for the local worker process to exit; the folder stays locked until it is proven stopped." } else { "The worker is not proven stopped and may still be writing: the folder stays locked." });
                         confirm = ui.small_button("I confirm the worker is stopped").clicked();
                     }
                 }
@@ -2618,7 +2625,7 @@ impl AiUi {
                             " (not accepted yet)"
                         }
                     ))
-                    .color(WARN)
+                    .color(theme::warn(ui))
                     .size(12.0),
                 );
             }
@@ -2633,21 +2640,21 @@ impl AiUi {
         if !warnings.is_empty() {
             egui::CollapsingHeader::new(
                 RichText::new(format!("{} warning{}", warnings.len(), if warnings.len() == 1 { "" } else { "s" }))
-                    .color(WARN)
+                    .color(theme::warn(ui))
                     .size(11.0),
             )
             .id_salt(("warnings", id))
             .default_open(false)
             .show(ui, |ui| {
                 for w in &warnings {
-                    ui.label(RichText::new(trunc(w)).color(WARN).size(11.0));
+                    ui.label(RichText::new(trunc(w)).color(theme::warn(ui)).size(11.0));
                 }
             });
         }
         if e.unverified_models {
             ui.label(
                 RichText::new("Model identity unverified on this worker.")
-                    .color(WARN)
+                    .color(theme::warn(ui))
                     .size(12.0),
             );
         }
@@ -2690,7 +2697,7 @@ impl AiUi {
                 "{} job(s) need your decision (writer not proven stopped)",
                 ids.len()
             ))
-            .color(WARN)
+            .color(theme::warn(ui))
             .strong(),
         );
         for id in ids {
@@ -2784,7 +2791,7 @@ impl AiUi {
                     }
                     Err(TryRecvError::Empty) => {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Checking the selected clips…").color(DIM));
+                            ui.label(RichText::new("Checking the selected clips…").color(theme::text_dim(ui)));
                             if ui.button("Cancel").clicked() {
                                 self.batch = None; // the thread's late answer finds no receiver and is dropped
                             }
@@ -2814,9 +2821,9 @@ impl AiUi {
             let Some(b) = self.batch.as_mut() else { return };
             let total = b.rows.len();
             let need = b.rows.iter().filter(|r| row_problem(r, &net).is_some() || r.offer_text().is_some()).count();
-            ui.label(RichText::new(format!("{} clip(s) ready; {need} need a decision.", total - need)).color(DIM));
+            ui.label(RichText::new(format!("{} clip(s) ready; {need} need a decision.", total - need)).color(theme::text_dim(ui)));
             for n in b.rows.iter().filter(|r| r.plan().is_some()).filter_map(|r| r.reuse_note()) {
-                ui.label(RichText::new(n).color(DIM).size(12.0));
+                ui.label(RichText::new(n).color(theme::text_dim(ui)).size(12.0));
             }
             // The rows scroll; the verdict and the Queue/Cancel buttons stay reachable below them.
             let max_h = (ui.available_height() * 0.5).max(140.0);
@@ -2835,13 +2842,13 @@ impl AiUi {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(&r.clip.display_name).strong());
                     if problem.is_some() {
-                        ui.colored_label(if ok_allowed { WARN } else { BAD }, trunc(&text));
+                        ui.colored_label(if ok_allowed { theme::warn(ui) } else { theme::error(ui) }, trunc(&text));
                     }
                     if problem.is_some() && ok_allowed {
                         ui.selectable_value(&mut r.choice, ok, "OK");
                     }
                     if let Some(q) = &offer {
-                        ui.colored_label(WARN, trunc(q));
+                        ui.colored_label(theme::warn(ui), trunc(q));
                         let mut reuse = r.reuse;
                         let mismatch = matches!(r.offer.as_ref().map(|o| &o.compat), Some(crate::hints::Compat::Mismatch(_)));
                         ui.selectable_value(&mut reuse, true, if mismatch { "Reuse anyway" } else { "Reuse" });
@@ -2875,7 +2882,7 @@ impl AiUi {
                 confirm = b.clicked();
                 cancel = ui.button("Cancel").clicked();
             });
-            ui.label(RichText::new("Clips queue on their assigned client.").color(DIM).size(12.0));
+            ui.label(RichText::new("Clips queue on their assigned client.").color(theme::text_dim(ui)).size(12.0));
         });
         self.batch_reset_rects = reset_rects;
         if let Some(c) = reset_shot {
@@ -3602,9 +3609,9 @@ fn target_line(t: &TargetView) -> String {
 
 fn notes(ui: &mut Ui, n: &[String]) {
     let info: Vec<_> = n.iter().filter(|n| n.starts_with("Hint mode ")).collect();
-    for t in n.iter().filter(|n| !n.starts_with("Hint mode ")) { ui.colored_label(WARN, t); }
+    for t in n.iter().filter(|n| !n.starts_with("Hint mode ")) { ui.colored_label(theme::warn(ui), t); }
     if !info.is_empty() {
-        egui::CollapsingHeader::new("Hint source details").show(ui, |ui| { for t in info { ui.label(RichText::new(t).color(DIM).size(12.0)); } });
+        egui::CollapsingHeader::new("Hint source details").show(ui, |ui| { for t in info { ui.label(RichText::new(t).color(theme::text_dim(ui)).size(12.0)); } });
     }
 }
 
@@ -3636,8 +3643,8 @@ pub fn card<R>(ui: &mut Ui, title: &str, stale: Option<f32>, add: impl FnOnce(&m
     // Border width stays fixed (Frame margins include it, so a changing width shifts everything below);
     // the stale amber outline is painted inside the finished frame rect instead.
     let out = egui::Frame::new()
-        .fill(theme::CARD)
-        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(77, 94, 82)))
+        .fill(theme::card_fill(ui))
+        .stroke(egui::Stroke::new(1.0, theme::card_stroke(ui).color))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
@@ -3645,14 +3652,14 @@ pub fn card<R>(ui: &mut Ui, title: &str, stale: Option<f32>, add: impl FnOnce(&m
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(title).strong());
                 if stale.is_some() {
-                    ui.label(RichText::new("Update required").color(theme::FOCUS).size(11.5));
+                    ui.label(RichText::new("Update required").color(theme::warn(ui)).size(11.5));
                 }
             });
             ui.add_space(2.0);
             add(ui)
         });
     if let Some(p) = stale {
-        let stroke = egui::Stroke::new(2.0 + p * 1.5, theme::FOCUS.lerp_to_gamma(Color32::WHITE, p * 0.55));
+        let stroke = egui::Stroke::new(2.0 + p * 1.5, theme::warn(ui).lerp_to_gamma(if ui.visuals().dark_mode { Color32::WHITE } else { Color32::BLACK }, p * 0.55));
         ui.painter().rect_stroke(out.response.rect, 6.0, stroke, egui::StrokeKind::Inside);
     }
     out.inner

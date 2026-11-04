@@ -351,11 +351,11 @@ impl AiUi {
     /// resumed or cancelled.
     pub fn auto_waiting_ui(&mut self, ui: &mut Ui) {
         if self.auto_pending.is_empty() {
-            ui.label(RichText::new("No shots are waiting. Automatic shots wait here until a PC is free.").color(DIM));
+            ui.label(RichText::new("No shots are waiting. Automatic shots wait here until a PC is free.").color(theme::text_dim(ui)));
             return;
         }
         if let Some(w) = &self.auto_wait {
-            ui.add(egui::Label::new(RichText::new(format!("Why: {w}")).color(DIM).size(11.5)).wrap());
+            ui.add(egui::Label::new(RichText::new(format!("Why: {w}")).color(theme::text_dim(ui)).size(11.5)).wrap());
         }
         if ui.small_button("Cancel all").clicked() {
             self.cancel_auto();
@@ -416,16 +416,16 @@ impl AiUi {
             let open = st.is_open();
             st.show_header(ui, |ui| {
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 3.0, super::super::theme::ACCENT);
+                ui.painter().circle_filled(dot.center(), 3.0, theme::accent_mark(ui));
                 ui.label(RichText::new(if is_local || client == local_id { "This computer" } else { &client }).strong());
-                if !open { ui.add(egui::Label::new(RichText::new(&head).color(DIM).size(11.0)).truncate()); }
+                if !open { ui.add(egui::Label::new(RichText::new(&head).color(theme::text_dim(ui)).size(11.0)).truncate()); }
             }).body(|ui| {
                 crate::ui::metrics_bar::machine_meters(ui, &t, if is_local { active } else { &[] });
-                if current.is_empty() { ui.label(RichText::new("Idle").color(DIM).size(11.0)); }
+                if current.is_empty() { ui.label(RichText::new("Idle").color(theme::text_dim(ui)).size(11.0)); }
                 for (n, (s, run)) in current.iter().enumerate() {
                     if n > 0 { ui.add_space(12.0); }
-                    egui::Frame::new().fill(super::super::theme::CARD)
-                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(77, 94, 82)))
+                    egui::Frame::new().fill(theme::card_fill(ui))
+                        .stroke(egui::Stroke::new(1.0, theme::card_stroke(ui).color))
                         .corner_radius(5).inner_margin(14).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.add(egui::Label::new(RichText::new(&s.title).strong().size(12.5)).truncate()).on_hover_text(s.root.display().to_string());
@@ -434,10 +434,10 @@ impl AiUi {
                     });
                 }
                 if !log.is_empty() {
-                    egui::CollapsingHeader::new(RichText::new(format!("Earlier ({})", log.len())).color(DIM).size(11.0))
+                    egui::CollapsingHeader::new(RichText::new(format!("Earlier ({})", log.len())).color(theme::text_dim(ui)).size(11.0))
                         .id_salt(("qlog", &client)).default_open(false).show(ui, |ui| {
                         for line in log.iter().rev().take(12) {
-                            ui.add(egui::Label::new(RichText::new(line).color(DIM).size(11.0)).wrap());
+                            ui.add(egui::Label::new(RichText::new(line).color(theme::text_dim(ui)).size(11.0)).wrap());
                         }
                     });
                 }
@@ -471,7 +471,11 @@ impl AiUi {
                     ui.painter().with_clip_rect(rect).text(rect.left_center(), egui::Align2::LEFT_CENTER, &row.heading, egui::FontId::proportional(12.0), ui.visuals().text_color());
                     response.on_hover_text(&row.heading);
                 }
-                let fill = if row.cell.bad { BAD } else if row.precomputed { DIM } else { super::super::theme::ACCENT };
+                // The bar text is the theme's selection text, so each fill must hold 4.5:1 with it in its own palette.
+                let dark = ui.visuals().dark_mode;
+                let fill = if row.cell.bad { if dark { Color32::from_rgb(138, 52, 48) } else { Color32::from_rgb(240, 172, 166) } }
+                    else if row.precomputed { if dark { Color32::from_rgb(72, 78, 86) } else { Color32::from_rgb(206, 212, 220) } }
+                    else { ui.visuals().selection.bg_fill };
                 ui.add_sized([w, 16.0], egui::ProgressBar::new(row.cell.frac).desired_width(w).desired_height(16.0).fill(fill).text(RichText::new(&row.cell.text).size(11.0)));
                 if live && ui.add_sized([54.0, 16.0], egui::Button::new("Cancel").small()).clicked() {
                     cancel.extend(row.ids.iter().cloned());
@@ -480,16 +484,16 @@ impl AiUi {
             ui.add_space(4.0);
             if !row.products.is_empty() {
                 let t = row.products.iter().map(|(p, s)| format!("{p} {s}")).collect::<Vec<_>>().join(" · ");
-                ui.add(egui::Label::new(RichText::new(t).color(DIM).size(11.0)).wrap());
+                ui.add(egui::Label::new(RichText::new(t).color(theme::text_dim(ui)).size(11.0)).wrap());
             }
         }
         let ids: Vec<(Stage, String)> = run.rows.iter().flat_map(|r| r.ids.iter().map(|i| (r.stage, i.clone()))).collect();
         if !ids.is_empty() {
             let open = run.rows.iter().any(|r| r.attention).then_some(true);
             let first = ids[0].1.clone();
-            egui::CollapsingHeader::new(RichText::new("Details").color(DIM).size(11.0)).id_salt(("qd", first)).open(open).show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("Details").color(theme::text_dim(ui)).size(11.0)).id_salt(("qd", first)).open(open).show(ui, |ui| {
                 for (stage, id) in &ids {
-                    ui.label(RichText::new(stage.heading()).color(DIM).size(11.0));
+                    ui.label(RichText::new(stage.heading()).color(theme::text_dim(ui)).size(11.0));
                     self.job_row(ui, id, false);
                 }
             });

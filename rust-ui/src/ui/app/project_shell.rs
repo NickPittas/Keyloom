@@ -367,9 +367,9 @@ impl App {
             if has {
                 let unsaved = self.unsaved();
                 let (t, c) = if unsaved {
-                    ("Unsaved", super::theme::FOCUS)
+                    ("Unsaved", theme::warn(ui))
                 } else {
-                    ("Saved", theme::ACCENT)
+                    ("Saved", theme::ok(ui))
                 };
                 let r = ui.label(RichText::new(t).color(c).strong());
                 if let Some(e) = &self.save_error {
@@ -412,12 +412,12 @@ impl App {
                 let r = ui.add(egui::TextEdit::singleline(&mut root).desired_width(500.0));
                 self.loc.root = root.into();
                 apply = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                ui.label(RichText::new("New renders use this root. Existing outputs stay in place.").color(DIM).size(12.0));
+                ui.label(RichText::new("New renders use this root. Existing outputs stay in place.").color(theme::text_dim(ui)).size(12.0));
                 apply |= super::theme::primary_button(ui, "Save folder").clicked();
                 if apply { ui.close(); }
             });
             let shown = if self.loc.root.as_os_str().is_empty() { "Each clip's default output folder".to_string() } else { self.loc.root.display().to_string() };
-            ui.add(egui::Label::new(RichText::new(&shown).color(DIM).size(12.0)).truncate()).on_hover_text(format!("{shown}/{}", self.loc.folder_template));
+            ui.add(egui::Label::new(RichText::new(&shown).color(theme::text_dim(ui)).size(12.0)).truncate()).on_hover_text(format!("{shown}/{}", self.loc.folder_template));
         });
         if apply {
             self.loc_note = Some(match self.save_output_location() {

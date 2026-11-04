@@ -8,6 +8,7 @@ failure or cancel leaves the old folder untouched). See docs/design/rust-ui/stan
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import types
 from dataclasses import dataclass, field
@@ -29,7 +31,8 @@ import numpy as np
 
 from ..clip_state import MASK_TRACK_MANIFEST, ClipAsset, ClipEntry, ClipState
 from ..errors import CorridorKeyError, JobCancelledError
-from ..frame_io import imread_unicode, imwrite_unicode
+from ..frame_encoding import EncodingError, FrameEncoder
+from ..frame_io import imread_unicode
 from ..natural_sort import natural_sort_key
 from .key_job import (
     MANIFEST_NAME, PROTOCOL, KeyJobRejected, PublishError, _clean_abs, _freeze, _inside,
@@ -989,6 +992,16 @@ class _Progress:
             self.ev("progress", phase=self.phase, done=int(cur), total=int(tot))
 
 
+@contextlib.contextmanager
+def _encoder(what: str):
+    """Bounded PNG encoder: joins on success, cancels on any error, reports a failed write as a job error."""
+    try:
+        with FrameEncoder() as enc:
+            yield enc
+    except EncodingError as e:
+        raise CorridorKeyError(f"Cannot write {what}: {e}") from e
+
+
 def _chroma(job: TaskJob, ctx: _Ctx, view, cancel, prog) -> None:
     """Headless chroma loop over the view (``run_chroma_key`` imports Qt for the holdout)."""
     from CorridorKeyModule.core.chroma_key import chroma_key_matte
@@ -1004,34 +1017,34 @@ def _chroma(job: TaskJob, ctx: _Ctx, view, cancel, prog) -> None:
         except (OSError, ValueError, AttributeError):
             _rej("invalid", "holdout_strokes.json is unreadable")
     files = view.input_asset.get_frame_files()
-    for i, fname in enumerate(files):
-        if cancel.is_set():
-            raise JobCancelledError(view.name, i)
-        path = os.path.join(view.input_asset.path, fname)
-        bgr = imread_unicode(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH if fname.lower().endswith(".exr")
-                             else cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise CorridorKeyError(f"Cannot read source frame {fname}")
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        if rgb.dtype != np.uint8:
-            rgb = (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
-        if strokes and holdout is None:  # 128 neutral, 255 force fg, 0 force bg
-            h, w = rgb.shape[:2]
-            holdout = np.full((h, w), 128, np.uint8)
-            for s in strokes:
-                col, rad = (255 if s.get("brush_type", "fg") == "fg" else 0), max(1, int(round(s.get("radius", 15.0))))
-                pts = [(int(round(x)), int(round(y))) for x, y in s["points"]]
-                for q in pts:
-                    cv2.circle(holdout, q, rad, col, -1)
-                for q0, q1 in zip(pts, pts[1:]):
-                    cv2.line(holdout, q0, q1, col, rad * 2)
-        matte = chroma_key_matte(
-            rgb, holdout_mask=holdout, screen_color=tuple(p["screen_color"]) if p["screen_color"] else None,
-            screen_type=p["screen_type"], strength=p["strength"], clip_black=p["clip_black"],
-            clip_white=p["clip_white"], shrink_grow=p["shrink_grow"], edge_blur=p["edge_blur"])
-        if not imwrite_unicode(os.path.join(out, f"{os.path.splitext(fname)[0]}.png"), matte):
-            raise CorridorKeyError(f"Cannot write hint frame for {fname}")
-        prog(view.name, i + 1, len(files))
+    with _encoder("hint frames") as enc:
+        for i, fname in enumerate(files):
+            if cancel.is_set():
+                raise JobCancelledError(view.name, i)
+            path = os.path.join(view.input_asset.path, fname)
+            bgr = imread_unicode(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH if fname.lower().endswith(".exr")
+                                 else cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise CorridorKeyError(f"Cannot read source frame {fname}")
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            if rgb.dtype != np.uint8:
+                rgb = (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+            if strokes and holdout is None:  # 128 neutral, 255 force fg, 0 force bg
+                h, w = rgb.shape[:2]
+                holdout = np.full((h, w), 128, np.uint8)
+                for s in strokes:
+                    col, rad = (255 if s.get("brush_type", "fg") == "fg" else 0), max(1, int(round(s.get("radius", 15.0))))
+                    pts = [(int(round(x)), int(round(y))) for x, y in s["points"]]
+                    for q in pts:
+                        cv2.circle(holdout, q, rad, col, -1)
+                    for q0, q1 in zip(pts, pts[1:]):
+                        cv2.line(holdout, q0, q1, col, rad * 2)
+            matte = chroma_key_matte(
+                rgb, holdout_mask=holdout, screen_color=tuple(p["screen_color"]) if p["screen_color"] else None,
+                screen_type=p["screen_type"], strength=p["strength"], clip_black=p["clip_black"],
+                clip_white=p["clip_white"], shrink_grow=p["shrink_grow"], edge_blur=p["edge_blur"])
+            enc.submit_image(os.path.join(out, f"{os.path.splitext(fname)[0]}.png"), matte)
+            prog(view.name, i + 1, len(files))
 
 
 def cleanup_mask(a: np.ndarray, c) -> np.ndarray:
@@ -1072,13 +1085,15 @@ def _cleanup_staged(job: TaskJob, ctx: _Ctx, staged: str, cancel) -> None:
     c = stage_cleanup(job.kind, job.publish_dir, job.params.get("mask_cleanup"))
     if not c or not (c["grow"] or c["fill_holes"] or c["feather"] > 0):
         return
-    for stem in ctx.stems:
-        if cancel.is_set():
-            raise JobCancelledError(job.job_id, 0)
-        path = os.path.join(staged, f"{stem}.png")
-        m = imread_unicode(path, cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH)
-        if m is None or not imwrite_unicode(path, cleanup_mask(m, c)):
-            raise CorridorKeyError(f"Cannot clean up mask for {stem}")
+    with _encoder("cleaned masks") as enc:
+        for stem in ctx.stems:
+            if cancel.is_set():
+                raise JobCancelledError(job.job_id, 0)
+            path = os.path.join(staged, f"{stem}.png")
+            m = imread_unicode(path, cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH)
+            if m is None:
+                raise CorridorKeyError(f"Cannot clean up mask for {stem}")
+            enc.submit_image(path, cleanup_mask(m, c))  # in place: each stem is read before its own write
 
 
 def _prompt_fp(prompts: dict) -> str:
@@ -1131,9 +1146,9 @@ def _run_hint(svc, job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     elif k == "sam_track":
         masks = _sam(svc, job, ctx, view, ev, cancel, prog, status, warn)
         os.makedirs(staged)
-        for stem, m in zip(ctx.stems, masks):
-            if not imwrite_unicode(os.path.join(staged, f"{stem}.png"), np.where(np.asarray(m) > 0, 255, 0).astype(np.uint8)):
-                raise CorridorKeyError(f"Cannot write mask for {stem}")
+        with _encoder("SAM masks") as enc:
+            for stem, m in zip(ctx.stems, masks):
+                enc.submit_image(os.path.join(staged, f"{stem}.png"), np.where(np.asarray(m) > 0, 255, 0).astype(np.uint8))
     else:
         ev("status", message="Loading model..." if k != "chroma" else "Keying...")
         if k == "gvm":
@@ -1180,17 +1195,17 @@ def _promote_guide(job: TaskJob, ctx: _Ctx, view, staged: str, cancel) -> None:
     first = imread_unicode(os.path.join(view.input_asset.path, ctx.files[0]), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
     if first is None:
         raise CorridorKeyError("Cannot read the first source frame")
-    for i, stem in enumerate(ctx.stems):
-        if cancel.is_set():
-            raise JobCancelledError(view.name, i)
-        m = imread_unicode(ctx.masks[stem], cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH)
-        if m is None or m.size == 0:
-            raise CorridorKeyError(f"Guide mask {stem} is unreadable; nothing was published.")
-        if m.shape != first.shape[:2]:
-            raise CorridorKeyError(f"Guide mask {stem} is {m.shape[1]}x{m.shape[0]}, the source is "
-                                   f"{first.shape[1]}x{first.shape[0]}; nothing was published.")
-        if not imwrite_unicode(os.path.join(staged, f"{stem}.png"), m):
-            raise CorridorKeyError(f"Cannot stage hint frame for {stem}")
+    with _encoder("staged hint frames") as enc:
+        for i, stem in enumerate(ctx.stems):
+            if cancel.is_set():
+                raise JobCancelledError(view.name, i)
+            m = imread_unicode(ctx.masks[stem], cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH)
+            if m is None or m.size == 0:
+                raise CorridorKeyError(f"Guide mask {stem} is unreadable; nothing was published.")
+            if m.shape != first.shape[:2]:
+                raise CorridorKeyError(f"Guide mask {stem} is {m.shape[1]}x{m.shape[0]}, the source is "
+                                       f"{first.shape[1]}x{first.shape[0]}; nothing was published.")
+            enc.submit_image(os.path.join(staged, f"{stem}.png"), m)
 
 
 def _sam(svc, job: TaskJob, ctx: _Ctx, view, ev, cancel, prog, status, warn):
@@ -1315,7 +1330,7 @@ def _ffprobe_check(path: str, n: int, fps: float, alpha: bool) -> None:
 
 
 def _read_exr(path: str) -> np.ndarray:
-    """Float32 (H, W, C) in R,G,B[,A] or Y order, via OpenEXR (FFmpeg's decoder rejects DWAB/Y files)."""
+    """Float32 (H, W, C) via OpenEXR; FFmpeg's DWA decoder misreads 32-bit float alpha as half (NaN), see ffmpeg-dwa-research.md."""
     import Imath
     import OpenEXR
     f = OpenEXR.InputFile(path)
@@ -1329,6 +1344,26 @@ def _read_exr(path: str) -> np.ndarray:
         raise CorridorKeyError(f"{path}: expected R,G,B[,A] or Y channels, found {sorted(names)}")
     flt = Imath.PixelType(Imath.PixelType.FLOAT)
     return np.stack([np.frombuffer(f.channel(c, flt), np.float32).reshape(hh, w) for c in order], -1)
+
+
+def _exr_layout(path: str) -> tuple:
+    """(width, height, has_alpha, ffmpeg_ok) from the EXR header only (no pixel decode). FFmpeg reads RGB(A)
+    EXR except Y-only files and DWAA/DWAB with FLOAT alpha (FFmpeg's DWA decoder misreads 32-bit float alpha
+    as half (NaN), see ffmpeg-dwa-research.md)."""
+    import OpenEXR
+    f = OpenEXR.InputFile(path)
+    try:
+        h = f.header()
+    finally:
+        f.close()
+    dw, names = h["dataWindow"], set(h["channels"])
+    dwa = h["compression"].v in (OpenEXR.Compression.DWAA_COMPRESSION.value, OpenEXR.Compression.DWAB_COMPRESSION.value)
+    float_alpha = "A" in names and h["channels"]["A"].type.v == OpenEXR.FLOAT
+    return (dw.max.x - dw.min.x + 1, dw.max.y - dw.min.y + 1, "A" in names,
+            {"R", "G", "B"} <= names and not (float_alpha and dwa))
+
+
+_EXPORT_DECODE_WORKERS = 4  # measured ~2.8x faster than one frame at a time (PLAN.md)
 
 
 def _raw_frame(img: np.ndarray, srgb: bool) -> bytes:
@@ -1368,6 +1403,7 @@ def _reap(proc, helpers: list, grace: float = 2.0) -> None:
 
 
 def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
+    from ..ffmpeg_tools.color import build_exr_export_vf
     from ..ffmpeg_tools.discovery import require_ffmpeg_install
     p, n = job.params, len(ctx.files)
     ffmpeg = require_ffmpeg_install(require_probe=True).ffmpeg_path
@@ -1378,16 +1414,31 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
     scratch = os.path.join(_scratch_root(), f"export-{job.job_id}")
     os.makedirs(scratch)
     ext = os.path.splitext(ctx.files[0])[1].lower()
-    raw = ext == ".exr"  # EXR is decoded here and piped as 16-bit; PNG goes straight to FFmpeg
+    # PNG and RGB(A) EXR go straight to FFmpeg (it reads the sequence itself, ~4x faster than a Python decode
+    # plus raw pipe); EXR it cannot decode correctly (see _exr_layout) is decoded here and piped as 16-bit
+    raw, exr_alpha = ext == ".exr", False
     owned_part = False
     proc, helpers, stop = None, [], threading.Event()
     try:
+        if raw:
+            lay = []
+            for i, f in enumerate(ctx.files):
+                try:
+                    lay.append(_exr_layout(f))
+                except Exception as exc:  # noqa: BLE001
+                    raise CorridorKeyError(f"Cannot read frame {i + 1}/{n} ({f}): {exc}") from exc
+            for i, (f, x) in enumerate(zip(ctx.files, lay)):
+                if x[:3] != lay[0][:3]:
+                    raise CorridorKeyError(f"Frame {i + 1}/{n} ({f}) is {x[0]}x{x[1]} (alpha {x[2]}); "
+                                           f"the first frame is {lay[0][0]}x{lay[0][1]} (alpha {lay[0][2]})")
+            exr_alpha, raw = lay[0][2], not all(x[3] for x in lay)
         codec, q = p["codec"], str(p["quality"])
         pix = CODEC_SPEC[codec][0]
         # the stream has an alpha plane (opaque for RGB/gray inputs); transparency is real only for 'processed'
         alpha_plane = codec in _ALPHA_CODECS
         alpha = alpha_plane and p["product"] == "processed"
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-n"]
+        vf_head = ""
         if raw:
             first = _read_exr(ctx.files[0])
             hh, ww, ch = first.shape
@@ -1397,12 +1448,16 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
             ev("warning", message="EXR frames are linear; the video is encoded with the sRGB transfer."
                if srgb else "Matte EXR values are written as-is (no sRGB curve) to a gray video.")
         else:
+            if ext == ".exr":
+                vf_head = build_exr_export_vf(p["product"] != "matte", exr_alpha) + ","
+                ev("warning", message="EXR frames are linear; the video is encoded with the sRGB transfer."
+                   if p["product"] != "matte" else "Matte EXR values are written as-is (no sRGB curve).")
             for i, src in enumerate(ctx.files):  # sequential names only inside our scratch; gaps were rejected
                 _link(src, os.path.join(scratch, f"f{i:08d}{ext}"))
             cmd += ["-framerate", repr(float(p["fps"])), "-i", os.path.join(scratch, f"f%08d{ext}"),
                     "-progress", "pipe:1", "-nostats"]
         # BT.709 limited-range YUV made by swscale from full-range RGB/gray
-        cmd += ["-vf", f"scale=in_range=pc:out_color_matrix=bt709:out_range=tv,format={pix}", "-colorspace", "bt709"]
+        cmd += ["-vf", f"{vf_head}scale=in_range=pc:out_color_matrix=bt709:out_range=tv,format={pix}", "-colorspace", "bt709"]
         if p["product"] != "matte":
             cmd += ["-color_primaries", "bt709", "-color_trc", "iec61966-2-1"]
         if codec.startswith("prores"):
@@ -1439,19 +1494,27 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
                     except BaseException as exc:  # noqa: BLE001 - reported by the supervising loop
                         failure.append(exc)
 
-        def feed():  # decodes EXR frames and writes them; the ONLY blocking pipe write lives here
+        def load(i, src):  # worker thread: decode + validate + 16-bit convert one frame
             try:
-                for i, src in enumerate(ctx.files):
+                img = first if i == 0 else _read_exr(src)
+            except Exception as exc:  # noqa: BLE001
+                raise CorridorKeyError(f"Cannot read frame {i + 1}/{n} ({src}): {exc}") from exc
+            if img.shape != first.shape:
+                raise CorridorKeyError(f"Frame {i + 1}/{n} ({src}) is {img.shape[1]}x{img.shape[0]}x"
+                                       f"{img.shape[2]}; the first frame is {ww}x{hh}x{ch}")
+            return _raw_frame(img, srgb)
+
+        def feed():  # decodes EXR frames on a few threads, writes them in order; the ONLY blocking pipe write
+            pool = ThreadPoolExecutor(_EXPORT_DECODE_WORKERS, thread_name_prefix="export-dec")
+            pending, nxt = [], 0  # at most _EXPORT_DECODE_WORKERS frames decoded or in flight
+            try:
+                for i in range(n):
+                    while nxt < n and len(pending) < _EXPORT_DECODE_WORKERS:
+                        pending.append(pool.submit(load, nxt, ctx.files[nxt]))
+                        nxt += 1
                     if stop.is_set():
                         return
-                    try:
-                        img = first if i == 0 else _read_exr(src)
-                    except Exception as exc:  # noqa: BLE001
-                        raise CorridorKeyError(f"Cannot read frame {i + 1}/{n} ({src}): {exc}") from exc
-                    if img.shape != first.shape:
-                        raise CorridorKeyError(f"Frame {i + 1}/{n} ({src}) is {img.shape[1]}x{img.shape[0]}x"
-                                               f"{img.shape[2]}; the first frame is {ww}x{hh}x{ch}")
-                    data = _raw_frame(img, srgb)
+                    data = pending.pop(0).result()
                     try:
                         proc.stdin.write(data)
                     except (BrokenPipeError, OSError):
@@ -1460,6 +1523,7 @@ def _run_export(job: TaskJob, ctx: _Ctx, ev, cancel) -> dict:
             except BaseException as exc:  # noqa: BLE001
                 failure.append(exc)
             finally:
+                pool.shutdown(wait=True, cancel_futures=True)
                 try:
                     proc.stdin.close()
                 except (OSError, ValueError):

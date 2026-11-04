@@ -50,6 +50,7 @@ pub fn hint_offer(clip: &Clip, steps: &[TaskJob]) -> Option<HintOffer> {
             upstream: Default::default(),
             // ponytail: the planner never makes a SAM hint itself, so there is no prompt fingerprint to compare
             prompt_fp: None,
+            guide: (dir == hint_dir).then(|| guide_dir.clone()),
         };
         if into_hint {
             // The pre-matte this hint is refined from. MatAnyone2 is conditioned only on the In frame (the worker
@@ -516,6 +517,7 @@ mod tests {
                 source: w["source"].as_object().unwrap().clone().into_iter().collect(),
                 upstream: w["upstream"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().into())).collect(),
                 prompt_fp: None,
+                guide: None,
             };
             let rust = match check_hint(&d.join("AlphaHint"), &stems, &want) {
                 Compat::Compatible => "compatible",
@@ -535,6 +537,86 @@ mod tests {
             assert_eq!(python, rust, "case {name}: python said {python:?}, rust {rust:?}; stderr {}", String::from_utf8_lossy(&out.stderr));
             assert_eq!(rust, expect, "case {name}");
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Writes the worker's record for every frame of `sub` of clip c1 (`upstream` = the pre-matte it was made from).
+    fn record(d: &Path, sub: &str, kind: &str, params: &serde_json::Value, upstream: bool) {
+        let stems: Vec<String> = (1..=4).map(|i| format!("f{i}")).collect();
+        let by = |f: &dyn Fn(String) -> serde_json::Value| stems.iter().map(|s| (s.clone(), f(s.clone()))).collect::<BTreeMap<_, _>>();
+        let file = |s: &str| d.join(format!("{sub}/{s}.png"));
+        let mut rec = json!({
+            "kind": kind, "job_id": "old", "params": params, "stems": stems,
+            "digests": by(&|s| json!(crate::sha256::hex(&std::fs::read(file(&s)).unwrap()))),
+            "stats": by(&|s| crate::hints::stamp_value(&file(&s))),
+            "source": by(&|s| crate::hints::stamp_value(&d.join(format!("Frames/{s}.png")))),
+        });
+        if upstream {
+            rec["upstream"] = json!(by(&|s| json!(crate::sha256::hex(&std::fs::read(d.join(format!("VideoMamaMaskHint/{s}.png"))).unwrap()))));
+        }
+        std::fs::write(d.join(sub).join(".corridorkey_hint.json"), json!({"kind": kind, "ranges": [rec]}).to_string()).unwrap();
+    }
+
+    /// The board plan (pre-matte promotion) over a clip whose hint was written by the producer directly (the Hint
+    /// page's "Generate hint", Final = Direct), or the other way round.
+    fn two_routes(tag: &str, direct_made: bool) -> (PathBuf, Clip, Vec<TaskJob>) {
+        let (root, clip, steps) = rendered(tag);
+        let d = root.join("clips/c1");
+        let producer = json!({"key": "green", "mask_cleanup": steps[0].params["mask_cleanup"]});
+        record(&d, "VideoMamaMaskHint", "chroma", &producer, false);
+        if direct_made {
+            record(&d, "AlphaHint", "chroma", &producer, false);
+        }
+        (root, clip, steps)
+    }
+
+    #[test]
+    fn a_hint_made_directly_by_the_producer_is_reused_by_the_board_plan_and_changes_still_ask() {
+        let (root, clip, steps) = two_routes("direct", true);
+        let d = root.join("clips/c1");
+        assert_eq!(hint_offer(&clip, &steps).unwrap().compat, Compat::Compatible);
+        let mut feather = steps.clone();
+        feather[0].params["mask_cleanup"]["feather"] = json!(3.0);
+        assert!(matches!(hint_offer(&clip, &feather).unwrap().compat, Compat::Mismatch(_)), "other settings ask");
+        std::fs::write(d.join("VideoMamaMaskHint/f3.png"), "a new pre-matte").unwrap();
+        assert!(matches!(hint_offer(&clip, &steps).unwrap().compat, Compat::Mismatch(_)), "a changed pre-matte asks");
+        std::fs::write(d.join("VideoMamaMaskHint/f3.png"), "guide3").unwrap(); // same bytes: certified again by hash
+        assert_eq!(hint_offer(&clip, &steps).unwrap().compat, Compat::Compatible);
+        std::fs::write(d.join("Frames/f2.png"), "replaced source!").unwrap();
+        assert!(matches!(hint_offer(&clip, &steps).unwrap().compat, Compat::Mismatch(_)), "a changed source asks");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_plain_direct_generate_hint_plans_the_same_steps_as_the_board() {
+        use crate::hints::{Final, Gen, HintCfg, Producer};
+        let (root, clip, _) = rendered("plain");
+        let d = root.join("clips/c1");
+        std::fs::remove_dir_all(d.join("VideoMamaMaskHint")).unwrap(); // no pre-matte first
+        let mut cfg = HintCfg::default();
+        (cfg.guide, cfg.finish) = (Producer::Birefnet, Final::Direct);
+        let stg = staging_root(&root, &clip.root, &clip.folder);
+        let mut n = 0;
+        let mut id = || { n += 1; format!("job{n}") };
+        let page = Gen { clip: &clip, cfg: &cfg, ann: None, linear: false, staging: &stg }.hint((0, 3), false, &mut id).unwrap();
+        let board = hint_steps(&clip, &root, &cfg, "full", (0, 3), false, || "b".to_string()).unwrap().steps;
+        let shape = |v: &[TaskJob]| v.iter().map(|t| (t.kind.wire(), t.publish_dir.clone().map(|p| p.file_name().unwrap().to_owned()), t.params.clone())).collect::<Vec<_>>();
+        assert_eq!(page.len(), 2, "pre-matte, then publish");
+        assert_eq!(shape(&page), shape(&board), "both routes write the same records");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_hint_made_by_the_batch_route_is_recognised_for_the_direct_producer() {
+        let (root, clip, steps) = two_routes("batch", false);
+        let mut direct = steps.clone();
+        direct[0].kind = crate::tasks::TaskKind::Chroma;
+        direct[0].params = json!({"key": "green", "mask_cleanup": steps[0].params["mask_cleanup"]});
+        assert_eq!(hint_offer(&clip, &direct).unwrap().compat, Compat::Compatible);
+        direct[0].params["key"] = json!("blue");
+        assert!(matches!(hint_offer(&clip, &direct).unwrap().compat, Compat::Mismatch(_)), "another producer setting asks");
+        direct[0].kind = crate::tasks::TaskKind::Birefnet;
+        assert!(matches!(hint_offer(&clip, &direct).unwrap().compat, Compat::Mismatch(_)), "another producer asks");
         let _ = std::fs::remove_dir_all(root);
     }
 

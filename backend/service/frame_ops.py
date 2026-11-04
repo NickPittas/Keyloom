@@ -294,20 +294,38 @@ class FrameOpsMixin:
         :meth:`_load_named_sequence_frames` (eager list) or pass
         ``num_frames`` explicitly alongside the generator.
         """
+        from concurrent.futures import ThreadPoolExecutor
         from . import read_image_frame
+        from ..frame_encoding import default_workers
+
+        def decode(fpath):
+            img = read_image_frame(fpath, gamma_correct_exr=gamma_correct_exr)
+            return None if img is None else (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
 
         total = len(file_names)
-        for index, fname in enumerate(file_names):
-            if job and job.is_cancelled:
-                raise JobCancelledError(clip_name, index)
-            fpath = os.path.join(asset.path, fname)
-            img = read_image_frame(fpath, gamma_correct_exr=gamma_correct_exr)
-            if img is None:
-                raise FrameReadError(clip_name, index, fpath)
-            frame = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
-            if on_status and index % 20 == 0 and index > 0:
-                on_status(f"Loading frames ({index}/{total})...")
-            yield fname, frame
+        workers = default_workers()
+        pool = ThreadPoolExecutor(workers, thread_name_prefix="frame-dec")
+        pending = []  # ordered window of (index, name, path, future): at most ``workers`` frames in flight
+        nxt = 0
+        try:
+            for index, fname in enumerate(file_names):
+                while nxt < total and len(pending) < workers:
+                    if job and job.is_cancelled:
+                        raise JobCancelledError(clip_name, index)
+                    path = os.path.join(asset.path, file_names[nxt])
+                    pending.append((nxt, file_names[nxt], path, pool.submit(decode, path)))
+                    nxt += 1
+                if job and job.is_cancelled:
+                    raise JobCancelledError(clip_name, index)
+                _, name, fpath, fut = pending.pop(0)
+                frame = fut.result()
+                if frame is None:
+                    raise FrameReadError(clip_name, index, fpath)
+                if on_status and index % 20 == 0 and index > 0:
+                    on_status(f"Loading frames ({index}/{total})...")
+                yield name, frame
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     @staticmethod
     def _resolve_sequence_input_is_linear(

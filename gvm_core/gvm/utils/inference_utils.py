@@ -161,6 +161,7 @@ class ImageSequenceWriter:
         self.path = path
         self.extension = extension
         self.counter = 0
+        self._encoder = None
         os.makedirs(path, exist_ok=True)
     
     def write(self, frames, filenames=None):
@@ -171,10 +172,29 @@ class ImageSequenceWriter:
             else:
                 filename = os.path.splitext(filenames[t])[0] + '.' + self.extension
 
-            to_pil_image(frames[t]).save(os.path.join(
-                self.path, filename))
+            out_path = os.path.join(self.path, filename)
+            if self.extension.lower() == 'png' and frames[t].shape[0] == 1:
+                # Gray PNG: same pixels as PIL (float * 255, truncated to uint8), encoded on the bounded threads.
+                if self._encoder is None:
+                    from backend.frame_encoding import FrameEncoder
+                    self._encoder = FrameEncoder()
+                f = frames[t]
+                if f.is_floating_point():
+                    f = f.mul(255).byte()
+                self._encoder.submit_image(out_path, f[0].cpu().numpy())
+            else:
+                to_pil_image(frames[t]).save(out_path)
             self.counter += 1
             
     def close(self):
-        pass
+        """Wait for every queued PNG; raises the first write error."""
+        enc, self._encoder = self._encoder, None
+        if enc is not None:
+            enc.join()
+
+    def abort(self):
+        """Stop queued writes (cancel/error path)."""
+        enc, self._encoder = self._encoder, None
+        if enc is not None:
+            enc.cancel()
         

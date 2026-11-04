@@ -317,7 +317,7 @@ impl App {
             if let Some(m) = self.media.movie.as_ref().filter(|m| m.folder == clip.folder) {
                 let ready = prepare_source_worker_ok(self.ai.local_worker_unstarted(), self.ai.local_caps().as_ref().is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false)))
                     && (matches!(m.verdict, Some(Ok(true))) || matches!(m.verdict, Some(Ok(false))) && m.confirm);
-                extract = ui.add_enabled(ready, egui::Button::new("Extract frames from this movie").fill(theme::ACCENT)).clicked();
+                extract = theme::accent(ui, ready, |ui| ui.add(egui::Button::new("Extract frames from this movie"))).clicked();
             }
             if let Some(s) = self.media.seq.as_ref().filter(|s| s.clip_folder == clip.folder) {
                 ui.horizontal(|ui| {
@@ -325,7 +325,7 @@ impl App {
                         ui.label("Importing frames…");
                         if ui.button("Stop import").clicked() { stop.store(true, std::sync::atomic::Ordering::Relaxed); }
                     } else {
-                        start = ui.add_enabled(s.plan.is_ok(), egui::Button::new("Import mask frames").fill(theme::ACCENT)).clicked();
+                        start = theme::accent(ui, s.plan.is_ok(), |ui| ui.add(egui::Button::new("Import mask frames"))).clicked();
                         cancel = ui.button("Cancel import").clicked();
                     }
                 });
@@ -358,11 +358,11 @@ impl App {
                 );
                 match (&m.verdict, &m.probed) {
                     (None, _) => {
-                        ui.label(RichText::new("Checking the movie…").color(DIM));
+                        ui.label(RichText::new("Checking the movie…").color(theme::text_dim(ui)));
                     }
                     (Some(Err(e)), _) => {
                         ui.colored_label(
-                            WARN,
+                            theme::warn(ui),
                             format!("Not the same footage: {e}. Nothing was changed."),
                         );
                     }
@@ -381,11 +381,11 @@ impl App {
                                 RichText::new(
                                     "Size, frame rate and frame count match the clip's records.",
                                 )
-                                .color(DIM)
+                                .color(theme::text_dim(ui))
                                 .size(12.0),
                             );
                         } else {
-                            ui.colored_label(WARN, "The clip kept no frame count to compare, so this match is partial (size and rate only).");
+                            ui.colored_label(theme::warn(ui), "The clip kept no frame count to compare, so this match is partial (size and rate only).");
                             theme::checkbox(
                                 ui,
                                 &mut m.confirm,
@@ -434,7 +434,7 @@ impl App {
                 }
                 match &s.plan {
                     Err(e) => {
-                        ui.colored_label(WARN, format!("Cannot import: {e}"));
+                        ui.colored_label(theme::warn(ui), format!("Cannot import: {e}"));
                     }
                     Ok(p) => {
                         ui.label(format!(
@@ -452,12 +452,12 @@ impl App {
                         ));
                     }
                 }
-                ui.label(RichText::new("Use the import action above the node graph.").color(DIM).size(12.0));
+                ui.label(RichText::new("Use the import action above the node graph.").color(theme::text_dim(ui)).size(12.0));
             }
 
         }
         if let Some(n) = &self.media.note {
-            ui.label(RichText::new(n).color(WARN).size(12.0));
+            ui.label(RichText::new(n).color(theme::warn(ui)).size(12.0));
         }
     }
 }
@@ -478,7 +478,7 @@ impl App {
     pub(super) fn media_details(&mut self, ui: &mut Ui, clip: &Clip) {
         let row = |ui: &mut Ui, label: &str, text: &str, copy: Option<&str>| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(label).color(DIM).size(11.5));
+                ui.label(RichText::new(label).color(theme::text_dim(ui)).size(11.5));
                 ui.add(egui::Label::new(RichText::new(text).monospace().size(11.0)).truncate())
                     .on_hover_text(text);
                 if let Some(c) = copy {
@@ -506,7 +506,7 @@ impl App {
                 Some(&path.display().to_string()),
             ),
             Source::Missing => {
-                ui.label(RichText::new("Source · missing (relink in Properties)").color(WARN).size(11.5));
+                ui.label(RichText::new("Source · missing (relink in Properties)").color(theme::warn(ui)).size(11.5));
             }
         }
         let stems = &clip.input_files;
@@ -541,7 +541,7 @@ impl App {
     /// Full path inventory for the Media properties panel: every folder this clip reads or writes.
     pub(super) fn media_paths(&mut self, ui: &mut Ui, clip: &Clip) {
         let row = |ui: &mut Ui, label: &str, text: &str| {
-            ui.label(RichText::new(label).color(DIM).size(11.5));
+            ui.label(RichText::new(label).color(theme::text_dim(ui)).size(11.5));
             ui.horizontal_wrapped(|ui| {
                 ui.add(egui::Label::new(RichText::new(text).monospace().size(11.0)).truncate())
                     .on_hover_text(text);
@@ -565,7 +565,7 @@ impl App {
             row(ui, "Last run wrote to", &m.display().to_string());
         }
         if let Some(r) = clip.result_range_text() {
-            ui.label(RichText::new(format!("Result covers {r}")).color(DIM).size(11.5));
+            ui.label(RichText::new(format!("Result covers {r}")).color(theme::text_dim(ui)).size(11.5));
         }
     }
 }

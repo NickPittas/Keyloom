@@ -2,6 +2,7 @@
 //! scrubbable timeline with In/Out band. One instance per open clip, shared by all workspace tabs.
 use crate::frames::*;
 use crate::project::{Clip, View};
+use super::theme;
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, Sense, Shape, Stroke, TextureHandle,
     TextureOptions, Ui, UiBuilder, Vec2,
@@ -15,11 +16,33 @@ pub const DIM: Color32 = Color32::from_rgb(150, 154, 160);
 const ACCENT: Color32 = Color32::from_rgb(110, 150, 190);
 
 const MAX_ZOOM: f32 = 32.0;
+/// Transport widths: the six icons, and Set In / Set Out / Clear In/Out / Loop.
+const ICONS_W: f32 = 34.0 * 6.0 + 5.0 * 4.0;
+const RANGE_W: f32 = 92.0 + 100.0 + 104.0 + 78.0 + 3.0 * 4.0;
+/// Width reserved for the view-mode chips at the right of the top bar.
+const CHIPS_W: f32 = 400.0;
 /// View, B view, input reading, alpha convention, In/Out bounds, looping.
 type PreviewSig = (View, Option<View>, bool, bool, (usize, usize), bool);
 
 fn mb(bytes: usize) -> String {
     format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// Which generated mask is tinted over the Input frame.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+pub enum Overlay {
+    #[default]
+    Off,
+    Guide,
+    Hint,
+}
+
+/// A marked-frame request from the viewer's mark controls, carried out by the Hint page.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MarkReq {
+    Mark,
+    Unmark,
+    Clear,
 }
 
 struct Tex {
@@ -35,6 +58,17 @@ pub struct Viewer {
     pub ann: super::annotate::AnnState,
     /// Hint keyframe marks as timeline indices (drawn as ticks).
     pub marks: Vec<usize>,
+    /// Mask tint (Off / Pre-matte / Hint), and the independent SAM prompt/preview layer; the SAM layer only
+    /// exists while the pre-matte producer is SAM (`sam_available`, set by the Hint page).
+    pub overlay: Overlay,
+    pub sam_overlay: bool,
+    pub sam_available: bool,
+    /// Mark / Unmark / Clear marks pressed this frame.
+    pub mark_req: Option<MarkReq>,
+    /// Controls drawn this frame (name, rect), for layout tests.
+    pub ui_rects: Vec<(&'static str, Rect)>,
+    /// Widths the A/B and overlay chip groups really took last frame (their text sets the size, not our estimate).
+    group_w: [f32; 2],
     pub clip: usize,
     pub index: FrameIndex,
     pub store: FrameStore,
@@ -79,12 +113,14 @@ fn icon_btn(ui: &mut Ui, kind: u8, active: bool, tip: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 28.0), Sense::click());
     let p = ui.painter();
     use super::theme as th;
-    let (bg, edge) = if active {
-        (th::CHECKED, th::BORDER_HOVER)
+    let w = &ui.visuals().widgets;
+    // Pressed-in (active) = accent fill with dark ink; otherwise the stock button states of the current palette.
+    let (bg, edge, c) = if active {
+        (if ui.visuals().dark_mode { th::CHECKED } else { Color32::from_rgb(157, 192, 165) }, w.hovered.bg_stroke.color, th::ACCENT_TEXT)
     } else if resp.hovered() {
-        (th::BUTTON_HOVER, th::BORDER_HOVER)
+        (w.hovered.weak_bg_fill, w.hovered.bg_stroke.color, w.hovered.fg_stroke.color)
     } else {
-        (th::BUTTON, th::BORDER)
+        (w.inactive.weak_bg_fill, w.inactive.bg_stroke.color, w.inactive.fg_stroke.color)
     };
     p.rect_filled(rect, 3.0, bg);
     p.rect_stroke(rect, 3.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
@@ -92,11 +128,10 @@ fn icon_btn(ui: &mut Ui, kind: u8, active: bool, tip: &str) -> egui::Response {
         p.rect_stroke(
             rect.expand(1.0),
             3.0,
-            Stroke::new(2.0, th::FOCUS),
+            Stroke::new(2.0, th::warn(ui)),
             egui::StrokeKind::Outside,
         );
     }
-    let c = th::TEXT;
     let m = rect.center();
     let tri = |dir: f32, x: f32| {
         Shape::convex_polygon(
@@ -146,7 +181,7 @@ fn icon_btn(ui: &mut Ui, kind: u8, active: bool, tip: &str) -> egui::Response {
             p.add(bar(m.x + 4.0));
         } // pause
     }
-    resp.on_hover_text(tip)
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 
 impl Viewer {
@@ -184,6 +219,12 @@ impl Viewer {
         Self {
             ann: super::annotate::AnnState::new(),
             marks: vec![],
+            overlay: Overlay::Off,
+            sam_overlay: true,
+            sam_available: false,
+            mark_req: None,
+            ui_rects: vec![],
+            group_w: [0.0; 2],
             clip: clip_idx,
             index,
             store,
@@ -632,14 +673,36 @@ impl Viewer {
         let full = ui.available_rect_before_wrap();
         let n = self.index.len();
 
-        // ---- top bar: info (left) · A/B (centre) · mode chips (right). Narrow windows put A/B on its own
-        // centred row so it can never overlap the chips or the info text.
-        let two_rows = full.width() < 960.0;
-        let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), 30.0));
-        let ab_bar = if two_rows {
-            Rect::from_min_size(bar.left_bottom(), Vec2::new(full.width(), 30.0))
+        // ---- top bar: info (left) · A/B wipe + overlay (centre) · mode chips (right). Narrow windows move the
+        // centre group to its own centred row (and the overlay chips to a third when even that is too wide), so
+        // nothing can overlap the chips or the info text.
+        // Measured last frame: the chips grow with the font and the enabled views, so a fixed width overlapped.
+        let chips_w = self.ui_rects.iter().find(|(k, _)| *k == "chips").map_or(CHIPS_W, |(_, r)| r.width().max(CHIPS_W));
+        let ab_w = (if self.ab { 84.0_f32 + 6.0 + 85.0 } else { 84.0 }).max(self.group_w[0]);
+        let ov_w = (36.0_f32 + 72.0 + 42.0 + 44.0 + 3.0 * 4.0).max(self.group_w[1]);
+        let both_w = ab_w + 12.0 + ov_w;
+        self.ui_rects.clear();
+        // The mode chips on the right are about 400 wide; the info text on the left gets 170 when shown.
+        let info_w = if full.width() >= 640.0 { 170.0 } else { 0.0 };
+        let one_row = full.width() >= info_w + both_w + 8.0 + chips_w;
+        let split = !one_row && full.width() < both_w + 8.0;
+        let row = |i: f32| Rect::from_min_size(full.min + Vec2::new(0.0, 30.0 * i), Vec2::new(full.width(), 30.0));
+        let bar = row(0.0);
+        let (ab_rect, ov_rect) = if split {
+            (
+                Rect::from_center_size(row(1.0).center(), Vec2::new(ab_w, 30.0)),
+                Rect::from_center_size(row(2.0).center(), Vec2::new(ov_w, 30.0)),
+            )
         } else {
-            bar
+            let c = if one_row { bar.center() } else { row(1.0).center() };
+            let mut l = c.x - both_w / 2.0;
+            if one_row {
+                l = l.clamp(full.left() + info_w, full.right() - chips_w - 8.0 - both_w);
+            }
+            (
+                Rect::from_min_size(Pos2::new(l, c.y - 15.0), Vec2::new(ab_w, 30.0)),
+                Rect::from_min_size(Pos2::new(l + ab_w + 12.0, c.y - 15.0), Vec2::new(ov_w, 30.0)),
+            )
         };
         let mut left = ui.new_child(
             UiBuilder::new()
@@ -651,15 +714,18 @@ impl Viewer {
                 .max_rect(bar)
                 .layout(Layout::right_to_left(Align::Center)),
         );
-        // Fixed widths (toggle 84 + gap 6 + combo 100) so the whole A/B group, not its left edge, is centred.
-        let group_w = if self.ab { 84.0 + 6.0 + 85.0 } else { 84.0 };
-        let cbar = Rect::from_center_size(ab_bar.center(), Vec2::new(group_w, 30.0));
         let mut mid = ui.new_child(
             UiBuilder::new()
-                .max_rect(cbar)
+                .max_rect(ab_rect)
                 .layout(Layout::left_to_right(Align::Center)),
         );
         mid.spacing_mut().item_spacing.x = 6.0;
+        let mut ovr = ui.new_child(
+            UiBuilder::new()
+                .max_rect(ov_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        ovr.spacing_mut().item_spacing.x = 4.0;
         let (mut view, mut ab, mut bv) = (self.view, self.ab, self.b_view);
         for v in View::ALL.into_iter().rev() {
             let en = self.view_enabled(v);
@@ -667,6 +733,7 @@ impl Viewer {
                 en.is_ok(),
                 egui::Button::selectable(view == v, v.label()).min_size(Vec2::new(0.0, 24.0)),
             );
+            let r = if en.is_ok() { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r };
             if r.clicked() {
                 view = v;
             }
@@ -674,10 +741,10 @@ impl Viewer {
                 r.on_disabled_hover_text(why);
             }
         }
-        if mid
-            .add(egui::Button::selectable(ab, "A/B wipe").min_size(Vec2::new(84.0, 24.0)))
-            .clicked()
-        {
+        self.ui_rects.push(("chips", right.min_rect()));
+        let r = mid.add(egui::Button::selectable(ab, "A/B wipe").min_size(Vec2::new(84.0, 24.0))).on_hover_cursor(egui::CursorIcon::PointingHand);
+        self.ui_rects.push(("ab", r.rect));
+        if r.clicked() {
             ab = !ab;
         }
         if ab {
@@ -692,6 +759,31 @@ impl Viewer {
                     }
                 });
         }
+        for (o, l, w, name) in [
+            (Overlay::Off, "Off", 36.0, "overlay_off"),
+            (Overlay::Guide, "Pre-matte", 72.0, "overlay_guide"),
+            (Overlay::Hint, "Hint", 42.0, "overlay_hint"),
+        ] {
+            let r = ovr
+                .add(egui::Button::selectable(self.overlay == o, l).min_size(Vec2::new(w, 24.0)))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Tint this mask over the Input frame");
+            self.ui_rects.push((name, r.rect));
+            if r.clicked() {
+                self.overlay = o;
+            }
+        }
+        let on = self.sam_overlay && self.sam_available;
+        let r = ovr
+            .add_enabled(self.sam_available, egui::Button::selectable(on, "SAM").min_size(Vec2::new(44.0, 24.0)))
+            .on_hover_text("Show the SAM prompts and preview on the frame")
+            .on_disabled_hover_text("The pre-matte producer is not SAM");
+        let r = if self.sam_available { r.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r };
+        self.ui_rects.push(("sam", r.rect));
+        if r.clicked() {
+            self.sam_overlay = !self.sam_overlay;
+        }
+        self.group_w = [mid.min_rect().width(), ovr.min_rect().width()];
         let info = self
             .held
             .as_ref()
@@ -701,14 +793,17 @@ impl Viewer {
         // The format/size text would run under the chips when the viewer is squeezed (Properties sheet open).
         if full.width() >= 640.0 {
             left.add_space(4.0);
-            left.label(egui::RichText::new(info).color(DIM).size(12.0));
+            left.label(egui::RichText::new(info).color(theme::text_dim(ui)).size(12.0));
         }
         (self.view, self.ab, self.b_view) = (view, ab, bv);
-        ui.advance_cursor_after_rect(if two_rows { bar.union(ab_bar) } else { bar });
+        ui.advance_cursor_after_rect(if one_row { bar } else if split { bar.union(row(2.0)) } else { bar.union(row(1.0)) });
 
         // ---- image area
-        let bottom_h = 36.0 + 38.0 + 22.0 + 6.0 + if full.width() < 864.0 { 30.0 } else { 0.0 };
-        let img_h = (full.bottom() - ui.cursor().top() - bottom_h).max(120.0);
+        // Wide enough that Set In/Out sit on the icon row; then the mark buttons sit on its left and the marks list
+        // shares the status line. Narrower: a compact second transport row and a marks row of their own.
+        let inline_w = full.width() / 2.0 + ICONS_W / 2.0 + 16.0 + RANGE_W <= full.width();
+        let bottom_h = 36.0 + 38.0 + 22.0 + 6.0 + if inline_w { 0.0 } else { 30.0 + 28.0 };
+        let img_h = (full.bottom() - ui.cursor().top() - bottom_h).max(56.0);
         let (rect, resp) =
             ui.allocate_exact_size(Vec2::new(full.width(), img_h), Sense::click_and_drag());
         ui.painter().rect_filled(rect, 2.0, Color32::from_gray(22));
@@ -717,8 +812,7 @@ impl Viewer {
         // ---- transport: the six icons are centred on the viewer by themselves; Set In / Set Out / Clear
         // live to their right on the same row when there is room, otherwise on a compact second row.
         ui.add_space(4.0);
-        let icons_w = 34.0 * 6.0 + 5.0 * 4.0;
-        let range_w = 92.0 + 100.0 + 104.0 + 78.0 + 3.0 * 4.0;
+        let (icons_w, range_w) = (ICONS_W, RANGE_W);
         let trow = ui.allocate_space(Vec2::new(full.width(), 30.0)).1;
         let crect = Rect::from_center_size(trow.center(), Vec2::new(icons_w, 30.0));
         let mut t = ui.new_child(
@@ -765,6 +859,13 @@ impl Viewer {
             self.set_playhead(n.saturating_sub(1));
         }
         let inline = crect.right() + 16.0 + range_w <= full.right();
+        debug_assert_eq!(inline, inline_w);
+        if inline {
+            let area = Rect::from_min_max(trow.left_top(), Pos2::new(crect.left() - 8.0, trow.bottom()));
+            let mut t = ui.new_child(UiBuilder::new().max_rect(area).layout(Layout::left_to_right(Align::Center)));
+            t.spacing_mut().item_spacing.x = 4.0;
+            self.mark_buttons(&mut t);
+        }
         let rrect = if inline {
             Rect::from_min_size(
                 Pos2::new(crect.right() + 16.0, trow.top()),
@@ -809,6 +910,14 @@ impl Viewer {
         // ---- timeline
         ui.add_space(4.0);
         self.timeline(ui, full.width());
+        if !inline {
+            let r1 = ui.allocate_space(Vec2::new(full.width(), 26.0)).1;
+            let mut t = ui.new_child(UiBuilder::new().max_rect(r1).layout(Layout::left_to_right(Align::Center)));
+            t.spacing_mut().item_spacing.x = 4.0;
+            self.mark_buttons(&mut t);
+            let area = Rect::from_min_max(Pos2::new(t.min_rect().right() + 8.0, r1.top()), r1.right_bottom());
+            self.marks_list(ui, area, None);
+        }
 
         // ---- status line
         let mut s = format!(
@@ -829,7 +938,13 @@ impl Viewer {
         if self.clock.is_some() || self.drops > 0 {
             s += &format!("  ·  dropped {}", self.drops);
         }
-        ui.label(egui::RichText::new(s).size(12.0).color(DIM));
+        if inline {
+            let area = ui.allocate_space(Vec2::new(full.width(), 15.0)).1;
+            self.marks_list(ui, area, Some(&s));
+        } else {
+            let s = format!("{s}  ·  {}", self.marks_text());
+            ui.label(egui::RichText::new(s).size(12.0).color(theme::text_dim(ui)));
+        }
     }
 
     fn draw_image(&mut self, ctx: &egui::Context, ui: &mut Ui, rect: Rect, resp: &egui::Response) {
@@ -1073,7 +1188,7 @@ impl Viewer {
             p.rect_filled(
                 Rect::from_min_size(bar.min, Vec2::new(bar.width() * f, bar.height())),
                 2.0,
-                ACCENT,
+                Color32::from_rgb(60, 100, 140), // white text on it holds >= 4.5:1
             );
             p.text(
                 bar.center(),
@@ -1085,6 +1200,60 @@ impl Viewer {
         }
     }
 
+    /// The current frame's name and how many marks are inside In/Out.
+    fn marks_text(&self) -> String {
+        let count = self.marks.iter().filter(|m| self.range.is_none_or(|(a, b)| (a..=b).contains(*m))).count();
+        format!("{} · {count} marked within In/Out", self.index.stems.get(self.playhead).map_or("", String::as_str))
+    }
+
+    /// Mark / Unmark / Clear marks. Pressing one sets `mark_req`; the Hint page saves it.
+    fn mark_buttons(&mut self, t: &mut Ui) {
+        let here = self.marks.contains(&self.playhead);
+        for (label, name, enabled, tip, req) in [
+            ("Mark frame", "mark", !self.index.is_empty() && !here, "Mark this frame", MarkReq::Mark),
+            ("Unmark", "unmark", here, "Remove the mark from this frame", MarkReq::Unmark),
+            ("Clear marks", "clear_marks", !self.marks.is_empty(), "Removes only the marks, never hint frames", MarkReq::Clear),
+        ] {
+            let r = t.add_enabled(enabled, egui::Button::new(label).min_size(Vec2::new(0.0, 22.0))).on_hover_text(tip);
+            self.ui_rects.push((name, r.rect));
+            if r.clicked() {
+                self.mark_req = Some(req);
+            }
+        }
+    }
+
+    /// In `area`: the current frame, how many marks are inside In/Out, and the marks themselves (click one to go
+    /// there). `lead` is text drawn first (the status line). Marks outside In/Out stay listed, dimmed.
+    fn marks_list(&mut self, ui: &mut Ui, area: Rect, lead: Option<&str>) {
+        let inside = |m: usize| self.range.is_none_or(|(a, b)| (a..=b).contains(&m));
+        let mut room = area;
+        if let Some(lead) = lead {
+            let text = format!("{lead}  ·  {}", self.marks_text());
+            let mut row = ui.new_child(UiBuilder::new().max_rect(area).layout(Layout::left_to_right(Align::Center)));
+            let l = row.label(egui::RichText::new(text).color(theme::text_dim(ui)).size(12.0));
+            self.ui_rects.push(("marks_text", l.rect));
+            room = Rect::from_min_max(Pos2::new(l.rect.right() + 8.0, area.top()), area.right_bottom());
+        }
+        if room.width() > 24.0 && !self.marks.is_empty() {
+            let mut goto = None;
+            let mut list = ui.new_child(UiBuilder::new().max_rect(room).layout(Layout::left_to_right(Align::Center)));
+            egui::ScrollArea::horizontal().id_salt("marks_list").show(&mut list, |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for m in self.marks.clone() {
+                    let b = egui::Button::selectable(self.playhead == m, self.index.frame_number(m).to_string())
+                        .min_size(Vec2::new(0.0, 20.0));
+                    let b = if inside(m) { b } else { b.fill(ui.visuals().extreme_bg_color) };
+                    if ui.add(b).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Go to this marked frame").clicked() {
+                        goto = Some(m);
+                    }
+                }
+            });
+            if let Some(m) = goto {
+                self.set_playhead(m);
+            }
+        }
+    }
+
     fn timeline(&mut self, ui: &mut Ui, width: f32) {
         let n = self.index.len();
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::click_and_drag());
@@ -1093,7 +1262,9 @@ impl Viewer {
             Pos2::new(rect.left() + 6.0, rect.top() + 14.0),
             Pos2::new(rect.right() - 6.0, rect.bottom() - 4.0),
         );
-        p.rect_filled(track, 2.0, Color32::from_gray(38));
+        let dark = ui.visuals().dark_mode;
+        p.rect_filled(track, 2.0, if dark { Color32::from_gray(38) } else { Color32::from_rgb(208, 215, 209) });
+        p.rect_stroke(track, 2.0, Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color), egui::StrokeKind::Inside);
         if n == 0 {
             return;
         }
@@ -1113,7 +1284,7 @@ impl Viewer {
                     Pos2::new(x_of(b).max(x_of(a) + 2.0), track.bottom()),
                 ),
                 0.0,
-                ACCENT.linear_multiply(0.45),
+                theme::accent_mark(ui).linear_multiply(0.45),
             );
         }
         for m in &self.marks {
@@ -1122,7 +1293,7 @@ impl Viewer {
                     Pos2::new(x_of(*m), track.top() - 4.0),
                     Pos2::new(x_of(*m), track.bottom()),
                 ],
-                Stroke::new(2.0, Color32::from_rgb(120, 220, 140)),
+                Stroke::new(2.0, theme::ok(ui)),
             );
         }
         // Holes in the current view: thin dark ticks, so missing frames stay visible.
@@ -1136,7 +1307,7 @@ impl Viewer {
                         Pos2::new(x_of(i), track.top()),
                         Pos2::new(x_of(i), track.bottom()),
                     ],
-                    Stroke::new(1.0, Color32::from_rgb(120, 60, 60)),
+                    Stroke::new(1.0, theme::error(ui)),
                 );
             }
         }
@@ -1146,7 +1317,7 @@ impl Viewer {
                 a,
                 self.index.frame_number(i).to_string(),
                 FontId::monospace(11.0),
-                DIM,
+                theme::text_dim(ui),
             )
         };
         label(track.left(), 0, Align2::LEFT_TOP);
@@ -1165,12 +1336,12 @@ impl Viewer {
                 Pos2::new(px, rect.top() + 12.0),
                 Pos2::new(px, rect.bottom()),
             ],
-            Stroke::new(2.0, Color32::from_rgb(235, 200, 90)),
+            Stroke::new(2.0, theme::warn(ui)),
         );
         p.circle_filled(
             Pos2::new(px, rect.top() + 12.0),
             3.5,
-            Color32::from_rgb(235, 200, 90),
+            theme::warn(ui),
         );
         if resp.dragged() || resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {

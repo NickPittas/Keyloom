@@ -260,15 +260,10 @@ impl AnnState {
             }
         }
         for b in &self.overlay.boxes {
-            p.rect_stroke(
-                Rect::from_two_pos(
-                    to_screen([b[0], b[1]], img, size),
-                    to_screen([b[2], b[3]], img, size),
-                ),
-                0.0,
-                Stroke::new(2.0, Color32::from_rgb(120, 190, 255)),
-                egui::StrokeKind::Middle,
-            );
+            let r = Rect::from_two_pos(to_screen([b[0], b[1]], img, size), to_screen([b[2], b[3]], img, size));
+            // Dark underlay: the prompt colour stays the same, but reads on bright and dark frames alike.
+            p.rect_stroke(r, 0.0, Stroke::new(4.0, Color32::from_black_alpha(160)), egui::StrokeKind::Middle);
+            p.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::from_rgb(120, 190, 255)), egui::StrokeKind::Middle);
         }
         for q in &self.overlay.points {
             let c = if q.label == 1 {
@@ -279,6 +274,7 @@ impl AnnState {
             let s = to_screen([q.x, q.y], img, size);
             p.circle_filled(s, 5.0, c);
             p.circle_stroke(s, 5.0, Stroke::new(1.5, Color32::BLACK));
+            p.circle_stroke(s, 6.5, Stroke::new(1.0, Color32::WHITE));
         }
         if !self.active() {
             return;
@@ -295,11 +291,9 @@ impl AnnState {
                 | Tool::EraseHold
         ) {
             if let Some(q) = pos.filter(|q| img.contains(*q)) {
-                p.circle_stroke(
-                    q,
-                    (self.brush as f32 * scale).max(2.0),
-                    Stroke::new(1.5, Color32::WHITE),
-                );
+                let rad = (self.brush as f32 * scale).max(2.0);
+                p.circle_stroke(q, rad, Stroke::new(3.5, Color32::from_black_alpha(160)));
+                p.circle_stroke(q, rad, Stroke::new(1.5, Color32::WHITE));
             }
         }
         let primary = resp.dragged_by(egui::PointerButton::Primary)

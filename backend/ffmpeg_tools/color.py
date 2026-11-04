@@ -230,6 +230,17 @@ def build_sam_jpeg_vf(srgb_encode: bool) -> str:
     """
     if not srgb_encode:
         return "format=rgb24,format=yuvj420p"
+    return f"format=rgb48le,{_srgb_lutrgb()},format=rgb24,format=yuvj420p"
+
+
+def _srgb_lutrgb() -> str:
+    """lutrgb filter applying the sRGB transfer to R,G,B only (alpha passes through unchanged)."""
     v = "val/maxval"
     curve = f"maxval*if(lte({v},0.0031308),12.92*{v},1.055*pow({v},1/2.4)-0.055)"
-    return f"format=rgb48le,lutrgb=r='{curve}':g='{curve}':b='{curve}',format=rgb24,format=yuvj420p"
+    return f"lutrgb=r='{curve}':g='{curve}':b='{curve}'"
+
+
+def build_exr_export_vf(srgb_encode: bool, alpha: bool) -> str:
+    """-vf head for video export straight from linear/display EXR: 16-bit RGB(A), full range, clipped
+    to 0..1, with the sRGB transfer on the colour channels when ``srgb_encode``."""
+    return f"format={'rgba64le' if alpha else 'rgb48le'}" + (f",{_srgb_lutrgb()}" if srgb_encode else "")

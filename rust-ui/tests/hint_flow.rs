@@ -74,7 +74,7 @@ fn saved_route_generates_the_hint_then_keys_and_history_survives_a_restart() {
         new_id,
     )
     .unwrap();
-    assert_eq!(steps.len(), 1);
+    assert_eq!(steps.len(), 2, "pre-matte, then publish");
     assert_eq!(
         steps[0].staging_dir.as_ref().unwrap().parent().unwrap(),
         stg
@@ -148,8 +148,8 @@ fn saved_route_generates_the_hint_then_keys_and_history_survives_a_restart() {
     assert!(err.is_none());
     assert_eq!(
         hist.iter().filter(|e| e.state == "complete").count(),
-        2,
-        "{hist:?}"
+        3,
+        "pre-matte, publish, Key: {hist:?}"
     );
 
     // Restart semantics: an entry that was still running when the app died comes back HELD, never running.

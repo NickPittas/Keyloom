@@ -567,7 +567,7 @@ impl AiUi {
                 return;
             }
             Err(e) => {
-                ui.colored_label(BAD, format!("Hint lock problem: {e}. Nothing was touched; remove it by hand once you are sure no hint job is writing."));
+                ui.colored_label(theme::error(ui), format!("Hint lock problem: {e}. Nothing was touched; remove it by hand once you are sure no hint job is writing."));
                 return;
             }
             Ok(Some(l)) => l,
@@ -594,14 +594,14 @@ impl AiUi {
             };
             ui.label(
                 RichText::new(format!("Hint lock held by job {j}: {t}."))
-                    .color(WARN)
+                    .color(theme::warn(ui))
                     .size(12.0),
             );
             return;
         }
         // A lock this very app holds for a running companion-sequence import: never offered for release.
         if self.external_writer(&clip.root) {
-            ui.label(RichText::new("Hint lock held by this app's running sequence import; it is released when the import ends.").color(WARN).size(12.0));
+            ui.label(RichText::new("Hint lock held by this app's running sequence import; it is released when the import ends.").color(theme::warn(ui)).size(12.0));
             return;
         }
         // Not a job of this session: ask the worker for the facts once, then offer explicit release.
@@ -634,7 +634,7 @@ impl AiUi {
         let Some(info) = info else {
             ui.label(
                 RichText::new("A hint lock exists; asking the worker who owns it…")
-                    .color(WARN)
+                    .color(theme::warn(ui))
                     .size(12.0),
             );
             return;
@@ -644,11 +644,11 @@ impl AiUi {
                 .get("problem")
                 .and_then(Value::as_str)
                 .unwrap_or("it names no writer");
-            ui.colored_label(BAD, format!("{} is unusable ({why}); left in place. Remove it by hand once you are sure no hint job is writing.", lock.path.display()));
+            ui.colored_label(theme::error(ui), format!("{} is unusable ({why}); left in place. Remove it by hand once you are sure no hint job is writing.", lock.path.display()));
             return;
         };
         let b = |k: &str| info.get(k).and_then(Value::as_bool);
-        ui.colored_label(WARN, format!(
+        ui.colored_label(theme::warn(ui), format!(
             "A hint job {job} from before this session left a lock (host {host}, pid {pid}{}). It is released only after the worker verifies ownership.",
             match b("local_dead") { Some(true) => ", its process has exited on this machine", Some(false) => ", its process is STILL RUNNING on this machine", None => ", it ran on another machine or its state is unknown" }
         ));
@@ -707,7 +707,7 @@ impl AiUi {
             if with_name {
                 ui.label(RichText::new(&name).strong());
             }
-            ui.label(RichText::new(e.job.kind.label()).color(DIM));
+            ui.label(RichText::new(e.job.kind.label()).color(theme::text_dim(ui)));
             match &e.state {
                 JobState::Queued => {
                     ui.label(if e.after.is_empty() {
@@ -734,7 +734,7 @@ impl AiUi {
                         )));
                     }
                     if e.cancel_requested {
-                        ui.label(RichText::new("cancel requested").color(WARN));
+                        ui.label(RichText::new("cancel requested").color(theme::warn(ui)));
                     } else {
                         cancel = ui.small_button("Cancel").clicked();
                     }
@@ -752,14 +752,14 @@ impl AiUi {
                         ui.label("Cancelled (previous result kept)");
                     }
                     Outcome::Failed => {
-                        ui.colored_label(BAD, trunc(info.message.as_deref().unwrap_or("Failed")));
+                        ui.colored_label(theme::error(ui), trunc(info.message.as_deref().unwrap_or("Failed")));
                     }
                 },
                 JobState::Rejected { code, message, .. } => {
-                    ui.colored_label(BAD, format!("Not started ({code}): {}", trunc(message)));
+                    ui.colored_label(theme::error(ui), format!("Not started ({code}): {}", trunc(message)));
                 }
                 JobState::Failed { reason } => {
-                    ui.colored_label(BAD, format!("Not started: {}", trunc(reason)));
+                    ui.colored_label(theme::error(ui), format!("Not started: {}", trunc(reason)));
                 }
                 JobState::Cancelled => {
                     ui.label("Cancelled before it started");
@@ -769,11 +769,11 @@ impl AiUi {
                     writer_stopped,
                     ..
                 } => {
-                    ui.colored_label(BAD, format!("Lost: {}", trunc(reason)));
+                    ui.colored_label(theme::error(ui), format!("Lost: {}", trunc(reason)));
                     if *writer_stopped {
                         ui.label("Writer stopped; the previous hint is unchanged.");
                     } else {
-                        ui.colored_label(WARN, "The worker may still be writing.");
+                        ui.colored_label(theme::warn(ui), "The worker may still be writing.");
                         confirm = ui.small_button("I confirm the worker is stopped").clicked();
                     }
                 }
@@ -788,7 +788,7 @@ impl AiUi {
             self.disk_gen += 1;
         }
         if let Some(n) = self.tk.lock_notes.get(id) {
-            ui.label(RichText::new(n).color(DIM).size(12.0));
+            ui.label(RichText::new(n).color(theme::text_dim(ui)).size(12.0));
         }
     }
 }
@@ -975,14 +975,14 @@ impl AiUi {
         for h in &older {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(&h.folder).strong());
-                ui.label(RichText::new(&h.label).color(DIM));
+                ui.label(RichText::new(&h.label).color(theme::text_dim(ui)));
                 if h.state == "held" {
-                    ui.colored_label(WARN, "held (interrupted)");
+                    ui.colored_label(theme::warn(ui), "held (interrupted)");
                 } else {
                     ui.label(&h.state);
                 }
                 if !h.detail.is_empty() {
-                    ui.label(RichText::new(trunc(&h.detail)).color(DIM).size(12.0));
+                    ui.label(RichText::new(trunc(&h.detail)).color(theme::text_dim(ui)).size(12.0));
                 }
                 if h.state == "held" {
                     if h.label == "Key" && ui.small_button("Review & re-queue").on_hover_text("Opens the normal review with the CURRENT settings; the old job is never re-sent").clicked() {

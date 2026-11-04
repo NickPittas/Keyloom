@@ -220,6 +220,11 @@ pub struct HintCfg {
     pub chroma: Chroma,
     pub videomama_chunk: u32,
     pub mask_cleanup: MaskCleanup,
+    /// Generate the pre-matte on the marked frames only (Pre-matte / Hint buttons follow this).
+    pub marks_pre: bool,
+    /// With `marks_pre`: the hint is also made on exactly those marks. Unchecked (MatAnyone2 only): the hint
+    /// runs over In/Out from the In-frame pre-matte.
+    pub marks_hint: bool,
     /// Pre-split key, only ever read (migrated into `guide`/`finish` when those are absent).
     #[serde(skip_serializing)]
     route: Option<Route>,
@@ -235,12 +240,23 @@ impl Default for HintCfg {
             chroma: Chroma::default(),
             videomama_chunk: 16,
             mask_cleanup: MaskCleanup::default(),
+            marks_pre: false,
+            marks_hint: true,
             route: None,
         }
     }
 }
 
 impl HintCfg {
+    /// The pre-matte buttons work on the marked frames.
+    pub fn pre_on_marks(&self) -> bool {
+        self.marks_pre && self.finish != Final::Import
+    }
+    /// The hint buttons work on the marked frames (and Key reads them as keyframes). Only MatAnyone2 can pair
+    /// marked pre-mattes with a dense hint; VideoMaMa and Direct have the one combined checkbox.
+    pub fn hint_on_marks(&self) -> bool {
+        self.pre_on_marks() && (self.marks_hint || self.finish != Final::Matanyone2)
+    }
     /// Stored settings. A config that only has the old `route` keeps its meaning: GVM/BiRefNet/Chroma were
     /// generated directly into the hint, MatAnyone2/VideoMaMa were refined from a SAM-tracked mask.
     pub fn from_value(v: &Value) -> Self {
@@ -1023,6 +1039,9 @@ pub struct HintWant {
     pub source: BTreeMap<String, Value>,
     pub upstream: BTreeMap<String, String>,
     pub prompt_fp: Option<String>,
+    /// The pre-matte folder. With it, a hint made by the producer directly and one made by promoting that producer's
+    /// pre-matte count as the same render (same pixels), whichever route wrote the record.
+    pub guide: Option<PathBuf>,
 }
 
 fn stamp(p: &Path) -> Option<(u64, u64)> {
@@ -1070,8 +1089,78 @@ fn same(want: &Value, have: &Value) -> bool {
     }
 }
 
-fn differs(rec: &Value, stem: &str, want: &HintWant) -> Option<String> {
+/// The certified frames of the pre-matte folder (a frame edited after it was made certifies nothing).
+struct GuideView {
+    files: BTreeMap<String, PathBuf>,
+    ranges: Vec<HintRange>,
+}
+
+impl GuideView {
+    fn new(dir: &Path) -> Self {
+        Self { files: hint_files(dir), ranges: read_hint_ranges(dir) }
+    }
+    /// The record that made pre-matte frame `s` and its digest, when the file still is that frame.
+    fn record(&self, s: &str) -> Option<(&Value, &String)> {
+        let path = self.files.get(s)?;
+        let r = self.ranges.iter().find(|r| !r.legacy && r.stems.iter().any(|x| x == s))?;
+        let dig = r.digests.get(s)?;
+        let by_stat = r.record.get("stats").and_then(|m| m.get(s)).is_some_and(|v| *v == stamp_value(path));
+        let by_hash = || {
+            crate::sha256::file(path, &std::sync::atomic::AtomicBool::new(false), |_, _| {}).ok().flatten().is_some_and(|h| h == *dig)
+        };
+        (by_stat || by_hash()).then_some((&r.record, dig))
+    }
+}
+
+/// `rec` (a hint frame's record) and `want` are the same render when one is the producer writing the hint directly
+/// ("Generate hint" with Direct) and the other the promotion of that producer's pre-matte (`prematte_hint`): the
+/// pre-matte record proves which producer, settings and source frame the pixels come from.
+fn via_guide(rec: &Value, stem: &str, want: &HintWant, g: &GuideView) -> bool {
+    const PM: &str = "prematte_hint";
+    let Some((gr, gdig)) = g.record(stem) else { return false };
+    let kind = |v: &Value| v.get("kind").and_then(Value::as_str).unwrap_or("").to_owned();
+    let params = |v: &Value| {
+        let mut p = v.get("params").cloned().unwrap_or(Value::Null);
+        if let Some(o) = p.as_object_mut() {
+            o.remove("source_map");
+        }
+        p
+    };
+    let cleanup = |p: &Value| p.get("mask_cleanup").cloned();
+    let src = |v: &Value| v.get("source").and_then(|m| m.get(stem)).cloned();
+    let (rk, rp, gp) = (kind(rec), params(rec), params(gr));
+    let same_cleanup = |w: &Value, h: &Value| matches!((cleanup(w), cleanup(h)), (Some(a), Some(b)) if same(&a, &b));
+    if want.kind == PM && rk != PM {
+        // the hint on disk is the producer's own output; the plan would promote that producer's pre-matte
+        rk == kind(gr)
+            && same(&gp, &rp)
+            && same(&rp, &gp)
+            && src(rec).is_some()
+            && src(rec) == src(gr)
+            && want.source.get(stem).is_none_or(|w| Some(w) == src(rec).as_ref())
+            && same_cleanup(&want.params, &rp)
+    } else if rk == PM && want.kind != PM {
+        // the hint on disk promotes the pre-matte; the plan would run the producer
+        let mut wp = want.params.clone();
+        if let Some(o) = wp.as_object_mut() {
+            o.remove("source_map");
+        }
+        want.kind == kind(gr)
+            && same(&wp, &gp)
+            && src(gr).is_some()
+            && src(gr).as_ref() == want.source.get(stem)
+            && rec.get("upstream").and_then(|u| u.get(stem)).and_then(Value::as_str) == Some(gdig.as_str())
+            && same_cleanup(&wp, &rp)
+    } else {
+        false
+    }
+}
+
+fn differs(rec: &Value, stem: &str, want: &HintWant, guide: Option<&GuideView>) -> Option<String> {
     if rec.get("kind").and_then(Value::as_str) != Some(want.kind.as_str()) {
+        if guide.is_some_and(|g| via_guide(rec, stem, want, g)) {
+            return None;
+        }
         return Some(format!("made by {}, not {}", rec.get("kind").and_then(Value::as_str).unwrap_or("?"), want.kind));
     }
     let mut wp = want.params.clone();
@@ -1107,6 +1196,7 @@ pub fn check_hint(dir: &Path, stems: &[String], want: &HintWant) -> Compat {
         return Compat::Missing;
     }
     let ranges = read_hint_ranges(dir);
+    let guide = want.guide.as_deref().map(GuideView::new);
     let mut unrecorded = false;
     for s in stems {
         let rec = ranges.iter().find(|r| !r.legacy && r.stems.contains(s));
@@ -1125,7 +1215,7 @@ pub fn check_hint(dir: &Path, stems: &[String], want: &HintWant) -> Compat {
         if !(by_stat || by_hash()) {
             return Compat::Mismatch(format!("frame {s} was changed after it was made"));
         }
-        if let Some(why) = differs(&r.record, s, want) {
+        if let Some(why) = differs(&r.record, s, want, guide.as_ref()) {
             return Compat::Mismatch(why);
         }
     }
@@ -1204,7 +1294,33 @@ impl Gen<'_> {
             Final::Import => {
                 Err("Imported alpha has nothing to generate: import one in Properties".into())
             }
-            Final::Direct => Ok(vec![self.produce(range, HINT_DIR, id)?]),
+            // Reuse only a certified pre-matte from this producer, settings, and source frames.
+            Final::Direct => {
+                let mut steps = vec![];
+                let stems = self.stems();
+                let task = self.cfg.guide.task();
+                // A source frame that is gone cannot be certified against: run the producer, never panic.
+                let source: Option<BTreeMap<String, Value>> = stems[range.0..=range.1]
+                    .iter()
+                    .map(|s| Some((s.clone(), stamp_value(&self.clip.input_files.iter().find(|f| &f.0 == s)?.1))))
+                    .collect();
+                let certified = source.is_some_and(|source| {
+                    let want = HintWant {
+                        kind: task.wire().into(),
+                        params: self.cfg.params(task),
+                        source,
+                        upstream: Default::default(),
+                        prompt_fp: None,
+                        guide: None,
+                    };
+                    check_hint(&self.clip.root.join(GUIDE_DIR), &stems[range.0..=range.1], &want) == Compat::Compatible
+                });
+                if !certified {
+                    steps.push(self.produce(range, GUIDE_DIR, id)?);
+                }
+                steps.push(self.cx(range, id).prematte_hint(self.cfg)?);
+                Ok(steps)
+            }
             f => {
                 let mut steps = vec![];
                 let dir = self.clip.root.join(GUIDE_DIR);
@@ -1242,8 +1358,21 @@ impl Gen<'_> {
         }
     }
 
+    /// Pre-matte on exactly the marked frames (one single-frame job per mark); other frames are untouched.
+    pub fn guide_marks(
+        &self,
+        marks: &[usize],
+        id: &mut dyn FnMut() -> String,
+    ) -> Result<Vec<TaskJob>, String> {
+        if marks.is_empty() {
+            return Err("no marked frames inside In/Out: mark frames first".into());
+        }
+        marks.iter().map(|k| self.guide((*k, *k), id)).collect()
+    }
+
     /// Real hints on exactly the marked frames (one single-frame job per mark), so Key's keyframe mode finds
-    /// them in `AlphaHint`. Other frames of the folder are untouched.
+    /// them in `AlphaHint`. Other frames of the folder are untouched. Missing pre-mattes are made first. Direct
+    /// publishes the pre-matte and promotes it, so the producer never runs twice for one mark.
     pub fn keyframes(
         &self,
         marks: &[usize],
@@ -1251,7 +1380,7 @@ impl Gen<'_> {
         id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<TaskJob>, String> {
         if marks.is_empty() {
-            return Err("no keyframe marks inside In/Out: mark frames first".into());
+            return Err("no marked frames inside In/Out: mark frames first".into());
         }
         let mut steps = vec![];
         for &k in marks {
@@ -1259,6 +1388,41 @@ impl Gen<'_> {
         }
         Ok(steps)
     }
+
+    /// The hint jobs the Hint button queues for `range` with the current marked-frame choice. `marks` are the
+    /// marks inside In/Out. MatAnyone2 with only its pre-matte on marks runs over In/Out from the In-frame
+    /// pre-matte, which must be marked or already on disk.
+    pub fn hint_run(
+        &self,
+        range: (usize, usize),
+        marks: &[usize],
+        id: &mut dyn FnMut() -> String,
+    ) -> Result<Vec<TaskJob>, String> {
+        if self.cfg.hint_on_marks() {
+            return self.keyframes(marks, true, id);
+        }
+        if self.cfg.pre_on_marks() {
+            // Matanyone2 only (hint_on_marks covers the others)
+            in_frame_gate(self.clip, self.cfg, range, marks)?;
+            return self.hint(range, true, id);
+        }
+        self.hint(range, false, id)
+    }
+}
+
+/// Why a dense MatAnyone2 hint from marked pre-mattes cannot start: its In frame has no pre-matte and is not
+/// marked (`marks` = marks inside In/Out). Nothing is marked or generated behind the user's back.
+pub fn in_frame_gate(clip: &Clip, cfg: &HintCfg, range: (usize, usize), marks: &[usize]) -> Result<(), String> {
+    let stems: Vec<String> = clip.input_files.iter().map(|f| f.0.clone()).collect();
+    if cfg.finish == Final::Matanyone2
+        && cfg.pre_on_marks()
+        && !cfg.marks_hint
+        && !marks.contains(&range.0)
+        && !covers(&clip.root.join(GUIDE_DIR), &stems, (range.0, range.0))
+    {
+        return Err("Mark In frame first".into());
+    }
+    Ok(())
 }
 
 /// What a Key run on `range` needs before it: the hint-generation steps (possibly none), in order.
@@ -1556,7 +1720,13 @@ mod tests {
         }
         // Basic producer: guide -> VideoMamaMaskHint, direct hint -> AlphaHint.
         assert!(g(&c, &cfg, &stg).guide((0, 3), &mut id).unwrap().publish_dir.unwrap().ends_with(GUIDE_DIR));
-        assert!(g(&c, &cfg, &stg).hint((0, 3), false, &mut id).unwrap()[0].publish_dir.as_ref().unwrap().ends_with(HINT_DIR));
+        let direct = g(&c, &cfg, &stg).hint((0, 3), false, &mut id).unwrap();
+        assert_eq!(
+            direct.iter().map(|j| (j.kind, j.publish_dir.as_ref().unwrap().ends_with(GUIDE_DIR))).collect::<Vec<_>>(),
+            vec![(TaskKind::Gvm, true), (TaskKind::PrematteHint, false)],
+            "pre-matte, then published into AlphaHint"
+        );
+        assert!(direct[1].publish_dir.as_ref().unwrap().ends_with(HINT_DIR));
         // Refine needs the guide: explicit hint refuses, a chain generates it first.
         cfg.finish = Final::Videomama;
         assert!(g(&c, &cfg, &stg).hint((0, 3), false, &mut id).unwrap_err().contains("guide first"));
