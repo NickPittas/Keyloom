@@ -1,15 +1,14 @@
 //! Import UI state: plan → confirm → run → progress/cancel/resume. The only code that starts the import helper.
 //! The UI thread never blocks: it polls the job channel once per frame.
 use super::picker::PickKind;
-use super::viewer::{DIM, WARN};
+use super::theme;
 use crate::import::{Event, Job, PlanItem, Request, Sources};
 use crate::project::{Clip, Source};
-use eframe::egui::{self, Color32, RichText, Ui};
+use eframe::egui::{self, RichText, Ui};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const ERR: Color32 = Color32::from_rgb(235, 120, 120);
 
 /// Where an import writes. Always shown on the confirm bar; nothing is written until the user confirms it.
 #[derive(Clone, Debug, PartialEq)]
@@ -480,7 +479,7 @@ impl ImportUi {
             let (msg, is_err, details) = (msg.clone(), *is_err, details.clone());
             let mut dismiss = false;
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(if is_err { ERR } else { WARN }, msg);
+                ui.colored_label(if is_err { theme::error(ui) } else { theme::warn(ui) }, msg);
                 if ui.button("Dismiss").clicked() {
                     dismiss = true;
                 }
@@ -544,17 +543,17 @@ impl ImportUi {
                                 t += &format!(" (“{o}” was taken)");
                             }
                             ui.label(RichText::new(t).color(if i.renamed_from.is_some() {
-                                WARN
+                                theme::warn(ui)
                             } else {
-                                DIM
+                                theme::text_dim(ui)
                             }));
                             if !i.detail.is_empty() {
-                                ui.label(RichText::new(format!("· {}", i.detail)).color(DIM));
+                                ui.label(RichText::new(format!("· {}", i.detail)).color(theme::text_dim(ui)));
                             }
-                            ui.label(RichText::new(format!("· {how}")).color(DIM));
+                            ui.label(RichText::new(format!("· {how}")).color(theme::text_dim(ui)));
                         } else {
                             ui.colored_label(
-                                ERR,
+                                theme::error(ui),
                                 format!(
                                     "Not imported: {label} — {}",
                                     i.reason.clone().unwrap_or_default()
@@ -677,7 +676,7 @@ fn dest_ui(ui: &mut Ui, p: &mut Pending, hold: bool, act: &mut Option<Act>) -> V
     });
     match p.dest.clone() {
         None => {
-            ui.colored_label(WARN, "Choose where to save before importing: a folder for a new project, or an existing project to add to.");
+            ui.colored_label(theme::warn(ui), "Choose where to save before importing: a folder for a new project, or an existing project to add to.");
         }
         Some(Dest::Add(project)) => {
             ui.label(
@@ -697,7 +696,7 @@ fn dest_ui(ui: &mut Ui, p: &mut Pending, hold: bool, act: &mut Option<Act>) -> V
                         .hint_text("Project name"),
                 );
             });
-            ui.label(RichText::new(format!("Chosen folder: {}", parent.display())).color(DIM));
+            ui.label(RichText::new(format!("Chosen folder: {}", parent.display())).color(theme::text_dim(ui)));
             ui.label(
                 RichText::new(format!(
                     "A new project folder will be created inside it: {}",

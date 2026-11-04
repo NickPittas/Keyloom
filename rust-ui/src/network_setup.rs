@@ -12,7 +12,7 @@
 use crate::netlink::{Link, Op, Source, State};
 use crate::remote::{err_text, nlog};
 use crate::settings::{Connection, Settings};
-use eframe::egui::{self, Color32, RichText, Ui};
+use eframe::egui::{self, RichText, Ui};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -20,9 +20,6 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const DIM: Color32 = Color32::from_rgb(169, 187, 175);
-const WARN: Color32 = Color32::from_rgb(224, 176, 80);
-const GOOD: Color32 = Color32::from_rgb(150, 190, 150);
 const IDLE_DROP: Duration = Duration::from_secs(30);
 const SERVICE_DEADLINE: Duration = Duration::from_secs(45);
 const SCAN_DEADLINE: Duration = Duration::from_secs(35);
@@ -943,32 +940,32 @@ impl Setup {
                 self.pend_name = Some(self.name.trim().to_owned());
             }
         });
-        ui.label(RichText::new("The name is shown to every PC you connect to. Two PCs may share a name; they are told apart by their certificate.").color(DIM).size(11.0));
+        ui.label(RichText::new("The name is shown to every PC you connect to. Two PCs may share a name; they are told apart by their certificate.").color(crate::ui::theme::text_dim(ui)).size(11.0));
         let (line, colour) = match (&self.svc().cloned(), svc.installed, svc.running) {
-            _ if self.hosting && self.hosted.is_none() => ("Starting this app's network endpoint…".to_owned(), DIM),
-            _ if self.hosting => ("Running inside this app; other PCs can find this PC while Keyloom is open.".to_owned(), GOOD),
-            _ if self.svc_unknown => ("Service state unknown after a timeout. Press Refresh.".to_owned(), WARN),
-            (None, ..) => ("Checking the service…".to_owned(), DIM),
-            (_, false, _) => ("Not installed. Start installs it and makes this PC visible to other PCs.".into(), DIM),
-            (_, true, false) => ("Stopped. Other PCs cannot reach this one until it is started (it also starts at sign-in).".into(), WARN),
-            (_, true, true) => ("Running; other PCs can find this PC on every network it is connected to.".into(), GOOD),
+            _ if self.hosting && self.hosted.is_none() => ("Starting this app's network endpoint…".to_owned(), crate::ui::theme::text_dim(ui)),
+            _ if self.hosting => ("Running inside this app; other PCs can find this PC while Keyloom is open.".to_owned(), crate::ui::theme::ok(ui)),
+            _ if self.svc_unknown => ("Service state unknown after a timeout. Press Refresh.".to_owned(), crate::ui::theme::warn(ui)),
+            (None, ..) => ("Checking the service…".to_owned(), crate::ui::theme::text_dim(ui)),
+            (_, false, _) => ("Not installed. Start installs it and makes this PC visible to other PCs.".into(), crate::ui::theme::text_dim(ui)),
+            (_, true, false) => ("Stopped. Other PCs cannot reach this one until it is started (it also starts at sign-in).".into(), crate::ui::theme::warn(ui)),
+            (_, true, true) => ("Running; other PCs can find this PC on every network it is connected to.".into(), crate::ui::theme::ok(ui)),
         };
         ui.colored_label(colour, line);
         if svc.running {
             if svc.endpoints.is_empty() {
-                ui.label(RichText::new("Addresses: none reported").color(DIM).size(11.5));
+                ui.label(RichText::new("Addresses: none reported").color(crate::ui::theme::text_dim(ui)).size(11.5));
             } else {
                 let list: Vec<String> = svc.endpoints.iter().map(|(u, k)| if k.is_empty() { short(u) } else { format!("{} ({k})", short(u)) }).collect();
-                ui.add(egui::Label::new(RichText::new(format!("Addresses: {}", list.join(" · "))).color(DIM).size(11.5)).wrap());
+                ui.add(egui::Label::new(RichText::new(format!("Addresses: {}", list.join(" · "))).color(crate::ui::theme::text_dim(ui)).size(11.5)).wrap());
             }
-            ui.label(RichText::new(format!("Discovery: {} · Receiver: {}", if svc.discovery { "on" } else { "off" }, if svc.receiver_online { "online" } else { "offline" })).color(DIM).size(11.5))
+            ui.label(RichText::new(format!("Discovery: {} · Receiver: {}", if svc.discovery { "on" } else { "off" }, if svc.receiver_online { "online" } else { "offline" })).color(crate::ui::theme::text_dim(ui)).size(11.5))
                 .on_hover_text("The receiver is on while Keyloom is open or running in the background.");
         }
         if let Some(id) = &svc.network_id {
-            ui.label(RichText::new(format!("Certificate: {id}")).color(DIM).size(10.5));
+            ui.label(RichText::new(format!("Certificate: {id}")).color(crate::ui::theme::text_dim(ui)).size(10.5));
         }
         if let Some(code) = &svc.error_code {
-            ui.colored_label(WARN, format!("{code}: {}", svc.message.chars().take(200).collect::<String>()));
+            ui.colored_label(crate::ui::theme::warn(ui), format!("{code}: {}", svc.message.chars().take(200).collect::<String>()));
         }
         if !self.hosting {
         ui.horizontal_wrapped(|ui| {
@@ -1002,7 +999,7 @@ impl Setup {
             if self.scanning() {
                 let secs = self.scan_started.map_or(0, |t| t.elapsed().as_secs());
                 ui.spinner();
-                ui.label(RichText::new(format!("Scanning… {secs} s")).color(DIM));
+                ui.label(RichText::new(format!("Scanning… {secs} s")).color(crate::ui::theme::text_dim(ui)));
                 if ui.button("Cancel").clicked() {
                     self.cancel_scan();
                 }
@@ -1022,7 +1019,7 @@ impl Setup {
                     line.push_str(&format!(" · {what} lookup failed"));
                 }
             }
-            ui.label(RichText::new(line).color(DIM).size(11.5));
+            ui.label(RichText::new(line).color(crate::ui::theme::text_dim(ui)).size(11.5));
         }
         let pcs: Vec<&Pc> = self.scan.iter().flat_map(|s| s.pcs.iter()).filter(|p| !p.is_self).collect();
         let mut rows = 0;
@@ -1060,35 +1057,35 @@ impl Setup {
                 ui.label(kinds.join(", "));
                 let up = pc.endpoints.iter().filter(|e| e.reachable).count();
                 let best = pc.endpoints.iter().filter(|e| e.reachable).filter_map(|e| e.rtt_ms).fold(f64::INFINITY, f64::min);
-                let reach = ui.colored_label(if up > 0 { GOOD } else { WARN }, if up > 0 && best.is_finite() { format!("{up}/{} · {best:.0} ms", pc.endpoints.len()) } else { format!("{up}/{}", pc.endpoints.len()) });
+                let reach = ui.colored_label(if up > 0 { crate::ui::theme::ok(ui) } else { crate::ui::theme::warn(ui) }, if up > 0 && best.is_finite() { format!("{up}/{} · {best:.0} ms", pc.endpoints.len()) } else { format!("{up}/{}", pc.endpoints.len()) });
                 if let Some(e) = pc.endpoints.iter().find_map(|e| e.error.as_ref()).filter(|_| up == 0) {
                     reach.on_hover_text(e.chars().take(200).collect::<String>());
                 }
                 let online = k.is_some_and(|k| c.connections.iter().any(|i| i.credentials == k.credentials && i.online));
                 let status = match k {
-                    Some(k) if k.enabled && online => ("Connected".to_owned(), GOOD),
-                    Some(k) if k.enabled => ("Enabled, not connected".into(), WARN),
-                    Some(_) => ("Not used".into(), DIM),
-                    None if pc.join => ("Available".into(), DIM),
-                    None => ("Join not allowed".into(), WARN),
+                    Some(k) if k.enabled && online => ("Connected".to_owned(), crate::ui::theme::ok(ui)),
+                    Some(k) if k.enabled => ("Enabled, not connected".into(), crate::ui::theme::warn(ui)),
+                    Some(_) => ("Not used".into(), crate::ui::theme::text_dim(ui)),
+                    None if pc.join => ("Available".into(), crate::ui::theme::text_dim(ui)),
+                    None => ("Join not allowed".into(), crate::ui::theme::warn(ui)),
                 };
                 ui.horizontal(|ui| {
                     ui.colored_label(status.1, status.0);
                     if !pc.receiver_online {
-                        ui.label(RichText::new("receiver offline").color(DIM).size(11.0)).on_hover_text("That PC answered, but its Keyloom app is not receiving work right now.");
+                        ui.label(RichText::new("receiver offline").color(crate::ui::theme::text_dim(ui)).size(11.0)).on_hover_text("That PC answered, but its Keyloom app is not receiving work right now.");
                     }
                 });
                 ui.end_row();
             }
         });
         if rows == 0 {
-            ui.label(RichText::new(if self.scan.is_some() { "No other Keyloom PCs were found. Check that the other PC is running Keyloom, then ReScan." } else { "Press ReScan to look for other PCs." }).color(DIM));
+            ui.label(RichText::new(if self.scan.is_some() { "No other Keyloom PCs were found. Check that the other PC is running Keyloom, then ReScan." } else { "Press ReScan to look for other PCs." }).color(crate::ui::theme::text_dim(ui)));
         }
         for pc in joins {
             self.join_pc(&pc);
         }
-        if self.busy() { ui.label(RichText::new("Working…").color(DIM)); }
-        if let Some(n) = &self.note { ui.add(egui::Label::new(RichText::new(n).color(DIM).size(12.0)).selectable(true)); }
+        if self.busy() { ui.label(RichText::new("Working…").color(crate::ui::theme::text_dim(ui))); }
+        if let Some(n) = &self.note { ui.add(egui::Label::new(RichText::new(n).color(crate::ui::theme::text_dim(ui)).size(12.0)).selectable(true)); }
         cmds
     }
 
@@ -1125,10 +1122,10 @@ impl Setup {
             }
             match &self.installs {
                 None => {
-                    ui.label(RichText::new("Loading…").color(DIM));
+                    ui.label(RichText::new("Loading…").color(crate::ui::theme::text_dim(ui)));
                 }
                 Some(list) if list.is_empty() => {
-                    ui.label(RichText::new("No PCs have joined this PC.").color(DIM));
+                    ui.label(RichText::new("No PCs have joined this PC.").color(crate::ui::theme::text_dim(ui)));
                 }
                 Some(list) => {
                     egui::Grid::new("registered_pcs_grid").num_columns(5).striped(true).spacing(egui::vec2(18.0, 8.0)).show(ui, |ui| {
@@ -1142,10 +1139,10 @@ impl Setup {
                             ui.label(i.last_seen.map_or("never".to_owned(), when));
                             ui.horizontal(|ui| {
                                 if i.in_use {
-                                    ui.colored_label(WARN, "in use");
+                                    ui.colored_label(crate::ui::theme::warn(ui), "in use");
                                 }
                                 if i.connected {
-                                    ui.colored_label(GOOD, "online");
+                                    ui.colored_label(crate::ui::theme::ok(ui), "online");
                                 }
                             });
                             let why = if i.is_this_pc { "This is this PC's own login; it cannot be retired." } else if i.in_use { "This PC is in use; it cannot be retired." } else { "" };

@@ -7,8 +7,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-const BAD: Color32 = Color32::from_rgb(235, 120, 120);
-const OK: Color32 = Color32::from_rgb(150, 190, 150);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Artifact {
@@ -865,7 +863,7 @@ impl Page {
                 RichText::new(if error_or_missing { "Models need attention" } else if self.required_ready == Some(true) { "Models ready" } else { "Checking models…" }).size(12.0).color(if error_or_missing {
                     theme::error(ui)
                 } else {
-                    Color32::from_rgb(150, 190, 150)
+                    theme::ok(ui)
                 }),
             ).on_hover_text(self.startup_label());
             if needs_attention && ui.button("Models…").clicked() {
@@ -906,12 +904,12 @@ impl Page {
                 ui.label(RichText::new(w.label()).color(theme::text_dim(ui))).on_hover_text("With Receive jobs on, this computer starts its worker ahead of work so it can report its GPU and accept jobs. An idle worker holds no model files and never blocks anything; Install, Repair and Delete only wait for a running job.");
             }
             if self.assets_in_use {
-                ui.colored_label(BAD, "Install, Repair and Delete are disabled while a job is queued or running on this PC's worker.");
+                ui.colored_label(theme::error(ui), "Install, Repair and Delete are disabled while a job is queued or running on this PC's worker.");
                 if self.unresolved_worker_fences {
-                    ui.colored_label(BAD, "Unresolved Key job fences still block model changes. Return to Key to resolve them.");
+                    ui.colored_label(theme::error(ui), "Unresolved Key job fences still block model changes. Return to Key to resolve them.");
                 }
             } else if self.busy() {
-                ui.colored_label(BAD, "One model operation at a time; wait for it to finish before starting another.");
+                ui.colored_label(theme::error(ui), "One model operation at a time; wait for it to finish before starting another.");
             }
             if let Some(r) = &self.active {
                 ui.label(RichText::new(format!("{} running…", r.action.name())).strong());
@@ -932,22 +930,22 @@ impl Page {
             }
             if let Some(note) = &self.cancel_note { ui.label(note); }
             if let Some((outcome, ok)) = &self.last_outcome {
-                ui.colored_label(if *ok { OK } else { BAD }, outcome);
+                ui.colored_label(if *ok { theme::ok(ui) } else { theme::error(ui) }, outcome);
             }
-            if let Some(error) = &self.startup_error { ui.colored_label(BAD, error); }
-            if let Some(e) = self.active.as_ref().and_then(|r| r.malformed.as_ref()) { ui.colored_label(BAD, e); }
+            if let Some(error) = &self.startup_error { ui.colored_label(theme::error(ui), error); }
+            if let Some(e) = self.active.as_ref().and_then(|r| r.malformed.as_ref()) { ui.colored_label(theme::error(ui), e); }
             ui.add_space(4.0);
         });
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Models & runtime");
-            let status_color = if self.startup_error.is_some() || self.required_ready == Some(false) { BAD } else { OK };
+            let status_color = if self.startup_error.is_some() || self.required_ready == Some(false) { theme::error(ui) } else { theme::ok(ui) };
             ui.label(RichText::new(self.startup_label()).color(status_color));
             if self.artifacts.is_empty() {
                 ui.label("Waiting for the local model catalog…");
                 return;
             }
             if self.artifacts.values().any(|a| a.id == "sam2-package" && a.state.is_some() && a.state.as_deref() != Some("installed")) {
-                ui.colored_label(BAD, "Runtime repair required: SAM2 checkpoint downloads do not install its pinned Python package. Repair the runtime to supply this dependency.");
+                ui.colored_label(theme::error(ui), "Runtime repair required: SAM2 checkpoint downloads do not install its pinned Python package. Repair the runtime to supply this dependency.");
             }
             if self.selected.as_ref().is_none_or(|id| !self.artifacts.contains_key(id)) {
                 self.selected = self.artifacts.get("corridorkey-weights").map(|a| a.id.clone()).or_else(|| self.artifacts.keys().next().cloned());
@@ -955,7 +953,7 @@ impl Page {
             ui.add_space(4.0);
             let wide = ui.available_width() >= 560.0;
             if wide {
-                egui::Panel::left("model_categories").resizable(false).exact_size(220.0).frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(12)).show(ui, |ui| {
+                egui::Panel::left("model_categories").resizable(false).exact_size(220.0).frame(egui::Frame::new().fill(theme::canvas_fill(ui)).inner_margin(12)).show(ui, |ui| {
                     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| self.nav(ui));
                 });
             } else {
@@ -1002,13 +1000,13 @@ impl Page {
             }
         }
         if groups.is_empty() {
-            ui.label(RichText::new("No matching assets").color(theme::TEXT_DIM));
+            ui.label(RichText::new("No matching assets").color(theme::text_dim(ui)));
         }
         let mut pick = None;
         for (family, items) in &groups {
             egui::CollapsingHeader::new(RichText::new(family).strong()).id_salt(("models_family", family)).default_open(items.iter().any(|a| self.selected.as_deref() == Some(&a.id))).open(if q.is_empty() { None } else { Some(true) }).show(ui, |ui| {
                 for a in items {
-                    let (dot, color) = status_dot(a);
+                    let (dot, color) = status_dot(a, ui);
                     ui.horizontal(|ui| {
                         let (_, r) = ui.allocate_space(egui::vec2(8.0, 22.0));
                         ui.painter().circle_filled(r.center(), 3.0, color);
@@ -1029,13 +1027,13 @@ impl Page {
     fn detail(&mut self, ui: &mut Ui) {
         let Some(item) = self.selected.as_ref().and_then(|id| self.artifacts.get(id)).cloned() else { return };
         let actions_enabled = !self.busy();
-        let (state, color) = status_dot(&item);
+        let (state, color) = status_dot(&item, ui);
         theme::section(ui, &item.label, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(state.to_string()).color(color).strong());
                 if item.required_profile { ui.label("Required profile"); }
                 if item.default_variant { ui.label("Default variant"); }
-                ui.label(RichText::new(&item.capability).color(theme::TEXT_DIM));
+                ui.label(RichText::new(&item.capability).color(theme::text_dim(ui)));
             });
             ui.label(if item.present == Some(true) { "Present" } else { "Missing — download it" });
             let size = item.bytes_required.or(item.size_bytes_estimate);
@@ -1044,14 +1042,14 @@ impl Page {
                 let deps = item.dependencies.iter().map(|id| self.artifacts.get(id).map_or(id.as_str(), |a| a.label.as_str())).collect::<Vec<_>>().join(", ");
                 ui.label(format!("Requires: {deps}"));
             }
-            if let Some(path) = &item.path { ui.label(RichText::new(format!("Location: {path}")).color(theme::TEXT_DIM)); }
+            if let Some(path) = &item.path { ui.label(RichText::new(format!("Location: {path}")).color(theme::text_dim(ui))); }
             if !item.problems.is_empty() {
-                ui.colored_label(BAD, format!("{} file issue(s): {}", item.problems.len(), item.problems[0]));
+                ui.colored_label(theme::error(ui), format!("{} file issue(s): {}", item.problems.len(), item.problems[0]));
                 if item.problems.len() > 1 {
                     egui::CollapsingHeader::new("File issues").show(ui, |ui| { for p in &item.problems { ui.label(p); } });
                 }
             }
-            if let Some(error) = &item.last_error { ui.colored_label(BAD, error); }
+            if let Some(error) = &item.last_error { ui.colored_label(theme::error(ui), error); }
             if matches!(item.kind.as_str(), "local_package" | "local_code") {
                 if item.state.is_some() && item.state.as_deref() != Some("installed") {
                     let message = if item.kind == "local_package" {
@@ -1059,15 +1057,15 @@ impl Page {
                     } else {
                         "Runtime repair required: restore vendored engine code with the app runtime."
                     };
-                    ui.colored_label(BAD, message);
+                    ui.colored_label(theme::error(ui), message);
                     if let Some(hint) = &item.install_hint { ui.label(hint); }
                 }
-                ui.label(RichText::new("Local runtime code/packages cannot be installed or deleted here; update or repair the app runtime.").color(theme::TEXT_DIM));
+                ui.label(RichText::new("Local runtime code/packages cannot be installed or deleted here; update or repair the app runtime.").color(theme::text_dim(ui)));
             } else {
                 ui.add_space(4.0);
                 let can_change = actions_enabled && !self.assets_in_use;
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(can_change, egui::Button::new(RichText::new("Download").color(if item.present != Some(true) { Color32::from_rgb(21, 36, 26) } else { theme::TEXT })).fill(if item.present != Some(true) { theme::ACCENT } else { theme::BUTTON })).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
+                    if ui.add_enabled(can_change, egui::Button::new(RichText::new("Download").color(ui.visuals().text_color())).fill(if item.present != Some(true) { theme::accent_mark(ui) } else { theme::card_fill(ui) })).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
                         self.start(Action::Download(item.id.clone()), ui.ctx());
                     }
                     if ui.add_enabled(actions_enabled, egui::Button::new("Verify")).on_hover_text("Optional: re-hash the files against the catalog. The app never needs it.").clicked() {
@@ -1077,7 +1075,7 @@ impl Page {
                         self.start(Action::Repair(item.id.clone()), ui.ctx());
                     }
                     let deletable = can_change && matches!(item.state.as_deref(), Some("installed" | "partial"));
-                    if ui.add_enabled(deletable, egui::Button::new(RichText::new("Delete…").color(BAD))).on_disabled_hover_text("Only installed or partial assets can be deleted, and not while a job runs on the worker.").clicked() {
+                    if ui.add_enabled(deletable, egui::Button::new(RichText::new("Delete…").color(theme::error(ui)))).on_disabled_hover_text("Only installed or partial assets can be deleted, and not while a job runs on the worker.").clicked() {
                         self.confirm_delete = Some(item.id.clone());
                     }
                 });
@@ -1085,11 +1083,11 @@ impl Page {
                     if !can_change {
                         self.confirm_delete = None;
                     } else {
-                        egui::Frame::new().fill(theme::FIELD).stroke(egui::Stroke::new(1.0, BAD)).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
-                            ui.colored_label(BAD, format!("Delete the files of “{}” ({})?", item.label, item.id));
+                        egui::Frame::new().fill(theme::card_fill(ui)).stroke(egui::Stroke::new(1.0, theme::error(ui))).corner_radius(4.0).inner_margin(8.0).show(ui, |ui| {
+                            ui.colored_label(theme::error(ui), format!("Delete the files of “{}” ({})?", item.label, item.id));
                             ui.label("Only this asset's catalog files are removed. Dependencies and projects/results are unchanged, and the shared download cache is retained.");
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button(RichText::new("Delete files").color(BAD)).clicked() {
+                                if ui.button(RichText::new("Delete files").color(theme::error(ui))).clicked() {
                                     self.confirm_delete = None;
                                     self.start(Action::Delete(item.id.clone()), ui.ctx());
                                 }
@@ -1117,18 +1115,18 @@ impl Page {
                 ui.label(format!("Runtime import requirements: {}", item.probe_imports.join(", ")));
             }
             for note in &item.notes { ui.label(note); }
-            ui.label(RichText::new("Catalog revision, gating and provenance are shown as recorded; no license approval is inferred. Capability labels do not confirm that a workflow route is integrated.").color(theme::TEXT_DIM));
+            ui.label(RichText::new("Catalog revision, gating and provenance are shown as recorded; no license approval is inferred. Capability labels do not confirm that a workflow route is integrated.").color(theme::text_dim(ui)));
         });
     }
 }
 
 /// Short status text plus colour for the nav dot and detail header.
-fn status_dot(a: &Artifact) -> (&'static str, Color32) {
+fn status_dot(a: &Artifact, ui: &Ui) -> (&'static str, Color32) {
     match a.state.as_deref() {
-        Some("installed") => ("Present", OK),
-        Some("partial") => ("Missing", BAD),
-        Some("missing") => ("Missing", BAD),
-        _ => ("Status not checked", theme::TEXT_DIM),
+        Some("installed") => ("Present", theme::ok(ui)),
+        Some("partial") => ("Missing", theme::error(ui)),
+        Some("missing") => ("Missing", theme::error(ui)),
+        _ => ("Status not checked", theme::text_dim(ui)),
     }
 }
 
