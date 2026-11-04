@@ -23,6 +23,7 @@ mod driver;
 mod hint;
 mod media;
 mod project_shell;
+mod strip;
 mod ws;
 /// 24 px less than before: the always-visible metrics footer takes that from the viewer.
 const GRAPH_DEFAULT: f32 = 156.0;
@@ -293,6 +294,7 @@ pub struct App {
     loc_saved: Option<Value>,
     ws: ws::WsState,
     media: media::MediaState,
+    strip: strip::StripState,
     last_ctx: Option<egui::Context>,
     /// Board thumbnails: decoded off the UI thread, kept per source frame.
     thumbs: Option<super::thumbs::Thumbs>,
@@ -523,6 +525,7 @@ impl App {
             loc_saved: None,
             ws: Default::default(),
             media: Default::default(),
+            strip: Default::default(),
             last_ctx: None,
             thumbs: None,
         };
@@ -1266,16 +1269,14 @@ impl App {
                 });
             });
         }
+        // The one activity strip: fixed height on every tab, in Focus and with the graph collapsed. Declared
+        // first among the bottom panels, so it sits directly above the system metrics.
+        let strip = Panel::bottom("activity")
+            .exact_size(super::activity::STRIP_H)
+            .frame(egui::Frame::new().fill(theme::card_fill(ui)).inner_margin(egui::Margin::symmetric(10, 4)).stroke(egui::Stroke::new(1.0, theme::panel_edge(ui))))
+            .show(ui, |ui| self.activity_strip(ui));
+        self.strip.rect = Some(strip.response.rect);
         if !focus {
-            // Narrow: the primary action lives here (Properties is a closed sheet), disabled with its reason.
-            Panel::bottom("queue")
-                .exact_size(if narrow { 36.0 } else { 26.0 })
-                .show(ui, |ui| {
-                    ui.horizontal_centered(|ui| {
-                        // Fixed-height bar: room for the global buttons without costing viewer height.
-                        self.ai_bar_status(ui);
-                    });
-                });
             if !narrow || self.props_sheet {
                 Panel::right("props")
                     .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(14).stroke(egui::Stroke::new(1.0, theme::panel_edge(ui))))
@@ -1298,7 +1299,7 @@ impl App {
             let short = ui.available_height() < 560.0;
             self.graph_short = short;
             let min_viewer = if narrow || short { 290.0 } else { MIN_VIEWER }; // 900x640: the action cards must keep their buttons visible
-            let max_h = (ui.available_height() - 34.0 - 26.0 - tools_h - min_viewer).max(graph_min);
+            let max_h = (ui.available_height() - 34.0 - super::activity::STRIP_H - tools_h - min_viewer).max(graph_min);
             if if short { !self.graph_short_open } else { self.graph_collapsed } {
                 Panel::bottom("graph_collapsed")
                     .frame(egui::Frame::new().fill(theme::canvas_fill(ui)).inner_margin(8))
@@ -1673,7 +1674,7 @@ impl App {
                 });
             }
             Tab::Hint => {
-                self.hint_tools(ui, &clip);
+                self.hint_tools(ui);
             }
             Tab::Key => {
                 let n = v_range.map_or(v_len, |r| r.1 - r.0 + 1);
@@ -2060,17 +2061,6 @@ impl App {
         };
         self.ai
             .watch_gate(ctx, &p.clips[i], p, self.settings.saved(), range, lin);
-    }
-
-    fn ai_bar_status(&mut self, ui: &mut Ui) {
-        let folder = self.clip().map(|c| c.folder.clone());
-        match (&self.ai.notice, folder) {
-            (Some(n), _) => {
-                ui.label(RichText::new(n).color(theme::warn(ui)).size(12.0));
-            }
-            (None, Some(f)) => self.ai.job_status(ui, &f),
-            _ => {}
-        }
     }
 
     /// In/Out and input colour are saved as soon as they change (same keys the Qt app reads). A failed save

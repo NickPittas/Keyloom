@@ -194,6 +194,123 @@ impl AiUi {
         self.task_row(ui, id, false);
     }
 
+    /// One Details row: the full job/task row with its Cancel, lock-confirm, force-stop and warnings.
+    pub fn activity_row(&mut self, ui: &mut Ui, id: &str) {
+        self.job_row(ui, id, false);
+    }
+
+    /// Friendly PC name for a target id: "This computer" for the local worker, else the remote's own name.
+    fn pc_name(&self, target: &str) -> String {
+        let tv = self.sched.targets();
+        if tv.iter().any(|t| t.id == target && t.local) {
+            return "This computer".into();
+        }
+        target.strip_prefix("network:").unwrap_or(target).to_owned()
+    }
+
+    /// Every step of this clip in submit order (Key jobs and tasks, one per job id), and how many OTHER clips
+    /// still have unfinished work.
+    pub fn activity_steps(&self, folder: &str) -> (Vec<crate::ui::activity::Step>, usize) {
+        use crate::ui::activity::{Cancel, Level, Step};
+        let local = || "This computer".to_string();
+        let mut out: Vec<Step> = vec![];
+        let mut others: Vec<&str> = vec![];
+        for t in &self.tracked {
+            let (state, cancel_req, task, hold, queued_pc) = if let Some(e) = self.sched.job(&t.job_id) {
+                let pc = match &e.placement {
+                    Placement::Auto => "Automatic".to_string(),
+                    Placement::Target(x) => self.pc_name(x),
+                };
+                (e.state.clone(), e.cancel_requested, None, None, pc)
+            } else if let Some(e) = self.sched.task(&t.job_id) {
+                let hold = self.sched.task_hold_reason(&t.job_id).or_else(|| (!e.after.is_empty()).then(|| "Waiting for the previous step".to_string()));
+                (e.state.clone(), e.cancel_requested, Some(e.job.kind), hold, local())
+            } else {
+                continue;
+            };
+            if t.folder != folder {
+                if !state.is_terminal() && !others.contains(&t.folder.as_str()) {
+                    others.push(&t.folder);
+                }
+                continue;
+            }
+            let stage = if t.label.is_empty() { "Key".to_string() } else { t.label.clone() };
+            let mut s = Step::new(&t.job_id, &stage, Level::Done);
+            s.preview = task == Some(TaskKind::SamPreview);
+            s.cancel = Cancel::Job(t.job_id.clone());
+            match &state {
+                JobState::Queued => {
+                    s.level = Level::Queued;
+                    s.pc = queued_pc;
+                    s.phase = "Queued".into();
+                    s.message = hold.unwrap_or_default();
+                }
+                JobState::Dispatching { target } => {
+                    s.level = Level::Active;
+                    s.pc = self.pc_name(target);
+                    s.phase = "Starting".into();
+                }
+                JobState::Running { target, phase, done, total } => {
+                    s.level = Level::Active;
+                    s.pc = self.pc_name(target);
+                    s.phase = if cancel_req { "Cancel requested".into() } else { super::queue_view::pass_name(phase) };
+                    (s.done, s.total) = (*done, *total);
+                    if cancel_req {
+                        s.cancel = Cancel::None;
+                    }
+                }
+                JobState::Done { target, info } => {
+                    s.pc = self.pc_name(target);
+                    s.cancel = Cancel::None;
+                    match info.outcome {
+                        Outcome::Complete => {
+                            let n = info.result.as_ref().and_then(|r| r.get("published")).and_then(Value::as_u64).unwrap_or(info.published);
+                            s.phase = "Complete".into();
+                            s.message = if task.is_some() { format!("Complete: {n} written") } else { format!("Complete: {} of {} published", info.published, info.expected) };
+                        }
+                        Outcome::Cancelled => {
+                            s.level = Level::Warn;
+                            s.phase = "Cancelled".into();
+                            s.message = "Cancelled (partial results kept)".into();
+                        }
+                        Outcome::Failed => {
+                            s.level = Level::Error;
+                            s.phase = "Failed".into();
+                            s.message = info.message.clone().unwrap_or_else(|| "Failed".into());
+                        }
+                    }
+                }
+                JobState::Rejected { target, code, message } => {
+                    (s.level, s.cancel) = (Level::Error, Cancel::None);
+                    s.pc = self.pc_name(target);
+                    s.phase = "Not started".into();
+                    s.message = format!("{code}: {message}");
+                }
+                JobState::Failed { reason } => {
+                    (s.level, s.cancel) = (Level::Error, Cancel::None);
+                    s.phase = "Not started".into();
+                    s.message = reason.clone();
+                }
+                JobState::Cancelled => {
+                    (s.level, s.cancel) = (Level::Warn, Cancel::None);
+                    s.phase = "Cancelled".into();
+                    s.message = "Cancelled before it started".into();
+                }
+                JobState::Lost { target, reason, writer_stopped, .. } => {
+                    (s.level, s.cancel) = (Level::Error, Cancel::None);
+                    s.pc = self.pc_name(target);
+                    s.phase = if *writer_stopped { "Lost".into() } else { "Needs your decision".into() };
+                    s.message = format!("Lost: {reason}");
+                }
+            }
+            if s.level != Level::Error && !t.warnings.is_empty() {
+                s.message = format!("{} ({} warning{})", s.message, t.warnings.len(), if t.warnings.len() == 1 { "" } else { "s" }).trim().to_owned();
+            }
+            out.push(s);
+        }
+        (out, others.len())
+    }
+
     /// A non-worker writer (the companion-sequence import) owns this clip's hint folders: no hint job and no
     /// Key may be queued for it until it ends.
     /// Keyed by the clip's absolute root, so an import under one project never fences another project's
@@ -535,8 +652,8 @@ impl AiUi {
     /// worker's inspection and release goes through its `clear_hint_lock` (exact job id + host + pid, liveness
     /// proof or the user's explicit orphan confirmation). A lock owned by a job of this session is released
     /// with that job's own proof instead.
-    pub fn hint_lock_ui(&mut self, ui: &mut Ui, clip: &Clip) {
-        let now = Instant::now();
+    /// Re-read the clip's lock file at most once a second (a NAS stat is slow).
+    fn lock_refresh(&mut self, clip: &Clip, now: Instant) {
         let stale = self
             .tk
             .locks
@@ -548,6 +665,24 @@ impl AiUi {
                 (now, crate::hints::read_hint_lock(&clip.root)),
             );
         }
+    }
+
+    /// A lock on this clip needs a human decision (not one a running job of this session owns).
+    pub fn lock_attention(&mut self, clip: &Clip) -> bool {
+        self.lock_refresh(clip, Instant::now());
+        match self.tk.locks.get(&clip.folder) {
+            Some((_, Ok(Some(l)))) => {
+                let running = l.job_id.as_deref().and_then(|j| self.sched.state_of(j)).is_some_and(|s| matches!(s, JobState::Dispatching { .. } | JobState::Running { .. }));
+                !running && !self.external_writer(&clip.root)
+            }
+            Some((_, Err(_))) => true,
+            _ => false,
+        }
+    }
+
+    pub fn hint_lock_ui(&mut self, ui: &mut Ui, clip: &Clip) {
+        let now = Instant::now();
+        self.lock_refresh(clip, now);
         let Some((_, state)) = self.tk.locks.get(&clip.folder).cloned() else {
             return;
         };

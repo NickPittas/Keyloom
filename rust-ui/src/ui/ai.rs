@@ -1546,10 +1546,6 @@ impl AiUi {
         self.disk_gen += 1;
     }
 
-    fn latest(&self, folder: &str) -> Option<&Tracked> {
-        self.tracked.iter().rev().find(|t| t.folder == folder)
-    }
-
     // -------------------------------------------------------------- controls
 
     /// The open clip's render client. The value lives in the clip (`ck_native.client`), so Board, Key and the
@@ -2302,9 +2298,8 @@ impl AiUi {
             .filter(|id| matches!(self.sched.state_of(id),
                 Some(JobState::Dispatching { .. } | JobState::Running { .. })))
             .map(str::to_owned);
-        if let Some(id) = running_here {
-            ui.label("Processing this clip…");
-            self.job_row(ui, &id, false);
+        if running_here.is_some() {
+            // Progress and Cancel live in the activity strip; this panel only explains the disabled button.
             let go = ui.add_enabled(false, egui::Button::new(action)
                 .min_size(egui::Vec2::new(ui.available_width(), 30.0)))
                 .on_disabled_hover_text("Key is running for this clip");
@@ -2498,7 +2493,6 @@ impl AiUi {
                 ui.colored_label(theme::warn(ui), n);
             }
             self.unresolved_ui(ui);
-            self.job_status(ui, &clip.folder);
         });
         if let Some((dir, id)) = recover {
             self.notice = Some(match self.release_lock(&dir, &id) {
@@ -2518,14 +2512,6 @@ impl AiUi {
                 self.notice = self.submit_current(clip, i).err();
             }
         }
-    }
-
-    /// Latest job of this clip: phase, bounded progress, Cancel, lost/stalled recovery.
-    pub fn job_status(&mut self, ui: &mut Ui, folder: &str) {
-        let Some(id) = self.latest(folder).map(|t| t.job_id.clone()) else {
-            return;
-        };
-        self.job_row(ui, &id, false);
     }
 
     fn job_row(&mut self, ui: &mut Ui, id: &str, with_name: bool) {

@@ -1165,7 +1165,8 @@ fn a_lock_owned_by_an_active_job_of_this_session_cannot_be_released_from_the_gat
     app.switch_tab(Tab::Key);
     gate_ready(&ctx, &mut app);
     let text: Vec<_> = texts_at(&ctx, &mut app).into_iter().map(|t| t.0).collect();
-    assert!(text.iter().any(|t| t == "Processing this clip…"), "{text:?}");
+    assert!(text.iter().any(|t| t == "Key is running for this clip"), "{text:?}");
+    assert!(!text.iter().any(|t| t == "Processing this clip…"), "progress belongs to the activity strip: {text:?}");
     assert!(!text.iter().any(|t| t.contains("This folder is locked") || t.contains("Fix the items above")), "{text:?}");
     // Even if a stale gate frame offered the button, the handler refuses a session-owned id.
     let r = app.ai_mut().release_lock(&dir, &id);
