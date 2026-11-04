@@ -317,6 +317,33 @@ mod tests {
     }
 
     #[test]
+    fn an_older_connection_with_only_a_learned_network_id_gets_one_row_and_keeps_its_direct_assignment() {
+        let (kamino_net, kamino_id, endor_net, reg_id) = ("kamino-net", "inst_kamino", "endor-net", "inst_reg_on_endor");
+        let dir = std::env::temp_dir().join(format!("ck-b5-learned-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let creds = dir.join("direct.json");
+        std::fs::write(&creds, "{}").unwrap();
+        std::fs::write(dir.join("direct.json.network.json"), format!(r#"{{"network_id":"{kamino_net}"}}"#)).unwrap(); // learned by a successful connection
+        let mut s = Settings::default();
+        // Saved by an older build: no network id, and the registration id already written over the direct id.
+        s.network.connections = vec![Connection { credentials: creds.display().to_string(), enabled: true, receive: true, host_installation_id: kamino_id.into(), legacy_ns: endor_net.into(), legacy_id: reg_id.into(), ..Default::default() }];
+        let d = crate::inbound::Dest { pc_id: reg_id.into(), name: "Kamino".into(), host_id: kamino_id.into(), network_id: kamino_net.into(), legacy_ns: endor_net.into(), credentials: "/reverse.json".into(), endpoints: vec![] };
+        assert!(crate::inbound::add_destinations(&mut s.network, &[d.clone()]));
+        assert!(!crate::inbound::add_destinations(&mut s.network, &[d]));
+        assert_eq!(s.network.connections.len(), 1, "one Remote row for the PC");
+        let c = &s.network.connections[0];
+        assert!(c.legacy_ns.is_empty() && c.legacy_id.is_empty() && (c.alias_ns.as_str(), c.alias_id.as_str()) == (endor_net, reg_id));
+        let conns = conn_of(&s, None);
+        let mut set = RemoteSet::new(Source::Off);
+        let mut r = Remote::new(Source::Off, creds.display().to_string());
+        r.online_for_test(kamino_net);
+        set.remotes.push(r);
+        assert_eq!(set.route(&Some(format!("{kamino_net}/{kamino_id}")), "", &conns).unwrap(), (0, Some(kamino_id.to_owned())));
+        assert_eq!(set.route(&Some(format!("{endor_net}/{reg_id}")), "", &conns).unwrap(), (0, Some(kamino_id.to_owned())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_destination_merged_into_a_direct_connection_keeps_its_direct_id_and_adds_the_old_host_alias() {
         let (kamino_net, kamino_id, endor_net, reg_id) = ("kamino-net", "inst_kamino", "endor-net", "inst_reg_on_endor");
         let mut s = Settings::default();

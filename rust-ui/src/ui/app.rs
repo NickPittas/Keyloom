@@ -2999,7 +2999,7 @@ impl App {
         });
         // A failed takeover must not look like it works: say so on the Clients page and the Board, with Retry.
         let inactive = match self.endpoint.as_ref().map(|e| e.status()) {
-            Some(Status::Passive { .. }) => Some("The old background service is still running; this app runs the shots it receives.".to_owned()),
+            Some(Status::Passive { message, .. }) => Some(format!("Network not active: the old background service could not be stopped ({message}).")),
             Some(Status::Failed { message, .. }) => Some(format!("Network not active: {message}")),
             _ => None,
         };

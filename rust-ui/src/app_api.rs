@@ -89,13 +89,6 @@ pub fn running() -> bool {
     RUNNING.load(Ordering::SeqCst)
 }
 
-/// True while the old service owns the listener and this app only works the shots it accepted (the inbox is read in process).
-static PASSIVE: AtomicBool = AtomicBool::new(false);
-
-pub fn passive() -> bool {
-    PASSIVE.load(Ordering::SeqCst)
-}
-
 /// The Python half: one dispatcher over a fixed list of operations. Returns/raises nothing: every answer is JSON text.
 const SHIM: &str = r#"
 import json, os, sys, threading
@@ -103,7 +96,6 @@ for _r in json.loads(ROOTS):
     if _r not in sys.path:
         sys.path.insert(0, _r)
 _ep = None
-_passive = None  # the old service owns the state: only its inbox is read here (see backend.app_api.PassiveInbox)
 _bridges = {}
 _nb = [0]
 _lock = threading.Lock()
@@ -122,19 +114,18 @@ def _need():
         raise _E("not_running", "the app endpoint is not running")
     return _ep
 
-def _passive_close():
-    global _passive
-    p, _passive = _passive, None
-    if p is not None:
-        p.stop()
-
-def _passive_open(a):
-    global _passive
-    with _lock:
-        _passive_close()
-        from backend import app_api
-        _passive = app_api.PassiveInbox(a["state_dir"], on_commit=_commit)
-    _commit("submitted", "")  # read the inbox once now (startup or Retry); nothing polls
+def _retire_legacy(a):
+    """Stop and remove the old background service THIS install owns (the installer's own cleanup), so the endpoint can take over."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ck_legacy_network_cleanup", os.path.join(a["root"], "packaging", "legacy_network_cleanup.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    try:
+        r = m.retire(a["prefix"])
+    except Exception as e:
+        raise _E("service_stop_failed", str(e))
+    if r.get("action") != "retired":
+        raise _E("service_not_retired", r.get("message") or "it is not a service of this install")
     return {}
 
 def _start(a):
@@ -142,7 +133,6 @@ def _start(a):
     with _lock:
         if _ep is not None:
             raise _E("already_running", "the app endpoint is already running")
-        _passive_close()
         from backend import app_api
         ep = app_api.AppEndpoint(a["state_dir"], on_commit=_commit).start()
         _ep = ep
@@ -155,16 +145,13 @@ def _info():
 def _stop(a):
     global _ep
     with _lock:
-        _passive_close()
         ep, _ep = _ep, None
     if ep is not None:
         ep.stop()
     return {}
 
 def _inbox(a):
-    ep = _ep or _passive
-    if ep is None:
-        raise _E("not_running", "the app endpoint is not running")
+    ep = _need()
     m = a.get("method")
     if m not in _INBOX:
         raise _E("bad_request", "unknown inbox method")
@@ -207,7 +194,7 @@ def _bridge_close(a):
 _OPS = {
     "ping": lambda a: {"pid": os.getpid()},
     "check_imports": lambda a: {m: bool(__import__(m)) for m in a["modules"]},
-    "endpoint_start": _start, "endpoint_stop": _stop, "passive_open": _passive_open, "endpoint_info": lambda a: _info(),
+    "endpoint_start": _start, "endpoint_stop": _stop, "retire_legacy": _retire_legacy, "endpoint_info": lambda a: _info(),
     "endpoint_refresh": lambda a: (_need().refresh(), {})[1],
     "registered": lambda a: _need().registered(),
     "retire": lambda a: _need().retire(a["installation_id"]),
@@ -497,6 +484,31 @@ struct Shared {
     start: Mutex<Option<std::thread::JoinHandle<()>>>,
     paths: Paths,
     state_dir: PathBuf,
+    /// The install folder whose old background service may be retired (None: a developer checkout, nothing to retire).
+    prefix: Option<PathBuf>,
+}
+
+/// Start the endpoint. If the old background service of this install still holds the state, retire it (stop + remove, like the
+/// installer) and try once more. A Passive result means it could not be stopped: `message` is the reason, and no shot runs.
+fn start_or_retire(s: &Shared) -> Result<Value, CallError> {
+    let start = || call("endpoint_start", json!({"state_dir": s.state_dir}));
+    match start() {
+        Err(e) if e.code == "service_conflict" => {
+            let (Some(prefix), Some(root)) = (&s.prefix, s.paths.roots.first()) else {
+                return Err(CallError::new("service_conflict", "this app was not started from an installation, so it cannot stop the service"));
+            };
+            let why = |e: CallError| CallError::new("service_conflict", e.message);
+            call("retire_legacy", json!({"prefix": prefix, "root": root})).map_err(why)?;
+            start().map_err(|e| if e.code == "service_conflict" { why(e) } else { e })
+        }
+        r => r,
+    }
+}
+
+/// The install folder (`<prefix>/versions/<v>/app`) a runtime root belongs to.
+fn prefix_of(paths: &Paths) -> Option<PathBuf> {
+    let r = paths.roots.first()?;
+    (r.file_name()? == "app" && r.parent()?.parent()?.file_name()? == "versions").then(|| r.parent()?.parent()?.parent().map(Path::to_path_buf))?
 }
 
 /// Bring the endpoint up on a background thread; the outcome lands in `status`.
@@ -504,16 +516,11 @@ fn spawn_start(shared: &Arc<Shared>) {
     let s2 = shared.clone();
     let h = std::thread::Builder::new().name("ck-app-api-start".into()).spawn(move || {
         let fail = |code: &str, message: String| Status::Failed { code: code.into(), message };
-        PASSIVE.store(false, Ordering::SeqCst);
         let st = match init(&s2.paths) {
             Err(e) => fail("runtime_unavailable", e),
-            Ok(()) => match call("endpoint_start", json!({"state_dir": s2.state_dir})) {
+            Ok(()) => match start_or_retire(&s2) {
                 Ok(info) => Status::Running(info),
-                Err(e) if e.code == "service_conflict" => {
-                    // The old service keeps the listener; this app still runs the shots it accepted (same local database).
-                    PASSIVE.store(call("passive_open", json!({"state_dir": s2.state_dir})).is_ok(), Ordering::SeqCst);
-                    Status::Passive { code: e.code, message: e.message }
-                }
+                Err(e) if e.code == "service_conflict" => Status::Passive { code: e.code, message: e.message },
                 Err(e) => fail(&e.code, e.message),
             },
         };
@@ -531,9 +538,15 @@ pub struct AppApi {
 
 impl AppApi {
     pub fn start(paths: Paths, state_dir: PathBuf, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let prefix = prefix_of(&paths);
+        Self::start_in(paths, state_dir, prefix, wake)
+    }
+
+    /// `start` with the install folder named (tests use a temporary one).
+    pub fn start_in(paths: Paths, state_dir: PathBuf, prefix: Option<PathBuf>, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         std::hint::black_box(&ENDPOINT_MARKER);
         *sink().wake.lock().unwrap() = Some(wake.clone());
-        let shared = Arc::new(Shared { status: Mutex::new(Status::Starting), wake, stopping: AtomicBool::new(false), start: Mutex::new(None), paths, state_dir });
+        let shared = Arc::new(Shared { status: Mutex::new(Status::Starting), wake, stopping: AtomicBool::new(false), start: Mutex::new(None), paths, state_dir, prefix });
         spawn_start(&shared);
         Self { shared }
     }
@@ -571,7 +584,6 @@ impl AppApi {
             return matches!(self.status(), Status::Stopped);
         }
         RUNNING.store(false, Ordering::SeqCst); // nothing new is read from or written to the inbox once a stop begins
-        PASSIVE.store(false, Ordering::SeqCst);
         let (tx, rx) = channel();
         let sh = self.shared.clone();
         let started = std::thread::Builder::new().name("ck-app-api-stop".into()).spawn(move || {

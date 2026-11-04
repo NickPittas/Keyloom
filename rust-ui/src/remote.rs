@@ -438,6 +438,12 @@ impl Remote {
     }
 }
 
+/// The network id a successful connection through `creds` once learned (the persisted side file), if any.
+pub fn learned_network_id(creds: &str) -> Option<String> {
+    let b = std::fs::read(side_file(Path::new(creds), ".network.json")).ok()?;
+    serde_json::from_slice::<Value>(&b).ok()?["network_id"].as_str().filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
 impl Remote {
     /// Labels are meaningful before the first connection: the URL comes from the private credentials file (read for that
     /// one field only, never logged) and the network id from the persisted side file.

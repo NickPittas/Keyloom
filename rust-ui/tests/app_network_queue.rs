@@ -868,32 +868,122 @@ fn a_previous_host_moves_old_shots_to_a_registered_pc_and_holds_the_started_one(
     assert_eq!(ck::queue::read(&ck::queue::history_path().unwrap()).0.into_iter().filter(|e| e.kind == "received").count(), 1, "only B's own shot ran here");
 }
 
-/// The old service still owns the listener and the state (Passive): the app runs the shots that listener accepted into the same local
-/// database and reports them there. The stand-in old listener holds the owner lock and accepts one push.
-#[test]
-fn a_passive_app_runs_a_shot_the_old_listener_accepted() {
-    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(mut w) = world("b4-passive", json!({})) else { return };
-    w.stop_b(); // this app's endpoint closes; its state stays
+/// Fake `systemctl` and a temp `XDG_CONFIG_HOME`, shared by the tests of this file. The embedded interpreter copies the environment
+/// when it starts, so this runs before the first endpoint of the process. `fail-disable` in the folder makes `systemctl disable` fail.
+fn fake_systemd() -> &'static Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("ck-b5-fake-systemd-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let script = format!("#!/bin/sh\necho \"systemctl $*\" >> \"{d}/calls.log\"\n[ \"$2\" = disable ] && [ -e \"{d}/fail-disable\" ] && {{ echo 'unit is masked' >&2; exit 1; }}\nexit 0\n", d = dir.display());
+        std::fs::write(dir.join("bin/systemctl"), script).unwrap();
+        std::fs::set_permissions(dir.join("bin/systemctl"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::env::set_var("PATH", format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default()));
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("xdg"));
+        dir
+    })
+}
+
+/// The stand-in old service of this install: its registry and install record (as the installer wrote them), the systemd unit, and a
+/// process holding the state lock until a `stop.request` appears (the old service's own graceful stop). Returns (process, prefix).
+fn old_service(w: &World) -> (std::process::Child, PathBuf) {
+    let fake = fake_systemd();
+    let prefix = w.base.join("prefix");
+    let unit = fake.join("xdg/systemd/user/keyloom-network.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, format!("# X-Keyloom-State-Dir={}\n[Service]\nExecStart=/x\n", w.sd.display())).unwrap();
+    let script = "import sys, os, time, json; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + '/packaging')\n\
+        import legacy_network_cleanup as cl; from backend.coordinator import pki\n\
+        sd, prefix = sys.argv[2], sys.argv[3]; os.makedirs(prefix, exist_ok=True)\n\
+        open(prefix + '/network-service.json', 'w').write(json.dumps({'version': 1, 'state_dir': sd}))\n\
+        open(sd + '/service-install.json', 'w').write(json.dumps({'version': 1, 'owner': cl.owner_id(prefix), 'mode': 'systemd'}))\n\
+        lock = pki.OwnerLock(sd + '/coordinator.lock', 'old service'); print('held', flush=True)\n\
+        while not os.path.exists(sd + '/stop.request'): time.sleep(0.05)\n\
+        lock.close()";
+    let mut child = std::process::Command::new(ck::import::python(&repo())).arg("-c").arg(script).arg(repo()).arg(&w.sd).arg(&prefix)
+        .stdout(std::process::Stdio::piped()).spawn().expect("the stand-in old service starts");
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+    assert_eq!(line.trim(), "held", "the old service holds the state");
+    (child, prefix)
+}
+
+/// A shot another PC pushed into this PC's inbox while the app's endpoint was closed. Returns its job id.
+fn queue_old_row(w: &World) -> String {
     let spec_file = w.base.join("spec.json");
     std::fs::write(&spec_file, serde_json::to_string(&spec(&w.mount_a, 1)).unwrap()).unwrap();
-    let old = "import sys, json; sys.path.insert(0, sys.argv[1]); from backend.coordinator import pki; from backend.coordinator.store import Store\n\
-        lock = pki.OwnerLock(sys.argv[2] + '/coordinator.lock', 'old service'); st = Store(sys.argv[2] + '/coordinator.sqlite3')\n\
-        iid, tok = st.join('sender-pc'); inst = st.authenticate(f'{iid}.{tok}')\n\
-        r = st.submit(inst, {'submission_id': 'sub_' + '1'.zfill(20), 'spec': json.load(open(sys.argv[3])), 'target': None})\n\
-        print(r['job_id'], flush=True); sys.stdin.read()";
-    let mut child = std::process::Command::new(ck::import::python(&repo())).arg("-c").arg(old).arg(repo()).arg(&w.sd).arg(&spec_file)
-        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().expect("the stand-in old listener starts");
-    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    std::io::BufRead::read_line(&mut out, &mut line).unwrap();
-    let job = line.trim().to_owned();
-    assert!(job.starts_with("job_"), "the old listener accepted the push: {line:?}");
-    let api = AppApi::start(w.paths.clone(), w.sd.clone(), Arc::new(|| {}));
-    assert!(matches!(wait_status(&api, |s| !matches!(s, Status::Starting)), Status::Passive { .. }), "the old listener keeps the state");
+    let script = "import sys, json; sys.path.insert(0, sys.argv[1]); from backend.coordinator.store import Store\n\
+        st = Store(sys.argv[2] + '/coordinator.sqlite3'); iid, tok = st.join('sender-pc'); inst = st.authenticate(f'{iid}.{tok}')\n\
+        r = st.submit(inst, {'submission_id': 'sub_' + '1'.zfill(20), 'spec': json.load(open(sys.argv[3])), 'target': None}); print(r['job_id'], flush=True)";
+    let out = std::process::Command::new(ck::import::python(&repo())).arg("-c").arg(script).arg(repo()).arg(&w.sd).arg(&spec_file).output().unwrap();
+    let job = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert!(job.starts_with("job_"), "the shot was queued: {job:?} {}", String::from_utf8_lossy(&out.stderr));
+    job
+}
+
+/// The old background service of this install still holds the state: the app retires it itself (stop, remove its unit), takes over,
+/// and runs a shot pushed AFTER the takeover.
+#[test]
+fn the_app_retires_the_old_service_and_runs_a_shot_pushed_after_the_takeover() {
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    fake_systemd();
+    let Some(mut w) = world("b5-retire", json!({})) else { return };
+    w.stop_b();
+    let (mut old, prefix) = old_service(&w);
+    let api = AppApi::start_in(w.paths.clone(), w.sd.clone(), Some(prefix.clone()), Arc::new(|| {}));
+    assert!(matches!(wait_status(&api, |s| !matches!(s, Status::Starting)), Status::Running(_)), "{:?}", api.status());
     w.api = Some(api);
-    w.until("the Passive app to run and report the shot", 60, |w| w.history(&job).is_some_and(|e| e.state == "succeeded"));
-    assert!(matches!(w.api.as_ref().unwrap().status(), Status::Passive { .. }));
-    drop(child.stdin.take()); // the old listener exits
-    let _ = child.wait();
+    old.wait().unwrap();
+    assert!(!prefix.join("network-service.json").exists() && !fake_systemd().join("xdg/systemd/user/keyloom-network.service").exists(), "the old service is unregistered");
+    assert!(std::fs::read_to_string(fake_systemd().join("calls.log")).unwrap().contains("systemctl --user disable"));
+    w.until("A to reach the app", 40, |w| w.a_set.online());
+    let sid = w.push(2);
+    w.until("the shot pushed after the takeover to be accepted", 30, |w| job_id(w, &sid).is_some());
+    let job = job_id(&w, &sid).unwrap();
+    w.until("the shot to run and succeed", 60, |w| w.history(&job).is_some_and(|e| e.state == "succeeded"));
+}
+
+/// The old service cannot be removed: the app says why, stays Passive and dispatches nothing, even a shot already in the inbox. Retry
+/// (once the cause is gone) takes over and the queued shot then runs.
+#[test]
+fn when_the_old_service_cannot_be_retired_the_banner_says_why_and_nothing_is_dispatched() {
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let fail = fake_systemd().join("fail-disable");
+    std::fs::write(&fail, "").unwrap();
+    let Some(mut w) = world("b5-noretire", json!({})) else { return };
+    w.stop_b();
+    let job = queue_old_row(&w);
+    let (mut old, prefix) = old_service(&w);
+    let api = AppApi::start_in(w.paths.clone(), w.sd.clone(), Some(prefix), Arc::new(|| {}));
+    let Status::Passive { message, .. } = wait_status(&api, |s| !matches!(s, Status::Starting)) else { panic!("not passive: {:?}", api.status()) };
+    assert!(message.contains("systemctl --user disable failed") && message.contains("unit is masked"), "{message}");
+    w.api = Some(api);
+    old.wait().unwrap();
+    for _ in 0..100 {
+        w.pump(false);
+    }
+    assert!(w.history(&job).is_none() && !w.b_ai.scheduler().running(), "nothing runs while the network is not active");
+    std::fs::remove_file(&fail).unwrap();
+    assert!(w.api.as_ref().unwrap().retry());
+    assert!(matches!(wait_status(w.api.as_ref().unwrap(), |s| !matches!(s, Status::Starting)), Status::Running(_)));
+    w.until("the queued shot to run after Retry", 60, |w| w.history(&job).is_some_and(|e| e.state == "succeeded"));
+}
+
+/// Receive jobs off: a shot already in the inbox is not dispatched; turning it on lets it run.
+#[test]
+fn receive_jobs_off_does_not_dispatch_a_queued_inbox_row() {
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut w) = world("b5-receive-off", json!({})) else { return };
+    w.stop_b();
+    let job = queue_old_row(&w);
+    w.start_b();
+    w.b_settings.network.receive_jobs = Some(false);
+    for _ in 0..100 {
+        w.pump(false);
+    }
+    assert!(w.history(&job).is_none() && !w.b_ai.scheduler().running() && w.b_in.receiving().is_none(), "the queued shot did not start");
+    let pending = app_api::call("inbox", json!({"method": "pending"})).unwrap();
+    assert!(pending.as_array().unwrap().iter().any(|p| p["job_id"] == job.as_str()), "it is still queued");
+    w.b_settings.network.receive_jobs = Some(true);
+    w.until("the shot to run once receiving is on", 60, |w| w.history(&job).is_some_and(|e| e.state == "succeeded"));
 }

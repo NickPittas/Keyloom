@@ -117,28 +117,6 @@ def _free_port(preferred=None):
     raise EndpointError("port_in_use", "ports 8443-8452 are all in use by other programs")
 
 
-class PassiveInbox:
-    """The old service still owns the listener and the state. This app only opens the same LOCAL database, so shots that listener
-    accepted are still run and reported here (`.store` and `.live` are all the app's inbox calls use). Nothing is served."""
-
-    def __init__(self, state_dir, on_commit=None):
-        self.sd = Path(state_dir)
-        if not (self.sd / "coordinator.sqlite3").exists():
-            raise EndpointError("no_state", "there is no network database to read")
-        self.store = open_inbox(self.sd, on_commit)
-        iid = read_local_id(self.sd)
-        self.live = {"iid": iid if iid and self.store.installation_active(iid) else None}
-        if not self.live["iid"]:
-            self.stop()
-            raise EndpointError("no_identity", "the old service has no registration for this PC")
-
-    def stop(self):
-        try:
-            self.store.close()
-        except Exception:
-            pass
-
-
 class AppEndpoint:
     """Listener + discovery + inbox for one state directory. start()/stop() are the only lifetime calls."""
 

@@ -61,7 +61,11 @@ impl Dest {
 pub fn add_destinations(n: &mut crate::settings::Network, dests: &[Dest]) -> bool {
     let mut changed = false;
     for d in dests {
-        let same_net = |c: &crate::settings::Connection| !c.local_host && !c.network_id.is_empty() && c.network_id.eq_ignore_ascii_case(&d.network_id) && c.credentials != d.credentials;
+        // The network a direct connection reaches: the saved id, else the one a successful connection taught it (credentials side file).
+        let same_net = |c: &crate::settings::Connection| {
+            let known = if c.network_id.is_empty() { crate::remote::learned_network_id(&c.credentials).unwrap_or_default() } else { c.network_id.clone() };
+            !c.local_host && !known.is_empty() && known.eq_ignore_ascii_case(&d.network_id) && c.credentials != d.credentials
+        };
         if let Some(c) = n.connections.iter_mut().find(|c| c.credentials == d.credentials) {
             let before = c.clone();
             c.endpoints.clone_from(&d.endpoints);
@@ -71,11 +75,12 @@ pub fn add_destinations(n: &mut crate::settings::Network, dests: &[Dest]) -> boo
             (c.legacy_ns, c.legacy_id) = (d.legacy_ns.clone(), d.pc_id.clone());
             changed |= *c != before;
         } else if let Some(c) = n.connections.iter_mut().find(|c| same_net(c)) {
-            // The direct namespace and PC id stay as they are; the old host's id is an extra alias for this connection.
-            if (c.alias_ns.as_str(), c.alias_id.as_str()) != (d.legacy_ns.as_str(), d.pc_id.as_str()) {
-                (c.alias_ns, c.alias_id) = (d.legacy_ns.clone(), d.pc_id.clone());
-                changed = true;
-            }
+            // The direct namespace and PC id stay as they are; the old host's id is an extra alias for this connection. An older
+            // build saved it as the connection's own id (legacy_*): that moves to the alias so the direct id resolves again.
+            let before = c.clone();
+            (c.legacy_ns, c.legacy_id) = Default::default();
+            (c.alias_ns, c.alias_id) = (d.legacy_ns.clone(), d.pc_id.clone());
+            changed |= *c != before;
         } else {
             n.connections.push(crate::settings::Connection {
                 credentials: d.credentials.clone(),
@@ -353,9 +358,7 @@ impl Inbound {
     // ---- the per-pass entry -----------------------------------------------------------------------------------
 
     pub fn tick(&mut self, now: Instant, env: &mut Env) {
-        // Passive: the old service owns the listener and the state; the inbox it filled is still worked here.
-        let passive = !app_api::running() && app_api::passive();
-        if !app_api::running() && !passive {
+        if !app_api::running() {
             return;
         }
         for Event::Commit { kind, job_id } in app_api::take_events() {
@@ -377,10 +380,8 @@ impl Inbound {
                 _ => {}
             }
         }
-        if !passive {
-            self.configure(env);
-            self.publish(now, env);
-        }
+        self.configure(env);
+        self.publish(now, env);
         self.load(now);
         self.settle_held();
         self.advance(now, env);
@@ -688,7 +689,8 @@ impl Inbound {
 
     /// Start the next waiting shot when this PC's GPU is free of local work (otherwise it simply waits in the queue).
     fn dispatch(&mut self, now: Instant, env: &mut Env) {
-        if self.closing || self.blocking_held() {
+        // Receive jobs off: a shot already in the inbox waits there; nothing starts on this PC.
+        if self.closing || self.blocking_held() || !env.settings.network.receives() {
             return;
         }
         let Some(pos) = self.queue.iter().position(|i| i.not_before.is_none_or(|t| now >= t)) else { return };
