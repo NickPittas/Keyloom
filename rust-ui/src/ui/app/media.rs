@@ -255,11 +255,8 @@ impl App {
             return;
         }
         let root = s.clip_root.clone();
-        if self.ai.clip_active(&root) || self.ai.external_writer(&root) {
-            self.media.note = Some(
-                "A hint job or another import is running for this clip; wait for it to finish."
-                    .into(),
-            );
+        if self.ai.external_writer(&root) {
+            self.media.note = Some("Another computer is importing into this clip. Wait for it to finish.".into());
             return;
         }
         // Exclusive on-disk ownership for the whole copy: worker hint jobs are refused, and so is a second
@@ -317,7 +314,9 @@ impl App {
             if let Some(m) = self.media.movie.as_ref().filter(|m| m.folder == clip.folder) {
                 let ready = prepare_source_worker_ok(self.ai.models_unknown(), self.ai.local_caps().as_ref().is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false)))
                     && (matches!(m.verdict, Some(Ok(true))) || matches!(m.verdict, Some(Ok(false))) && m.confirm);
-                extract = theme::accent(ui, ready, |ui| ui.add(egui::Button::new("Extract frames from this movie"))).clicked();
+                let d = crate::actions::decide(self.ai.scheduler(), &clip.root, crate::actions::Action::Extract, "Extract frames", if !ready { Some("FFmpeg or a verified movie is required".into()) } else if self.ai.external_writer(&clip.root) { Some("Another computer is importing into this clip. Wait for it to finish.".into()) } else { None });
+                let response = ui.add_enabled(d.enabled, egui::Button::new(&d.label));
+                extract = response.on_disabled_hover_text(d.reason).clicked();
             }
             if let Some(s) = self.media.seq.as_ref().filter(|s| s.clip_folder == clip.folder) {
                 ui.horizontal(|ui| {
