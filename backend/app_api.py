@@ -117,6 +117,28 @@ def _free_port(preferred=None):
     raise EndpointError("port_in_use", "ports 8443-8452 are all in use by other programs")
 
 
+class PassiveInbox:
+    """The old service still owns the listener and the state. This app only opens the same LOCAL database, so shots that listener
+    accepted are still run and reported here (`.store` and `.live` are all the app's inbox calls use). Nothing is served."""
+
+    def __init__(self, state_dir, on_commit=None):
+        self.sd = Path(state_dir)
+        if not (self.sd / "coordinator.sqlite3").exists():
+            raise EndpointError("no_state", "there is no network database to read")
+        self.store = open_inbox(self.sd, on_commit)
+        iid = read_local_id(self.sd)
+        self.live = {"iid": iid if iid and self.store.installation_active(iid) else None}
+        if not self.live["iid"]:
+            self.stop()
+            raise EndpointError("no_identity", "the old service has no registration for this PC")
+
+    def stop(self):
+        try:
+            self.store.close()
+        except Exception:
+            pass
+
+
 class AppEndpoint:
     """Listener + discovery + inbox for one state directory. start()/stop() are the only lifetime calls."""
 
@@ -268,7 +290,10 @@ class AppEndpoint:
         a fresh login that PC may use to push here. Called by the app only on open and after Join, never on a timer."""
         from .coordinator import pki
         host = pki.read_credentials(credentials_path)
-        iid, token = self.store.issue_destination(host["fingerprint_sha256"].lower(), "PC pushing to " + (self.live["name"] or "a PC")[:40])
+        offers = self.sd / "destination-offers"  # the replacement token waiting for its first use (private files)
+        offers.mkdir(mode=0o700, exist_ok=True)
+        fp = host["fingerprint_sha256"].lower()
+        iid, token = self.store.issue_destination(fp, "PC pushing to " + (self.live["name"] or "a PC")[:40], str(offers / f"{fp}.token"))
         urls = [e["url"] for e in (self._cache.get(self.port) or []) if isinstance(e, dict) and isinstance(e.get("url"), str)]
         return {"protocol": 1, "name": self.live["name"] or "This PC", "network_id": self.network_id, "fingerprint_sha256": self.fp,
                 "certificate_pem": (self.sd / "server-cert.pem").read_text(encoding="utf-8"),

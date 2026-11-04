@@ -3002,7 +3002,7 @@ impl App {
         });
         // A failed takeover must not look like it works: say so on the Clients page and the Board, with Retry.
         let inactive = match self.endpoint.as_ref().map(|e| e.status()) {
-            Some(Status::Passive { .. }) => Some("Network not active: the old background service is still running.".to_owned()),
+            Some(Status::Passive { .. }) => Some("The old background service is still running; this app runs the shots it receives.".to_owned()),
             Some(Status::Failed { message, .. }) => Some(format!("Network not active: {message}")),
             _ => None,
         };
@@ -3293,7 +3293,7 @@ impl App {
                     self.ai.notice = Some("Taken back. It was sent before the app restarted, so select the clip and Key it again.".into());
                 }
             }
-            Action::ReleaseHeld => self.inbound.release_held(),
+            Action::ReleaseHeld(attempt_id) => self.inbound.release_held(&attempt_id),
             Action::RetryEndpoint => self.retry_endpoint(),
             Action::ReceiveJobs(on) => {
                 self.net_draft().receive_jobs = Some(on);

@@ -188,6 +188,10 @@ pub struct Connection {
     /// (`network:<legacy_ns>/<legacy_id>`), so they keep resolving to it.
     pub legacy_ns: String,
     pub legacy_id: String,
+    /// A PC already joined directly that an old host also knows: its old `network:<alias_ns>/<alias_id>` assignments route to it too,
+    /// while its direct namespace and PC id stay as they are.
+    pub alias_ns: String,
+    pub alias_id: String,
     /// This PC's own service (joined automatically, receives work by default).
     pub local_host: bool,
     #[serde(flatten)]

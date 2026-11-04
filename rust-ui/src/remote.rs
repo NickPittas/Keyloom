@@ -57,6 +57,9 @@ enum Publish {
     Offering(Receiver<Result<Value, crate::app_api::CallError>>),
     /// Sent over the link; waiting for the host's answer.
     Sent,
+    /// The host refused (an HTTP error) or the answer was lost: nothing more is sent until the link is lost and comes back, the next app
+    /// open or a Join. The same login offer is kept by the endpoint, so a retry never mints another one.
+    Stopped,
     Done,
 }
 
@@ -197,7 +200,7 @@ pub enum Action {
     /// A send the PC never accepted: take it back and put the shot at the end of the Automatic list.
     Resend { creds: String, submission_id: String },
     /// The user checked this PC and releases a shot that was running when the app last closed.
-    ReleaseHeld,
+    ReleaseHeld(String),
     /// "Network not active" -> Retry: start this app's endpoint again.
     RetryEndpoint,
     Prefer { creds: String, url: String },
@@ -221,6 +224,16 @@ pub struct Conn {
     /// The PC keeps showing under them, so nothing it was assigned has to be picked again.
     pub legacy_ns: String,
     pub legacy_id: String,
+    /// The old host's namespace and PC id of a directly joined PC: assignments written there still reach it (see `Connection::alias_ns`).
+    pub alias_ns: String,
+    pub alias_id: String,
+}
+
+impl Conn {
+    /// `ns/iid` is this directly joined PC's id on the old host that also reached it (its target PC id is known).
+    pub(crate) fn is_alias(&self, ns: &str, iid: &str) -> bool {
+        !self.alias_id.is_empty() && !self.target_host.is_empty() && self.alias_ns == ns && self.alias_id == iid
+    }
 }
 
 pub struct Env<'a> {
@@ -413,6 +426,16 @@ fn net_overall(stages: &[NetStage], state: &str) -> String {
     if stages.is_empty() || matches!(state, "failed" | "cancelled" | "not sent") || stages.iter().all(|s| !s.completed && s.done == 0) { return state.into(); }
     let f = stages.iter().map(|s| if s.completed { 1.0 } else if s.total > 0 { (s.done as f32 / s.total as f32).min(0.99) } else { 0.0 }).sum::<f32>() / stages.len() as f32;
     format!("{}%", (f * 100.0).floor() as u32)
+}
+
+#[cfg(test)]
+impl Remote {
+    /// A connection that has answered on network `ns` (route tests only).
+    pub(crate) fn online_for_test(&mut self, ns: &str) {
+        self.phase = Phase::Online;
+        self.contacted = true;
+        self.cached_ns = Some(ns.to_owned());
+    }
 }
 
 impl Remote {
@@ -915,10 +938,7 @@ impl Remote {
             }
             (Pend::Cancel(_), Ok(_)) => {}
             (Pend::Destination, Ok(_)) => self.publish = Publish::Done,
-            (Pend::Destination, Err(e)) => {
-                self.publish = Publish::Idle; // told again after the next reconnect, not on a timer
-                self.status = Some(format!("Could not tell {} this PC's address: {}", self.label(), err_text(&e)));
-            }
+            (Pend::Destination, Err(e)) => self.destination_failed(&e),
         }
     }
 
@@ -1004,6 +1024,11 @@ impl Remote {
     /// Reverse publication: over this authenticated connection, tell the host this app's own endpoint (addresses, certificate and a login it
     /// may use to push to this PC), so a host that only knew this PC from its registration can send to it. Once per app open and after a
     /// Join (a new connection); a dropped link before the answer repeats it. A destination connection (the other side of this) never does.
+    fn destination_failed(&mut self, e: &LinkError) {
+        self.publish = Publish::Stopped; // told again after the next reconnect (same offer), never in a loop
+        self.status = Some(format!("Could not tell {} this PC's address: {}", self.label(), err_text(e)));
+    }
+
     fn publish_endpoint(&mut self) {
         if !self.legacy_id.is_empty() || !crate::app_api::running() {
             return;
@@ -1015,13 +1040,13 @@ impl Remote {
             Publish::Offering(rx) => match rx.try_recv() {
                 Err(TryRecvError::Empty) => {}
                 Ok(Ok(body)) => {
-                    self.publish = if self.req(Op::Destination, body, Pend::Destination) { Publish::Sent } else { Publish::Idle };
+                    self.publish = if self.req(Op::Destination, body, Pend::Destination) { Publish::Sent } else { Publish::Stopped };
                 }
                 Ok(Err(e)) => {
                     self.status = Some(format!("This PC's address could not be prepared for {}: {}", self.label(), truncate(&e.message, 200)));
                     self.publish = Publish::Done; // a local failure repeats on the next app open, not in a loop
                 }
-                Err(TryRecvError::Disconnected) => self.publish = Publish::Idle,
+                Err(TryRecvError::Disconnected) => self.publish = Publish::Stopped,
             },
             _ => {}
         }
@@ -1456,6 +1481,21 @@ mod discovery_tests {
     }
     fn job_on(iid: &str, state: &str) -> NetJob {
         NetJob { submission_id: "s".into(), submission: None, installation: Some(iid.into()), stages: vec![], active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: String::new(), name: String::new(), state: state.into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, submission_attempted: false, inflight: false }
+    }
+
+    #[test]
+    fn a_host_that_answers_404_to_the_destination_gets_one_publication_per_open() {
+        let mut r = Remote::blank(Source::Off, String::new());
+        r.contacted = true;
+        assert!(matches!(r.publish, Publish::Idle), "an app open: the first publication is due");
+        r.publish = Publish::Sent;
+        r.destination_failed(&LinkError { code: "not_found".into(), message: "404".into() });
+        for _ in 0..5 {
+            r.contacted = true; // every driver pass while the link stays up
+            assert!(!matches!(r.publish, Publish::Idle), "no second publication");
+        }
+        r.stop(); // the link was lost and came back: one more try
+        assert!(matches!(r.publish, Publish::Idle));
     }
 
     #[test]

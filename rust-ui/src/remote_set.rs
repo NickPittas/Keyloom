@@ -35,7 +35,7 @@ fn conn_of(s: &Settings, _sp: Option<&Path>) -> Vec<(Conn, bool)> {
             endpoints.retain(|u| u.as_str() != p);
             endpoints.insert(0, p.to_owned());
         }
-        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), endpoints, preferred: p.to_owned(), target_host: c.host_installation_id.trim().to_owned(), legacy_ns: c.legacy_ns.trim().to_owned(), legacy_id: c.legacy_id.trim().to_owned() }, default)
+        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), endpoints, preferred: p.to_owned(), target_host: c.host_installation_id.trim().to_owned(), legacy_ns: c.legacy_ns.trim().to_owned(), legacy_id: c.legacy_id.trim().to_owned(), alias_ns: c.alias_ns.trim().to_owned(), alias_id: c.alias_id.trim().to_owned() }, default)
     }).collect()
 }
 
@@ -85,8 +85,10 @@ impl RemoteSet {
             Some(t) => {
                 if let Some((ns, iid)) = t.split_once('/') {
                     // Every registered PC of an old host shares that host's namespace: the PC id says which connection reaches it.
-                    let i = self.remotes.iter().enumerate().position(|(i, r)| r.ns().as_deref() == Some(ns) && r.fits(iid) && r.accepts_work(&conns[i].0)).ok_or("that PC's network is not set up on this computer, or no enabled connection to it takes work")?;
-                    return Ok((i, Some(iid.to_owned())));
+                    let i = self.remotes.iter().enumerate().position(|(i, r)| (r.ns().as_deref() == Some(ns) && r.fits(iid) || conns[i].0.is_alias(ns, iid)) && r.accepts_work(&conns[i].0)).ok_or("that PC's network is not set up on this computer, or no enabled connection to it takes work")?;
+                    // The old host's id of a directly joined PC is sent as that PC's own id.
+                    let real = if conns[i].0.is_alias(ns, iid) { conns[i].0.target_host.clone() } else { iid.to_owned() };
+                    return Ok((i, Some(real)));
                 }
                 Err("that PC is not known on any joined network; pick it again".into())
             }
@@ -312,5 +314,25 @@ mod tests {
         c.preferred = u3.into();
         s.network.connections = vec![c];
         assert_eq!(conn_of(&s, None)[0].0.endpoints, [u3, u1, u2]);
+    }
+
+    #[test]
+    fn a_destination_merged_into_a_direct_connection_keeps_its_direct_id_and_adds_the_old_host_alias() {
+        let (kamino_net, kamino_id, endor_net, reg_id) = ("kamino-net", "inst_kamino", "endor-net", "inst_reg_on_endor");
+        let mut s = Settings::default();
+        s.network.connections = vec![Connection { credentials: "/direct.json".into(), enabled: true, receive: true, network_id: kamino_net.into(), host_installation_id: kamino_id.into(), ..Default::default() }];
+        let d = crate::inbound::Dest { pc_id: reg_id.into(), name: "Kamino".into(), host_id: kamino_id.into(), network_id: kamino_net.into(), legacy_ns: endor_net.into(), credentials: "/reverse.json".into(), endpoints: vec![] };
+        assert!(crate::inbound::add_destinations(&mut s.network, &[d.clone()]));
+        assert!(!crate::inbound::add_destinations(&mut s.network, &[d]));  // merging again changes nothing
+        assert_eq!(s.network.connections.len(), 1);
+        let conns = conn_of(&s, None);
+        let mut set = RemoteSet::new(Source::Off);
+        let mut r = Remote::new(Source::Off, "/direct.json".into());
+        r.online_for_test(kamino_net);
+        set.remotes.push(r);
+        // The saved direct assignment still resolves, as the PC's own id.
+        assert_eq!(set.route(&Some(format!("{kamino_net}/{kamino_id}")), "", &conns).unwrap(), (0, Some(kamino_id.to_owned())));
+        // And so does the old host's id, sent as that PC's own id.
+        assert_eq!(set.route(&Some(format!("{endor_net}/{reg_id}")), "", &conns).unwrap(), (0, Some(kamino_id.to_owned())));
     }
 }

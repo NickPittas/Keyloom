@@ -582,8 +582,57 @@ fn automatic_skips_a_pc_with_a_held_shot() {
     app_api::call("inbox", json!({"method": "begin", "job_id": job, "slot": "old:slot", "plan": {}})).expect("started in the old run");
     w.b_in = Inbound::new(); // the app restarted: the shot is uncertain
     w.until("B to say it holds a shot", 25, |w| w.free().is_empty() && w.a_set.installs().iter().any(|i| i.id == w.host_iid && i.held == Some(true)));
-    w.b_in.release_held(); // the user checked and released it
+    let attempt = held_attempts(&w).pop().expect("one held attempt");
+    w.b_in.release_held(&attempt); // the user checked and released it
     w.until("B to be free again", 40, |w| w.free() == [want.clone()]);
+}
+
+fn held_attempts(_w: &World) -> Vec<String> {
+    app_api::call("inbox", json!({"method": "held"})).unwrap().as_array().unwrap().iter().map(|h| h["attempt_id"].as_str().unwrap().to_owned()).collect()
+}
+
+/// Clear/Forget on one held shot releases only that attempt (the action carries its attempt id; the handler in the app is that one call).
+#[test]
+fn clear_on_one_held_attempt_leaves_the_other_held() {
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut w) = world("b4-clear-one", json!({})) else { return };
+    free_b(&mut w);
+    w.b_in.shutdown_requested(); // nothing is started: the shots stay where a restart would find them
+    let (s1, s2) = (w.push(1), w.push(2));
+    w.until("both shots in B's inbox", 30, |w| job_id(w, &s1).is_some() && job_id(w, &s2).is_some());
+    for (s, slot) in [(&s1, "old:slot1"), (&s2, "old:slot2")] {
+        app_api::call("inbox", json!({"method": "begin", "job_id": job_id(&w, s).unwrap(), "slot": slot, "plan": {}})).expect("started in the old run");
+    }
+    w.b_in = Inbound::new(); // the app restarted: both are uncertain
+    w.until("B to hold both", 25, |w| w.b_in.busy_reason().is_some() && held_attempts(w).len() == 2);
+    let (a1, a2) = { let h = held_attempts(&w); (h[0].clone(), h[1].clone()) };
+    w.b_in.release_held(&a1);
+    w.until("the first attempt to be released", 25, |w| !held_attempts(w).contains(&a1));
+    for _ in 0..20 {
+        w.pump(true);
+    }
+    assert_eq!(held_attempts(&w), [a2], "the other attempt is still held");
+    assert!(w.b_in.busy_reason().is_some(), "and still blocks new work");
+}
+
+/// A shot this PC refuses (its input is missing here) still lands on the Board of the project it maps to, with its clip.
+#[test]
+fn a_refused_received_shot_keeps_its_project_and_clip_on_the_board() {
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut w) = world("b4-refused-history", json!({})) else { return };
+    let project = w.mount_b.join("projects/Show");
+    std::fs::remove_dir_all(project.join("clips/shot_01/Frames")).unwrap(); // B has no frames: the preflight refuses it
+    w.b_ai.queue_open(Some(&project));
+    w.until("A to reach B", 40, |w| w.a_set.online());
+    let sid = w.push(1);
+    w.until("the shot to be refused", 60, |w| w.state_of(&sid).as_deref() == Some("failed"));
+    let job = job_id(&w, &sid).unwrap();
+    let id = format!("received:{job}");
+    let e = w.history(&job).expect("history");
+    assert_eq!((e.kind.as_str(), e.state.as_str(), e.folder.as_str(), e.owner.as_str()), ("received", "failed", "shot_01", project.to_str().unwrap()));
+    let mut after = AiUi::new(&w.b_settings, None); // the Board loader of the project, after a restart
+    after.queue_open(Some(&project));
+    assert!(after.earlier_entries().iter().any(|e| e.id == id && e.state == "failed" && e.folder == "shot_01"), "the refusal is on the Board");
 }
 
 /// The race: an Automatic shot arrives after the PC stopped being free (the sender's list is a few seconds old). It is refused with
@@ -817,4 +866,34 @@ fn a_previous_host_moves_old_shots_to_a_registered_pc_and_holds_the_started_one(
     app_api::call("inbox", json!({"method": "abandon", "attempt_id": row["attempt_id"], "reason": "cleared"})).unwrap();
     assert!(app_api::call("inbox", json!({"method": "held"})).unwrap().as_array().unwrap().iter().all(|h| h["job_id"] != started_job.as_str()));
     assert_eq!(ck::queue::read(&ck::queue::history_path().unwrap()).0.into_iter().filter(|e| e.kind == "received").count(), 1, "only B's own shot ran here");
+}
+
+/// The old service still owns the listener and the state (Passive): the app runs the shots that listener accepted into the same local
+/// database and reports them there. The stand-in old listener holds the owner lock and accepts one push.
+#[test]
+fn a_passive_app_runs_a_shot_the_old_listener_accepted() {
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut w) = world("b4-passive", json!({})) else { return };
+    w.stop_b(); // this app's endpoint closes; its state stays
+    let spec_file = w.base.join("spec.json");
+    std::fs::write(&spec_file, serde_json::to_string(&spec(&w.mount_a, 1)).unwrap()).unwrap();
+    let old = "import sys, json; sys.path.insert(0, sys.argv[1]); from backend.coordinator import pki; from backend.coordinator.store import Store\n\
+        lock = pki.OwnerLock(sys.argv[2] + '/coordinator.lock', 'old service'); st = Store(sys.argv[2] + '/coordinator.sqlite3')\n\
+        iid, tok = st.join('sender-pc'); inst = st.authenticate(f'{iid}.{tok}')\n\
+        r = st.submit(inst, {'submission_id': 'sub_' + '1'.zfill(20), 'spec': json.load(open(sys.argv[3])), 'target': None})\n\
+        print(r['job_id'], flush=True); sys.stdin.read()";
+    let mut child = std::process::Command::new(ck::import::python(&repo())).arg("-c").arg(old).arg(repo()).arg(&w.sd).arg(&spec_file)
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().expect("the stand-in old listener starts");
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+    let job = line.trim().to_owned();
+    assert!(job.starts_with("job_"), "the old listener accepted the push: {line:?}");
+    let api = AppApi::start(w.paths.clone(), w.sd.clone(), Arc::new(|| {}));
+    assert!(matches!(wait_status(&api, |s| !matches!(s, Status::Starting)), Status::Passive { .. }), "the old listener keeps the state");
+    w.api = Some(api);
+    w.until("the Passive app to run and report the shot", 60, |w| w.history(&job).is_some_and(|e| e.state == "succeeded"));
+    assert!(matches!(w.api.as_ref().unwrap().status(), Status::Passive { .. }));
+    drop(child.stdin.take()); // the old listener exits
+    let _ = child.wait();
 }

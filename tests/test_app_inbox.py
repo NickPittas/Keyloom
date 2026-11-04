@@ -394,15 +394,14 @@ def test_a_joined_pc_tells_the_host_its_endpoint_and_the_host_can_push_back(tmp_
         c = Client(pki.read_credentials(d["credentials"]))
         job = c.submit(sid(1), SPEC, a.live["iid"])
         assert [j["job_id"] for j in a.store.inbox_pending(a.live["iid"])] == [job["job_id"]] and ("submitted", job["job_id"]) in a_seen
-        # Publishing again (the next app open) replaces A's login for the host instead of piling up logins; the PC id is unchanged.
+        # Publishing again (the next app open) keeps the SAME login id for the host (no pile-up); the PC id is unchanged.
         before = a.store.db.execute("SELECT count(*) FROM installations WHERE revoked_at IS NULL").fetchone()[0]
         Client(pki.read_credentials(str(creds_a))).destination(a.destination_offer(str(creds_a)))
         assert a.store.db.execute("SELECT count(*) FROM installations WHERE revoked_at IS NULL").fetchone()[0] == before
         [d2] = host.destinations()
         assert d2["pc_id"] == reg_id
-        with pytest.raises(CoordinatorError):  # the old login no longer works
-            c.submit(sid(2), SPEC, a.live["iid"])
-        assert Client(pki.read_credentials(d2["credentials"])).submit(sid(2), SPEC, a.live["iid"])["state"] == "queued"
+        assert c.submit(sid(2), SPEC, a.live["iid"])["state"] == "queued"  # the old token still works until the host uses the new one
+        assert Client(pki.read_credentials(d2["credentials"])).submit(sid(3), SPEC, a.live["iid"])["state"] == "queued"
         # Only a PC registered on the host can tell it anything, and only LAN-like addresses are kept.
         with pytest.raises(CoordinatorError) as lan:
             Client(pki.read_credentials(str(creds_a))).destination({**body, "endpoints": ["https://8.8.8.8:8443"], "installation_id": body["installation_id"]})
@@ -411,4 +410,35 @@ def test_a_joined_pc_tells_the_host_its_endpoint_and_the_host_can_push_back(tmp_
         assert host.destinations() == [] and host.store.installation_active(reg_id)
     finally:
         a.stop()
+        host.stop()
+
+
+def test_a_hosts_sender_identity_survives_a_receiver_restart_and_republication(tmp_path, monkeypatch):
+    host, host_port, _ = _endpoint(tmp_path, monkeypatch, "host")
+    a, a_port, _ = _endpoint(tmp_path, monkeypatch, "a")
+    try:
+        creds_a = tmp_path / "a-on-host.json"
+        join_to_file(f"https://127.0.0.1:{host_port}", str(creds_a), "kamino-3", pem=(host.sd / "server-cert.pem").read_text())
+        host_client = Client(pki.read_credentials(str(creds_a)))
+        offer1 = a.destination_offer(str(creds_a))
+        assert a.destination_offer(str(creds_a)) == offer1  # a retried publication reuses the same offer
+        host_client.destination(offer1)
+        c = Client(pki.read_credentials(host.destinations()[0]["credentials"]))
+        job = c.submit(sid(1), SPEC, a.live["iid"])  # the first send uses the first token (which becomes the login)
+        a.stop()  # the receiver restarts and publishes again
+        a2 = app_api.AppEndpoint(a.sd).start()
+        try:
+            offer2 = a2.destination_offer(str(creds_a))
+            assert offer2["installation_id"] == offer1["installation_id"] and offer2["token"] != offer1["token"]  # same identity, new token
+            assert c.job(job["job_id"])["state"] == "queued"  # the old token works until the new one is used
+            host_client.destination(offer2)
+            c2 = Client(pki.read_credentials(host.destinations()[0]["credentials"]))
+            assert c2.job(job["job_id"])["job_id"] == job["job_id"]  # the host still reads its earlier shot with the new token
+            assert c2.submit(sid(1), SPEC, a2.live["iid"]) == job  # a retried lost acknowledgment returns the same job
+            c2.cancel(job["job_id"])  # and can cancel it
+            with pytest.raises(CoordinatorError):  # the old token stopped once the new one was used
+                c.job(job["job_id"])
+        finally:
+            a2.stop()
+    finally:
         host.stop()

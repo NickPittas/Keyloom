@@ -89,6 +89,13 @@ pub fn running() -> bool {
     RUNNING.load(Ordering::SeqCst)
 }
 
+/// True while the old service owns the listener and this app only works the shots it accepted (the inbox is read in process).
+static PASSIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn passive() -> bool {
+    PASSIVE.load(Ordering::SeqCst)
+}
+
 /// The Python half: one dispatcher over a fixed list of operations. Returns/raises nothing: every answer is JSON text.
 const SHIM: &str = r#"
 import json, os, sys, threading
@@ -96,6 +103,7 @@ for _r in json.loads(ROOTS):
     if _r not in sys.path:
         sys.path.insert(0, _r)
 _ep = None
+_passive = None  # the old service owns the state: only its inbox is read here (see backend.app_api.PassiveInbox)
 _bridges = {}
 _nb = [0]
 _lock = threading.Lock()
@@ -114,11 +122,27 @@ def _need():
         raise _E("not_running", "the app endpoint is not running")
     return _ep
 
+def _passive_close():
+    global _passive
+    p, _passive = _passive, None
+    if p is not None:
+        p.stop()
+
+def _passive_open(a):
+    global _passive
+    with _lock:
+        _passive_close()
+        from backend import app_api
+        _passive = app_api.PassiveInbox(a["state_dir"], on_commit=_commit)
+    _commit("submitted", "")  # read the inbox once now (startup or Retry); nothing polls
+    return {}
+
 def _start(a):
     global _ep
     with _lock:
         if _ep is not None:
             raise _E("already_running", "the app endpoint is already running")
+        _passive_close()
         from backend import app_api
         ep = app_api.AppEndpoint(a["state_dir"], on_commit=_commit).start()
         _ep = ep
@@ -131,13 +155,16 @@ def _info():
 def _stop(a):
     global _ep
     with _lock:
+        _passive_close()
         ep, _ep = _ep, None
     if ep is not None:
         ep.stop()
     return {}
 
 def _inbox(a):
-    ep = _need()
+    ep = _ep or _passive
+    if ep is None:
+        raise _E("not_running", "the app endpoint is not running")
     m = a.get("method")
     if m not in _INBOX:
         raise _E("bad_request", "unknown inbox method")
@@ -180,7 +207,7 @@ def _bridge_close(a):
 _OPS = {
     "ping": lambda a: {"pid": os.getpid()},
     "check_imports": lambda a: {m: bool(__import__(m)) for m in a["modules"]},
-    "endpoint_start": _start, "endpoint_stop": _stop, "endpoint_info": lambda a: _info(),
+    "endpoint_start": _start, "endpoint_stop": _stop, "passive_open": _passive_open, "endpoint_info": lambda a: _info(),
     "endpoint_refresh": lambda a: (_need().refresh(), {})[1],
     "registered": lambda a: _need().registered(),
     "retire": lambda a: _need().retire(a["installation_id"]),
@@ -477,11 +504,16 @@ fn spawn_start(shared: &Arc<Shared>) {
     let s2 = shared.clone();
     let h = std::thread::Builder::new().name("ck-app-api-start".into()).spawn(move || {
         let fail = |code: &str, message: String| Status::Failed { code: code.into(), message };
+        PASSIVE.store(false, Ordering::SeqCst);
         let st = match init(&s2.paths) {
             Err(e) => fail("runtime_unavailable", e),
             Ok(()) => match call("endpoint_start", json!({"state_dir": s2.state_dir})) {
                 Ok(info) => Status::Running(info),
-                Err(e) if e.code == "service_conflict" => Status::Passive { code: e.code, message: e.message },
+                Err(e) if e.code == "service_conflict" => {
+                    // The old service keeps the listener; this app still runs the shots it accepted (same local database).
+                    PASSIVE.store(call("passive_open", json!({"state_dir": s2.state_dir})).is_ok(), Ordering::SeqCst);
+                    Status::Passive { code: e.code, message: e.message }
+                }
                 Err(e) => fail(&e.code, e.message),
             },
         };
@@ -539,6 +571,7 @@ impl AppApi {
             return matches!(self.status(), Status::Stopped);
         }
         RUNNING.store(false, Ordering::SeqCst); // nothing new is read from or written to the inbox once a stop begins
+        PASSIVE.store(false, Ordering::SeqCst);
         let (tx, rx) = channel();
         let sh = self.shared.clone();
         let started = std::thread::Builder::new().name("ck-app-api-stop".into()).spawn(move || {

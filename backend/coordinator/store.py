@@ -194,6 +194,8 @@ class Store:
         with self._lock:
             row = self.db.execute("SELECT * FROM installations WHERE id=?", (iid,)).fetchone()
         ok = hmac.compare_digest(row["token_hash"] if row else "0" * 64, token_hash(token))
+        if row and not ok and row["revoked_at"] is None:
+            ok = self._promote_pending(iid, token)
         if not row or not ok or row["revoked_at"] is not None:
             raise ApiError(401, "unauthorized", "invalid credentials")
         self._seen[iid] = self.clock()  # a successful call is the proof that PC is on
@@ -499,19 +501,49 @@ class Store:
 
     # ---- destinations (reverse publication) -----------------------------------------------------
 
-    def issue_destination(self, host_key, name):
-        """The login another PC (host_key = its certificate fingerprint) uses to push to THIS PC. One per host: asking again retires the
-        earlier one (it only ever pushes; it has no attempts), so repeated publications never fill the 64 installation slots."""
+    def issue_destination(self, host_key, name, pending_file):
+        """The login another PC (host_key = its certificate fingerprint) uses to push to THIS PC. ONE installation id per host, kept for
+        good: it owns that host's earlier sends. Asking again only prepares a replacement token for the SAME id (kept in the private
+        `pending_file`); the old token keeps working until the host first uses the new one (`authenticate` promotes it). Asking again
+        before that returns the same offer, so a retried or lost publication never mints another login."""
         text(name, "name", 64)
         key = f"reverse:{host_key}"
         with self._tx() as db:
-            old = db.execute("SELECT value FROM inbox_meta WHERE key=?", (key,)).fetchone()
-            if old:
-                db.execute("UPDATE installations SET revoked_at=? WHERE id=? AND revoked_at IS NULL", (self.clock(), old[0]))
-            self._room(db)
-            iid, token = self._issue(db, name, False, self.clock())
-            db.execute("INSERT OR REPLACE INTO inbox_meta VALUES(?,?)", (key, iid))
-        return iid, token
+            old = db.execute("SELECT i.id FROM inbox_meta m JOIN installations i ON i.id=m.value WHERE m.key=? AND i.revoked_at IS NULL", (key,)).fetchone()
+            if not old:  # the identity starts with a token nobody has; the pending token below is its first real login
+                self._room(db)
+                iid, _ = self._issue(db, name, False, self.clock())
+                db.execute("INSERT OR REPLACE INTO inbox_meta VALUES(?,?)", (key, iid))
+            else:
+                iid = old[0]
+            pkey = f"reversepend:{iid}"
+            if db.execute("SELECT 1 FROM inbox_meta WHERE key=?", (pkey,)).fetchone() and os.path.exists(pending_file):
+                with open(pending_file, encoding="utf-8") as f:
+                    return iid, f.read().strip()
+            token = secrets.token_urlsafe(32)
+            tmp = f"{pending_file}.{uuid.uuid4().hex[:8]}"
+            from . import pki
+            pki.write_private_new(tmp, token)
+            os.replace(tmp, pending_file)
+            db.execute("INSERT OR REPLACE INTO inbox_meta VALUES(?,?)", (pkey, json.dumps({"hash": token_hash(token), "file": str(pending_file)})))
+            return iid, token
+
+    def _promote_pending(self, iid, token):
+        """The host used its replacement token: it becomes the login and the old one stops working."""
+        with self._tx() as db:
+            r = db.execute("SELECT value FROM inbox_meta WHERE key=?", (f"reversepend:{iid}",)).fetchone()
+            if not r:
+                return False
+            p = json.loads(r[0])
+            if not hmac.compare_digest(p["hash"], token_hash(token)):
+                return False
+            db.execute("UPDATE installations SET token_hash=? WHERE id=?", (p["hash"], iid))
+            db.execute("DELETE FROM inbox_meta WHERE key=?", (f"reversepend:{iid}",))
+        try:
+            os.unlink(p["file"])
+        except OSError:
+            pass
+        return True
 
     def set_destination(self, iid, meta):
         """Remember how to push to the PC registered here as `iid` (same PC id as its registration). Re-publishing replaces it."""

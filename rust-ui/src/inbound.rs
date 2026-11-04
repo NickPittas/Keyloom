@@ -71,8 +71,9 @@ pub fn add_destinations(n: &mut crate::settings::Network, dests: &[Dest]) -> boo
             (c.legacy_ns, c.legacy_id) = (d.legacy_ns.clone(), d.pc_id.clone());
             changed |= *c != before;
         } else if let Some(c) = n.connections.iter_mut().find(|c| same_net(c)) {
-            if c.legacy_id.is_empty() {
-                (c.legacy_ns, c.legacy_id) = (d.legacy_ns.clone(), d.pc_id.clone());
+            // The direct namespace and PC id stay as they are; the old host's id is an extra alias for this connection.
+            if (c.alias_ns.as_str(), c.alias_id.as_str()) != (d.legacy_ns.as_str(), d.pc_id.as_str()) {
+                (c.alias_ns, c.alias_id) = (d.legacy_ns.clone(), d.pc_id.clone());
                 changed = true;
             }
         } else {
@@ -248,6 +249,8 @@ pub struct Inbound {
     /// Old job id -> the submission id it was handed to the sender with (never handed twice).
     handed: HashMap<String, String>,
     closing_fwd: Vec<(String, Reply)>,
+    /// Shot id -> (clip folder, project) mapped through this PC's shared folders, known before any refusal so a refused shot keeps its place on the Board.
+    homes: HashMap<String, (String, String)>,
 }
 
 impl Default for Inbound {
@@ -288,6 +291,7 @@ impl Inbound {
             forward: vec![],
             handed: HashMap::new(),
             closing_fwd: vec![],
+            homes: HashMap::new(),
         }
     }
 
@@ -349,7 +353,9 @@ impl Inbound {
     // ---- the per-pass entry -----------------------------------------------------------------------------------
 
     pub fn tick(&mut self, now: Instant, env: &mut Env) {
-        if !app_api::running() {
+        // Passive: the old service owns the listener and the state; the inbox it filled is still worked here.
+        let passive = !app_api::running() && app_api::passive();
+        if !app_api::running() && !passive {
             return;
         }
         for Event::Commit { kind, job_id } in app_api::take_events() {
@@ -371,8 +377,10 @@ impl Inbound {
                 _ => {}
             }
         }
-        self.configure(env);
-        self.publish(now, env);
+        if !passive {
+            self.configure(env);
+            self.publish(now, env);
+        }
         self.load(now);
         self.settle_held();
         self.advance(now, env);
@@ -626,8 +634,8 @@ impl Inbound {
     }
 
     /// "Forget attempt": the user checked this PC and its storage and releases shots that could not be settled by looking.
-    pub fn release_held(&mut self) {
-        for h in &mut self.held {
+    pub fn release_held(&mut self, attempt_id: &str) {
+        for h in self.held.iter_mut().filter(|h| h.attempt_id == attempt_id) {
             if matches!(h.state, HeldState::Owned(_)) {
                 h.state = HeldState::Release(call(json!({"method": "abandon", "attempt_id": h.attempt_id, "reason": "released by the user on this PC"})));
             }
@@ -692,6 +700,7 @@ impl Inbound {
             Err(why) => self.begin(item.id, None, Some(why), json!({"refused": true})),
             Ok(spec) => {
                 let roots = env.settings.shared_roots.clone();
+                self.homes.insert(item.id.clone(), home_of(&spec, &roots));
                 let (tx, rx) = channel();
                 let (id, wake) = (item.id.clone(), env.wake.clone());
                 nlog(&format!("shot {id}: preflight"));
@@ -754,7 +763,8 @@ impl Inbound {
     }
 
     fn begun(&mut self, id: String, pf: Option<Box<Preflight>>, fail: Option<String>, env: &mut Env) {
-        let mut run = Run { job_id: id.clone(), folder: String::new(), project: String::new(), stages: vec![], announced: 0, outbox: vec![], seq: 0, last_phase: String::new(), last_done: 0, last_total: 0, last_progress: Instant::now(), inflight: None, retry_at: None, cancel_sent: false, terminal: None };
+        let (folder, project) = self.homes.remove(&id).unwrap_or_default();
+        let mut run = Run { job_id: id.clone(), folder, project, stages: vec![], announced: 0, outbox: vec![], seq: 0, last_phase: String::new(), last_done: 0, last_total: 0, last_progress: Instant::now(), inflight: None, retry_at: None, cancel_sent: false, terminal: None };
         match (pf, fail) {
             (Some(pf), _) => {
                 run.stages = pf.stages.iter().map(|s| (s.job_id().to_owned(), s.label())).collect();
@@ -937,7 +947,7 @@ impl Inbound {
             ui.colored_label(egui::Color32::from_rgb(225, 110, 110), msg);
             let label = if h.foreign.is_some() { "Clear" } else { "Forget attempt" };
             if ask && ui.small_button(label).on_hover_text("I checked: release this shot (it is marked failed, and never run again)").clicked() {
-                acts.push(Action::ReleaseHeld);
+                acts.push(Action::ReleaseHeld(h.attempt_id.clone()));
             }
         }
         if let Some(n) = &self.note {
@@ -1025,6 +1035,14 @@ pub(crate) fn stats_args(s: &Sample, seq: u64) -> Value {
         o.insert("gpus".into(), json!(list));
     }
     Value::Object(o)
+}
+
+/// The clip folder name and project folder this shot maps to on this PC (empty when its clip folder cannot be mapped).
+fn home_of(spec: &JobSpec, roots: &[crate::shared_paths::SharedRoot]) -> (String, String) {
+    match crate::shared_paths::SharedRef::decode(&spec.clip_root).and_then(|r| crate::shared_paths::resolve(roots, &r)) {
+        Ok(p) => (p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), project_of(&p)),
+        Err(_) => Default::default(),
+    }
 }
 
 /// `<project>/clips/<clip>` -> `<project>`: the folder the Board opens a project by (empty when the path has no such shape).
