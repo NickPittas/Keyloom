@@ -352,3 +352,21 @@ fn remove_shot_is_refused_with_the_reason_while_the_shot_is_queued() {
     drop(app);
     let _ = fs::remove_dir_all(e.base);
 }
+
+#[test]
+fn shot_context_menu_shows_remove_and_disabled_reveal_entries() {
+    let e = env("bs-context", &["a"], json!({}));
+    let (ctx, mut app) = open(&e, "Dark");
+    let card = app.board_cards()[0].2;
+    let p = card.center();
+    frame_with(&ctx, &mut app, mv(p));
+    frame_with(&ctx, &mut app, vec![Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: true, modifiers: Default::default() }]);
+    frame_with(&ctx, &mut app, vec![Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: false, modifiers: Default::default() }]);
+    let menu = frames(&ctx, &mut app, 2);
+    let labels = texts(&menu).into_iter().map(|(_, t)| t).collect::<Vec<_>>();
+    for label in ["Remove shot…", "Reveal Source", "Reveal Exports"] { assert!(labels.iter().any(|t| t == label), "missing {label}: {labels:?}"); }
+    click(&ctx, &mut app, text_rect(&menu, "Remove shot…").center());
+    assert!(app.remove_shot_open());
+    drop(app);
+    let _ = fs::remove_dir_all(e.base);
+}

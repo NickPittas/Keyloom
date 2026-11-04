@@ -516,6 +516,7 @@ fn stems_of(c: &Clip) -> Vec<String> {
 }
 
 impl State {
+    pub(super) fn board_export_root(&self) -> Option<&Path> { self.export_dir.as_deref() }
     pub(super) fn deliveries_has_video(&self) -> bool {
         self.deliveries.values().any(|d| matches!(d, Delivery::Video(_)))
     }

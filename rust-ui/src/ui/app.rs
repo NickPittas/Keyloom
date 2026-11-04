@@ -16,7 +16,7 @@ use crate::settings::{default_path, Store};
 use eframe::egui::{self, Color32, Key, Panel, RichText, Sense, Ui, Vec2};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 mod driver;
@@ -962,6 +962,8 @@ impl App {
                                                 &mut self.card_rects,
                                                 &mut drag,
                                                 &mut remove_idx,
+                                                &p.root,
+                                                self.hint.board_export_root(),
                                             );
                                         },
                                     );
@@ -2318,6 +2320,8 @@ fn board_card(
     card_rects: &mut Vec<(usize, egui::Rect, egui::Rect)>,
     drag: &mut Option<(usize, bool)>,
     remove: &mut Option<usize>,
+    project_root: &Path,
+    export_root: Option<&Path>,
 ) {
     let idle = matches!(st, CardState::Idle);
     let mut on = sel.contains(&i);
@@ -2381,6 +2385,23 @@ fn board_card(
             if idle && resp.double_clicked() {
                 *open = Some(i);
             }
+            let source = match &c.source {
+                Source::Video { path } => Some((path.clone(), true)),
+                Source::Sequence { dir, .. } => Some((dir.clone(), false)),
+                Source::Missing => None,
+            };
+            let exports = crate::pipeline::export_dir(c, project_root, export_root);
+            resp.context_menu(|ui| {
+                if ui.button("Remove shot…").clicked() { *remove = Some(i); ui.close(); }
+                let source_exists = source.as_ref().is_some_and(|(path, _)| path.exists());
+                let source_entry = ui.add_enabled(source_exists, egui::Button::new("Reveal Source"));
+                if !source_exists { source_entry.clone().on_hover_text(source.as_ref().map_or_else(|| "Source not found".to_string(), |(path, _)| format!("Source not found at {}", path.display()))); }
+                if source_entry.clicked() { if let Some((path, select)) = &source { reveal(path, *select, ai); } ui.close(); }
+                let exports_exist = exports.is_dir();
+                let export_entry = ui.add_enabled(exports_exist, egui::Button::new("Reveal Exports"));
+                if !exports_exist { export_entry.clone().on_hover_text("No exports yet for this shot"); }
+                if export_entry.clicked() { reveal(&exports, false, ai); ui.close(); }
+            });
         });
     ui.horizontal_wrapped(|ui| {
         let mut on_box = on;
@@ -2451,6 +2472,17 @@ fn board_card(
             *remove = Some(i);
         }
     });
+}
+
+fn reveal(path: &Path, select_file: bool, ai: &mut AiUi) {
+    let result = if cfg!(target_os = "windows") {
+        let mut cmd = std::process::Command::new("explorer");
+        if select_file { cmd.arg(format!("/select,{}", path.display())); } else { cmd.arg(path); }
+        cmd.spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(if select_file { path.parent().unwrap_or(path) } else { path }).spawn()
+    };
+    if let Err(e) = result { ai.notice = Some(format!("Could not open {}: {e}", path.display())); }
 }
 
 /// Where a card dropped at `pos` lands: (slot, nearest card). Slot `s` is the place before card `s`, `cards.len()`
