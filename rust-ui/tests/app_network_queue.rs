@@ -449,7 +449,7 @@ fn a_retry_after_an_uncertain_acknowledgment_creates_no_duplicate() {
     link.close(); // releases the credentials, so A's own loop can connect meanwhile
     // B runs it exactly once.
     w.until("B to finish it", 60, |w| w.history(&jobs[0]).is_some_and(|h| h.state == "succeeded"));
-    let received = ck::queue::read(&ck::queue::history_path().unwrap()).0.into_iter().filter(|e| e.kind == "received").count();
+    let received = ck::queue::read(&ck::queue::history_path().unwrap()).0.into_iter().filter(|e| e.id == format!("received:{}", jobs[0])).count(); // this shot only: the history file is shared by the process
     assert_eq!(received, 1, "one history entry, one run");
 }
 
@@ -884,6 +884,21 @@ fn fake_systemd() -> &'static Path {
     })
 }
 
+/// The takeover tests need their own PATH/XDG_CONFIG_HOME before the process-wide embedded interpreter starts, so each runs in its own
+/// child process (this test binary re-run on that one test). Returns true in the child, where the real body runs; in the parent it
+/// runs the child, asserts it succeeded and returns false. The parent's environment is never changed.
+fn in_own_process(name: &str) -> bool {
+    if std::env::var_os("KEYLOOM_TAKEOVER_CHILD").is_some() {
+        return true;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--test-threads=1", "--nocapture"]).env("KEYLOOM_TAKEOVER_CHILD", "1").output().unwrap();
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{name} failed in its own process: {}", out.status);
+    false
+}
+
 /// The stand-in old service of this install: its registry and install record (as the installer wrote them), the systemd unit, and a
 /// process holding the state lock until a `stop.request` appears (the old service's own graceful stop). Returns (process, prefix).
 fn old_service(w: &World) -> (std::process::Child, PathBuf) {
@@ -925,6 +940,9 @@ fn queue_old_row(w: &World) -> String {
 /// and runs a shot pushed AFTER the takeover.
 #[test]
 fn the_app_retires_the_old_service_and_runs_a_shot_pushed_after_the_takeover() {
+    if !in_own_process("the_app_retires_the_old_service_and_runs_a_shot_pushed_after_the_takeover") {
+        return;
+    }
     let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
     fake_systemd();
     let Some(mut w) = world("b5-retire", json!({})) else { return };
@@ -947,6 +965,9 @@ fn the_app_retires_the_old_service_and_runs_a_shot_pushed_after_the_takeover() {
 /// (once the cause is gone) takes over and the queued shot then runs.
 #[test]
 fn when_the_old_service_cannot_be_retired_the_banner_says_why_and_nothing_is_dispatched() {
+    if !in_own_process("when_the_old_service_cannot_be_retired_the_banner_says_why_and_nothing_is_dispatched") {
+        return;
+    }
     let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let fail = fake_systemd().join("fail-disable");
     std::fs::write(&fail, "").unwrap();
