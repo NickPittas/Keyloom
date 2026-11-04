@@ -77,6 +77,7 @@ fn wait_status(api: &AppApi, ok: impl Fn(&Status) -> bool) -> Status {
 }
 
 /// Listening sockets of this process on `port`: the socket inode appears in /proc/net/tcp{,6} and in our own fd table.
+#[cfg(target_os = "linux")]
 fn listener_is_ours(port: u16) -> bool {
     let want = format!(":{port:04X} ");
     let inodes: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
@@ -89,6 +90,24 @@ fn listener_is_ours(port: u16) -> bool {
     std::fs::read_dir("/proc/self/fd").unwrap().filter_map(Result::ok).filter_map(|e| std::fs::read_link(e.path()).ok()).any(|l| inodes.iter().any(|i| l.to_string_lossy() == format!("socket:[{i}]")))
 }
 
+#[cfg(windows)]
+fn listener_is_ours(port: u16) -> bool {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Get-NetTCPConnection -LocalPort {port} -State Listen | Select-Object -ExpandProperty OwningProcess"),
+        ])
+        .output()
+        .expect("query listening port owner");
+    assert!(output.status.success(), "Get-NetTCPConnection failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .any(|pid| pid == std::process::id())
+}
+
+#[cfg(target_os = "linux")]
 fn child_processes() -> Vec<String> {
     let mut out = vec![];
     for t in std::fs::read_dir("/proc/self/task").unwrap().filter_map(Result::ok) {
@@ -97,6 +116,28 @@ fn child_processes() -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(windows)]
+fn child_processes() -> Vec<String> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Get-CimInstance Win32_Process -Filter 'ParentProcessId={}' | Select-Object -ExpandProperty ProcessId",
+                std::process::id()
+            ),
+        ])
+        .output()
+        .expect("query child processes");
+    assert!(output.status.success(), "Get-CimInstance failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn reaches(port: u16) -> bool {
