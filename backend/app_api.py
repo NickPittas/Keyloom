@@ -11,6 +11,7 @@ local-installation.json, coordinator.sqlite3 (upgraded in place to schema 3 afte
 `open_inbox` migrates the database, `read_attempt_file` reads the old `<credentials>.attempt.json` side file.
 """
 import errno
+import ipaddress
 import json
 import os
 import re
@@ -123,13 +124,14 @@ class AppEndpoint:
         self.sd, self.on_commit = Path(state_dir), on_commit
         self.store = self.server = self.resp = self.lock = self.thread = None
         self.live = {"allow": False, "name": "", "iid": None}
+        self.receive = True  # "Receive jobs": a push is refused (not_receiving) while this is off
         self.port = self.fp = self.network_id = None
         self.discovery_error = None
 
     def info(self):
         iid = self.live["iid"]
         return {"fingerprint_sha256": self.fp, "network_id": self.network_id, "name": self.live["name"], "host_installation_id": iid,
-                "receiver_online": bool(iid and self.store.session_online(iid)), "join": self.live["allow"],
+                "receiver_online": bool(iid), "join": self.live["allow"],
                 "endpoints": self._cache.get(self.port)}
 
     def _set_iid(self, iid):  # called by the API after a local join / verified local-identity
@@ -191,8 +193,11 @@ class AppEndpoint:
         self.live.update(allow=cfg["allow_address_join"], name=read_name(sd), iid=None)
         iid = read_local_id(sd)
         self.live["iid"] = iid if iid and self.store.installation_active(iid) else None
-        first = (self._cache.get(port) or [{"url": f"https://{cfg['address']}:{port}"}])[0]["url"]
-        opts = dict(join_enabled=self.live["allow"], local_token=token, advertise_url=first, info=self.info, local_identity=self._set_iid)
+        if not self.live["iid"]:
+            self._own_iid()
+        first =(self._cache.get(port) or [{"url": f"https://{cfg['address']}:{port}"}])[0]["url"]
+        opts = dict(join_enabled=self.live["allow"], local_token=token, advertise_url=first, info=self.info, local_identity=self._set_iid,
+                    accepting=lambda: self.receive, destination=self.set_destination)
         ctx = pki.server_context(str(cert), str(key))
         try:
             try:
@@ -235,6 +240,98 @@ class AppEndpoint:
         except OSError:
             pass
         self.resp = self.server = self.store = self.lock = self.thread = None
+
+    # ---- what the app tells its own endpoint ----------------------------------------------------
+
+    def configure(self, allow_join=None, name=None, receive=None):
+        """Settings the app owns: Receive jobs (memory), the join policy and the PC name (the two files an older build reads)."""
+        if receive is not None:
+            self.receive = bool(receive)
+        if allow_join is not None:
+            cfg = read_config(self.sd)
+            if cfg and cfg["allow_address_join"] != bool(allow_join):
+                _write_plain(self.sd / CONFIG, {**cfg, "allow_address_join": bool(allow_join)})
+        if isinstance(name, str) and 1 <= len(name) <= 64 and name.isprintable() and name != read_name(self.sd):
+            meta = _read_json(self.sd / META) or {}
+            _write_plain(self.sd / META, {**meta, "name": name})
+        self.refresh()
+
+    def publish(self, name=None, gpu=None, stats=None, avail=None):
+        """This PC's own entry for the other PCs (its name, GPU, load and whether it is free), written in-process: no HTTP and no
+        session. The first call on a fresh state creates the PC's own installation; an existing one is reused."""
+        self.store.publish_self(self.live["iid"] or self._own_iid(), name, gpu, stats, avail=avail)
+
+    # ---- reverse publication: PCs that hold a connection to this app tell it their own endpoint ----------
+
+    def destination_offer(self, credentials_path):
+        """What to tell the PC behind `credentials_path` (a saved connection of this app): this app's own addresses, certificate and
+        a fresh login that PC may use to push here. Called by the app only on open and after Join, never on a timer."""
+        from .coordinator import pki
+        host = pki.read_credentials(credentials_path)
+        iid, token = self.store.issue_destination(host["fingerprint_sha256"].lower(), "PC pushing to " + (self.live["name"] or "a PC")[:40])
+        urls = [e["url"] for e in (self._cache.get(self.port) or []) if isinstance(e, dict) and isinstance(e.get("url"), str)]
+        return {"protocol": 1, "name": self.live["name"] or "This PC", "network_id": self.network_id, "fingerprint_sha256": self.fp,
+                "certificate_pem": (self.sd / "server-cert.pem").read_text(encoding="utf-8"),
+                "host_installation_id": self.live["iid"] or self._own_iid(), "endpoints": urls[:16] or [f"https://127.0.0.1:{self.port}"],
+                "installation_id": iid, "token": token}
+
+    def set_destination(self, inst, b, peer=None):
+        """API hook (a registered PC, authenticated): keep how to push to it. Its PC id is its registration id, so nothing about it changes."""
+        from .coordinator import pki
+        from .coordinator.schema import ApiError, bad, obj, text
+        obj(b, "destination", ("protocol", "name", "network_id", "fingerprint_sha256", "certificate_pem", "host_installation_id",
+                               "endpoints", "installation_id", "token"))
+        if b["protocol"] != 1 or isinstance(b["protocol"], bool):
+            bad("unsupported protocol", "unsupported_protocol")
+        text(b["name"], "name", 64)
+        fp, pem = b["fingerprint_sha256"], b["certificate_pem"]
+        try:
+            match = (isinstance(fp, str) and re.fullmatch(r"[0-9a-fA-F]{64}", fp) and isinstance(pem, str) and len(pem) <= 8192
+                     and pki.fingerprint(pem) == fp.lower())
+        except Exception:  # an unparsable certificate is a bad request, not a server error
+            match = False
+        if not match:
+            bad("the certificate does not match its fingerprint")
+        if not (pki.valid_installation_id(b["host_installation_id"]) and pki.valid_installation_id(b["installation_id"]) and pki.valid_token(b["token"])):
+            bad("invalid installation id or token")
+        # LAN / Tailscale / ZeroTier addresses only, plus the address this very call came from (the PC proved it is there).
+        explicit = []
+        try:
+            ip = ipaddress.ip_address(str(peer).split("%")[0])
+            explicit = [pki.url_for(str(getattr(ip, "ipv4_mapped", None) or ip), 1)]
+        except ValueError:
+            pass
+        eps = pki.clean_endpoints(b["endpoints"] if isinstance(b["endpoints"], list) else [], explicit=explicit)
+        if not eps:
+            raise ApiError(400, "invalid", "none of those addresses is a LAN, Tailscale or ZeroTier address")
+        d = self.sd / "destinations"
+        d.mkdir(mode=0o700, exist_ok=True)
+        path = d / f"{inst['id']}.json"
+        tmp = d / f".{inst['id']}.{uuid.uuid4().hex[:8]}"
+        pki.write_private_new(str(tmp), pki.credentials_json(eps[0], pem, fp.lower(), b["installation_id"], b["token"]))
+        os.replace(tmp, path)
+        self.store.set_destination(inst["id"], {"name": b["name"], "host_installation_id": b["host_installation_id"], "network_id": b["network_id"][:64],
+                                                "fingerprint_sha256": fp.lower(), "endpoints": eps, "creds_path": str(path)})
+        return {"stored": True}
+
+    def destinations(self):
+        return [{**d, "legacy_network_id": self.network_id} for d in self.store.destinations()]
+
+    def remove_destination(self, pc_id):
+        self.store.remove_destination(pc_id)
+        (self.sd / "destinations" / f"{pc_id}.json").unlink(missing_ok=True)
+
+    def _own_iid(self):
+        """This PC's own installation (a fresh state has none): created once, the token is never needed because nothing logs in as this PC."""
+        iid, _ = self.store.join(self.live["name"] or "This PC")
+        self._set_iid(iid)
+        return iid
+
+    def retire(self, installation_id):
+        """Retire a PC that registered here (Retire): refused for this PC itself and while the login has unfinished work."""
+        if installation_id == self.live["iid"]:
+            raise EndpointError("cannot_retire_self", "this PC's own installation cannot be retired")
+        return {"retired": installation_id, "started_attempts": self.store.revoke(installation_id, only_if_unused=True)}
 
     # ---- what the app asks of its own inbox -----------------------------------------------------
 

@@ -226,6 +226,8 @@ pub struct App {
     metrics_wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     metrics_rect: Option<egui::Rect>,
     remote: driver::Held<crate::remote_set::RemoteSet>,
+    /// The receiving half: shots other PCs pushed into this app's endpoint, run on this app's own scheduler.
+    inbound: driver::Held<crate::inbound::Inbound>,
     setup: crate::network_setup::Setup,
     /// The runtime driver thread (set by `App::new`, the window path); `None` = this host ticks inline from `frame`.
     driver: Option<driver::Driver>,
@@ -285,6 +287,7 @@ impl App {
         let parts = driver::Parts {
             ai: app.ai.shared(),
             remote: app.remote.shared(),
+            inbound: app.inbound.shared(),
             metrics: app.metrics.shared(),
             repo: app.net_repo.clone(),
             python: app.net_python.clone(),
@@ -330,6 +333,13 @@ impl App {
                 ctx.request_repaint();
             }),
         ));
+    }
+
+    /// Try the endpoint again (the Retry buttons, and once when the Clients page opens). Only does anything while it stayed off.
+    fn retry_endpoint(&mut self) {
+        if self.endpoint.as_ref().is_some_and(|e| e.retry()) {
+            self.endpoint_noted = false;
+        }
     }
 
     /// Once the endpoint has settled, say so if it could not take over (the old service still owns this PC's state, or it failed).
@@ -441,6 +451,7 @@ impl App {
             metrics_wake: None,
             metrics_rect: None,
             remote: driver::Held::new(crate::remote_set::RemoteSet::new(opts.net.clone())),
+            inbound: driver::Held::new(crate::inbound::Inbound::new()),
             setup: crate::network_setup::Setup::new(opts.net.clone()),
             driver: None,
             endpoint: None,
@@ -968,6 +979,7 @@ impl App {
             }
         });
         ui.data_mut(|d| d.insert_temp(tab_id, waiting));
+        ai.net_inactive_ui(ui);
         let mut actions = vec![];
         egui::ScrollArea::vertical().id_salt("batch_work_queue").auto_shrink([false; 2]).show(ui, |ui| {
             if waiting {
@@ -1938,7 +1950,7 @@ impl App {
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_force {
             let (jobs, alive, models) = (
                 self.ai.running_jobs(),
-                self.ai.workers_alive() || !self.remote.quiescent(),
+                self.ai.workers_alive() || !self.inbound.quiescent(),
                 self.models.busy(),
             );
             if jobs || alive || models {
@@ -1948,13 +1960,13 @@ impl App {
                         self.close = CloseState::Prompt;
                     } else {
                         self.ai.begin_stop(); // only idle workers: no question to ask
-                        self.remote.shutdown_requested();
+                        self.inbound.shutdown_requested();
                         self.close = CloseState::Stopping;
                     }
                 }
             }
         }
-        if self.close == CloseState::Stopping && self.ai.all_stopped() && self.remote.quiescent() && !self.models.busy() {
+        if self.close == CloseState::Stopping && self.ai.all_stopped() && self.inbound.quiescent() && !self.models.busy() {
             self.close_force = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -2013,7 +2025,7 @@ impl App {
                 self.models.stop_for_close(ctx);
             }
             self.ai.begin_stop();
-            self.remote.shutdown_requested();
+            self.inbound.shutdown_requested();
             next = CloseState::Stopping;
         }
         self.close = next;
@@ -2565,6 +2577,7 @@ impl App {
                 v.pause();
             }
             self.clients_open = true;
+            self.retry_endpoint(); // one more try when the page opens (no-op while the endpoint runs)
         }
         self.clients_rect = Some(r.rect);
         r.rect
@@ -2644,6 +2657,37 @@ impl App {
 
     /// Per frame: drive the network client (connect, stats, Batch submissions, receiving) without blocking.
     fn net_tick(&mut self, now: std::time::Instant, wake: &std::sync::Arc<dyn Fn() + Send + Sync>) {
+        use crate::app_api::Status;
+        self.setup.set_hosted(match self.endpoint.as_ref().map(|e| e.status()) {
+            Some(Status::Starting) => crate::network_setup::Hosted::Starting,
+            Some(Status::Running(info)) => crate::network_setup::Hosted::Running(info),
+            _ => crate::network_setup::Hosted::Off,
+        });
+        // A failed takeover must not look like it works: say so on the Clients page and the Board, with Retry.
+        let inactive = match self.endpoint.as_ref().map(|e| e.status()) {
+            Some(Status::Passive { .. }) => Some("Network not active: the old background service is still running.".to_owned()),
+            Some(Status::Failed { message, .. }) => Some(format!("Network not active: {message}")),
+            _ => None,
+        };
+        self.inbound.inactive.clone_from(&inactive);
+        self.ai.net_inactive = inactive;
+        if std::mem::take(&mut self.ai.retry_endpoint) {
+            self.retry_endpoint();
+        }
+        // Registered PCs that told this app their endpoint become connections (once per change, never on a timer).
+        if !self.settings_open && self.inbound.take_destinations_changed() {
+            let dests = self.inbound.destinations().to_vec();
+            for d in &dests {
+                self.remote.reachable(&d.network_id); // it just published a fresh login: a failed link reads it now, not at the retry timer
+            }
+            let changed = {
+                let n = self.net_draft();
+                crate::inbound::add_destinations(n, &dests)
+            };
+            if changed {
+                self.net_save("Registered PCs added as destinations");
+            }
+        }
         self.setup.ensure(self.settings.saved(), self.settings.store_path());
         self.setup.tick(self.net_repo.as_deref(), self.net_python.as_deref(), wake);
         if !self.settings_open {
@@ -2653,6 +2697,29 @@ impl App {
             let ups = self.setup.take_updates();
             if !ups.is_empty() {
                 self.net_scan_updates(ups);
+            }
+        }
+        // The receiving side runs whenever the app's endpoint does, joined to a network or not.
+        if self.driver.is_none() {
+            let view = self.metrics.view(now);
+            let mut env = crate::remote::Env {
+                settings: self.settings.saved(),
+                settings_path: self.settings.store_path(),
+                ai: &mut self.ai,
+                metrics: &view,
+                repo: self.net_repo.as_deref(),
+                python: self.net_python.as_deref(),
+                wake,
+                cfg: Default::default(),
+            };
+            self.inbound.tick(now, &mut env);
+            if self.inbound.take_history_changed() {
+                env.ai.queue_refresh_received();
+            }
+            for f in self.inbound.take_finished() {
+                if let Some(ctx) = self.last_ctx.clone() {
+                    self.refresh_clip(&ctx, &f);
+                }
             }
         }
         if !self.remote.available() {
@@ -2684,6 +2751,7 @@ impl App {
                 cfg: Default::default(),
             };
             self.remote.tick(now, &mut env);
+            crate::inbound::pump_forwards(&mut self.inbound, &mut self.remote, &mut env);
             for f in self.remote.take_finished() {
                 if let Some(ctx) = self.last_ctx.clone() {
                     self.refresh_clip(&ctx, &f);
@@ -2751,6 +2819,9 @@ impl App {
     /// Fresh scan addresses for saved connections (matched by full fingerprint, never by name). A legacy connection
     /// keeps targeting every member; one that already names a host is corrected to the host the scan shows.
     fn net_scan_updates(&mut self, ups: Vec<crate::network_setup::ScanUpdate>) {
+        for u in &ups {
+            self.remote.reachable(&u.network_id); // the PC answered discovery: reconnect now
+        }
         let infos = self.remote.infos();
         let conns = self.settings.saved().network.connections();
         let nid = |c: &crate::settings::Connection| if c.network_id.is_empty() { infos.iter().find(|i| i.credentials == c.credentials).and_then(|i| i.network_id.clone()).unwrap_or_default() } else { c.network_id.clone() };
@@ -2838,7 +2909,12 @@ impl App {
     fn finish_remove(&mut self, creds: &str, notice: Option<String>) {
         let n = self.net_draft();
         let own = n.connections.iter().any(|c| c.credentials == creds && c.local_host);
+        let destination = n.connections.iter().find(|c| c.credentials == creds).map(|c| c.legacy_id.clone()).filter(|l| !l.is_empty());
         n.connections.retain(|c| c.credentials != creds);
+        if let Some(pc_id) = destination {
+            // The user removed a registered PC's destination: it is not offered again (its registration is Retired from the Clients page).
+            let _ = crate::app_api::spawn_call("destination_remove", serde_json::json!({"pc_id": pc_id}));
+        }
         if n.default_submit == creds {
             n.default_submit.clear();
         }
@@ -2880,7 +2956,12 @@ impl App {
                     self.ai.notice = Some("Taken back. It was sent before the app restarted, so select the clip and Key it again.".into());
                 }
             }
-            Action::ForgetAttempt(creds) => self.remote.forget_attempt(&creds),
+            Action::ReleaseHeld => self.inbound.release_held(),
+            Action::RetryEndpoint => self.retry_endpoint(),
+            Action::ReceiveJobs(on) => {
+                self.net_draft().receive_jobs = Some(on);
+                self.net_save("Updated");
+            }
             Action::Prefer { creds, url } => {
                 if let Some(c) = self.net_draft().connections.iter_mut().find(|c| c.credentials == creds) {
                     c.preferred = url;
@@ -3048,6 +3129,7 @@ impl App {
     fn release_shared(&mut self) {
         self.ai.release();
         self.remote.release();
+        self.inbound.release();
         self.metrics.release();
     }
 
@@ -3055,6 +3137,7 @@ impl App {
         // Take the shared objects in the driver's lock order for the whole frame, give them back at its end.
         self.ai.hold();
         self.remote.hold();
+        self.inbound.hold();
         self.metrics.hold();
         if let Some(d) = &self.driver {
             d.publish(self.settings.saved(), self.settings.store_path());
@@ -3223,7 +3306,7 @@ impl App {
                                 ui.add_space(14.0);
                             }
                             let (own_net, own_iid) = self.setup.svc().map(|v| (v.network_id.clone(), v.host_installation_id.clone())).unwrap_or_default();
-                            let (placement, table_acts) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.remote, self.settings.saved(), self.settings.store_path(), own_net.as_deref(), own_iid.as_deref());
+                            let (placement, table_acts) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.remote, &self.inbound, self.settings.saved(), self.settings.store_path(), own_net.as_deref(), own_iid.as_deref());
                             if let Some(p) = placement {
                                 self.ai.placement = p;
                             }
@@ -4252,6 +4335,7 @@ mod lock_order_tests {
         let parts = driver::Parts {
             ai: app.ai.shared(),
             remote: app.remote.shared(),
+            inbound: app.inbound.shared(),
             metrics: app.metrics.shared(),
             repo: None,
             python: None,
@@ -4264,6 +4348,7 @@ mod lock_order_tests {
             assert!(!app.ai.is_held() && !app.remote.is_held() && !app.metrics.is_held());
             app.ai.hold(); // what `frame` does next: must not wait on a driver that waits on us
             app.remote.hold();
+            app.inbound.hold();
             app.metrics.hold();
             app.release_shared();
         }

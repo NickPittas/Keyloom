@@ -545,6 +545,8 @@ pub struct NetSubmit {
     pub target: Option<String>,
     pub folder: String,
     pub name: String,
+    /// Automatic picked the PC: it refuses the shot (`not_free`) if it is no longer free, and the shot waits for the next free PC.
+    pub automatic: bool,
 }
 
 pub struct AiUi {
@@ -604,6 +606,12 @@ pub struct AiUi {
     /// the coordinator link is online, and the shots waiting to be sent.
     pub net_targets: Vec<(String, String)>,
     pub net_online: bool,
+    /// Why this app's own network endpoint is not running ("Network not active: ..."), shown on the Board with Retry; None = it runs.
+    pub net_inactive: Option<String>,
+    /// The Board's Retry was clicked; the app starts the endpoint again and clears this.
+    pub retry_endpoint: bool,
+    /// An Automatic shot is being handed to a PC (set only while `dispatch_auto` submits it).
+    sending_auto: bool,
     net_outbox: Vec<NetSubmit>,
     /// Confirmed Automatic shots waiting for a free PC, in order.
     // ponytail: dropped on quit, not saved; the user confirms them again.
@@ -753,6 +761,9 @@ impl AiUi {
             touched: Default::default(),
             net_targets: vec![],
             net_online: false,
+            net_inactive: None,
+            retry_endpoint: false,
+            sending_auto: false,
             net_outbox: vec![],
             auto_pending: Default::default(),
             sent_shots: Default::default(),
@@ -3011,7 +3022,9 @@ impl AiUi {
             if let Some(id) = &pc {
                 a.row.placement = Placement::Target(id.clone());
             }
+            self.sending_auto = pc.is_some();
             let sent = self.submit_row(&a.project, &a.st, a.preset_name.as_deref(), &a.row, a.plan.clone());
+            self.sending_auto = false;
             if let Ok(id) = &sent {
                 // Followed to its end: a failure brings it back for another PC.
                 a.row.placement = automatic.clone();
@@ -3086,6 +3099,11 @@ impl AiUi {
         for sid in ids {
             match outcome(&sid) {
                 Some(Ok(())) => {}
+                // The PC was no longer free when the shot arrived: not the shot's fault and not a failure of that PC; it keeps waiting
+                // for the next free PC (the Remote already counts the refusing PC as busy until it answers again).
+                Some(Err(Some(why))) if why.starts_with("not_free") => {
+                    self.requeue_sent(&sid);
+                }
                 Some(Err(Some(why))) => {
                     let a = self.sent_shots.remove(&sid).expect("listed");
                     if a.on.is_some() { self.auto_failed(a, &why) }
@@ -3161,7 +3179,7 @@ impl AiUi {
         })?;
         commit(&r.clip, &plan, &r.params, &r.out)?; // clip id / output values, as a local queue does
         self.persist_row_settings(&r);
-        Ok(NetSubmit { submission_id: format!("sub_{}", new_id()), spec, target: target.clone(), folder: r.clip.folder.clone(), name: r.clip.display_name.clone() })
+        Ok(NetSubmit { submission_id: format!("sub_{}", new_id()), spec, target: target.clone(), folder: r.clip.folder.clone(), name: r.clip.display_name.clone(), automatic: self.sending_auto })
     }
 
     /// Shots confirmed for the network, for the controller to send.
@@ -4026,6 +4044,23 @@ mod tests {
         ai.dispatch_auto(&["network:n/a".into(), "network:n/b".into()], &busy_view());
         let again = ai.take_net_outbox();
         assert_eq!((again.len(), again[0].target.as_deref()), (1, Some("n/b")), "another PC takes it");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_not_free_refusal_keeps_the_shot_pending_for_the_next_free_pc_without_blaming_the_pc() {
+        let (mut ai, d) = auto_fixture("notfree", 1);
+        ai.net_online = true;
+        ai.net_targets = vec![("n/a".into(), "A".into()), ("n/b".into(), "B".into())];
+        ai.dispatch_auto(&["network:n/a".into()], &busy_view());
+        let sent = ai.take_net_outbox().remove(0);
+        assert!(sent.automatic, "an Automatic pick says so, so the receiving PC can refuse it when it is no longer free");
+        ai.settle_sent(|sid| (sid == sent.submission_id).then_some(Err(Some("not_free: this PC is busy or holds an unsettled shot".into()))));
+        assert_eq!(ai.auto_pending.len(), 1, "the shot is pending again");
+        assert!(ai.auto_pending[0].failed_on.is_empty(), "A did not fail: it may be picked again when it is free");
+        ai.dispatch_auto(&["network:n/b".into()], &busy_view());
+        let again = ai.take_net_outbox();
+        assert_eq!((again.len(), again[0].target.as_deref()), (1, Some("n/b")), "the next free PC gets it");
         let _ = std::fs::remove_dir_all(d);
     }
 

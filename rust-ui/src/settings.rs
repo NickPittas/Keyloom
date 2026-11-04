@@ -136,8 +136,18 @@ pub struct Network {
     pub host_removed: bool,
     /// Allow other PCs to join this PC's service.
     pub allow_join: bool,
+    /// Take shots other PCs push to this app. Absent (an older file) = what this PC's own connection had: on unless it was ticked off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receive_jobs: Option<bool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Network {
+    /// "Receive jobs": the app's endpoint accepts pushed shots only while this is on.
+    pub fn receives(&self) -> bool {
+        self.receive_jobs.unwrap_or_else(|| self.connections.iter().find(|c| c.local_host).is_none_or(|c| c.receive))
+    }
 }
 
 impl Default for Network {
@@ -151,6 +161,7 @@ impl Default for Network {
             name: String::new(),
             host_removed: false,
             allow_join: true,
+            receive_jobs: None,
             extra: Map::new(),
         }
     }
@@ -173,6 +184,10 @@ pub struct Connection {
     /// Exact host installation this connection targets (empty = legacy: every member).
     pub host_installation_id: String,
     pub host_name: String,
+    /// A PC that registered on this app and told it its endpoint: the network id and PC id its old assignments were written in
+    /// (`network:<legacy_ns>/<legacy_id>`), so they keep resolving to it.
+    pub legacy_ns: String,
+    pub legacy_id: String,
     /// This PC's own service (joined automatically, receives work by default).
     pub local_host: bool,
     #[serde(flatten)]

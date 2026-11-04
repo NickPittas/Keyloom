@@ -45,13 +45,13 @@ def make_inst(store, name="pc", admin=False):
     return store.authenticate(f"{iid}.{tok}"), f"{iid}.{tok}"
 
 
-def session(inst, n="s1", gpu="GPU-aaaaaaaa"):
-    return {"protocol": 1, "session_id": sid(n), "build": "t", "gpus": [{"uuid": gpu, "name": "RTX", "vram_total_mb": 24000, "ram_total_mb": 64000}]}
+def gpu(uuid="GPU-aaaaaaaa"):
+    return {"uuid": uuid, "name": "RTX", "vram_total_mb": 24000, "ram_total_mb": 64000}
 
 
-def claim_body(clock, session_n="s1", claim_n="c1", caps=CAPS):
-    return {"session_id": sid(session_n), "claim_id": sid(claim_n), "capabilities": caps,
-            "resources": {"sampled_at": int(clock.t), "free_vram_mb": 20000, "free_ram_mb": 30000}}
+def begin(store, host, job_id, slot="gpu0", plan=None):
+    """The receiving app starts a queued shot on its own worker: the one way a shot becomes `started` now."""
+    return store.inbox_begin(host["id"], job_id, slot, plan or {"x": 1})["attempt_id"]
 
 
 @pytest.fixture

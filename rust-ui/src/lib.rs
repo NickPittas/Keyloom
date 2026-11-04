@@ -6,6 +6,7 @@ pub mod decode;
 pub mod frames;
 pub mod hints;
 pub mod import;
+pub mod inbound;
 pub mod jobs;
 pub mod metrics;
 pub mod models;

@@ -71,7 +71,7 @@ fn main() -> eframe::Result {
         std::process::exit(code);
     }
     ck::ui::platform::prefer_xwayland();
-    let mut o = AppOptions { metrics: ck::metrics::Source::Local, net: ck::netlink::Source::Local, ..Default::default() };
+    let mut o = AppOptions { metrics: ck::metrics::Source::Local, net: ck::netlink::Source::Local, endpoint: true, ..Default::default() };
     let mut background = false;
     let mut size = (1440.0f32, 900.0f32);
     let mut i = 0;
@@ -96,8 +96,9 @@ fn main() -> eframe::Result {
             "--auto-confirm" => o.auto_confirm = true,
             "--keys" => o.keys = next(&mut i).split(',').map(str::to_owned).collect(),
             "--frame" => o.frame = next(&mut i).parse().ok(),
-            // Opt-in until the app-to-app cutover: the old network service still owns this PC's network state by default.
+            // The app hosts its own endpoint by default (it stays passive if an old service still owns the state).
             "--app-endpoint" => o.endpoint = true,
+            "--no-app-endpoint" => o.endpoint = false,
             "--metrics-fixture" => o.metrics = ck::metrics::Source::Fixture(next(&mut i).into()),
             "--screenshot" => o.screenshot = Some(next(&mut i).into()),
             "--screenshot-after" => o.screenshot_after = next(&mut i).parse().ok(),

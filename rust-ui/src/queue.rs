@@ -115,7 +115,7 @@ pub fn read(p: &Path) -> (Vec<Entry>, Option<String>) {
 /// `read`, with local entries that were queued/running when the app closed turned into HELD.
 pub fn load(p: &Path) -> (Vec<Entry>, Option<String>) {
     let (mut e, err) = read(p);
-    for x in e.iter_mut().filter(|x| x.kind == "local" && x.active()) {
+    for x in e.iter_mut().filter(|x| (x.kind == "local" || x.kind == "received") && x.active()) {
         x.detail = format!(
             "interrupted while {}: not restarted, not assumed finished",
             x.state

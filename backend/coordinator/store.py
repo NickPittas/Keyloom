@@ -13,12 +13,13 @@ import uuid
 from contextlib import contextmanager
 
 from . import PROTOCOL
-from .schema import (ApiError, MAX_BATCH, canonical, digest, validate_claim, validate_event, validate_session,
-                     validate_spec, validate_stats, validate_target, ident, obj, text, choice, bad, REJECT_CODES)
+from .schema import (ApiError, MAX_BATCH, canonical, digest, validate_event, validate_session,
+                     validate_spec, validate_stats, validate_target, ident, obj, text, bad)
 
 SCHEMA_VERSION = 2
 MAX_INSTALLATIONS = 64  # joins stop here
-SESSION_TTL = 120  # s without any call before another session id may take over the installation
+SESSION_TTL = 120  # s without any contact before a registered PC shows as offline (it is never removed)
+APP_SESSION = "keyloom-app-session"  # the one session id of the app's own in-process publication
 # Unfinished work of one login ({i} = its id column or a placeholder, used three times).
 _IN_USE = ("(EXISTS(SELECT 1 FROM jobs j WHERE (j.target={i} OR j.submitter={i}) AND j.state IN ('queued','offered','started')) OR "
            "EXISTS(SELECT 1 FROM attempts a WHERE a.installation_id={i} AND a.state IN ('offered','started')))")
@@ -60,6 +61,15 @@ CREATE TABLE inbox_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
+# Destinations: PCs that registered here AND told this app their own endpoint (reverse publication). Metadata only: the
+# credential this app uses to push to that PC lives in a private file, never in the database.
+_DDL_V4 = """
+CREATE TABLE destinations(installation_id TEXT PRIMARY KEY, name TEXT NOT NULL, host_installation_id TEXT NOT NULL,
+  network_id TEXT NOT NULL, fingerprint_sha256 TEXT NOT NULL, endpoints_json TEXT NOT NULL, creds_path TEXT NOT NULL,
+  updated_at REAL NOT NULL, removed INTEGER NOT NULL DEFAULT 0);
+"""
+
+
 def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -73,10 +83,11 @@ class Store:
         self.clock = clock
         self.on_commit = on_commit  # (kind, job_id) after a NEW submission or a cancel commits; never called under the lock
         self._lock = threading.Lock()
-        self._ready = False
         self._stats_lock = threading.Lock()
         self._stats = {}  # installation_id -> latest sample of the current session; memory only, no history
-        self._caps = {}  # installation_id -> capabilities of its latest claim (to explain why a queued job waits)
+        self._seen = {}  # installation_id -> time of its last authenticated call (memory only): who is online
+        self._avail = {}  # installation_id -> {receiving, busy, held} the app last published for itself (memory only)
+        self._self_iid = None
         # A corrupt or newer database raises here and is left untouched; it is never recreated silently.
         self.db = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False, timeout=10)
         self.db.row_factory = sqlite3.Row
@@ -89,7 +100,7 @@ class Store:
             if self.db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
                 raise RuntimeError("coordinator database has tables but no schema version; refusing to touch it")
             with self._tx():
-                for stmt in (_DDL + _DDL_V2 + _DDL_V3).split(";\n"):
+                for stmt in (_DDL + _DDL_V2 + _DDL_V3 + _DDL_V4).split(";\n"):
                     if stmt.strip():
                         self.db.execute(stmt)
                 self.db.execute("INSERT INTO inbox_meta VALUES('migrated_from', '0')")
@@ -104,6 +115,10 @@ class Store:
                 self._backup(path, ver)
                 with self._tx():
                     self.db.execute(_DDL_V3.strip().rstrip(";"))
+            if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='destinations'").fetchone():
+                self._backup(path, ver)
+                with self._tx():
+                    self.db.execute(_DDL_V4.strip().rstrip(";"))
             if not self.db.execute("SELECT 1 FROM inbox_meta WHERE key='migrated_from'").fetchone():
                 self._backup(path, ver)
                 with self._tx():
@@ -111,7 +126,6 @@ class Store:
                     for att in self.db.execute("SELECT * FROM attempts WHERE state='offered'").fetchall():
                         self._requeue_offer(self.db, att, "offer cleared by the app inbox upgrade", now)
                     self.db.execute("INSERT INTO inbox_meta VALUES('migrated_from', ?)", (str(ver),))
-        self._ready = True
 
     def _backup(self, path, ver):
         """Consistent copy of the old database beside it, taken once before the first in-place upgrade."""
@@ -142,8 +156,6 @@ class Store:
         with self._lock:
             self.db.execute("BEGIN IMMEDIATE")
             try:
-                if self._ready:
-                    self._expire_offers(self.db)
                 yield self.db
             except BaseException:
                 self.db.execute("ROLLBACK")
@@ -157,14 +169,6 @@ class Store:
                       (now, why, att["attempt_id"])).rowcount:
             db.execute("UPDATE jobs SET state='queued', attempt_id=NULL, updated_at=? WHERE job_id=? AND state='offered'",
                        (now, att["job_id"]))
-
-    def _expire_offers(self, db):
-        """An offer whose owner has no live session is unstarted work nobody holds: revoke and requeue it."""
-        now = self.clock()
-        for att in db.execute("SELECT a.* FROM attempts a LEFT JOIN sessions s ON s.installation_id=a.installation_id "
-                              "WHERE a.state='offered' AND (s.last_seen IS NULL OR ? - s.last_seen > ?)",
-                              (now, SESSION_TTL)).fetchall():
-            self._requeue_offer(db, att, "offer expired: owner session lapsed before start", now)
 
     # ---- identity -----------------------------------------------------------------------------------
 
@@ -192,17 +196,22 @@ class Store:
         ok = hmac.compare_digest(row["token_hash"] if row else "0" * 64, token_hash(token))
         if not row or not ok or row["revoked_at"] is not None:
             raise ApiError(401, "unauthorized", "invalid credentials")
+        self._seen[iid] = self.clock()  # a successful call is the proof that PC is on
         return dict(row)
 
     def installation_active(self, installation_id):
         with self._lock:
             return self.db.execute("SELECT 1 FROM installations WHERE id=? AND revoked_at IS NULL", (installation_id,)).fetchone() is not None
 
+    def _online(self, iid, last_seen=None):
+        """True while this PC made an authenticated call, or the app published itself, within SESSION_TTL."""
+        t = max(self._seen.get(iid) or 0, last_seen or 0)
+        return bool(t) and self.clock() - t < SESSION_TTL
+
     def session_online(self, installation_id):
-        """True while this installation's session has called in within SESSION_TTL (honest receiver/app presence)."""
         with self._lock:
             row = self.db.execute("SELECT last_seen FROM sessions WHERE installation_id=?", (installation_id,)).fetchone()
-        return row is not None and self.clock() - row["last_seen"] < SESSION_TTL
+        return self._online(installation_id, row["last_seen"] if row else None)
 
     def revoke(self, installation_id, only_if_unused=False):
         """Returns the STARTED attempts that stay fenced: revoking credentials proves nothing about a running writer.
@@ -245,23 +254,18 @@ class Store:
             raise ApiError(409, "stale_session", "register a session first (or another session now owns this installation)")
         db.execute("UPDATE sessions SET last_seen=? WHERE installation_id=?", (self.clock(), iid))
 
-    def register(self, inst, body):
+    def _register_gpu(self, inst, body):
         validate_session(body)
         g, now, iid = body["gpus"][0], self.clock(), inst["id"]
         slot = f"{iid}:{g['uuid']}"
         with self._tx() as db:
             cur = db.execute("SELECT * FROM sessions WHERE installation_id=?", (iid,)).fetchone()
-            if cur and cur["session_id"] != body["session_id"] and now - cur["last_seen"] < SESSION_TTL:
-                raise ApiError(409, "session_conflict", "another live session already owns this installation")
             owner = db.execute("SELECT g.installation_id FROM gpu_slots g JOIN installations i ON i.id=g.installation_id "
                                "WHERE g.gpu_uuid=? AND i.revoked_at IS NULL", (g["uuid"],)).fetchone()
             if owner and owner[0] != iid:
                 raise ApiError(409, "gpu_identity_conflict", "this physical GPU is already registered by another installation")
             if db.execute("SELECT 1 FROM gpu_slots WHERE installation_id=? AND gpu_uuid<>?", (iid, g["uuid"])).fetchone():
                 raise ApiError(409, "gpu_identity_conflict", "this installation already registered a different GPU")
-            if db.execute("SELECT 1 FROM attempts a JOIN gpu_slots g ON g.slot_id=a.slot_id WHERE g.gpu_uuid=? AND g.installation_id<>? "
-                          "AND a.state IN ('offered','started')", (g["uuid"], iid)).fetchone():
-                raise ApiError(409, "gpu_identity_conflict", "a previous installation still has an active attempt on this GPU; abandon it first")
             db.execute("DELETE FROM gpu_slots WHERE gpu_uuid=? AND installation_id<>?", (g["uuid"], iid))
             db.execute("INSERT INTO gpu_slots VALUES(?,?,?,?,?,?,1) ON CONFLICT(slot_id) DO UPDATE SET name=excluded.name,"
                        "vram_total_mb=excluded.vram_total_mb, ram_total_mb=excluded.ram_total_mb",
@@ -270,11 +274,42 @@ class Store:
                 db.execute("UPDATE installations SET name=? WHERE id=?", (body["name"], iid))
             started = cur["started_at"] if cur and cur["session_id"] == body["session_id"] else now
             db.execute("INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?)", (iid, body["session_id"], body["build"], started, now))
-        return {"installation_id": iid, "session_id": body["session_id"], "slot_id": slot, "protocol": PROTOCOL}
+
+    def publish_self(self, iid, name=None, gpu=None, stats=None, build="app", avail=None):
+        """The app writes its OWN row in-process (no HTTP, no session handshake): display name, GPU slot and the latest load
+        sample the other PCs read from `installations`. Called with the same 5 s cadence the load was always reported at."""
+        if not self.installation_active(iid):
+            raise ApiError(404, "unknown_installation", "this PC's installation is not registered here")
+        if gpu:
+            body = {"protocol": PROTOCOL, "session_id": APP_SESSION, "build": build, "gpus": [gpu]}
+            if name:
+                body["name"] = name
+            self._register_gpu({"id": iid}, body)
+        elif name:
+            with self._tx() as db:
+                db.execute("UPDATE installations SET name=? WHERE id=?", (name, iid))
+        if stats:
+            self.report_stats({"id": iid}, {"session_id": APP_SESSION, **stats})
+        self._seen[iid] = self.clock()
+        self._self_iid = iid
+        if avail is not None:
+            self._avail[iid] = {k: bool(avail.get(k)) for k in ("receiving", "busy", "held")}
+
+    def _not_free(self, db):
+        """Why this PC is not free for an Automatic shot right now (None = free): what the app last published, plus anything
+        already in the inbox (a shot that landed after that publication)."""
+        a = self._avail.get(self._self_iid)
+        if a is None or not a["receiving"]:
+            return "Receive jobs is off or this PC has not reported yet"
+        if a["busy"] or a["held"]:
+            return "this PC is busy or holds an unsettled shot"
+        if db.execute("SELECT 1 FROM jobs WHERE state IN ('queued','offered','started')").fetchone():
+            return "this PC already has a shot"
+        return None
 
     # ---- submission -------------------------------------------------------------------------------
 
-    def submit(self, inst, body):
+    def submit(self, inst, body, only_if_free=False):
         obj(body, "submission", ("submission_id", "spec", "target"))
         sid = ident(body["submission_id"], "submission_id")
         target = validate_target(body["target"])
@@ -288,6 +323,8 @@ class Store:
                 return json.loads(prior["response_json"])
             if target and not db.execute("SELECT 1 FROM installations WHERE id=? AND revoked_at IS NULL", (target,)).fetchone():
                 bad("target installation does not exist")
+            if only_if_free and (why := self._not_free(db)):  # an Automatic shot is only taken by a PC that is still free
+                raise ApiError(409, "not_free", why)
             if db.execute("SELECT count(*) FROM jobs WHERE state IN ('queued','offered','started')").fetchone()[0] >= MAX_ACTIVE_JOBS:
                 raise ApiError(429, "queue_full", "too many active jobs")
             now, jid = self.clock(), new_id("job")
@@ -299,135 +336,12 @@ class Store:
         self._notify("submitted", jid)  # after COMMIT: the app learns of the shot only once it is durable
         return resp
 
-    # ---- claim / reject / start -------------------------------------------------------------------
-
-    @staticmethod
-    def _skip_reason(job, cap):
-        """Why a receiver with these capabilities cannot take this queued job (None = eligible). Concrete, never a
-        silent downgrade: the first mismatch is named."""
-        kind = json.loads(job["spec_json"]).get("kind")
-        if kind not in cap["kinds"]:
-            return f"does not support {kind!r} jobs (older build?)"
-        missing = sorted({n.lower() for n in json.loads(job["roots_json"])} - {n.lower() for n in cap["maps"]})
-        if missing:
-            return f"no path mapping for {', '.join(missing)}"
-        for n, d in json.loads(job["models_json"]).items():
-            if n not in cap["models"]:
-                return f"model {n} is not installed"
-            if d is not None and cap["models"][n] != d:
-                return f"model {n} differs (different digest)"
-        return None
-
-    def _offer(self, db, att):
-        job = db.execute("SELECT spec_json, cancel_requested FROM jobs WHERE job_id=?", (att["job_id"],)).fetchone()
-        return {"attempt_id": att["attempt_id"], "job_id": att["job_id"], "state": att["state"],
-                "cancel_requested": bool(job["cancel_requested"]), "spec": json.loads(job["spec_json"])}
-
-    def claim(self, inst, body):
-        validate_claim(body)
-        iid, cap = inst["id"], body["capabilities"]
-        rhash = digest({k: v for k, v in body.items() if k != "claim_id"})
-        now = self.clock()
-        self._caps[iid] = (self.clock(), cap)
-        with self._tx() as db:
-            self._session(db, iid, body["session_id"])
-            prior = db.execute("SELECT * FROM claims WHERE claim_id=?", (body["claim_id"],)).fetchone()
-            if prior:
-                if prior["installation_id"] != iid or prior["request_hash"] != rhash:
-                    raise ApiError(409, "claim_conflict", "claim_id was already used with a different request")
-                att = db.execute("SELECT * FROM attempts WHERE attempt_id=?", (prior["attempt_id"],)).fetchone()
-                return {"offer": self._offer(db, att)}
-            if body["resources"] and abs(body["resources"]["sampled_at"] - now) > 120:
-                bad("resources.sampled_at is not fresh; resample before claiming", "stale_resources")
-            slot = db.execute("SELECT * FROM gpu_slots WHERE installation_id=? AND enabled=1", (iid,)).fetchone()
-            if not slot:
-                return {"offer": None, "reason": "no_enabled_gpu"}
-            live = db.execute("SELECT * FROM attempts WHERE slot_id=? AND state IN ('offered','started')", (slot["slot_id"],)).fetchone()
-            if live:
-                if live["state"] == "started":
-                    return {"offer": None, "reason": "slot_busy"}
-                # Lost the earlier response: hand the same pending offer to the new claim id.
-                db.execute("INSERT INTO claims VALUES(?,?,?,?)", (body["claim_id"], iid, rhash, live["attempt_id"]))
-                return {"offer": self._offer(db, live)}
-            # Targeting and rejection filters are in SQL and the queue is bounded by MAX_ACTIVE_JOBS, so no job can be starved
-            # by a long run of ineligible ones ahead of it.
-            for job in db.execute("SELECT * FROM jobs j WHERE state='queued' AND (target IS NULL OR target=?) AND NOT EXISTS("
-                                  "SELECT 1 FROM job_rejections r WHERE r.job_id=j.job_id AND r.installation_id=?) ORDER BY seq",
-                                  (iid, iid)):
-                if self._skip_reason(job, cap):
-                    continue
-                aid = new_id("att")
-                res = canonical(body["resources"]) if body["resources"] else None
-                db.execute("INSERT INTO attempts(attempt_id,job_id,installation_id,slot_id,state,offered_at,resources_json)"
-                           " VALUES(?,?,?,?,'offered',?,?)", (aid, job["job_id"], iid, slot["slot_id"], now, res))
-                db.execute("UPDATE jobs SET state='offered', attempt_id=?, updated_at=? WHERE job_id=? AND state='queued'",
-                           (aid, now, job["job_id"]))
-                db.execute("INSERT INTO claims VALUES(?,?,?,?)", (body["claim_id"], iid, rhash, aid))
-                return {"offer": self._offer(db, db.execute("SELECT * FROM attempts WHERE attempt_id=?", (aid,)).fetchone())}
-        return {"offer": None, "reason": "no_eligible_job"}
-
-    def _attempt(self, db, inst, attempt_id, session_id):
-        self._session(db, inst["id"], session_id)
-        att = db.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
-        if not att or att["installation_id"] != inst["id"]:  # same answer for unknown and foreign ids
-            raise ApiError(404, "unknown_attempt", "no such attempt for this installation")
-        return att
-
-    def reject(self, inst, attempt_id, body):
-        obj(body, "reject", ("session_id", "code", "message"))
-        choice(body["code"], "code", REJECT_CODES)
-        text(body["message"], "message", 1024, 0)
-        with self._tx() as db:
-            att = self._attempt(db, inst, attempt_id, body["session_id"])
-            if att["state"] != "offered":
-                raise ApiError(409, "attempt_not_offered", f"attempt is {att['state']}; only an offered attempt can be rejected")
-            now = self.clock()
-            reason = f"{body['code']}: {body['message']}"
-            db.execute("UPDATE attempts SET state='rejected', ended_at=?, reason=? WHERE attempt_id=?", (now, reason, attempt_id))
-            job = db.execute("SELECT * FROM jobs WHERE job_id=?", (att["job_id"],)).fetchone()
-            if job["target"] is None and not job["cancel_requested"]:  # never started: safe to try another client
-                if body["code"] != "busy":  # busy is this moment's state, not a property of the receiver
-                    db.execute("INSERT OR IGNORE INTO job_rejections VALUES(?,?)", (att["job_id"], inst["id"]))
-                db.execute("UPDATE jobs SET state='queued', attempt_id=NULL, updated_at=? WHERE job_id=?", (now, att["job_id"]))
-            else:
-                db.execute("UPDATE jobs SET state='failed', reason=?, updated_at=? WHERE job_id=?", (reason, now, att["job_id"]))
-        return {"state": "rejected"}
-
-    def start(self, inst, attempt_id, body):
-        obj(body, "start", ("session_id", "effective_plan"))
-        plan = body["effective_plan"]
-        if not isinstance(plan, dict) or len(canonical(plan)) > 8192:
-            bad("effective_plan must be an object of at most 8 KiB (receiver-reported, not validated by the server)")
-        h = digest(plan)
-        with self._tx() as db:
-            att = self._attempt(db, inst, attempt_id, body["session_id"])
-            if att["state"] == "started" and att["start_hash"] == h:
-                return self._ctl(db, att)
-            if att["state"] != "offered":
-                raise ApiError(409, "attempt_not_offered", f"attempt is {att['state']}; it can no longer be started")
-            now = self.clock()
-            db.execute("UPDATE attempts SET state='started', started_at=?, start_hash=?, effective_plan_json=? "
-                       "WHERE attempt_id=? AND state='offered'", (now, h, canonical(plan), attempt_id))
-            db.execute("UPDATE jobs SET state='started', updated_at=? WHERE job_id=?", (now, att["job_id"]))
-            return self._ctl(db, att)
-
     def _ctl(self, db, att):
         job = db.execute("SELECT cancel_requested FROM jobs WHERE job_id=?", (att["job_id"],)).fetchone()
         cur = db.execute("SELECT state, last_seq FROM attempts WHERE attempt_id=?", (att["attempt_id"],)).fetchone()
         return {"state": cur["state"], "last_seq": cur["last_seq"], "cancel_requested": bool(job["cancel_requested"])}
 
     # ---- events -----------------------------------------------------------------------------------
-
-    def report(self, inst, attempt_id, body):
-        obj(body, "events", ("session_id", "events"))
-        evs = body["events"]
-        if not isinstance(evs, list) or len(evs) > MAX_BATCH:
-            bad(f"events must be a list of at most {MAX_BATCH}")
-        for e in evs:
-            validate_event(e)
-        with self._tx() as db:
-            att = self._attempt(db, inst, attempt_id, body["session_id"])
-            return self._record(db, att, evs, attempt_id)
 
     def _record(self, db, att, evs, attempt_id):
         if att["state"] == "offered":
@@ -477,29 +391,12 @@ class Store:
                 view.update(attempt_state=a["state"], installation_id=a["installation_id"], last_seq=a["last_seq"],
                             effective_plan=json.loads(a["effective_plan_json"]) if a["effective_plan_json"] else None)
             if job["state"] == "queued":
-                view["ineligible"] = self._ineligible(db, job)
                 view["queue_position"] = db.execute("SELECT count(*) FROM jobs WHERE state='queued' AND seq<=?", (job["seq"],)).fetchone()[0]
             for kind in ("progress", "terminal"):  # the sender's whole answer: how far, and how it ended
                 r = db.execute("SELECT payload_json FROM events WHERE job_id=? AND type=? ORDER BY id DESC LIMIT 1", (job_id, kind)).fetchone()
                 if r:
                     view["result" if kind == "terminal" else kind] = json.loads(r[0])["data"]
             return view
-
-    def _ineligible(self, db, job):
-        """Per paired installation that has claimed recently: why it cannot take this queued job. An installation that
-        never claimed (receiving off, or no capabilities reported) is simply not listed."""
-        out, now = [], self.clock()
-        for r in db.execute("SELECT i.id, i.name FROM installations i JOIN gpu_slots g ON g.installation_id=i.id AND g.enabled=1 "
-                            "WHERE i.revoked_at IS NULL AND (? IS NULL OR i.id=?) AND NOT EXISTS("
-                            "SELECT 1 FROM job_rejections x WHERE x.job_id=? AND x.installation_id=i.id)",
-                            (job["target"], job["target"], job["job_id"])).fetchall():
-            seen = self._caps.get(r["id"])
-            if not seen or now - seen[0] > SESSION_TTL:
-                continue
-            why = self._skip_reason(job, seen[1])
-            if why:
-                out.append({"installation_id": r["id"], "name": r["name"], "reason": why})
-        return out
 
     def cancel(self, inst, job_id):
         with self._tx() as db:
@@ -537,9 +434,33 @@ class Store:
         return [{"job_id": r["job_id"], "spec": json.loads(r["spec_json"]), "cancel_requested": bool(r["cancel_requested"])} for r in rows]
 
     def inbox_held(self, host_id):
-        """Started shots with no terminal event: uncertain after a restart. Never replayed; the user resolves them (abandon)."""
+        """Started shots with no terminal event: uncertain after a restart. Never replayed; the user resolves them (abandon).
+        A started attempt that belonged to ANOTHER PC (an old database that served several PCs) is listed with `foreign`
+        and that PC's name: nothing here can run or settle it any more."""
         with self._lock:
-            return [dict(r) for r in self.db.execute("SELECT job_id, attempt_id, started_at FROM attempts WHERE state='started' AND installation_id=? ORDER BY started_at", (host_id,))]
+            rows = self.db.execute("SELECT a.job_id, a.attempt_id, a.started_at, a.last_seq, a.effective_plan_json, a.installation_id, i.name "
+                                   "FROM attempts a LEFT JOIN installations i ON i.id=a.installation_id WHERE a.state='started' ORDER BY a.started_at").fetchall()
+        return [{"job_id": r["job_id"], "attempt_id": r["attempt_id"], "started_at": r["started_at"], "last_seq": r["last_seq"],
+                 "plan": json.loads(r["effective_plan_json"]) if r["effective_plan_json"] else {},
+                 **({"foreign": True, "pc": r["name"] or r["installation_id"]} if r["installation_id"] != host_id else {})} for r in rows]
+
+    def inbox_foreign(self, host_id):
+        """Queued shots an OLD database holds for ANOTHER registered PC (offers were already put back in the queue). The app sends
+        each to that PC's own app with its original submission id, so a retry never makes a second shot."""
+        with self._lock:
+            rows = self.db.execute("SELECT job_id, target, spec_json FROM jobs WHERE state='queued' AND target IS NOT NULL AND target<>? ORDER BY seq", (host_id,)).fetchall()
+            out = []
+            for r in rows:
+                sub = self.db.execute("SELECT submission_id FROM submissions WHERE response_json=?", (canonical({"job_id": r["job_id"], "state": "queued"}),)).fetchone()
+                out.append({"job_id": r["job_id"], "target": r["target"], "submission_id": sub[0] if sub else None, "spec": json.loads(r["spec_json"])})
+        return out
+
+    def inbox_forwarded(self, job_id, note):
+        """The target PC's app accepted a shot that was queued here for it: close it here, with where it went. Never re-run."""
+        text(note, "note", 400)
+        with self._tx() as db:
+            db.execute("UPDATE jobs SET state='forwarded', reason=?, updated_at=? WHERE job_id=? AND state='queued'", (note, self.clock(), job_id))
+        return {"job_id": job_id, "state": "forwarded"}
 
     def inbox_begin(self, host_id, job_id, slot, plan):
         """The app starts one queued shot on its own worker `slot`. A busy slot refuses (the shot stays queued)."""
@@ -576,6 +497,44 @@ class Store:
             r = self.db.execute("SELECT cancel_requested FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         return bool(r and r[0])
 
+    # ---- destinations (reverse publication) -----------------------------------------------------
+
+    def issue_destination(self, host_key, name):
+        """The login another PC (host_key = its certificate fingerprint) uses to push to THIS PC. One per host: asking again retires the
+        earlier one (it only ever pushes; it has no attempts), so repeated publications never fill the 64 installation slots."""
+        text(name, "name", 64)
+        key = f"reverse:{host_key}"
+        with self._tx() as db:
+            old = db.execute("SELECT value FROM inbox_meta WHERE key=?", (key,)).fetchone()
+            if old:
+                db.execute("UPDATE installations SET revoked_at=? WHERE id=? AND revoked_at IS NULL", (self.clock(), old[0]))
+            self._room(db)
+            iid, token = self._issue(db, name, False, self.clock())
+            db.execute("INSERT OR REPLACE INTO inbox_meta VALUES(?,?)", (key, iid))
+        return iid, token
+
+    def set_destination(self, iid, meta):
+        """Remember how to push to the PC registered here as `iid` (same PC id as its registration). Re-publishing replaces it."""
+        with self._tx() as db:
+            if not db.execute("SELECT 1 FROM installations WHERE id=? AND revoked_at IS NULL", (iid,)).fetchone():
+                raise ApiError(404, "unknown_installation", "no such installation")
+            db.execute("INSERT OR REPLACE INTO destinations VALUES(?,?,?,?,?,?,?,?,0)",
+                       (iid, meta["name"], meta["host_installation_id"], meta["network_id"], meta["fingerprint_sha256"],
+                        json.dumps(meta["endpoints"]), meta["creds_path"], self.clock()))
+        self._notify("destination", iid)
+
+    def destinations(self):
+        with self._lock:
+            rows = self.db.execute("SELECT d.* FROM destinations d JOIN installations i ON i.id=d.installation_id "
+                                   "WHERE d.removed=0 AND i.revoked_at IS NULL ORDER BY d.updated_at").fetchall()
+        return [{"pc_id": r["installation_id"], "name": r["name"], "host_installation_id": r["host_installation_id"],
+                 "network_id": r["network_id"], "fingerprint_sha256": r["fingerprint_sha256"],
+                 "endpoints": json.loads(r["endpoints_json"]), "credentials": r["creds_path"]} for r in rows]
+
+    def remove_destination(self, iid):
+        with self._tx() as db:
+            db.execute("UPDATE destinations SET removed=1 WHERE installation_id=?", (iid,))
+
     # ---- live stats (separate from job events; works while idle) ----------------------------------
 
     def report_stats(self, inst, body):
@@ -593,14 +552,13 @@ class Store:
         return {"accepted": True, "seq": body["seq"]}
 
     def local_installations(self, own):
-        now = self.clock()
         with self._lock:
             rows = self.db.execute("SELECT i.id, i.name, i.created_at, s.last_seen, "
                 + _IN_USE.format(i="i.id") + " AS in_use "
                 "FROM installations i LEFT JOIN sessions s ON s.installation_id=i.id "
                 "WHERE i.revoked_at IS NULL ORDER BY i.created_at").fetchall()
         return {"installations": [{"installation_id": r["id"], "name": r["name"], "created_at": r["created_at"],
-                "last_seen": r["last_seen"], "connected": r["last_seen"] is not None and now - r["last_seen"] < SESSION_TTL,
+                "last_seen": r["last_seen"], "connected": self._online(r["id"], r["last_seen"]),
                 "in_use": bool(r["in_use"]), "is_this_pc": r["id"] == own} for r in rows]}
 
     def installations(self, _inst):
@@ -615,8 +573,10 @@ class Store:
         for r in rows:
             st = self._stats.get(r["id"])
             live = st if st and st["session_id"] == r["session_id"] else None
+            av = self._avail.get(r["id"]) or {}
             out.append({"installation_id": r["id"], "name": r["name"], "gpu_slot": r["slot_id"], "gpu_name": r["gpu"],
-                        "connected": r["last_seen"] is not None and now - r["last_seen"] < SESSION_TTL,
+                        "receiving": av.get("receiving"), "busy": av.get("busy"), "held": av.get("held"),
+                        "connected": self._online(r["id"], r["last_seen"]),
                         "last_seen_age_s": None if r["last_seen"] is None else round(now - r["last_seen"], 3),
                         "stats": None if not live else {**live["sample"], "measured_age_s": round(now - live["measured_at"], 3),
                                                         "received_age_s": round(now - live["received_at"], 3)}})

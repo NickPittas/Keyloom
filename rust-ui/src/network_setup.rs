@@ -16,6 +16,7 @@ use eframe::egui::{self, Color32, RichText, Ui};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -196,7 +197,20 @@ pub enum Cmd {
     AllowJoin(bool),
 }
 
+/// Whether this app hosts the network endpoint itself (then there is no service to install, start or join).
+pub enum Hosted {
+    Off,
+    /// The endpoint is coming up: nothing may touch an old service meanwhile.
+    Starting,
+    /// The endpoint's own answer (name, address, certificate, join policy ...).
+    Running(Value),
+}
+
 pub struct Setup {
+    hosted: Option<Svc>,
+    hosting: bool,
+    /// Registered-PC list and Retire answered by the app itself (no HTTP, no bridge).
+    app_pend: Vec<(Pend, Receiver<Result<Value, crate::app_api::CallError>>)>,
     source: Source,
     link: Option<Link>,
     pend: HashMap<String, (Pend, Instant)>,
@@ -383,6 +397,9 @@ fn find_conn<'a>(conns: &'a [Connection], infos: &[ConnectionInfo], nid: &str, i
 impl Setup {
     pub fn new(source: Source) -> Self {
         Self {
+            hosted: None,
+            hosting: false,
+            app_pend: vec![],
             source,
             link: None,
             pend: HashMap::new(),
@@ -424,7 +441,23 @@ impl Setup {
     }
 
     pub fn svc(&self) -> Option<&Svc> {
-        self.svc.as_ref()
+        self.hosted.as_ref().or(self.svc.as_ref())
+    }
+
+    /// Per frame: the app tells setup whether it hosts the endpoint. While it does, status comes from the endpoint itself.
+    pub fn set_hosted(&mut self, h: Hosted) {
+        (self.hosting, self.hosted) = match h {
+            Hosted::Off => (false, None),
+            Hosted::Starting => (true, None),
+            Hosted::Running(info) => {
+                let mut v = info.clone();
+                v["installed"] = json!(true);
+                v["running"] = json!(true);
+                v["allow_address_join"] = info.get("join").cloned().unwrap_or(json!(false));
+                v["discovery"] = json!(info.get("discovery_error").is_none_or(Value::is_null));
+                (true, Some(parse_svc(&v)))
+            }
+        };
     }
 
     pub fn take_joined(&mut self) -> Option<Joined> {
@@ -438,7 +471,7 @@ impl Setup {
         self.note = Some(s);
     }
     fn busy(&self) -> bool {
-        !self.pend.is_empty() || !self.queue.is_empty()
+        !self.pend.is_empty() || !self.queue.is_empty() || !self.app_pend.is_empty()
     }
     fn joining(&self) -> bool {
         self.pend.values().any(|p| matches!(p.0, Pend::Join(_))) || self.queue.iter().any(|q| matches!(q.p, Pend::Join(_)))
@@ -456,6 +489,15 @@ impl Setup {
     }
 
     fn push(&mut self, op: Op, mut args: Value, p: Pend) {
+        if self.hosting && matches!(op, Op::ServiceInstallations | Op::ServiceRetire) {
+            // The PCs registered on this app are read and retired in-process.
+            let rx = match op {
+                Op::ServiceInstallations => crate::app_api::spawn_call("registered", json!({})),
+                _ => crate::app_api::spawn_call("retire", args),
+            };
+            self.app_pend.push((p, rx));
+            return;
+        }
         if matches!(op, Op::ServiceStatus | Op::ServiceInstall | Op::ServiceStart | Op::ServiceStop | Op::ServiceRemove | Op::ServiceConfigure | Op::ServiceLocalJoin | Op::ServiceInstallations | Op::ServiceRetire) {
             args["state_dir"] = json!(self.dir);
         }
@@ -485,6 +527,10 @@ impl Setup {
         let n: String = s.network.name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
         self.reg_name = if n.is_empty() { crate::remote::default_name().chars().filter(|c| !c.is_control()).take(64).collect() } else { n };
         self.known_urls = conns.iter().flat_map(|c| c.endpoints.iter().cloned()).collect();
+        if self.hosting {
+            self.ensure = Ensure::Done; // this app is the host: there is no service to install or join
+            return;
+        }
         if self.ensure != Ensure::Idle || self.host_removed || sp.is_none() {
             return;
         }
@@ -528,6 +574,18 @@ impl Setup {
     /// Per frame: start the link when something is queued, send, collect replies, enforce deadlines, drop the link when idle.
     pub fn tick(&mut self, repo: Option<&Path>, python: Option<&Path>, wake: &Arc<dyn Fn() + Send + Sync>) {
         self.tick_scan(repo, python, wake);
+        for (p, rx) in std::mem::take(&mut self.app_pend) {
+            match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.app_pend.push((p, rx)),
+                Ok(Ok(v)) => {
+                    // `registered` answers a bare list; the setup page reads {"installations": [...]}
+                    let v = if v.is_array() { json!({"installations": v}) } else { v };
+                    self.on_reply(p, Ok(v));
+                }
+                Ok(Err(e)) => self.on_reply(p, Err(crate::netlink::LinkError { code: e.code, message: e.message })),
+                Err(_) => self.on_reply(p, Err(crate::netlink::LinkError { code: "internal".into(), message: "the app endpoint did not answer".into() })),
+            }
+        }
         self.flush_cfg();
         let now = Instant::now();
         let late = |t: Instant| now.saturating_duration_since(t) > SERVICE_DEADLINE;
@@ -641,6 +699,12 @@ impl Setup {
     /// nothing is lost when a status poll or another operation was in flight at the click.
     fn flush_cfg(&mut self) {
         if self.pend_name.is_none() && self.pend_allow.is_none() {
+            return;
+        }
+        if self.hosting {
+            // The app tells its own endpoint (`Inbound::configure`) from the saved settings.
+            self.pend_name = None;
+            self.pend_allow = None;
             return;
         }
         let Some(svc) = &self.svc else { return };
@@ -843,7 +907,7 @@ impl Setup {
             return cmds;
         }
         self.set_dir(sp);
-        if self.seen.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) && !self.busy() {
+        if !self.hosting && self.seen.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) && !self.busy() {
             self.push(Op::ServiceStatus, json!({}), Pend::Status { ensure: false });
         }
         self.seen = Some(Instant::now());
@@ -861,7 +925,7 @@ impl Setup {
         }
         let conns = c.settings.network.connections();
         let idle = !self.busy();
-        let svc = self.svc.clone().unwrap_or_default();
+        let svc = self.svc().cloned().unwrap_or_default();
         let name_ok = !self.name.trim().is_empty() && self.name.trim().chars().count() <= 64 && !self.name.chars().any(char::is_control);
 
         ui.add_space(8.0);
@@ -880,7 +944,9 @@ impl Setup {
             }
         });
         ui.label(RichText::new("The name is shown to every PC you connect to. Two PCs may share a name; they are told apart by their certificate.").color(DIM).size(11.0));
-        let (line, colour) = match (&self.svc, svc.installed, svc.running) {
+        let (line, colour) = match (&self.svc().cloned(), svc.installed, svc.running) {
+            _ if self.hosting && self.hosted.is_none() => ("Starting this app's network endpoint…".to_owned(), DIM),
+            _ if self.hosting => ("Running inside this app; other PCs can find this PC while Keyloom is open.".to_owned(), GOOD),
             _ if self.svc_unknown => ("Service state unknown after a timeout. Press Refresh.".to_owned(), WARN),
             (None, ..) => ("Checking the service…".to_owned(), DIM),
             (_, false, _) => ("Not installed. Start installs it and makes this PC visible to other PCs.".into(), DIM),
@@ -896,7 +962,7 @@ impl Setup {
                 ui.add(egui::Label::new(RichText::new(format!("Addresses: {}", list.join(" · "))).color(DIM).size(11.5)).wrap());
             }
             ui.label(RichText::new(format!("Discovery: {} · Receiver: {}", if svc.discovery { "on" } else { "off" }, if svc.receiver_online { "online" } else { "offline" })).color(DIM).size(11.5))
-                .on_hover_text("This reports the service coordinator only. This PC accepts work only while Keyloom is open or running in the background.");
+                .on_hover_text("The receiver is on while Keyloom is open or running in the background.");
         }
         if let Some(id) = &svc.network_id {
             ui.label(RichText::new(format!("Certificate: {id}")).color(DIM).size(10.5));
@@ -904,6 +970,7 @@ impl Setup {
         if let Some(code) = &svc.error_code {
             ui.colored_label(WARN, format!("{code}: {}", svc.message.chars().take(200).collect::<String>()));
         }
+        if !self.hosting {
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(idle && !svc.running, egui::Button::new("Start")).clicked() {
                 cmds.push(Cmd::HostRemoved(false));
@@ -928,6 +995,7 @@ impl Setup {
                 self.push(Op::ServiceStatus, json!({}), Pend::Status { ensure: false });
             }
         });
+        }
         ui.add_space(14.0);
         ui.horizontal(|ui| {
             ui.heading("Other PCs");
@@ -1007,7 +1075,7 @@ impl Setup {
                 ui.horizontal(|ui| {
                     ui.colored_label(status.1, status.0);
                     if !pc.receiver_online {
-                        ui.label(RichText::new("receiver offline").color(DIM).size(11.0)).on_hover_text("The PC's service coordinator is reachable, but its Keyloom app is not receiving work right now.");
+                        ui.label(RichText::new("receiver offline").color(DIM).size(11.0)).on_hover_text("That PC answered, but its Keyloom app is not receiving work right now.");
                     }
                 });
                 ui.end_row();

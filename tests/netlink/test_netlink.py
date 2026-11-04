@@ -10,7 +10,8 @@ from backend.coordinator import client as cl
 from backend.coordinator import pki
 from backend.netlink import Bridge
 
-from ..coordinator.specs import CAPS, SPEC
+from ..coordinator.conftest import make_inst
+from ..coordinator.specs import SPEC
 from .conftest import call, connected
 
 GPU = {"uuid": "GPU-aaaaaaaa", "name": "RTX", "vram_total_mb": 24000, "ram_total_mb": 64000}
@@ -66,12 +67,11 @@ def test_eof_without_close_and_partial_line():
     assert out[1]["id"] == "q"
 
 
-def test_ids_cannot_inject_url_parts_and_stats_cannot_override_session():
+def test_ids_cannot_inject_url_parts():
     b = Bridge(client_cls=Fake)
     b.client, b.session_id = Fake(None, 1), "s" * 32
     for bad in ("../../v1/pair", "a b", "x/y", "a" * 81, "a?b=1", ""):
         assert call(b, "job", {"job_id": bad})["error"]["code"] == "bad_request"
-    assert call(b, "stats", {"session_id": "x" * 20, "seq": 1, "measured_age_ms": 0})["error"]["code"] == "bad_request"
     assert call(b, "job", {"job_id": "job_1", "url": "https://evil"})["error"]["code"] == "bad_request"
     assert b.client.calls == []
 
@@ -89,41 +89,41 @@ def test_error_messages_redact_secrets():
 
 
 def test_full_flow_through_bridge_and_session_is_stable(env):
-    sub, _ = connected(env, "submitter")
-    rec, creds = connected(env, "receiver")
-    sess = call(rec, "connect", {"credentials_path": creds})["result"]["session_id"]
-    assert call(rec, "register", {"build": "t", "gpu": GPU})["ok"]
+    sub, creds = connected(env, "submitter")
+    store = env["store"]
+    host, _ = make_inst(store, "host")  # the receiving app reads and answers its own inbox in-process
+    sess = call(sub, "connect", {"credentials_path": creds})["result"]["session_id"]
     j = call(sub, "submit", {"submission_id": SUBMISSION, "spec": SPEC, "target": None})["result"]
-    assert call(sub, "submit", {"submission_id": SUBMISSION, "spec": SPEC, "target": None})["result"] == j
+    assert call(sub, "submit", {"submission_id": SUBMISSION, "spec": SPEC, "target": None})["result"] == j  # a retry is the same shot
     clash = call(sub, "submit", {"submission_id": SUBMISSION, "spec": {**SPEC, "clip_id": "other"}, "target": None})
     assert clash["error"]["code"] == "submission_conflict"
-    res = {"sampled_at": int(__import__("time").time()), "free_vram_mb": 1, "free_ram_mb": 1}
-    off = call(rec, "claim", {"claim_id": "claim-00000000001", "capabilities": CAPS, "resources": res})["result"]["offer"]
-    assert off["job_id"] == j["job_id"] and off["spec"] == SPEC
-    assert call(rec, "start", {"attempt_id": off["attempt_id"], "effective_plan": {"a": 1}})["result"]["state"] == "started"
-    ev = {"attempt_id": off["attempt_id"], "events": [{"seq": 1, "type": "progress", "data": {"done": 1, "total": 2}}]}
-    assert call(rec, "events", ev)["ok"] and call(rec, "events", ev)["ok"]  # replay is idempotent
-    assert call(rec, "stats", {"seq": 1, "measured_age_ms": 5, "cpu_percent": 1.5})["result"]["accepted"]
+    assert [r["job_id"] for r in store.inbox_pending(host["id"])] == [j["job_id"]]
+    store.inbox_begin(host["id"], j["job_id"], "gpu0", {"a": 1})
+    store.inbox_report(host["id"], j["job_id"], [{"seq": 1, "type": "progress", "data": {"done": 1, "total": 2}}])
     assert call(sub, "cancel", {"job_id": j["job_id"]})["result"]["cancel_requested"]
-    assert call(sub, "job", {"job_id": j["job_id"]})["result"]["state"] == "started"
+    view = call(sub, "job", {"job_id": j["job_id"]})["result"]
+    assert view["state"] == "started" and view["progress"] == {"done": 1, "total": 2}
     assert len(call(sub, "job_events", {"job_id": j["job_id"]})["result"]["events"]) == 1
+    store.inbox_report(host["id"], j["job_id"], [{"seq": 2, "type": "terminal", "data": {"state": "cancelled", "message": "stopped"}}])
+    done = call(sub, "job", {"job_id": j["job_id"]})["result"]
+    assert done["state"] == "cancelled" and done["result"] == {"state": "cancelled", "message": "stopped"}
     names = {i["name"] for i in call(sub, "installations")["result"]["installations"]}
-    assert {"submitter", "receiver"} <= names
+    assert {"submitter", "host"} <= names
     # restart of the app/bridge: the old bridge ends first (its lock is released), then the same session id is reused
-    run(rec, b'{"id":"c","op":"close"}\n')
+    run(sub, b'{"id":"c","op":"close"}\n')
     again = Bridge()
     assert call(again, "connect", {"credentials_path": creds})["result"]["session_id"] == sess
-    assert call(again, "register", {"build": "t", "gpu": GPU})["ok"]
-    ev2 = {"attempt_id": off["attempt_id"], "events": [{"seq": 2, "type": "terminal", "data": {"state": "cancelled"}}]}
-    assert call(again, "events", ev2)["ok"]
-    r = call(again, "reject", {"attempt_id": off["attempt_id"], "code": "busy", "message": ""})
-    assert r["error"]["code"] == "attempt_not_offered"
+
+
+def test_the_claim_and_session_operations_no_longer_exist(env):
+    b, _ = connected(env)
+    for op in ("register", "claim", "start", "reject", "events", "stats"):
+        assert call(b, op, {})["error"]["code"] == "unknown_op", op
 
 
 def test_coordinator_and_transport_errors_pass_through(env):
     b, creds = connected(env)
-    assert call(b, "claim", {"claim_id": "claim-00000000002", "capabilities": CAPS, "resources": None})["error"]["code"] == "stale_session"
-    assert call(b, "start", {"attempt_id": "att_nope", "effective_plan": {}})["error"]["code"] in ("stale_session", "unknown_attempt")
+    assert call(b, "job", {"job_id": "job_nope"})["error"]["code"] == "unknown_job"
     assert call(b, "submit", {"submission_id": "s", "spec": {}, "target": None})["error"]["code"] == "invalid"
     d = json.loads(open(creds).read())
     d["token"] = "x" * 43

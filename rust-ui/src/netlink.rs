@@ -39,13 +39,7 @@ pub const BRIDGE_TIMEOUT_S: u32 = 15;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     Connect,
-    Register,
     Submit,
-    Claim,
-    Start,
-    Reject,
-    Events,
-    Stats,
     Cancel,
     Job,
     JobEvents,
@@ -64,19 +58,15 @@ pub enum Op {
     ServiceInstallations,
     ServiceRetire,
     Leave,
+    /// Tell the host this app's own endpoint (reverse publication).
+    Destination,
 }
 
 impl Op {
     pub fn name(self) -> &'static str {
         match self {
             Op::Connect => "connect",
-            Op::Register => "register",
             Op::Submit => "submit",
-            Op::Claim => "claim",
-            Op::Start => "start",
-            Op::Reject => "reject",
-            Op::Events => "events",
-            Op::Stats => "stats",
             Op::Cancel => "cancel",
             Op::Job => "job",
             Op::JobEvents => "job_events",
@@ -95,6 +85,7 @@ impl Op {
             Op::ServiceInstallations => "service_installations",
             Op::ServiceRetire => "service_retire",
             Op::Leave => "leave",
+            Op::Destination => "destination",
         }
     }
 }
@@ -566,8 +557,8 @@ mod tests {
 
     #[test]
     fn op_names_match_the_bridge() {
-        let names: Vec<_> = [Op::Connect, Op::Register, Op::Submit, Op::Claim, Op::Start, Op::Reject, Op::Events, Op::Stats, Op::Cancel, Op::Job, Op::JobEvents, Op::Installations, Op::Leave, Op::ServiceRetire, Op::ServiceInstallations].map(Op::name).to_vec();
-        assert_eq!(names, ["connect", "register", "submit", "claim", "start", "reject", "events", "stats", "cancel", "job", "job_events", "installations", "leave", "service_retire", "service_installations"]);
+        let names: Vec<_> = [Op::Connect, Op::Submit, Op::Cancel, Op::Job, Op::JobEvents, Op::Installations, Op::Leave, Op::ServiceRetire, Op::ServiceInstallations].map(Op::name).to_vec();
+        assert_eq!(names, ["connect", "submit", "cancel", "job", "job_events", "installations", "leave", "service_retire", "service_installations"]);
     }
 
     #[test]

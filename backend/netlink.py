@@ -20,13 +20,8 @@ Ops (args are exact; unknown keys are refused; bodies are validated by the coord
                 endpoints[{url, kind, reachable, rtt_ms, error}]}]}   (synchronous, returns by its deadline; run it on its own bridge process)
   Addressing: the pinned certificate is the identity; addresses are routes. Calls try the last working address first and fail over only
   on connect/TLS/pin failure BEFORE any request byte; a sent request is never retried.
-  register      build, gpu{uuid,name,vram_total_mb,ram_total_mb}, [name]   (name = this PC's display name; updates the same installation)
-  submit        submission_id, spec, target
-  claim         claim_id, capabilities, resources
-  start         attempt_id, effective_plan
-  reject        attempt_id, code, message
-  events        attempt_id, events[]
-  stats         seq, measured_age_ms, [cpu_percent, ram_used_bytes, ram_total_bytes, gpus]   (README stats schema)
+  submit        submission_id, spec, target     (push a shot to that PC's app; the same submission_id is never a second shot)
+  estimate      first_frame, frames, temporal_window, vram_profile, free_vram_mb   (the app's own receiver check; needs no connection)
   cancel | job  job_id          job_events  job_id, [after, limit]          installations      close
   service_status|service_start|service_stop|service_remove  state_dir   (start installs first when nothing is installed; stop never removes)
   service_install  state_dir, [allow_address_join, name]   (+ optional legacy address, port: not needed)
@@ -374,37 +369,16 @@ class Bridge:
             raise BridgeError("bad_request", "timeout_s must be a number from 3 to 20")
         return _disc.scan(t, _urls(a.get("known", []), "known", 64))
 
-    def op_register(self, a):
-        _need(a, ("build", "gpu"), ("name",))
-        c = self._live()
-        name = {"name": a["name"]} if "name" in a else {}  # the coordinator validates it (<= 64 chars)
-        return c.register({"protocol": _c.PROTOCOL, "session_id": self.session_id, "build": a["build"], "gpus": [a["gpu"]], **name})
-
     def op_submit(self, a):
-        _need(a, ("submission_id", "spec", "target"))
-        return self._live().submit(a["submission_id"], a["spec"], a["target"])
+        _need(a, ("submission_id", "spec", "target"), ("automatic",))
+        return self._live().submit(a["submission_id"], a["spec"], a["target"], a.get("automatic") is True)
 
-    def op_claim(self, a):
-        _need(a, ("claim_id", "capabilities", "resources"))
-        return self._live().claim({"session_id": self.session_id, **a})
-
-    def op_start(self, a):
-        _need(a, ("attempt_id", "effective_plan"))
-        return self._live().start(_ref(a["attempt_id"], "attempt_id"), {"session_id": self.session_id, "effective_plan": a["effective_plan"]})
-
-    def op_reject(self, a):
-        _need(a, ("attempt_id", "code", "message"))
-        return self._live().reject(_ref(a["attempt_id"], "attempt_id"),
-                                   {"session_id": self.session_id, "code": a["code"], "message": a["message"]})
-
-    def op_events(self, a):
-        _need(a, ("attempt_id", "events"))
-        return self._live().report(_ref(a["attempt_id"], "attempt_id"), {"session_id": self.session_id, "events": a["events"]})
-
-    def op_stats(self, a):
-        if not isinstance(a, dict) or "session_id" in a:
-            raise BridgeError("bad_request", "stats args must be an object without session_id")
-        return self._live().stats({"session_id": self.session_id, **a})
+    def op_destination(self, a):
+        """Tell the host this app's own endpoint over the authenticated connection (addresses, certificate, a login to push with)."""
+        _need(a, ("protocol", "name", "network_id", "fingerprint_sha256", "certificate_pem", "host_installation_id", "endpoints",
+                  "installation_id", "token"))
+        self._secret(a["token"])
+        return self._live().destination(a)
 
     def op_cancel(self, a):
         return self._live().cancel(_ref(_need(a, ("job_id",))["job_id"], "job_id"))

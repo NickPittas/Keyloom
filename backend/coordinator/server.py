@@ -55,8 +55,8 @@ def trusted_peer(ip, loopback_only=False):
 
 _POST = {
     r"/v1/leave": "leave", r"/v1/local-retire": "local_retire", r"/v1/local-installations": "local_installations",
-    r"/v1/join": "join", r"/v1/local-join": "local_join", r"/v1/local-identity": "local_identity", r"/v1/session": "session", r"/v1/stats": "stats", r"/v1/claim": "claim", r"/v1/jobs": "submit",
-    r"/v1/attempts/([\w-]{1,80})/(reject|start|events)": "attempt", r"/v1/jobs/([\w-]{1,80})/cancel": "cancel",
+    r"/v1/join": "join", r"/v1/local-join": "local_join", r"/v1/local-identity": "local_identity", r"/v1/jobs": "submit",
+    r"/v1/jobs/([\w-]{1,80})/cancel": "cancel", r"/v1/destination": "destination",
 }
 _GET = {r"/v1/hello": "hello", r"/v1/installations": "installations", r"/v1/jobs/([\w-]{1,80})": "job", r"/v1/jobs/([\w-]{1,80})/events": "job_events"}
 
@@ -64,8 +64,11 @@ _GET = {r"/v1/hello": "hello", r"/v1/installations": "installations", r"/v1/jobs
 class Api:
     """Transport-independent routing so the HTTP layer stays dumb."""
 
-    def __init__(self, store, throttle=None, join_enabled=False, local_token=None, advertise_url=None, info=None, local_identity=None):
+    def __init__(self, store, throttle=None, join_enabled=False, local_token=None, advertise_url=None, info=None, local_identity=None,
+                 accepting=None, destination=None):
         self.store = store
+        self.accepting = accepting  # () -> bool: "Receive jobs" is on; None = always
+        self.destination = destination  # (installation, body, peer address) -> dict: a registered PC tells this app its own endpoint
         self.info = info  # () -> {fingerprint_sha256, network_id, name, host_installation_id, receiver_online, endpoints[{url,kind}]}
         self.local_identity = local_identity  # (installation_id) -> None: records which installation is THIS PC (private file)
         self.hello_try = Limiter(60, 60)
@@ -121,18 +124,20 @@ class Api:
             obj(b, "leave", ())
             s.revoke(inst["id"])
             return {"left": True}
-        if name == "session":
-            return s.register(inst, b)
-        if name == "stats":
-            return s.report_stats(inst, b)
-        if name == "claim":
-            return s.claim(inst, b)
+        if name == "destination":
+            if not self.destination:
+                raise ApiError(404, "not_found", "no such endpoint")
+            return self.destination(inst, b, peer)
         if name == "submit":
-            return s.submit(inst, b)
-        if name == "cancel":
-            obj(b, "cancel", ())
-            return s.cancel(inst, m[1])
-        return {"reject": s.reject, "start": s.start, "events": s.report}[m[2]](inst, m[1], b)
+            # `automatic`: the sender picked this PC because it looked free; it is refused (not_free) if it no longer is.
+            auto = b.pop("automatic", False) if isinstance(b, dict) else False
+            if not isinstance(auto, bool):
+                bad("automatic must be a boolean")
+            if self.accepting is not None and not self.accepting():
+                raise ApiError(409, "not_free" if auto else "not_receiving", "this PC is not taking jobs from other PCs (Receive jobs is off)")
+            return s.submit(inst, b, only_if_free=auto)
+        obj(b, "cancel", ())
+        return s.cancel(inst, m[1])
 
     def _hello(self, peer):
         """Unauthenticated, read-only, secret-free identity of this host (peer certificate fingerprint, PC name, whether the

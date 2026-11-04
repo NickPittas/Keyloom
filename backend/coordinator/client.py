@@ -208,16 +208,16 @@ class Client:
             raise BadReply("hello does not carry the pinned fingerprint")
         return out
 
-    def register(self, body): return self._call("POST", "/v1/session", body)
-    def submit(self, submission_id, spec, target=None): return self._call("POST", "/v1/jobs", {"submission_id": submission_id, "spec": spec, "target": target})
-    def claim(self, body): return self._call("POST", "/v1/claim", body)
-    def reject(self, attempt_id, body): return self._call("POST", f"/v1/attempts/{attempt_id}/reject", body)
-    def start(self, attempt_id, body): return self._call("POST", f"/v1/attempts/{attempt_id}/start", body)
-    def report(self, attempt_id, body): return self._call("POST", f"/v1/attempts/{attempt_id}/events", body)
+    def submit(self, submission_id, spec, target=None, automatic=False):
+        body = {"submission_id": submission_id, "spec": spec, "target": target}
+        if automatic:
+            body["automatic"] = True
+        return self._call("POST", "/v1/jobs", body)
+
+    def destination(self, body): return self._call("POST", "/v1/destination", body)
     def cancel(self, job_id): return self._call("POST", f"/v1/jobs/{job_id}/cancel", {})
     def job(self, job_id): return self._call("GET", f"/v1/jobs/{job_id}")
     def job_events(self, job_id, after=0, limit=100): return self._call("GET", f"/v1/jobs/{job_id}/events?after={after}&limit={limit}")
-    def stats(self, body): return self._call("POST", "/v1/stats", body)
     def installations(self): return self._call("GET", "/v1/installations")
     def leave(self): return self._call("POST", "/v1/leave", {})
 

@@ -1,10 +1,10 @@
-//! Every joined network, each driven by its own `Remote` (own bridge, sidefiles, retry and attempt state). The set
-//! only routes: Batch submissions go to the owning network, offers/claims are serialized across networks (round
-//! robin), and the pickers see one merged list of PCs. Assignments are namespaced `network id/PC id` (never an index).
+//! Every joined PC, each driven by its own `Remote` (own link, sidefiles and retry state). The set only routes: Batch
+//! submissions go to the owning connection, and the pickers see one merged list of PCs. Assignments are namespaced `network id/PC id` (never an index).
 use crate::netlink::Source;
 use crate::network_setup::ConnectionInfo;
 use crate::queue::Entry;
 use crate::remote::{Action, Conn, Env, Remote};
+use crate::ui::ai::NetSubmit;
 use crate::settings::Settings;
 use eframe::egui::{self, RichText, Ui};
 use std::collections::BTreeMap;
@@ -16,8 +16,6 @@ const DIM: egui::Color32 = egui::Color32::from_rgb(169, 187, 175);
 pub struct RemoteSet {
     source: Source,
     remotes: Vec<Remote>,
-    /// Round robin start for the next claim.
-    rr: usize,
     /// Sent jobs of removed PCs, read from history.json at most once a second (and after a Clear).
     history: Option<(Instant, Vec<Entry>)>,
     /// The last Clear that could not be saved.
@@ -27,7 +25,8 @@ pub struct RemoteSet {
 fn conn_of(s: &Settings, _sp: Option<&Path>) -> Vec<(Conn, bool)> {
     let name = s.network.name.trim().to_owned(); // empty = do not rename (an existing host name is never overwritten)
     let mut seen = std::collections::HashSet::new();
-    s.network.connections().iter().filter(|c| !c.credentials.trim().is_empty() && seen.insert(c.credentials.trim().to_owned())).map(|c| {
+    // A connection to this PC's own old service is never driven: a local shot enters the queue directly and nothing talks to our own endpoint.
+    s.network.connections().iter().filter(|c| !c.local_host && !c.credentials.trim().is_empty() && seen.insert(c.credentials.trim().to_owned())).map(|c| {
         let key = c.credentials.trim().to_owned();
         let default = s.network.default_submit.trim() == key;
         let mut endpoints = c.endpoints.clone();
@@ -36,7 +35,7 @@ fn conn_of(s: &Settings, _sp: Option<&Path>) -> Vec<(Conn, bool)> {
             endpoints.retain(|u| u.as_str() != p);
             endpoints.insert(0, p.to_owned());
         }
-        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), may_claim: false, endpoints, preferred: p.to_owned(), target_host: c.host_installation_id.trim().to_owned(), local_host: c.local_host }, default)
+        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), endpoints, preferred: p.to_owned(), target_host: c.host_installation_id.trim().to_owned(), legacy_ns: c.legacy_ns.trim().to_owned(), legacy_id: c.legacy_id.trim().to_owned() }, default)
     }).collect()
 }
 
@@ -46,7 +45,7 @@ fn key_of(c: &Conn) -> String {
 
 impl RemoteSet {
     pub fn new(source: Source) -> Self {
-        Self { source, remotes: vec![], rr: 0, history: None, history_err: None }
+        Self { source, remotes: vec![], history: None, history_err: None }
     }
     pub fn available(&self) -> bool {
         self.source != Source::Off
@@ -85,7 +84,8 @@ impl RemoteSet {
         match target {
             Some(t) => {
                 if let Some((ns, iid)) = t.split_once('/') {
-                    let i = self.remotes.iter().enumerate().position(|(i, r)| r.ns().as_deref() == Some(ns) && r.accepts_work(&conns[i].0)).ok_or("that PC's network is not set up on this computer, or no enabled connection to it takes work")?;
+                    // Every registered PC of an old host shares that host's namespace: the PC id says which connection reaches it.
+                    let i = self.remotes.iter().enumerate().position(|(i, r)| r.ns().as_deref() == Some(ns) && r.fits(iid) && r.accepts_work(&conns[i].0)).ok_or("that PC's network is not set up on this computer, or no enabled connection to it takes work")?;
                     return Ok((i, Some(iid.to_owned())));
                 }
                 Err("that PC is not known on any joined network; pick it again".into())
@@ -97,6 +97,47 @@ impl RemoteSet {
         }
     }
 
+    fn route_send(&mut self, mut n: NetSubmit, default: &str, conns: &[(Conn, bool)], env: &mut Env) -> Result<(), String> {
+        let (i, t) = self.route(&n.target, default, conns)?;
+        n.target = t;
+        env.cfg = conns[i].0.clone();
+        self.remotes[i].enqueue(n, env);
+        Ok(())
+    }
+
+    /// Push one frozen shot to the PC its target names (kept and re-sent with the same submission id until that PC's app answers).
+    /// `Err` = nothing was sent.
+    pub fn send(&mut self, n: NetSubmit, env: &mut Env) -> Result<(), String> {
+        let conns = conn_of(env.settings, env.settings_path);
+        let default = env.settings.network.default_submit.trim().to_owned();
+        self.route_send(n, &default, &conns, env)
+    }
+
+    /// A discovery answer from this network: a connection that failed does not wait for its retry timer.
+    pub fn reachable(&mut self, network_id: &str) {
+        for r in self.remotes.iter_mut().filter(|r| r.real_ns().is_some_and(|n| n.eq_ignore_ascii_case(network_id))) {
+            r.retry_now();
+        }
+    }
+
+    /// The job id the target PC's app gave a submission, once it accepted it.
+    pub fn accepted(&self, submission_id: &str) -> Option<String> {
+        self.remotes.iter().find_map(|r| r.accepted(submission_id))
+    }
+    /// How a submission is going, as the connection sees it (see `Remote::sent_outcome`).
+    pub fn sent_outcome(&self, submission_id: &str) -> Option<Result<(), Option<String>>> {
+        self.remotes.iter().find_map(|r| r.sent_outcome(submission_id))
+    }
+
+    /// Every shot this PC sent, as the receiving apps last reported it.
+    pub fn jobs(&self) -> Vec<&crate::remote::NetJob> {
+        self.remotes.iter().flat_map(|r| r.jobs.iter()).collect()
+    }
+    /// The PCs the connections last listed (name, GPU, load, connected).
+    pub fn installs(&self) -> Vec<&crate::remote::Install> {
+        self.remotes.iter().flat_map(|r| r.installs.iter()).collect()
+    }
+
     /// Per frame (UI thread or driver thread): sync connections, route Batch submissions once, run every network,
     /// then publish the merged targets and `online`.
     pub fn tick(&mut self, now: Instant, env: &mut Env) {
@@ -104,7 +145,9 @@ impl RemoteSet {
         self.remotes.retain(|r| conns.iter().any(|(c, _)| key_of(c) == r.key));
         for (c, _) in &conns {
             if !self.remotes.iter().any(|r| r.key == key_of(c)) {
-                self.remotes.push(Remote::new(self.source.clone(), key_of(c)));
+                let mut r = Remote::new(self.source.clone(), key_of(c));
+                r.seed(c);
+                self.remotes.push(r);
             }
         }
         self.remotes.sort_by_key(|r| conns.iter().position(|(c, _)| key_of(c) == r.key));
@@ -112,50 +155,26 @@ impl RemoteSet {
         env.ai.auto_clients = self.automatic_candidates(env.settings, env.settings_path).len();
         env.ai.dispatch_auto(&free, env.metrics);
         let default = env.settings.network.default_submit.trim().to_owned();
-        for mut n in env.ai.take_net_outbox() {
-            match self.route(&n.target, &default, &conns) {
-                Ok((i, t)) => {
-                    n.target = t;
-                    env.cfg = conns[i].0.clone();
-                    self.remotes[i].enqueue(n, env);
-                }
-                Err(e) => env.ai.notice = Some(format!("{}: not sent, {e}.", n.name)),
+        for n in env.ai.take_net_outbox() {
+            let name = n.name.clone();
+            if let Err(e) = self.route_send(n, &default, &conns, env) {
+                env.ai.notice = Some(format!("{name}: not sent, {e}."));
             }
         }
         // After routing, so this tick's new sends are already followed.
         env.ai.settle_sent(|sid| self.remotes.iter().find_map(|r| r.sent_outcome(sid)));
-        // One offer/claim/attempt at a time across networks; the next claimer is the next ready network after the last.
-        let n = self.remotes.len();
-        let chosen = if self.remotes.iter().any(Remote::claim_busy) {
-            None
-        } else {
-            (0..n).map(|k| (self.rr + k) % n).find(|&i| self.remotes[i].claim_ready(now, &conns[i].0))
-        };
         for (i, r) in self.remotes.iter_mut().enumerate() {
             env.cfg = conns[i].0.clone();
-            env.cfg.may_claim = Some(i) == chosen;
             r.tick(now, env);
         }
-        if let Some(i) = chosen.filter(|&i| self.remotes[i].claiming()) {
-            self.rr = i + 1;
-        }
         let many = self.remotes.len() > 1;
-        // A connection to this computer's own network offers the same PCs as the local one: count those once.
-        let own: Vec<String> = self.remotes.iter().zip(&conns).filter(|(_, (c, _))| c.local_host).filter_map(|(r, _)| r.ns()).collect();
-        env.ai.net_targets = self.remotes.iter().filter(|r| !r.leaving() && !r.ns().is_some_and(|n| own.contains(&n))).flat_map(|r| r.targets(many.then(|| r.label()).as_deref())).collect();
+        env.ai.net_targets = self.remotes.iter().filter(|r| !r.leaving()).flat_map(|r| r.targets(many.then(|| r.label()).as_deref())).collect();
         env.ai.net_online = self.online();
     }
 
     pub fn take_finished(&mut self) -> Vec<String> {
         self.remotes.iter_mut().flat_map(Remote::take_finished).collect()
     }
-    pub fn shutdown_requested(&mut self) {
-        self.remotes.iter_mut().for_each(Remote::shutdown_requested);
-    }
-    pub fn quiescent(&self) -> bool {
-        self.remotes.iter().all(Remote::quiescent)
-    }
-
     /// What Setup needs to name and offer each connection.
     pub fn infos(&self) -> Vec<ConnectionInfo> {
         self.remotes.iter().map(|r| ConnectionInfo { credentials: r.key.clone(), label: r.label(), network_id: r.ns(), online: r.online(), url: r.url() }).collect()
@@ -172,11 +191,6 @@ impl RemoteSet {
     }
     pub fn clear_finished(&mut self) {
         self.remotes.iter_mut().for_each(Remote::clear_finished);
-    }
-    pub fn forget_attempt(&mut self, creds: &str) {
-        if let Some(r) = self.get(creds) {
-            r.forget_attempt(Some(Path::new(creds)));
-        }
     }
     /// Why this connection may not be removed now (`None` = nothing would be orphaned).
     pub fn remove_blocker(&self, creds: &str) -> Option<String> {
@@ -272,7 +286,7 @@ impl RemoteSet {
             // `own_net` unknown (None) must not match a connection whose network is unknown too. A leftover
             // self-connection is skipped only when idle and removable; otherwise its controls must stay reachable.
             let own_net_conn = own_net.is_some_and(|n| r.ns().as_deref() == Some(n));
-            if c.local_host || (own_net_conn && !c.enabled && r.receiving().is_none() && blocker.is_none()) {
+            if own_net_conn && !c.enabled && blocker.is_none() {
                 continue;
             }
             acts.extend(r.row(ui, &c, default, blocker, &own));
@@ -281,28 +295,6 @@ impl RemoteSet {
         acts
     }
 
-    /// This computer's own connection controls (its local-host connection), or five empty cells when there is none.
-    pub fn local_controls(&self, ui: &mut Ui, s: &Settings, sp: Option<&Path>) -> Vec<Action> {
-        let conns = conn_of(s, sp);
-        if let Some((c, default)) = conns.iter().find(|(c, _)| c.local_host) {
-            if let Some(r) = self.remotes.iter().find(|r| r.key == key_of(c)) {
-                return r.controls(ui, c, *default, r.remove_blocker(c.creds.as_deref()));
-            }
-        }
-        for _ in 0..5 {
-            ui.label("");
-        }
-        vec![]
-    }
-
-    /// This computer's own connection status and attempt message, drawn in the Local row's Status cell.
-    pub fn local_status(&self, ui: &mut Ui, s: &Settings, sp: Option<&Path>) -> Vec<Action> {
-        let conns = conn_of(s, sp);
-        match conns.iter().find(|(c, _)| c.local_host).and_then(|(c, _)| self.remotes.iter().find(|r| r.key == key_of(c)).map(|r| (r, c))) {
-            Some((r, c)) => r.status_cell(ui, c),
-            None => vec![],
-        }
-    }
 }
 
 #[cfg(test)]

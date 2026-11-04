@@ -46,6 +46,7 @@ pub fn ui(
     _local: &crate::metrics::View,
     _active: &[u32],
     net: &crate::remote_set::RemoteSet,
+    inbound: &crate::inbound::Inbound,
     s: &Settings,
     sp: Option<&Path>,
     own_net: Option<&str>,
@@ -76,13 +77,13 @@ pub fn ui(
                 ui.vertical(|ui| {
                     ui.colored_label(colour, state.to_string());
                     if i == 0 {
-                        acts.extend(net.local_status(ui, s, sp));
+                        acts.extend(inbound.status_ui(ui));
                     }
                 });
                 let gpu = t.ready.as_ref().and_then(|h| h.gpu.as_ref()).map(|g| format!("{} · {:.0} GB", g.name, g.vram_gb)).unwrap_or_else(|| "Not reported".into());
                 ui.label(gpu);
                 if i == 0 {
-                    acts.extend(net.local_controls(ui, s, sp));
+                    acts.extend(this_pc_controls(ui, s, inbound.inactive.is_none()));
                 } else {
                     for _ in 0..5 { ui.label(""); }
                 }
@@ -110,6 +111,23 @@ pub fn ui(
         if &cur != default { want = Some(cur); }
     });
     (want, acts)
+}
+
+/// This PC's cells after GPU: ID, Connect, Accept work, Default, and one more. The app always hosts, so only "Accept work"
+/// (Receive jobs) is a choice here.
+fn this_pc_controls(ui: &mut Ui, s: &Settings, active: bool) -> Vec<Action> {
+    let mut acts = vec![];
+    ui.label("");
+    ui.label("");
+    // While the endpoint is not running this PC takes nothing and does not offer itself: the box shows that, whatever was saved.
+    let mut on = active && s.network.receives();
+    let r = ui.add_enabled_ui(active, |ui| crate::ui::theme::checkbox(ui, &mut on, "").on_hover_text("This PC takes jobs that other PCs send to it").changed()).inner;
+    if r {
+        acts.push(Action::ReceiveJobs(on));
+    }
+    ui.label("");
+    ui.label("");
+    acts
 }
 
 /// A grid header cell at least `w` wide, with a drag handle on its right edge that changes `w`.

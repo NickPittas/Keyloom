@@ -52,13 +52,13 @@ fn replies_are_correlated_to_their_requests_and_wake_the_ui() {
     let mut l = Link::start(fake("echo"), w).unwrap();
     until("ready", || l.state() == State::Ready);
     let a = l.request(Op::Submit, json!({"k": 1})).unwrap();
-    let b = l.request(Op::Stats, json!({"seq": 2})).unwrap();
+    let b = l.request(Op::Cancel, json!({"job_id": "job_2"})).unwrap();
     assert_ne!(a, b);
     assert_eq!(l.pending(), 2);
     let r = collect(&mut l, 2);
     assert_eq!(r[0].id.as_deref(), Some(a.as_str()));
     assert_eq!(r[0].outcome, Ok(json!({"op": "submit", "args": {"k": 1}})));
-    assert_eq!(r[1].outcome.as_ref().unwrap()["op"], "stats");
+    assert_eq!(r[1].outcome.as_ref().unwrap()["op"], "cancel");
     assert_eq!(l.pending(), 0);
     assert!(n.load(Ordering::SeqCst) >= 3, "woken by ready and by replies, not polled per frame");
 }

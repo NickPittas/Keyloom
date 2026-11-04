@@ -349,6 +349,17 @@ impl AiUi {
 
     /// The Queue's Waiting tab: Automatic's waiting shots in the order they are handed out; each can be paused,
     /// resumed or cancelled.
+    /// "Network not active: ..." with Retry, on the Board, while this app's own endpoint is not running.
+    pub fn net_inactive_ui(&mut self, ui: &mut Ui) {
+        let Some(why) = self.net_inactive.clone() else { return };
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(theme::warn(ui), why);
+            if ui.small_button("Retry").on_hover_text("Try to start this app's network endpoint again").clicked() {
+                self.retry_endpoint = true;
+            }
+        });
+    }
+
     pub fn auto_waiting_ui(&mut self, ui: &mut Ui) {
         if self.auto_pending.is_empty() {
             ui.label(RichText::new("No shots are waiting. Automatic shots wait here until a PC is free.").color(theme::text_dim(ui)));

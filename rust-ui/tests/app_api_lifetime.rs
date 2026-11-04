@@ -252,7 +252,10 @@ fn authenticated_push_reaches_the_inbox_and_wakes_the_driver() {
     let pending = app_api::call("inbox", json!({"method": "pending"})).expect("inbox");
     assert_eq!(pending.as_array().unwrap().iter().map(|j| j["job_id"].as_str().unwrap()).collect::<Vec<_>>(), [job.as_str()]);
     let regs = app_api::call("registered", json!({})).unwrap();
-    assert_eq!(regs.as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect::<Vec<_>>(), ["sender"]);
+    // The sender is registered here, and so is this app's own entry (created once at start, shown as this PC).
+    let regs = regs.as_array().unwrap();
+    assert!(regs.iter().any(|r| r["name"] == "sender" && r["is_this_pc"] == false));
+    assert_eq!(regs.iter().filter(|r| r["is_this_pc"] == true).count(), 1);
     assert!(child_processes().is_empty(), "{:?}", child_processes());
 
     // Quit: the socket closes, the same state reopens with the shot still queued.
@@ -287,6 +290,40 @@ fn old_service_holding_the_state_makes_the_app_passive() {
     drop(holder.stdin.take());
     holder.wait().unwrap();
     assert!(api.stop(Duration::from_secs(20)));
+}
+
+/// Retry (the button, and opening the Clients page) starts the endpoint again once the old service has let go; while it still holds
+/// the state a retry just reports Passive again, and a running endpoint is never started twice.
+#[test]
+fn retry_starts_the_endpoint_after_the_conflict_ends() {
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(paths) = paths() else { return };
+    let port = free_port();
+    let dir = state_dir(port);
+    let sd = dir.path().join("server");
+    let mut holder = std::process::Command::new(venv_python())
+        .args(["-c", "import sys; sys.path.insert(0, sys.argv[1]); from backend.coordinator import pki; l = pki.OwnerLock(sys.argv[2] + '/coordinator.lock', 'old service'); print('held', flush=True); sys.stdin.read()"])
+        .arg(repo()).arg(&sd)
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(holder.stdout.take().unwrap()), &mut line).unwrap();
+    assert_eq!(line.trim(), "held");
+    let api = AppApi::start(paths.clone(), sd.clone(), Arc::new(|| {}));
+    assert!(matches!(wait_status(&api, |s| !matches!(s, Status::Starting)), Status::Passive { .. }));
+    assert!(!ck::app_api::running(), "a passive app is not an endpoint: it takes and offers nothing");
+    // Still held: the retry tries and stays passive.
+    assert!(api.retry());
+    assert!(matches!(wait_status(&api, |s| !matches!(s, Status::Starting)), Status::Passive { .. }));
+    assert!(!reaches(port));
+    // The old service stops: one more try starts the endpoint.
+    drop(holder.stdin.take());
+    holder.wait().unwrap();
+    assert!(api.retry());
+    assert!(matches!(wait_status(&api, |s| !matches!(s, Status::Starting)), Status::Running(_)));
+    assert!(reaches(port) && ck::app_api::running());
+    assert!(!api.retry(), "a running endpoint is not started twice");
+    assert!(api.stop(Duration::from_secs(20)));
+    assert!(!api.retry(), "nothing restarts after Quit");
 }
 
 /// The in-process bridge link speaks the netlink protocol: the same request/reply shape and error codes, no child process.

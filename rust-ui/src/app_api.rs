@@ -22,10 +22,10 @@ use std::time::Duration;
 
 type Obj = *mut c_void;
 
-/// The installer looks for this exact text inside the UI binary: only a binary that really starts the endpoint in-process lets it retire
-/// the old background service (packaging `bundle.write_endpoint_marker`). `AppApi::start` reads it, so the linker keeps it.
+/// The installer looks for this exact text inside the UI binary: only a binary that starts the endpoint in-process BY DEFAULT lets it
+/// retire the old background service (packaging `bundle.ENDPOINT_MARKER`). `AppApi::start` reads it, so the linker keeps it.
 #[used]
-pub static ENDPOINT_MARKER: [u8; 23] = *b"KEYLOOM_APP_ENDPOINT_V1";
+pub static ENDPOINT_MARKER: [u8; 31] = *b"KEYLOOM_APP_ENDPOINT_DEFAULT_V1";
 
 /// This PC's network state folder for a settings file (the same folder the old network service used, so identity, joins and inbox carry over).
 pub fn state_dir(settings_path: &Path) -> PathBuf {
@@ -82,6 +82,13 @@ unsafe impl Sync for Api {}
 
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
 
+/// True while this process's endpoint answers (set when it comes up, cleared the moment a stop begins).
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+pub fn running() -> bool {
+    RUNNING.load(Ordering::SeqCst)
+}
+
 /// The Python half: one dispatcher over a fixed list of operations. Returns/raises nothing: every answer is JSON text.
 const SHIM: &str = r#"
 import json, os, sys, threading
@@ -92,7 +99,7 @@ _ep = None
 _bridges = {}
 _nb = [0]
 _lock = threading.Lock()
-_INBOX = {"pending", "held", "begin", "report", "cancel_requested"}
+_INBOX = {"pending", "held", "begin", "report", "cancel_requested", "abandon", "foreign", "forwarded"}
 
 class _E(Exception):
     def __init__(self, code, message):
@@ -135,9 +142,15 @@ def _inbox(a):
     if m not in _INBOX:
         raise _E("bad_request", "unknown inbox method")
     kw = {k: v for k, v in a.items() if k != "method"}
-    if m in ("pending", "held", "begin", "report") and "host_id" not in kw:
+    if m in ("pending", "held", "begin", "report", "foreign") and "host_id" not in kw:
         kw["host_id"] = ep.live["iid"]
+    if m == "abandon":  # the user settles a shot left uncertain by a restart
+        return ep.store.abandon(**kw)
     return getattr(ep.store, "inbox_" + m)(**kw)
+
+def _estimate(a):
+    from backend import netlink
+    return netlink.Bridge().op_estimate(a)
 
 def _bridge_open(a):
     from backend import netlink
@@ -170,7 +183,14 @@ _OPS = {
     "endpoint_start": _start, "endpoint_stop": _stop, "endpoint_info": lambda a: _info(),
     "endpoint_refresh": lambda a: (_need().refresh(), {})[1],
     "registered": lambda a: _need().registered(),
+    "retire": lambda a: _need().retire(a["installation_id"]),
     "inbox": _inbox,
+    "publish": lambda a: (_need().publish(a.get("name"), a.get("gpu"), a.get("stats"), a.get("avail")), {})[1],
+    "destinations": lambda a: _need().destinations(),
+    "destination_offer": lambda a: _need().destination_offer(a["credentials_path"]),
+    "destination_remove": lambda a: (_need().remove_destination(a["pc_id"]), {})[1],
+    "configure": lambda a: (_need().configure(a.get("allow_join"), a.get("name"), a.get("receive")), {})[1],
+    "estimate": _estimate,
     "bridge_open": _bridge_open, "bridge_line": _bridge_line, "bridge_close": _bridge_close,
 }
 
@@ -198,6 +218,11 @@ struct Sink {
 fn sink() -> &'static Sink {
     static S: OnceLock<Sink> = OnceLock::new();
     S.get_or_init(Sink::default)
+}
+
+/// Events that arrived since the last call, whoever started the endpoint (the app driver drains them; the wake already ran).
+pub fn take_events() -> Vec<Event> {
+    sink().events.lock().unwrap().drain(..).collect()
 }
 
 /// Called by Python (interpreter lock held) for every committed event. Quick: queue + wake, nothing else.
@@ -443,6 +468,28 @@ struct Shared {
     wake: Arc<dyn Fn() + Send + Sync>,
     stopping: AtomicBool,
     start: Mutex<Option<std::thread::JoinHandle<()>>>,
+    paths: Paths,
+    state_dir: PathBuf,
+}
+
+/// Bring the endpoint up on a background thread; the outcome lands in `status`.
+fn spawn_start(shared: &Arc<Shared>) {
+    let s2 = shared.clone();
+    let h = std::thread::Builder::new().name("ck-app-api-start".into()).spawn(move || {
+        let fail = |code: &str, message: String| Status::Failed { code: code.into(), message };
+        let st = match init(&s2.paths) {
+            Err(e) => fail("runtime_unavailable", e),
+            Ok(()) => match call("endpoint_start", json!({"state_dir": s2.state_dir})) {
+                Ok(info) => Status::Running(info),
+                Err(e) if e.code == "service_conflict" => Status::Passive { code: e.code, message: e.message },
+                Err(e) => fail(&e.code, e.message),
+            },
+        };
+        RUNNING.store(matches!(st, Status::Running(_)), Ordering::SeqCst);
+        *s2.status.lock().unwrap() = st; // a Quit during start is handled by the stop thread, which joins this one first
+        (s2.wake)();
+    });
+    *shared.start.lock().unwrap() = h.ok();
 }
 
 /// The endpoint's lifetime handle: `start` returns at once, the listener comes up on a background thread.
@@ -454,23 +501,26 @@ impl AppApi {
     pub fn start(paths: Paths, state_dir: PathBuf, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         std::hint::black_box(&ENDPOINT_MARKER);
         *sink().wake.lock().unwrap() = Some(wake.clone());
-        let shared = Arc::new(Shared { status: Mutex::new(Status::Starting), wake, stopping: AtomicBool::new(false), start: Mutex::new(None) });
-        let s2 = shared.clone();
-        let h = std::thread::Builder::new().name("ck-app-api-start".into()).spawn(move || {
-            let fail = |code: &str, message: String| Status::Failed { code: code.into(), message };
-            let st = match init(&paths) {
-                Err(e) => fail("runtime_unavailable", e),
-                Ok(()) => match call("endpoint_start", json!({"state_dir": state_dir})) {
-                    Ok(info) => Status::Running(info),
-                    Err(e) if e.code == "service_conflict" => Status::Passive { code: e.code, message: e.message },
-                    Err(e) => fail(&e.code, e.message),
-                },
-            };
-            *s2.status.lock().unwrap() = st; // a Quit during start is handled by the stop thread, which joins this one first
-            (s2.wake)();
-        });
-        *shared.start.lock().unwrap() = h.ok();
+        let shared = Arc::new(Shared { status: Mutex::new(Status::Starting), wake, stopping: AtomicBool::new(false), start: Mutex::new(None), paths, state_dir });
+        spawn_start(&shared);
         Self { shared }
+    }
+
+    /// Try the endpoint again after it stayed off (the old service held the state, or a port was taken). Does nothing unless it is
+    /// Passive or Failed and no stop has begun. Called by the Retry button and when the Clients page opens; never on a timer.
+    pub fn retry(&self) -> bool {
+        if self.shared.stopping.load(Ordering::SeqCst) {
+            return false;
+        }
+        {
+            let mut st = self.shared.status.lock().unwrap();
+            if !matches!(&*st, Status::Passive { .. } | Status::Failed { .. }) {
+                return false;
+            }
+            *st = Status::Starting;
+        }
+        spawn_start(&self.shared);
+        true
     }
 
     pub fn status(&self) -> Status {
@@ -479,7 +529,7 @@ impl AppApi {
 
     /// Events that arrived since the last call (the app driver is woken for each).
     pub fn take_events(&self) -> Vec<Event> {
-        sink().events.lock().unwrap().drain(..).collect()
+        take_events()
     }
 
     /// Close the listener, discovery and inbox. Idempotent. Waits at most `deadline` for the close to finish (never under a
@@ -488,6 +538,7 @@ impl AppApi {
         if self.shared.stopping.swap(true, Ordering::SeqCst) {
             return matches!(self.status(), Status::Stopped);
         }
+        RUNNING.store(false, Ordering::SeqCst); // nothing new is read from or written to the inbox once a stop begins
         let (tx, rx) = channel();
         let sh = self.shared.clone();
         let started = std::thread::Builder::new().name("ck-app-api-stop".into()).spawn(move || {

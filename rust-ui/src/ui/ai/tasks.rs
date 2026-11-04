@@ -833,10 +833,25 @@ impl AiUi {
                     self.notice = err;
                 }
                 let owner = r.to_string_lossy();
-                h.into_iter().filter(|e| e.kind == "local" && e.owner == owner).collect()
+                // This project's own runs, and the shots other PCs sent to this PC for it (kind "received", owned by the project folder).
+                h.into_iter().filter(|e| matches!(e.kind.as_str(), "local" | "received") && e.owner == owner).collect()
             }
             _ => vec![],
         };
+    }
+
+    /// A shot another PC sent here changed its history entry: re-read this project's received entries (event driven, no polling).
+    pub fn queue_refresh_received(&mut self) {
+        let (Some(root), Some(path)) = (self.tk.history_root.clone(), crate::queue::history_path()) else { return };
+        let owner = root.to_string_lossy();
+        let fresh: Vec<crate::queue::Entry> = crate::queue::read(&path).0.into_iter().filter(|e| e.kind == "received" && e.owner == owner).collect();
+        self.tk.history.retain(|h| h.kind != "received");
+        self.tk.history.extend(fresh);
+    }
+
+    /// Earlier sessions' entries of the open project (what "Earlier sessions" lists).
+    pub fn earlier_entries(&self) -> &[crate::queue::Entry] {
+        &self.tk.history
     }
 
     fn queue_entries(&mut self, root: &Path) -> Vec<crate::queue::Entry> {
@@ -903,7 +918,7 @@ impl AiUi {
             .tk
             .history
             .iter()
-            .filter(|h| !mine.iter().any(|m| m.id == h.id))
+            .filter(|h| h.kind == "local" && !mine.iter().any(|m| m.id == h.id))
             .cloned()
             .collect();
         all.extend(mine);
@@ -930,7 +945,9 @@ impl AiUi {
         let done: Vec<String> = self.queue_view().into_iter().flat_map(|s| s.runs).filter(|r| !r.active).flat_map(|r| r.rows.into_iter().flat_map(|x| x.ids)).collect();
         self.cleared.extend(done);
         let mine: Vec<String> = self.tracked.iter().map(|t| t.job_id.clone()).collect();
-        self.tk.history.retain(|h| mine.contains(&h.id));
+        let received: Vec<String> = self.tk.history.iter().filter(|h| h.kind == "received" && !matches!(h.state.as_str(), "running" | "held")).map(|h| h.id.clone()).collect();
+        let _ = crate::queue::forget(&received);
+        self.tk.history.retain(|h| mine.contains(&h.id) || (h.kind == "received" && !received.contains(&h.id)));
         self.tk.last_saved.clear();
     }
 
@@ -979,12 +996,20 @@ impl AiUi {
             dismiss_all = true;
         }
         });
+        // A received entry lives in history.json beside the local ones: dismissing it removes it there too, or it would come back.
+        let forget_received = |ids: Vec<String>| {
+            let _ = crate::queue::forget(&ids);
+        };
         if let Some(id) = dismiss {
+            if self.tk.history.iter().any(|h| h.id == id && h.kind == "received") {
+                forget_received(vec![id.clone()]);
+            }
             self.tk.history.retain(|h| h.id != id);
             self.tk.last_saved.clear();
         }
         // Every earlier-session entry, not only the 20 shown; this session's tracked jobs stay.
         if dismiss_all {
+            forget_received(self.tk.history.iter().filter(|h| h.kind == "received" && !mine.contains(&h.id)).map(|h| h.id.clone()).collect());
             self.tk.history.retain(|h| mine.contains(&h.id));
             self.tk.last_saved.clear();
         }

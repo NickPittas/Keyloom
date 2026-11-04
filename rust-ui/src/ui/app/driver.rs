@@ -2,7 +2,7 @@
 //! task-end effects, queue history, network claims/progress/outbox, metrics helper) runs on its own thread, so a
 //! covered or minimized window cannot stall it. The UI shares the same objects through `Held`: a frame takes
 //! them for its duration, then hands them back; between frames (or while nothing is drawn) the driver owns them.
-//! Lock order is always ai → remote → metrics.
+//! Lock order is always ai → remote → inbound → metrics.
 use crate::ui::ai::AiUi;
 use parking_lot::{lock_api::ArcMutexGuard, Mutex, RawMutex};
 use std::cell::OnceCell;
@@ -72,6 +72,7 @@ pub struct Driver {
 pub struct Parts {
     pub ai: Arc<Mutex<AiUi>>,
     pub remote: Arc<Mutex<crate::remote_set::RemoteSet>>,
+    pub inbound: Arc<Mutex<crate::inbound::Inbound>>,
     pub metrics: Arc<Mutex<crate::metrics::Supervisor>>,
     pub repo: Option<PathBuf>,
     pub python: Option<PathBuf>,
@@ -93,10 +94,11 @@ impl Driver {
                 {
                     let mut ai = p.ai.lock();
                     let mut remote = p.remote.lock();
+                    let mut inbound = p.inbound.lock();
                     let mut metrics = p.metrics.lock();
                     metrics.tick(now, &wake);
                     ai.exec_tick();
-                    if remote.available() {
+                    {
                         let view = metrics.view(now);
                         let snap = snap2.lock();
                         let mut env = crate::remote::Env {
@@ -109,8 +111,16 @@ impl Driver {
                             wake: &wake,
                             cfg: Default::default(),
                         };
-                        remote.tick(now, &mut env);
-                        for f in remote.take_finished() {
+                        if remote.available() {
+                            remote.tick(now, &mut env);
+                        }
+                        // Shots other PCs pushed into this app: read when the endpoint announces them, run on the app's own scheduler.
+                        inbound.tick(now, &mut env);
+                        crate::inbound::pump_forwards(&mut inbound, &mut remote, &mut env);
+                        if inbound.take_history_changed() {
+                            env.ai.queue_refresh_received();
+                        }
+                        for f in remote.take_finished().into_iter().chain(inbound.take_finished()) {
                             ai.push_refresh(f);
                         }
                     }

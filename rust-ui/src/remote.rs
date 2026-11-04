@@ -1,32 +1,26 @@
-//! Network client controller: one coordinator connection per installation, owned by the App and driven by its
-//! frame tick (never blocking). Submitter side: sends a confirmed Batch's frozen `JobSpec`s and follows their jobs.
-//! Receiver side (opt-in): when this computer's verified GPU is idle it claims one job, runs the receiver
-//! preflight on its own mappings, asks the coordinator to start the attempt and only then runs the job on its own
-//! local scheduler client (the sole executor), reporting progress and the result. Durable local state records the
-//! one started attempt, so a restart never claims or runs anything else while ownership is unresolved, and nothing
-//! here ever releases a writer on a timeout. Credentials stay in their private file; only their path is a setting.
+//! Network client controller (the SENDING half): one connection per joined PC, owned by the App and driven by its frame tick
+//! (never blocking). It pushes a confirmed Batch's frozen `JobSpec`s to that PC's app, then asks that app's status/event API
+//! every 3 s for progress, the final result paths and errors, and passes a Cancel to it. A PC is online once it has answered
+//! (a successful push or status contact). Receiving is `inbound::Inbound`: this PC's own app takes pushed shots straight into its
+//! scheduler, so no connection here ever claims, offers, starts or reports work, and nothing here talks to this PC's own endpoint.
+//! Credentials stay in their private file; only their path is a setting.
 use crate::metrics::{ClientTelemetry, Sample, View};
 use crate::netlink::{Link, LinkError, Op, Source, State};
 use crate::network_setup::{ep_kind, host_of};
-use crate::scheduler::JobState;
 use crate::settings::Settings;
-use crate::shared_paths::SharedRoot;
-use crate::submission::{JobSpec, Preflight, Stage};
+use crate::submission::JobSpec;
 use crate::ui::ai::{AiUi, NetSubmit};
-use crate::worker::Outcome;
 use eframe::egui::{self, RichText, Ui};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const STATS_EVERY: Duration = Duration::from_secs(5);
 const INSTALLS_EVERY: Duration = Duration::from_secs(4);
-const CLAIM_EVERY: Duration = Duration::from_secs(3);
+/// The sender asks the receiving app for progress, results and errors this often.
 const JOB_POLL_EVERY: Duration = Duration::from_secs(3);
-const PROGRESS_EVERY: Duration = Duration::from_millis(1500);
 const RESTART_AFTER: Duration = Duration::from_secs(15);
 const DIM: egui::Color32 = egui::Color32::from_rgb(169, 187, 175);
 
@@ -42,24 +36,28 @@ pub enum Phase {
 /// What a request was for (replies come back by id).
 enum Pend {
     Connect,
-    Register,
-    Stats,
     Installs,
-    Claim,
-    Start(String),
-    Reject,
-    Events,
     Submit(NetJob),
     Job(String),
     JobEvents(String),
     Cancel(String),
-    /// An empty event batch: asks the coordinator for the attempt's last accepted sequence.
-    Resync,
-    Estimate(String),
     /// Replaces the connected client's endpoint list (token and session are kept).
     Endpoints(Vec<String>, String),
     /// This PC retires its own login on the host (Remove).
     Leave,
+    /// This app's own endpoint, told to the host over this connection (reverse publication).
+    Destination,
+}
+
+/// Telling the host this app's own endpoint: once per app open and once after a Join, never on a timer.
+enum Publish {
+    /// Not told yet (also again after the link dropped before the host answered).
+    Idle,
+    /// The embedded endpoint is preparing the addresses, certificate and a login for the host.
+    Offering(Receiver<Result<Value, crate::app_api::CallError>>),
+    /// Sent over the link; waiting for the host's answer.
+    Sent,
+    Done,
 }
 
 /// How a Remove's leave request ended; the app finishes the local removal either way.
@@ -88,6 +86,11 @@ pub struct Install {
     pub connected: bool,
     pub last_seen_s: Option<f64>,
     pub stats: Value,
+    /// What the PC's app publishes for Automatic: Receive jobs on and the endpoint running / anything running or queued / a shot held.
+    /// Unknown (an older app) is never free.
+    pub receiving: Option<bool>,
+    pub busy: Option<bool>,
+    pub held: Option<bool>,
     received: Instant,
 }
 
@@ -147,7 +150,8 @@ pub struct NetJob {
 
 impl NetJob {
     fn terminal(&self) -> bool {
-        matches!(self.state.as_str(), "succeeded" | "failed" | "cancelled" | "not sent")
+        // "forwarded": an old host moved this shot to the PC's own app at the upgrade (the reason says where).
+        matches!(self.state.as_str(), "succeeded" | "failed" | "cancelled" | "not sent" | "forwarded")
     }
 
     fn can_take_unsent(&self) -> bool {
@@ -181,67 +185,21 @@ fn reconcile_submit(j: &mut NetJob, r: Result<Value, LinkError>, now: Instant) -
     }
 }
 
-struct Recv {
-    /// The worker pass last announced (sent as a "pass: …" note: every host accepts notes, but rejects unknown
-    /// fields in progress events).
-    last_phase: String,
-    attempt: String,
-    job_id: String,
-    /// manifest_dir / clip_root / exports of the attempt, kept in its durable file for restart reconciliation.
-    meta: Value,
-    /// Scheduler job ids in execution order with the stage's label.
-    stages: Vec<(String, &'static str)>,
-    announced: usize,
-    outbox: Vec<Value>,
-    seq: u64,
-    last_done: u64,
-    last_total: u64,
-    last_report: Instant,
-    last_progress: Instant,
-    inflight: bool,
-    retry_at: Option<Instant>,
-    cancel_sent: bool,
-    terminal: bool,
-    report_saved: bool,
-}
-
-/// What the storage says about an attempt left by an earlier run.
-enum Recon {
-    /// Manifest complete, no writer lock, all deliveries present.
-    Complete,
-    Terminal(&'static str, String),
-    /// No lock anywhere and the result is incomplete: nothing is writing, the run was cut short.
-    Interrupted(String),
-    /// A lock is present or the state cannot be read: a writer may still exist. Never released automatically.
-    Fenced(String),
-}
-
-enum Rx {
-    Idle,
-    /// The receiver preflight runs on a thread (it scans the shared storage).
-    Preflight { attempt: String, rx: Receiver<Result<Preflight, Vec<String>>> },
-    /// A pinned temporal window is being checked against this GPU's free memory (engine estimator) before the start.
-    Estimating { attempt: String, pf: Box<Preflight>, plan: Value, free_mb: u64 },
-    Starting { attempt: String, pf: Box<Preflight> },
-    Running(Recv),
-    /// A previous run started an attempt this installation still owns: nothing else is claimed.
-    Owned(String),
-    /// Restart: the attempt's storage is inspected on a thread to learn whether anything can still be writing.
-    Reconcile { attempt: String, meta: Value, rx: Receiver<Recon> },
-    /// Restart: waiting for the coordinator's last sequence before reporting the reconciled end of the attempt.
-    Resync { attempt: String, state: &'static str, message: String },
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Enable { creds: String, on: bool },
     Receive { creds: String, on: bool },
+    /// This PC's own "Receive jobs" switch (the app's endpoint refuses pushes while it is off).
+    ReceiveJobs(bool),
     DefaultSubmit(String),
     Remove(String),
     CancelJob { creds: String, job_id: String },
     /// A send the PC never accepted: take it back and put the shot at the end of the Automatic list.
     Resend { creds: String, submission_id: String },
-    ForgetAttempt(String),
+    /// The user checked this PC and releases a shot that was running when the app last closed.
+    ReleaseHeld,
+    /// "Network not active" -> Retry: start this app's endpoint again.
+    RetryEndpoint,
     Prefer { creds: String, url: String },
 }
 
@@ -253,16 +211,16 @@ pub struct Conn {
     pub receive: bool,
     /// This PC's name on the network.
     pub name: String,
-    /// The set's round robin allows this connection to claim now (offers are serialized across networks).
-    pub may_claim: bool,
     /// Known https addresses of the host, sent on connect and refreshed while online.
     pub endpoints: Vec<String>,
     /// The user's pick, already first in `endpoints` (empty = automatic).
     pub preferred: String,
     /// Exact host installation this connection targets (empty = every member, as before).
     pub target_host: String,
-    /// This PC's queue receives work; other PCs are selected through their own host connection.
-    pub local_host: bool,
+    /// A PC that registered on this app and told it its endpoint: the PC id and network namespace its old assignments were written in.
+    /// The PC keeps showing under them, so nothing it was assigned has to be picked again.
+    pub legacy_ns: String,
+    pub legacy_id: String,
 }
 
 pub struct Env<'a> {
@@ -290,40 +248,24 @@ pub struct Remote {
     me: Option<String>,
     network_url: Option<String>,
     network_id: Option<String>,
-    registered: bool,
-    /// Name sent with the last registration, whether the bridge/host rejected a name, and the user-facing note.
-    reg_name: String,
-    reg_sent_name: bool,
-    name_unsupported: bool,
-    name_note: Option<String>,
     jobs_loaded: bool,
     /// The network id remembered from an earlier connect (a PC's assignments stay valid while offline).
     cached_ns: Option<String>,
-    register_note: Option<String>,
-    reg_inflight: bool,
-    stats_seq: u64,
-    last_stats: Option<Instant>,
     last_installs: Option<Instant>,
-    last_claim: Option<Instant>,
-    claim_inflight: bool,
-    stats_inflight: bool,
     installs_inflight: bool,
+    /// The PC has answered (a successful push or status contact): only then is it online.
+    contacted: bool,
     pub installs: Vec<Install>,
     pub jobs: Vec<NetJob>,
-    rx: Rx,
-    /// Attempt id whose GPU slot this installation holds (empty = none).
-    held: String,
-    pub receive_note: Option<String>,
     finished: Vec<String>,
     pub status: Option<String>,
-    /// Shutdown began: nothing new is claimed.
-    closing: bool,
-    wake_hint: Option<Arc<dyn Fn() + Send + Sync>>,
     sent_endpoints: Vec<String>,
     sent_prefer: String,
     endpoints_inflight: bool,
     target_host: String,
-    local_host: bool,
+    legacy_ns: String,
+    legacy_id: String,
+    publish: Publish,
 }
 
 pub(crate) fn default_name() -> String {
@@ -331,18 +273,6 @@ pub(crate) fn default_name() -> String {
         // HOSTNAME is a shell variable, not exported to GUI launches; the kernel value matches the service's own name
         .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "Keyloom PC".into())
-}
-
-fn attempt_meta(pf: &Preflight) -> Value {
-    json!({
-        "manifest_dir": pf.job.manifest_dir.display().to_string(),
-        "clip_root": pf.job.clip_root.display().to_string(),
-        "exports": pf.stages.iter().filter_map(|s| match s { Stage::Task(t) if t.kind == crate::tasks::TaskKind::ExportVideo => t.params.get("dest").and_then(Value::as_str).map(str::to_owned), _ => None }).collect::<Vec<_>>(),
-    })
-}
-
-fn attempt_file(attempt: &str, job_id: &str, seq: u64, stages: &[(String, &'static str)], meta: &Value) -> Value {
-    json!({"attempt_id": attempt, "job_id": job_id, "seq": seq, "stages": stages.iter().map(|s| &s.0).collect::<Vec<_>>(), "meta": meta})
 }
 
 /// A sent job's saved record as a history entry, keyed by connection and submission.
@@ -436,41 +366,6 @@ pub(crate) fn write_private(path: &Path, v: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Inspect an earlier run's storage (on a helper thread): files only, nothing inferred from a pid or an age, nothing
-/// written or removed.
-fn reconcile(meta: &Value) -> Recon {
-    let dir = |k: &str| meta.get(k).and_then(Value::as_str).map(PathBuf::from);
-    let (Some(mdir), Some(clip)) = (dir("manifest_dir"), dir("clip_root")) else { return Recon::Fenced("the saved attempt has no storage paths".into()) };
-    for lock in [mdir.join(crate::jobs::LOCK_NAME), clip.join(crate::hints::HINT_LOCK)] {
-        match std::fs::symlink_metadata(&lock) {
-            Ok(_) => return Recon::Fenced(format!("{} exists: a writer may still be running (or died without cleaning up).", lock.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Recon::Fenced(format!("{} cannot be inspected ({e}).", lock.display())),
-        }
-    }
-    if let Some(t) = meta.get("terminal") {
-        let state = match t.get("state").and_then(Value::as_str) {
-            Some("succeeded") => Some("succeeded"),
-            Some("failed") => Some("failed"),
-            Some("cancelled") => Some("cancelled"),
-            _ => None,
-        };
-        if let Some(state) = state {
-            return Recon::Terminal(state, t.get("message").and_then(Value::as_str).unwrap_or("finished before disconnect").to_owned());
-        }
-    }
-    let manifest = std::fs::read(mdir.join(crate::project::MANIFEST_NAME)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-    let complete = manifest.as_ref().and_then(|m| m.get("complete")).and_then(Value::as_bool) == Some(true);
-    let exports: Vec<PathBuf> = meta.get("exports").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(PathBuf::from).collect();
-    let missing: Vec<String> = exports.iter().filter(|p| !p.is_file()).map(|p| p.display().to_string()).collect();
-    match (complete, missing.is_empty()) {
-        (true, true) => Recon::Complete,
-        (true, false) => Recon::Interrupted(format!("the Key result is complete but {} delivery file(s) are missing, e.g. {}", missing.len(), missing[0])),
-        (false, _) if manifest.is_none() => Recon::Interrupted("no result was written before the app closed".into()),
-        (false, _) => Recon::Interrupted("the result is incomplete (partial frames are kept in the result folder; Resume it locally)".into()),
-    }
-}
-
 /// Bounded, secret-free diagnostics on stderr (phase changes and every claim/offer/start/report step).
 pub(crate) fn nlog(msg: &str) {
     static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -504,7 +399,7 @@ fn chrono_free_stamp() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub(crate) fn truncate(s: &str, n: usize) -> String {
     s.chars().filter(|c| !c.is_control()).take(n).collect()
 }
 
@@ -544,50 +439,40 @@ impl Remote {
             me: None,
             network_url: None,
             network_id: None,
-            registered: false,
-            reg_name: String::new(),
-            reg_sent_name: false,
-            name_unsupported: false,
-            name_note: None,
             jobs_loaded: false,
             cached_ns: None,
-            register_note: None,
-            reg_inflight: false,
-            stats_seq: 0,
-            last_stats: None,
             last_installs: None,
-            last_claim: None,
-            claim_inflight: false,
-            stats_inflight: false,
             installs_inflight: false,
+            contacted: false,
             installs: vec![],
             jobs: vec![],
-            rx: Rx::Idle,
-            held: String::new(),
-            receive_note: None,
             finished: vec![],
             status: None,
-            closing: false,
-            wake_hint: None,
             sent_endpoints: vec![],
             sent_prefer: String::new(),
             endpoints_inflight: false,
             target_host: String::new(),
-            local_host: false,
+            legacy_ns: String::new(),
+            legacy_id: String::new(),
+            publish: Publish::Idle,
         }
     }
 
+    /// Try again now instead of at the retry timer (a discovery answer says the PC is up).
+    pub fn retry_now(&mut self) {
+        if matches!(self.phase, Phase::Failed(_)) {
+            self.retry_at = None;
+        }
+    }
     pub fn available(&self) -> bool {
         self.source != Source::Off
     }
+    /// Connected AND the PC has answered: a successful push or status contact, never just a credentials file that loads.
     pub fn online(&self) -> bool {
-        self.phase == Phase::Online
+        self.phase == Phase::Online && self.contacted
     }
     pub fn accepts_work(&self, cfg: &Conn) -> bool {
-        !self.leaving && !cfg.local_host && cfg.enabled && cfg.receive && self.online()
-    }
-    pub fn registered(&self) -> bool {
-        self.registered
+        !self.leaving && cfg.enabled && cfg.receive && self.online()
     }
     /// Shots whose outputs just finished (the App re-reads them).
     pub fn take_finished(&mut self) -> Vec<String> {
@@ -598,13 +483,7 @@ impl Remote {
         if self.jobs.iter().any(|j| !j.terminal() || j.submission.is_some()) {
             return Some("jobs sent to the current network are still running".into());
         }
-        if !matches!(self.rx, Rx::Idle) || !self.held.is_empty() {
-            return Some("this computer is working on, or holding, a network job".into());
-        }
         if let Some(c) = creds {
-            if side_file(c, ".attempt.json").exists() {
-                return Some("an unresolved network attempt is recorded on this computer".into());
-            }
             if self.jobs.is_empty() {
                 let pending = |jobs: &[Value]| jobs.iter().any(|j| !matches!(j["state"].as_str(), Some("succeeded" | "failed" | "cancelled" | "not sent")) || j.get("submission").is_some_and(|v| !v.is_null()));
                 let unreadable = || Some("the saved network job list cannot be read".to_string());
@@ -633,51 +512,37 @@ impl Remote {
         }
         None
     }
-    pub fn forget_attempt(&mut self, creds: Option<&Path>) {
-        if let Some(c) = creds {
-            let _ = std::fs::remove_file(side_file(c, ".attempt.json"));
-        }
-        self.rx = Rx::Idle; // the next tick releases the GPU slot
-    }
-    fn forget_file(env: &Env, yes: bool) {
-        if let (true, Some(c)) = (yes, &env.cfg.creds) {
-            let _ = std::fs::remove_file(side_file(c, ".attempt.json"));
-        }
-    }
-    /// Begin shutdown: no further offers are claimed.
-    pub fn shutdown_requested(&mut self) {
-        self.closing = true;
-    }
-    /// A held attempt has no local work; its durable ownership survives closing.
-    pub fn quiescent(&self) -> bool {
-        matches!(self.rx, Rx::Idle | Rx::Owned(_)) || (self.closing && !self.online() && matches!(&self.rx, Rx::Running(r) if r.terminal && r.report_saved))
-    }
-    /// Another claim/offer/attempt is in progress on this connection (the set never overlaps two networks' work).
-    pub(crate) fn claim_busy(&self) -> bool {
-        self.claim_inflight || !matches!(self.rx, Rx::Idle) || !self.held.is_empty()
-    }
-    pub(crate) fn claim_ready(&self, now: Instant, cfg: &Conn) -> bool {
-        cfg.local_host && cfg.receive && self.registered && self.online() && !self.closing && !self.claim_busy() && self.last_claim.is_none_or(|t| now.saturating_duration_since(t) >= CLAIM_EVERY)
-    }
-    pub(crate) fn claiming(&self) -> bool {
-        self.claim_inflight
-    }
     /// The coordinator's network id (remembered across restarts), the namespace of this connection's PCs.
     pub fn ns(&self) -> Option<String> {
+        // A destination keeps the namespace its old assignments were written in.
+        Some(self.legacy_ns.clone()).filter(|n| !n.is_empty()).or_else(|| self.network_id.clone()).or_else(|| self.cached_ns.clone())
+    }
+    /// Take the connection's identity settings now (a new connection routes sends before its first tick).
+    pub(crate) fn seed(&mut self, c: &Conn) {
+        self.target_host.clone_from(&c.target_host);
+        self.legacy_ns.clone_from(&c.legacy_ns);
+        self.legacy_id.clone_from(&c.legacy_id);
+    }
+    /// This connection can carry a shot for PC `iid`: any PC of a normal network, only its own PC for a destination.
+    pub(crate) fn fits(&self, iid: &str) -> bool {
+        self.legacy_id.is_empty() || self.legacy_id == iid
+    }
+    /// The PC's own network id (what discovery reports), whatever namespace its assignments use.
+    pub fn real_ns(&self) -> Option<String> {
         self.network_id.clone().or_else(|| self.cached_ns.clone())
+    }
+    /// The id the target PC is shown and assigned under (a destination keeps its old registration id).
+    fn public_host(&self) -> &str {
+        if self.legacy_id.is_empty() { &self.target_host } else { &self.legacy_id }
     }
     /// This computer's own installation id on this network (from its last registration).
     pub fn me(&self) -> Option<&str> {
         self.me.as_deref()
     }
-    /// The GPU-slot key of an attempt: namespaced by connection, so two networks' attempt ids can never alias.
-    fn slot(&self, attempt: &str) -> String {
-        format!("{}/{attempt}", self.key)
-    }
     /// A connection that names its host targets only that exact installation (and never this PC itself);
-    /// Older peer connections without metadata keep every member; our own queue supplies no remote targets.
+    /// older peer connections without metadata keep every member.
     fn host_only(&self, id: &str) -> bool {
-        !self.local_host && (self.target_host.is_empty() || (id == self.target_host && Some(id) != self.me.as_deref()))
+        self.target_host.is_empty() || (id == self.public_host() && Some(id) != self.me.as_deref())
     }
     /// The coordinator address from the credentials file (labels and discovery's known addresses).
     pub fn url(&self) -> Option<String> {
@@ -688,9 +553,6 @@ impl Remote {
     }
     /// Remove: ask the host to retire this PC's login. False = not sent (offline), so the caller removes locally.
     pub fn leave(&mut self) -> bool {
-        if self.local_host {
-            return false; // this PC never retires its own login on its own service
-        }
         if self.leaving {
             return true;
         }
@@ -734,37 +596,25 @@ impl Remote {
         let j = self.jobs.iter().find(|j| j.submission_id == submission_id)?;
         Some(if !j.terminal() { Ok(()) } else if j.state == "failed" || j.state == "not sent" { Err(Some(j.reason.clone().unwrap_or_else(|| j.state.clone()))) } else { Err(None) })
     }
-    pub fn receiving(&self) -> Option<String> {
-        match &self.rx {
-            Rx::Idle => None,
-            Rx::Preflight { attempt, .. } => Some(format!("checking offer {attempt}")),
-            Rx::Starting { attempt, .. } => Some(format!("starting {attempt}")),
-            Rx::Estimating { attempt, .. } => Some(format!("checking GPU memory for {attempt}")),
-            Rx::Running(r) => Some(format!("running {}", r.job_id)),
-            Rx::Owned(m) => Some(m.clone()),
-            Rx::Reconcile { attempt, .. } | Rx::Resync { attempt, .. } => Some(format!("reconciling {attempt} after a restart")),
-        }
-    }
-
     /// Accept a Batch submission for this network now (kept and sent when it is online).
     pub(crate) fn enqueue(&mut self, n: NetSubmit, env: &Env) {
+        self.target_host.clone_from(&env.cfg.target_host);
+        self.legacy_ns.clone_from(&env.cfg.legacy_ns);
+        self.legacy_id.clone_from(&env.cfg.legacy_id);
         self.load_jobs(env.cfg.creds.as_deref());
+        // The same submission id is the same shot: handing it over again (an old shot moved at the upgrade) never makes a second one.
+        if self.jobs.iter().any(|j| j.submission_id == n.submission_id) {
+            return;
+        }
         self.send(n, env);
+    }
+    /// The target PC's app accepted this submission: its job id there.
+    pub(crate) fn accepted(&self, submission_id: &str) -> Option<String> {
+        self.jobs.iter().find(|j| j.submission_id == submission_id).and_then(|j| j.job_id.clone())
     }
 
     fn stop(&mut self) {
-        if let Rx::Running(r) = &mut self.rx {
-            r.inflight = false; // the request died with the link; the outbox replays after reconnect
-        }
-        if matches!(self.rx, Rx::Preflight { .. } | Rx::Estimating { .. } | Rx::Starting { .. }) {
-            // (unstarted offers) — and a restart reconciliation in flight simply restarts from the saved attempt file on reconnect
-            self.rx = Rx::Idle;
-        }
-        if matches!(self.rx, Rx::Reconcile { .. } | Rx::Resync { .. }) {
-            self.held.clear();
-            self.rx = Rx::Idle; // unstarted: the coordinator offer is revoked/expired, the slot is released next tick
-        }
-        self.link = None; // Drop kills and reaps the bridge; the coordinator keeps ownership of anything started
+        self.link = None; // Drop closes the link; the receiving app keeps ownership of anything it started
         self.pend.clear();
         if std::mem::take(&mut self.leaving) {
             self.left = Some(Leave::Failed); // the link died before the host answered
@@ -772,14 +622,12 @@ impl Remote {
         for j in &mut self.jobs {
             j.inflight = false;
         }
-        self.registered = false;
-        self.reg_inflight = false;
-        self.name_unsupported = false;
-        self.claim_inflight = false;
-        self.stats_inflight = false;
+        self.contacted = false;
+        if !matches!(self.publish, Publish::Done) {
+            self.publish = Publish::Idle; // the host may not have heard it: tell it again once the link is back
+        }
         self.installs_inflight = false;
         self.me = None;
-        self.last_stats = None;
         self.last_installs = None;
         self.endpoints_inflight = false;
     }
@@ -835,18 +683,11 @@ impl Remote {
     // ---- the frame tick --------------------------------------------------------------------------------------------
 
     pub fn tick(&mut self, now: Instant, env: &mut Env) {
-        self.wake_hint = Some(env.wake.clone());
         self.target_host.clone_from(&env.cfg.target_host);
-        self.local_host = env.cfg.local_host;
-        if !self.held.is_empty() && matches!(self.rx, Rx::Idle) {
-            env.ai.release_network_slot(&self.held);
-            self.held.clear();
-        }
+        self.legacy_ns.clone_from(&env.cfg.legacy_ns);
+        self.legacy_id.clone_from(&env.cfg.legacy_id);
         let creds = env.cfg.creds.clone();
         self.load_jobs(creds.as_deref());
-        if !self.online() && matches!(self.rx, Rx::Running(_)) {
-            self.run_attempt(now, env, creds.as_deref());
-        }
         let enabled = env.cfg.enabled && creds.as_ref().is_some_and(|c| c.exists());
         if !enabled {
             if self.link.is_some() || self.phase != Phase::Off {
@@ -946,7 +787,7 @@ impl Remote {
 
     fn on_reply(&mut self, p: Pend, out: Result<Value, LinkError>, now: Instant, env: &mut Env) {
         match (&p, &out) {
-            (Pend::Stats | Pend::Installs | Pend::Job(_) | Pend::JobEvents(_), Ok(_)) => {}
+            (Pend::Installs | Pend::Job(_) | Pend::JobEvents(_), Ok(_)) => {}
             (_, Ok(v)) => nlog(&format!("{} ok {}", Self::pname(&p), v.to_string().chars().take(120).collect::<String>())),
             (_, Err(e)) => nlog(&format!("{} ERR {}", Self::pname(&p), err_text(e))),
         }
@@ -972,7 +813,7 @@ impl Remote {
                 self.network_url = v.get("url").and_then(Value::as_str).map(str::to_owned);
                 self.network_id = v.get("network_id").and_then(Value::as_str).map(str::to_owned);
                 self.me = v.get("installation_id").and_then(Value::as_str).map(str::to_owned);
-                self.phase = Phase::Online;
+                self.phase = Phase::Online; // connected; online() waits for the first answer from the PC
                 self.retry_at = None;
                 if let (Some(c), Some(n)) = (&env.cfg.creds, &self.network_id) {
                     if self.cached_ns.as_ref() != Some(n) {
@@ -980,36 +821,14 @@ impl Remote {
                         let _ = write_private(&side_file(c, ".network.json"), &json!({"network_id": n}));
                     }
                 }
-                self.load_state(env);
             }
             (Pend::Connect, Err(e)) => {
                 self.stop();
                 self.fail(now, format!("could not connect ({})", err_text(&e)));
             }
-            (Pend::Register, r) => {
-                self.reg_inflight = false;
-                match r {
-                    Ok(_) => {
-                        self.registered = true;
-                        self.register_note = None;
-                        self.name_note = (self.name_unsupported).then(|| "This network's host is too old to sync the PC name: update Keyloom on the host.".into());
-                    }
-                    // An older host may reject the name field: register again without it (the next tick), rendering unchanged.
-                    Err(e) if self.reg_sent_name && e.code == "invalid" && e.message.contains("unknown keys") && e.message.contains("'name'") => {
-                        self.name_unsupported = true;
-                        self.register_note = Some(format!("registering without the PC name ({})", err_text(&e)));
-                    }
-                    Err(e) => self.register_note = Some(format!("not registered ({})", err_text(&e))),
-                }
-            }
-            (Pend::Stats, Ok(v)) => {
-                self.stats_inflight = false;
-                // Reopening keeps the session, so resume after its last accepted sample.
-                self.stats_seq = self.stats_seq.max(v.get("seq").and_then(Value::as_u64).unwrap_or(0));
-            }
-            (Pend::Stats, Err(_)) => self.stats_inflight = false,
             (Pend::Installs, Ok(v)) => {
                 self.installs_inflight = false;
+                self.contacted = true;
                 self.set_installs(&v);
             }
             (Pend::Installs, Err(e)) => {
@@ -1018,23 +837,13 @@ impl Remote {
                 self.stop();
                 self.fail(now, format!("connection lost ({})", err_text(&e)));
             }
-            (Pend::Claim, r) => {
-                self.claim_inflight = false;
-                match r {
-                    Ok(v) => self.on_claim(v, env),
-                    Err(e) => self.receive_note = Some(format!("claim failed ({})", err_text(&e))),
-                }
-            }
-            (Pend::Start(attempt), r) => self.on_start(attempt, r, env),
-            (Pend::Reject, _) => {}
-            (Pend::Resync, r) => self.on_resync(r, env),
-            (Pend::Estimate(a), r) => self.on_estimate(a, r, env),
-            (Pend::Events, r) => self.on_events(r, env),
             (Pend::Submit(submitted), r) => {
+                self.contacted |= r.is_ok();
                 self.on_submit_reply(submitted, r, now);
                 self.save_jobs(env);
             }
             (Pend::Job(jid), r) => {
+                self.contacted |= r.is_ok();
                 let installs = self.installs.clone();
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.job_id.as_deref() == Some(jid.as_str())) {
                     j.inflight = false;
@@ -1049,6 +858,7 @@ impl Remote {
                             }
                         }
                         if let Some(id) = v.get("installation_id").and_then(Value::as_str) {
+                            let id = if !self.legacy_id.is_empty() && id == self.target_host { self.legacy_id.as_str() } else { id };
                             j.installation = Some(id.to_owned());
                             j.on = installs.iter().find(|x| x.id == id).map(|x| x.name.clone());
                         }
@@ -1062,6 +872,7 @@ impl Remote {
                 self.save_jobs(env);
             }
             (Pend::JobEvents(jid), Ok(v)) => {
+                self.contacted = true;
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.job_id.as_deref() == Some(jid.as_str())) {
                     j.inflight = false;
                     j.events_done = j.terminal() && v.get("events").and_then(Value::as_array).is_some_and(|e| e.len() < 50);
@@ -1103,10 +914,23 @@ impl Remote {
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.job_id.as_deref() == Some(jid.as_str())) { j.inflight = false; }
             }
             (Pend::Cancel(_), Ok(_)) => {}
+            (Pend::Destination, Ok(_)) => self.publish = Publish::Done,
+            (Pend::Destination, Err(e)) => {
+                self.publish = Publish::Idle; // told again after the next reconnect, not on a timer
+                self.status = Some(format!("Could not tell {} this PC's address: {}", self.label(), err_text(&e)));
+            }
         }
     }
 
     fn on_submit_reply(&mut self, mut submitted: NetJob, r: Result<Value, LinkError>, now: Instant) {
+        // The PC said it is no longer free: until its next answer it counts as busy, so Automatic moves on to another PC.
+        if let (Err(e), Some(iid)) = (&r, submitted.installation.as_deref()) {
+            if e.code == "not_free" {
+                if let Some(i) = self.installs.iter_mut().find(|i| i.id == iid) {
+                    i.busy = Some(true);
+                }
+            }
+        }
         let existing = self.jobs.iter().position(|j| j.submission_id == submitted.submission_id);
         if let Some(i) = existing {
             reconcile_submit(&mut self.jobs[i], r, now);
@@ -1119,20 +943,13 @@ impl Remote {
         match p {
             Pend::Endpoints(..) => "endpoints",
             Pend::Connect => "connect",
-            Pend::Register => "register",
-            Pend::Stats => "stats",
             Pend::Installs => "installations",
-            Pend::Claim => "claim",
-            Pend::Start(_) => "start",
-            Pend::Reject => "reject",
-            Pend::Events => "events",
             Pend::Submit(_) => "submit",
             Pend::Job(_) => "job",
             Pend::JobEvents(_) => "job_events",
             Pend::Cancel(_) => "cancel",
-            Pend::Resync => "resync",
-            Pend::Estimate(_) => "estimate",
             Pend::Leave => "leave",
+            Pend::Destination => "destination",
         }
     }
 
@@ -1143,8 +960,13 @@ impl Remote {
             .into_iter()
             .flatten()
             .filter_map(|i| {
+                let real = i.get("installation_id")?.as_str()?;
+                let flag = |k: &str| i.get(k).and_then(Value::as_bool);
                 Some(Install {
-                    id: i.get("installation_id")?.as_str()?.to_owned(),
+                    id: if !self.legacy_id.is_empty() && real == self.target_host { self.legacy_id.clone() } else { real.to_owned() },
+                    receiving: flag("receiving"),
+                    busy: flag("busy"),
+                    held: flag("held"),
                     name: i.get("name").and_then(Value::as_str).unwrap_or("?").to_owned(),
                     gpu: i.get("gpu_name").and_then(Value::as_str).map(str::to_owned),
                     connected: i.get("connected").and_then(Value::as_bool).unwrap_or(false),
@@ -1163,97 +985,57 @@ impl Remote {
 
     // ---- driving ---------------------------------------------------------------------------------------------------
 
-    fn drive(&mut self, now: Instant, env: &mut Env, creds: Option<&Path>) {
+    fn drive(&mut self, now: Instant, _env: &mut Env, _creds: Option<&Path>) {
         let due = |last: Option<Instant>, every: Duration| last.is_none_or(|t| now.saturating_duration_since(t) >= every);
-        // 1. This computer's verified GPU (needed to register, report stats and receive).
-        let local = env.ai.scheduler().targets().into_iter().find(|t| t.local && t.enabled);
-        let hello_gpu = local.as_ref().and_then(|t| t.ready.as_ref()).and_then(|h| h.gpu.clone());
-        let sample = if let View::Live(s) = env.metrics { Some(s.clone()) } else { None };
-        // The app starts the worker when it opens, so its GPU is reported without any request from here.
-        // A renamed PC registers again right away; a host that cannot take names keeps the old registration.
-        if self.registered && !self.reg_inflight && !self.name_unsupported && self.reg_name != truncate(env.cfg.name.trim(), 64) {
-            self.registered = false;
-        }
-        if env.cfg.local_host && !self.registered && !self.reg_inflight {
-            match (&hello_gpu, &sample) {
-                (Some(g), Some(s)) => match g.verified_uuid() {
-                    Ok(u) => {
-                        let ram_mb = s.ram_total.map(|b| b / (1 << 20));
-                        if let Some(ram) = ram_mb.filter(|r| *r > 0) {
-                            let mut args = json!({"build": format!("keyloom-ui {}", env!("CARGO_PKG_VERSION")), "gpu": {"uuid": u, "name": truncate(&g.name, 120), "vram_total_mb": ((g.vram_gb * 1024.0) as u64).max(1), "ram_total_mb": ram}});
-                            let name = truncate(env.cfg.name.trim(), 64); // the host accepts 1-64 characters
-                            self.reg_sent_name = !name.is_empty() && !self.name_unsupported;
-                            if self.reg_sent_name {
-                                args["name"] = json!(name);
-                            }
-                            self.reg_name = if self.reg_sent_name { name } else { String::new() };
-                            self.reg_inflight = self.req(Op::Register, args, Pend::Register);
-                        }
-                    }
-                    Err(e) => self.register_note = Some(format!("this computer cannot take network work: {e}")),
-                },
-                (None, _) => self.register_note = Some(if env.cfg.receive { "waiting for the local client's GPU identity (Clients > Check workers)" } else { "the GPU is identified when you queue work or turn on Receive jobs" }.into()),
-                (_, None) => self.register_note = Some("waiting for system metrics".into()),
-            }
-        }
-        // 2. Stats / clients.
-        if self.registered && !self.stats_inflight && due(self.last_stats, STATS_EVERY) {
-            if let Some(s) = &sample {
-                self.last_stats = Some(now);
-                self.stats_seq += 1;
-                let mut o = serde_json::Map::new();
-                o.insert("seq".into(), json!(self.stats_seq));
-                o.insert("measured_age_ms".into(), json!(0));
-                if let Some(c) = s.cpu_percent {
-                    o.insert("cpu_percent".into(), json!(c));
-                }
-                if let (Some(u), Some(t)) = (s.ram_used, s.ram_total) {
-                    o.insert("ram_used_bytes".into(), json!(u));
-                    o.insert("ram_total_bytes".into(), json!(t));
-                }
-                if let Some(g) = &s.gpus {
-                    let list: Vec<Value> = g
-                        .iter()
-                        .filter(|x| x.uuid.len() >= 8)
-                        .take(8)
-                        .map(|x| {
-                            let mut m = serde_json::Map::new();
-                            m.insert("uuid".into(), json!(x.uuid));
-                            m.insert("index".into(), json!(x.index.unwrap_or(0)));
-                            m.insert("name".into(), json!(x.name.clone().unwrap_or_else(|| "GPU".into())));
-                            if let Some(u) = x.util {
-                                m.insert("utilization_percent".into(), json!(u));
-                            }
-                            if let (Some(u), Some(t)) = (x.vram_used, x.vram_total) {
-                                m.insert("vram_used_bytes".into(), json!(u));
-                                m.insert("vram_total_bytes".into(), json!(t));
-                            }
-                            Value::Object(m)
-                        })
-                        .collect();
-                    o.insert("gpus".into(), json!(list));
-                }
-                self.stats_inflight = self.req(Op::Stats, Value::Object(o), Pend::Stats);
-            }
-        }
+        // The PC's own answer (its name, GPU, load) every 4 s: this is also what proves it is online.
         if !self.installs_inflight && due(self.last_installs, INSTALLS_EVERY) {
             self.last_installs = Some(now);
             self.installs_inflight = self.req(Op::Installations, json!({}), Pend::Installs);
         }
-        // 3. Submitter: send what the Batch confirmed, follow what was sent.
+        self.publish_endpoint();
+        // Send what the Batch confirmed, follow what was sent.
         self.poll_jobs(now);
-        // 4. Receiver.
-        self.receive(now, env, creds, local.as_ref().map(|t| (t.status.clone(), t.busy_with.is_some())), hello_gpu.as_ref().and_then(|g| g.verified_uuid().ok().map(str::to_owned)), sample.as_ref());
         if self.leaving && !self.request_leave_if_ready() {
             self.leaving = false;
             self.left = Some(Leave::Failed);
         }
     }
 
+    /// Reverse publication: over this authenticated connection, tell the host this app's own endpoint (addresses, certificate and a login it
+    /// may use to push to this PC), so a host that only knew this PC from its registration can send to it. Once per app open and after a
+    /// Join (a new connection); a dropped link before the answer repeats it. A destination connection (the other side of this) never does.
+    fn publish_endpoint(&mut self) {
+        if !self.legacy_id.is_empty() || !crate::app_api::running() {
+            return;
+        }
+        match &self.publish {
+            Publish::Idle if self.contacted => {
+                self.publish = Publish::Offering(crate::app_api::spawn_call("destination_offer", json!({"credentials_path": self.key})));
+            }
+            Publish::Offering(rx) => match rx.try_recv() {
+                Err(TryRecvError::Empty) => {}
+                Ok(Ok(body)) => {
+                    self.publish = if self.req(Op::Destination, body, Pend::Destination) { Publish::Sent } else { Publish::Idle };
+                }
+                Ok(Err(e)) => {
+                    self.status = Some(format!("This PC's address could not be prepared for {}: {}", self.label(), truncate(&e.message, 200)));
+                    self.publish = Publish::Done; // a local failure repeats on the next app open, not in a loop
+                }
+                Err(TryRecvError::Disconnected) => self.publish = Publish::Idle,
+            },
+            _ => {}
+        }
+    }
+
     fn send(&mut self, n: NetSubmit, env: &Env) {
         let stages = stage_list(&n.spec);
         let installation = n.target.clone();
-        let body = json!({"submission_id": n.submission_id, "spec": serde_json::to_value(&n.spec).unwrap_or_default(), "target": n.target});
+        // A destination is shown under its old registration id; the PC's own app knows itself by its own id.
+        let wire = if !self.legacy_id.is_empty() && n.target.as_deref() == Some(self.legacy_id.as_str()) { Some(self.target_host.clone()) } else { n.target.clone() };
+        let mut body = json!({"submission_id": n.submission_id, "spec": serde_json::to_value(&n.spec).unwrap_or_default(), "target": wire});
+        if n.automatic {
+            body["automatic"] = json!(true); // the receiver refuses it (not_free) if it is no longer free
+        }
         self.jobs.push(NetJob { submission_id: n.submission_id.clone(), submission: Some(body), installation, stages, active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: n.folder, name: n.name, state: "sending".into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, submission_attempted: false, inflight: false });
         self.save_jobs(env);
     }
@@ -1300,440 +1082,6 @@ impl Remote {
         for (jid, after, terminal) in todo {
             if !terminal { self.req(Op::Job, json!({"job_id": jid}), Pend::Job(jid.clone())); }
             self.req(Op::JobEvents, json!({"job_id": jid, "after": after, "limit": 50}), Pend::JobEvents(jid));
-        }
-    }
-
-    // ---- receiver --------------------------------------------------------------------------------------------------
-
-    #[allow(clippy::too_many_arguments)]
-    fn receive(&mut self, now: Instant, env: &mut Env, creds: Option<&Path>, local: Option<(crate::scheduler::TargetStatus, bool)>, uuid: Option<String>, sample: Option<&Sample>) {
-        // Preflight finished?
-        if let Rx::Preflight { attempt, rx } = &self.rx {
-            match rx.try_recv() {
-                Ok(Ok(pf)) => {
-                    let attempt = attempt.clone();
-                    nlog(&format!("offer {attempt}: preflight passed"));
-                    let plan = json!({"mode": "new", "gpu": uuid, "local_client": true, "temporal_window": pf.job.params.get("temporal_window"), "stages": pf.stages.iter().map(Stage::label).collect::<Vec<_>>(), "free_vram_mb": sample.and_then(|s| Self::free_vram(s, uuid.as_deref()))});
-                    let free_mb = sample.and_then(|s| Self::free_vram(s, uuid.as_deref()));
-                    let pinned = pf.job.params.get("temporal_window").and_then(Value::as_str).filter(|w| *w != "auto").map(str::to_owned);
-                    match (pinned, free_mb) {
-                        // Fixed window: the engine's own estimate against the memory this GPU has now, before anything is started.
-                        (Some(w), Some(free)) if free > 0 => {
-                            let args = json!({"first_frame": pf.first_frame.display().to_string(), "frames": pf.job.range.out_point - pf.job.range.in_point + 1, "temporal_window": w, "vram_profile": pf.job.params.get("vram_profile").and_then(Value::as_str).unwrap_or("auto"), "free_vram_mb": free});
-                            if self.req(Op::Estimate, args, Pend::Estimate(attempt.clone())) {
-                                self.rx = Rx::Estimating { attempt, pf: Box::new(pf), plan, free_mb: free };
-                            } else {
-                                self.rx = Rx::Idle;
-                            }
-                        }
-                        _ => self.send_start(attempt, pf, plan, env),
-                    }
-                }
-                Ok(Err(problems)) => {
-                    let attempt = attempt.clone();
-                    nlog(&format!("offer {attempt}: preflight refused: {}", problems.join("; ")));
-                    let code = if problems.iter().any(|p| p.contains("no path mapping")) { "missing_map" } else { "other" };
-                    self.receive_note = Some(format!("offer {attempt} refused: {}", truncate(&problems.join("; "), 300)));
-                    self.req(Op::Reject, json!({"attempt_id": attempt, "code": code, "message": truncate(&problems.join("; "), 1000)}), Pend::Reject);
-                    self.rx = Rx::Idle;
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    let attempt = attempt.clone();
-                    self.req(Op::Reject, json!({"attempt_id": attempt, "code": "other", "message": "the receiver preflight stopped unexpectedly"}), Pend::Reject);
-                    self.rx = Rx::Idle;
-                }
-            }
-        }
-        if let Rx::Reconcile { attempt, meta, rx } = &self.rx {
-            match rx.try_recv() {
-                Ok(Recon::Terminal(state, message)) => self.resync(attempt.clone(), state, message),
-                Ok(Recon::Complete) => self.resync(attempt.clone(), "succeeded", "complete (reconciled after a restart: manifest complete, no writer lock)".into()),
-                Ok(Recon::Interrupted(m)) => self.resync(attempt.clone(), "failed", format!("interrupted by a restart of the app: {m}")),
-                Ok(Recon::Fenced(m)) => {
-                    let _ = meta;
-                    self.rx = Rx::Owned(format!("attempt {attempt} is still owned by this installation: {m} Nothing new is claimed. Check this computer and the storage; the server operator resolves it with `abandon`."));
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => self.rx = Rx::Owned(format!("attempt {attempt} could not be inspected after the restart; it stays owned.")),
-            }
-        }
-        if let Rx::Running(_) = &self.rx {
-            self.run_attempt(now, env, creds);
-            return;
-        }
-        // Claim only when opted in, registered, nothing is in progress, the verified local GPU is idle and the app is not closing.
-        let idle = local.as_ref().is_some_and(|(st, busy)| *st == crate::scheduler::TargetStatus::Ready && !busy) && !env.ai.scheduler().running() && !env.ai.targets_pending();
-        let ok = env.cfg.local_host && env.cfg.receive && env.cfg.may_claim && !self.closing && self.registered && matches!(self.rx, Rx::Idle) && self.held.is_empty() && uuid.is_some() && idle;
-        if ok && !self.claim_inflight && self.last_claim.is_none_or(|t| now.saturating_duration_since(t) >= CLAIM_EVERY) {
-            self.last_claim = Some(now);
-            let maps: Vec<String> = env.settings.shared_roots.iter().map(|r| r.name.clone()).collect();
-            let models = Self::claim_models(env.ai.scheduler().models().is_some_and(|m| m.key_files().is_ok()));
-            let resources = sample.and_then(|s| Self::free_vram(s, uuid.as_deref()).zip(s.ram_total.zip(s.ram_used))).map(|(v, (t, u))| {
-                json!({"sampled_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs()), "free_vram_mb": v, "free_ram_mb": t.saturating_sub(u) / (1 << 20)})
-            });
-            let claim = format!("clm_{}", crate::workflow::new_id());
-            let args = json!({"claim_id": claim, "capabilities": {"protocol": 1, "kinds": ["key", "workflow"], "maps": maps, "models": models}, "resources": resources});
-            nlog("claiming");
-            self.claim_inflight = self.req(Op::Claim, args, Pend::Claim);
-        }
-    }
-
-    /// Models offered to the coordinator's job filter: Key jobs require `corridorkey_v2` (null = any digest; the app
-    /// sends its own exact files to its worker), so it is listed only when this app's Key files are present.
-    fn claim_models(key_present: bool) -> serde_json::Map<String, Value> {
-        let mut m = serde_json::Map::new();
-        if key_present {
-            m.insert("corridorkey_v2".into(), Value::Null);
-        }
-        m
-    }
-
-    fn free_vram(s: &Sample, uuid: Option<&str>) -> Option<u64> {
-        let g = s.gpus.as_ref()?.iter().find(|g| Some(g.uuid.as_str()) == uuid)?;
-        Some(g.vram_total?.saturating_sub(g.vram_used?) / (1 << 20))
-    }
-
-    fn on_claim(&mut self, v: Value, env: &mut Env) {
-        let Some(offer) = v.get("offer").filter(|o| o.is_object()) else {
-            self.receive_note = None;
-            return;
-        };
-        let attempt = offer.get("attempt_id").and_then(Value::as_str).unwrap_or("").to_owned();
-        if offer.get("state").and_then(Value::as_str) != Some("offered") || attempt.is_empty() || !matches!(self.rx, Rx::Idle) || self.closing {
-            return; // a claim retry that shows `revoked` (or anything but offered): never run
-        }
-        let spec: Result<JobSpec, _> = serde_json::from_value(offer.get("spec").cloned().unwrap_or_default());
-        let spec = match spec {
-            Ok(s) => s,
-            Err(e) => {
-                self.req(Op::Reject, json!({"attempt_id": attempt, "code": "incompatible_protocol", "message": truncate(&format!("the job spec is not understood by this build: {e}"), 500)}), Pend::Reject);
-                return;
-            }
-        };
-        // The GPU slot is reserved BEFORE anything else is acknowledged, so a local Queue cannot race the start.
-        if !env.ai.reserve_network_slot(&self.slot(&attempt)) {
-            self.req(Op::Reject, json!({"attempt_id": attempt, "code": "busy", "message": "this computer's GPU has local work"}), Pend::Reject);
-            self.receive_note = Some(format!("offer {attempt} declined: local work holds the GPU"));
-            return;
-        }
-        self.held = self.slot(&attempt);
-        let roots: Vec<SharedRoot> = env.settings.shared_roots.clone();
-        let (tx, rx) = channel();
-        let (a2, wake) = (attempt.clone(), env.wake.clone());
-        nlog(&format!("offer {attempt}: preflight"));
-        let started = std::thread::Builder::new().name("net-preflight".into()).spawn(move || {
-            let _ = tx.send(spec.preflight(&roots, &a2));
-            wake();
-        });
-        if started.is_ok() {
-            self.receive_note = Some(format!("checking offer {attempt} against this computer's shared storage"));
-            self.rx = Rx::Preflight { attempt, rx };
-        }
-    }
-
-    /// Ownership is written BEFORE the start is requested, then the coordinator is asked to start the attempt.
-    fn send_start(&mut self, attempt: String, pf: Preflight, plan: Value, env: &mut Env) {
-        let stages: Vec<(String, &'static str)> = pf.stages.iter().map(|s| (s.job_id().to_owned(), s.label())).collect();
-        let saved = match env.cfg.creds.clone() {
-            Some(c) => write_private(&side_file(&c, ".attempt.json"), &attempt_file(&attempt, &pf.job.job_id, 0, &stages, &attempt_meta(&pf))),
-            None => Err("no credentials folder to keep ownership in".into()),
-        };
-        if let Err(e) = saved {
-            self.receive_note = Some(format!("offer {attempt} not started: ownership could not be saved ({e})"));
-            self.req(Op::Reject, json!({"attempt_id": attempt, "code": "other", "message": truncate(&format!("receiver cannot record ownership: {e}"), 500)}), Pend::Reject);
-            self.rx = Rx::Idle;
-        } else if self.req(Op::Start, json!({"attempt_id": attempt, "effective_plan": plan}), Pend::Start(attempt.clone())) {
-            self.rx = Rx::Starting { attempt, pf: Box::new(pf) };
-        } else {
-            Self::forget_file(env, true);
-            self.rx = Rx::Idle;
-        }
-    }
-
-    /// The engine's verdict on a pinned temporal window. Over budget: the offer is declined with the concrete figures
-    /// (this receiver is then excluded for this job and nothing was started). No answer: the worker still enforces it.
-    fn on_estimate(&mut self, attempt: String, r: Result<Value, LinkError>, env: &mut Env) {
-        let Rx::Estimating { attempt: a, pf, plan, free_mb } = std::mem::replace(&mut self.rx, Rx::Idle) else { return };
-        if a != attempt {
-            return;
-        }
-        match r {
-            Ok(v) if v.get("over_budget").and_then(Value::as_bool) == Some(true) => {
-                let g = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-                let w = pf.job.params.get("temporal_window").and_then(Value::as_str).unwrap_or("?");
-                let msg = format!("pinned temporal window {w} ({} VRAM) needs ~{:.1} GiB (peak {:.1} GiB) but this GPU has ~{:.1} GiB free; a fixed window is never downgraded", if v.get("low_vram").and_then(Value::as_bool) == Some(true) { "low" } else { "normal" }, g("required_gib"), g("peak_gib"), g("budget_gib"));
-                nlog(&format!("offer {attempt}: declined: {msg}"));
-                self.receive_note = Some(format!("offer {attempt} declined: {msg}"));
-                self.req(Op::Reject, json!({"attempt_id": attempt, "code": "insufficient_resources", "message": truncate(&msg, 900)}), Pend::Reject);
-            }
-            Ok(v) => {
-                let mut plan = plan;
-                plan["estimate"] = json!({"required_gib": v.get("required_gib"), "budget_gib": v.get("budget_gib"), "free_vram_mb": free_mb});
-                self.send_start(attempt, *pf, plan, env);
-            }
-            Err(e) => {
-                nlog(&format!("offer {attempt}: estimate unavailable ({}); the worker enforces the window at launch", err_text(&e)));
-                self.send_start(attempt, *pf, plan, env);
-            }
-        }
-    }
-
-    fn on_start(&mut self, attempt: String, r: Result<Value, LinkError>, env: &mut Env) {
-        let Rx::Starting { attempt: a, pf } = std::mem::replace(&mut self.rx, Rx::Idle) else { return };
-        if a != attempt {
-            return;
-        }
-        let v = match r {
-            Ok(v) if v.get("state").and_then(Value::as_str) == Some("started") => v,
-            Ok(v) => {
-                self.receive_note = Some(format!("offer {attempt} was not started by the coordinator ({}); not run", v.get("state").and_then(Value::as_str).unwrap_or("?")));
-                Self::forget_file(env, true);
-                return;
-            }
-            Err(e) => {
-                self.receive_note = Some(format!("offer {attempt} could not be started ({})", err_text(&e)));
-                // A coordinator answer that says the attempt cannot be started settles it; a transport failure may not.
-                Self::forget_file(env, e.code.starts_with("attempt_") || e.code == "unknown_attempt");
-                return;
-            }
-        };
-        let stages: Vec<(String, &'static str)> = pf.stages.iter().map(|s| (s.job_id().to_owned(), s.label())).collect();
-        let job_id = pf.job.job_id.clone();
-        // Ownership is durable BEFORE anything runs. If it cannot be written the attempt stays fenced (the coordinator
-        // already considers it started): nothing is launched and the operator resolves it.
-        let meta = attempt_meta(&pf);
-        let persisted = match env.cfg.creds.clone() {
-            Some(c) => write_private(&side_file(&c, ".attempt.json"), &attempt_file(&attempt, &job_id, 0, &stages, &meta)),
-            None => Err("no credentials folder to keep ownership in".into()),
-        };
-        if let Err(e) = persisted {
-            nlog(&format!("attempt {attempt}: ownership not persisted: {e}"));
-            self.rx = Rx::Owned(format!("attempt {attempt} was started by the coordinator but this computer could not record it ({e}). Nothing was launched and the attempt stays held. Fix the storage, then ask the server operator to resolve it with `abandon`."));
-            self.receive_note = Some(format!("not launched: ownership could not be saved ({e})"));
-            return;
-        }
-        let mut rv = Recv { last_phase: String::new(), attempt: attempt.clone(), job_id: job_id.clone(), meta: meta.clone(), stages: stages.clone(), announced: 0, outbox: vec![], seq: 0, last_done: 0, last_total: 0, last_report: Instant::now(), last_progress: Instant::now(), inflight: false, retry_at: None, cancel_sent: false, terminal: false, report_saved: false };
-        nlog(&format!("attempt {attempt} started; running {} stage(s) for {job_id} on the local client", stages.len()));
-        match env.ai.submit_network_plan(&self.slot(&attempt), pf.stages) {
-            Ok(()) => {
-                self.receive_note = Some(format!("running network job {job_id}"));
-                if v.get("cancel_requested").and_then(Value::as_bool) == Some(true) {
-                    Self::cancel_all(&mut rv, env);
-                }
-            }
-            Err(e) => Self::push_terminal(&mut rv, "failed", &format!("this computer could not start it: {e}")),
-        }
-        self.rx = Rx::Running(rv);
-    }
-
-    fn cancel_all(r: &mut Recv, env: &mut Env) {
-        r.cancel_sent = true;
-        for (id, _) in &r.stages {
-            env.ai.cancel(id);
-        }
-    }
-
-    /// Ask the coordinator where the attempt's event stream stands, then report the reconciled end.
-    fn resync(&mut self, attempt: String, state: &'static str, message: String) {
-        if self.req(Op::Events, json!({"attempt_id": attempt, "events": []}), Pend::Resync) {
-            self.rx = Rx::Resync { attempt, state, message };
-        } else {
-            self.rx = Rx::Owned(format!("attempt {attempt}: the coordinator could not be asked to close it; it stays owned."));
-        }
-    }
-
-    fn on_resync(&mut self, r: Result<Value, LinkError>, env: &mut Env) {
-        let Rx::Resync { attempt, state, message } = std::mem::replace(&mut self.rx, Rx::Idle) else { return };
-        match r {
-            Ok(v) => {
-                let mut rv = Recv { last_phase: String::new(), attempt: attempt.clone(), job_id: attempt.clone(), meta: Value::Null, stages: vec![], announced: 0, outbox: vec![], seq: v.get("last_seq").and_then(Value::as_u64).unwrap_or(0), last_done: 0, last_total: 0, last_report: Instant::now(), last_progress: Instant::now(), inflight: false, retry_at: None, cancel_sent: false, terminal: false, report_saved: false };
-                Self::push_terminal(&mut rv, state, &message);
-                self.receive_note = Some(format!("attempt {attempt} reconciled after a restart: {state}"));
-                self.rx = Rx::Running(rv);
-            }
-            Err(e) if e.code == "attempt_terminal" || e.code == "unknown_attempt" || e.code == "attempt_not_started" => {
-                if let Some(c) = env.cfg.creds.clone() {
-                    let _ = std::fs::remove_file(side_file(&c, ".attempt.json"));
-                }
-                self.receive_note = Some(format!("attempt {attempt} was already resolved by the coordinator operator ({}); local ownership cleared", e.code));
-            }
-            Err(e) => self.rx = Rx::Owned(format!("attempt {attempt}: the coordinator could not be reached to close it ({}); it stays owned.", err_text(&e))),
-        }
-    }
-
-    fn push_event(r: &mut Recv, t: &str, data: Value) {
-        r.seq += 1;
-        r.outbox.push(json!({"seq": r.seq, "type": t, "data": data}));
-    }
-    fn push_terminal(r: &mut Recv, state: &str, msg: &str) {
-        if r.terminal {
-            return;
-        }
-        r.terminal = true;
-        if let Some(meta) = r.meta.as_object_mut() {
-            meta.insert("terminal".into(), json!({"state": state, "message": truncate(msg, 900)}));
-        }
-        Self::push_event(r, "terminal", json!({"state": state, "message": truncate(msg, 900)}));
-    }
-
-    fn lost_verdict(label: &str, reason: &str, writer_stopped: bool) -> Option<(&'static str, String)> {
-        writer_stopped.then(|| ("failed", format!("{label} stage was lost: {reason}")))
-    }
-
-    fn run_attempt(&mut self, now: Instant, env: &mut Env, creds: Option<&Path>) {
-        let Rx::Running(r) = &mut self.rx else { return };
-        if !r.terminal {
-            // The first stage that is not Complete decides (a failed one fails everything after it).
-            let mut verdict = None;
-            let mut active = r.stages.len();
-            let mut progress = None;
-            for (i, (id, label)) in r.stages.iter().enumerate() {
-                match env.ai.job_state(id) {
-                    Some(JobState::Done { info, .. }) => match info.outcome {
-                        Outcome::Complete => continue,
-                        Outcome::Cancelled => verdict = Some(("cancelled", format!("{label} stage cancelled"))),
-                        Outcome::Failed => verdict = Some(("failed", format!("{label} stage failed: {}", info.message.as_deref().unwrap_or("the render failed")))),
-                    },
-                    Some(JobState::Rejected { message, .. }) => verdict = Some(("failed", format!("{label} stage refused by the local client: {message}"))),
-                    Some(JobState::Failed { reason }) => verdict = Some(("failed", format!("{label} stage: {reason}"))),
-                    Some(JobState::Cancelled) => verdict = Some(("cancelled", format!("{label} stage cancelled"))),
-                    Some(JobState::Lost { reason, writer_stopped, .. }) => {
-                        // A lost stage is terminal only after the scheduler proves its writer has stopped.
-                        self.receive_note = Some(format!("the {label} stage was lost ({reason}); writer {}. Inspect this computer and the storage; the coordinator keeps ownership.", if writer_stopped { "stopped" } else { "NOT proven stopped" }));
-                        if let Some((state, msg)) = Self::lost_verdict(label, &reason, writer_stopped) {
-                            verdict = Some((state, msg));
-                        } else {
-                            active = i;
-                        }
-                        break;
-                    }
-                    Some(JobState::Running { done, total, phase, .. }) => {
-                        active = i;
-                        progress = Some((done, total.max(done), phase));
-                        break;
-                    }
-                    _ => {
-                        active = i;
-                        break;
-                    }
-                }
-                break;
-            }
-            if let Some((state, msg)) = verdict {
-                Self::push_terminal(r, state, &msg);
-            } else if active == r.stages.len() {
-                Self::push_terminal(r, "succeeded", "complete");
-            } else if active + 1 > r.announced {
-                r.announced = active + 1;
-                let msg = format!("stage {} of {}: {}", active + 1, r.stages.len(), r.stages[active].1);
-                Self::push_event(r, "note", json!({"message": msg}));
-                r.last_done = u64::MAX;
-                r.last_total = 0;
-                Self::push_event(r, "progress", json!({"done": 0, "total": 0}));
-            }
-            if let Some((done, total, phase)) = progress {
-                if (done != r.last_done || total != r.last_total) && (r.last_done == u64::MAX || now.saturating_duration_since(r.last_progress) >= PROGRESS_EVERY) {
-                    r.last_done = done;
-                    r.last_total = total;
-                    r.last_progress = now;
-                    if phase != r.last_phase && !phase.is_empty() {
-                        Self::push_event(r, "note", json!({"message": format!("pass: {phase}")}));
-                        r.last_phase = phase;
-                    }
-                    Self::push_event(r, "progress", json!({"done": done, "total": total}));
-                }
-            }
-        }
-        let Rx::Running(r) = &mut self.rx else { return };
-        if (!r.outbox.is_empty() || (!r.terminal && now.saturating_duration_since(r.last_report) >= CLAIM_EVERY)) && !r.inflight && r.retry_at.is_none_or(|t| now >= t) {
-            let evs: Vec<Value> = r.outbox.iter().take(256).cloned().collect();
-            let (attempt, last, job_id) = (r.attempt.clone(), r.seq, r.job_id.clone());
-            let (stages, meta) = (r.stages.clone(), r.meta.clone());
-            r.inflight = true;
-            r.last_report = now;
-            let sent = self.phase == Phase::Online && self.link.as_mut().is_some_and(|l| match l.request(Op::Events, json!({"attempt_id": attempt, "events": evs})) {
-                Ok(id) => {
-                    self.pend.insert(id, Pend::Events);
-                    true
-                }
-                Err(_) => false,
-            });
-            if let Rx::Running(r) = &mut self.rx {
-                if !sent {
-                    r.inflight = false;
-                    r.retry_at = Some(now + Duration::from_secs(5));
-                }
-            }
-            if let Some(c) = creds {
-                match write_private(&side_file(c, ".attempt.json"), &attempt_file(&attempt, &job_id, last, &stages, &meta)) {
-                    Ok(()) => {
-                        if let Rx::Running(r) = &mut self.rx {
-                            r.report_saved = r.terminal && meta.get("terminal").is_some();
-                        }
-                    }
-                    Err(e) => self.receive_note = Some(format!("could not update the saved attempt state ({e}); the attempt stays held")),
-                }
-            }
-        }
-    }
-
-    fn on_events(&mut self, r: Result<Value, LinkError>, env: &mut Env) {
-        let Rx::Running(rv) = &mut self.rx else { return };
-        rv.inflight = false;
-        match r {
-            Ok(v) => {
-                let last = v.get("last_seq").and_then(Value::as_u64).unwrap_or(0);
-                rv.outbox.retain(|e| e["seq"].as_u64().unwrap_or(0) > last);
-                if v.get("cancel_requested").and_then(Value::as_bool) == Some(true) && !rv.cancel_sent {
-                    Self::cancel_all(rv, env);
-                }
-                if rv.terminal && rv.outbox.is_empty() {
-                    let job_id = rv.job_id.clone();
-                    if let Some(c) = env.cfg.creds.clone() {
-                        let _ = std::fs::remove_file(side_file(&c, ".attempt.json"));
-                    }
-                    self.receive_note = Some(format!("network job {job_id} finished and reported"));
-                    if let Some(f) = Self::folder_of(env.ai, &job_id) {
-                        self.finished.push(f);
-                    }
-                    self.rx = Rx::Idle; // the next tick releases the GPU slot
-                }
-            }
-            Err(e) => {
-                rv.retry_at = Some(Instant::now() + Duration::from_secs(5));
-                self.receive_note = Some(format!("could not report progress ({}); retrying", err_text(&e)));
-            }
-        }
-    }
-
-    fn folder_of(ai: &AiUi, job_id: &str) -> Option<String> {
-        ai.scheduler().snapshot().iter().find(|e| e.job.job_id == job_id).and_then(|e| e.job.clip_root.file_name().map(|n| n.to_string_lossy().into_owned()))
-    }
-
-    // ---- durable state ---------------------------------------------------------------------------------------------
-
-    fn load_state(&mut self, env: &Env) {
-        let Some(c) = env.cfg.creds.clone() else { return };
-        let idle = matches!(self.rx, Rx::Idle);
-        if let Some(v) = std::fs::read(side_file(&c, ".attempt.json")).ok().filter(|_| idle).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
-            let attempt = v.get("attempt_id").and_then(Value::as_str).unwrap_or("?").to_owned();
-            self.held = self.slot(&attempt);
-            let meta = v.get("meta").cloned().unwrap_or(Value::Null);
-            let owned = |why: &str| Rx::Owned(format!("attempt {attempt} (job {}) was started by an earlier run of this app and is still owned by this installation: {why} Nothing new is claimed. Check this computer and the storage; the server operator resolves it with `abandon`.", v.get("job_id").and_then(Value::as_str).unwrap_or("?")));
-            self.rx = if meta.get("manifest_dir").is_some() {
-                let (tx, rx) = channel();
-                let (m2, wake) = (meta.clone(), self.wake_hint.clone());
-                let spawned = std::thread::Builder::new().name("net-reconcile".into()).spawn(move || {
-                    let _ = tx.send(reconcile(&m2));
-                    if let Some(w) = wake {
-                        w();
-                    }
-                });
-                if spawned.is_ok() { Rx::Reconcile { attempt: attempt.clone(), meta, rx } } else { owned("its storage could not be inspected.") }
-            } else {
-                owned("it predates restart reconciliation.")
-            };
         }
     }
 
@@ -1827,13 +1175,11 @@ impl Remote {
 
     // ---- UI --------------------------------------------------------------------------------------------------------
 
-    pub fn status_line(&self, cfg: &Conn) -> (String, bool) {
+    pub fn status_line(&self, _cfg: &Conn) -> (String, bool) {
         match &self.phase {
-            Phase::Online if !cfg.local_host => ("Connected".into(), true),
-            Phase::Online if self.registered => (format!("Connected{}", if cfg.receive { ", taking network work when the GPU is idle" } else { "" }), true),
-            Phase::Online => (format!("Connected; {}", self.register_note.clone().unwrap_or_else(|| "registering this computer…".into())), true),
-            Phase::Off if cfg.enabled => ("Not connected".into(), false),
-            Phase::Off => ("Network client is off".into(), false),
+            Phase::Online if self.contacted => ("Connected".into(), true),
+            Phase::Online => ("Connecting…".into(), false),
+            Phase::Off => ("Not connected".into(), false),
             Phase::Starting | Phase::Connecting => ("Connecting…".into(), false),
             Phase::Failed(w) => (format!("Not connected: {w}"), false),
         }
@@ -1860,7 +1206,9 @@ impl Remote {
     pub(crate) fn is_free(&self, iid: &str) -> bool {
         !self.leaving && self.online() && !self.has_unfinished(iid)
             && self.installs.iter().find(|i| i.id == iid).is_some_and(|i| {
-                i.connected && matches!(Sample::from_api(&i.stats), Ok(Some((s, Some(age))))
+                // The PC's own app says so: Receive jobs on, nothing running or queued there (received or local), nothing held.
+                i.receiving == Some(true) && i.busy == Some(false) && i.held == Some(false)
+                && i.connected && matches!(Sample::from_api(&i.stats), Ok(Some((s, Some(age))))
                     if age + i.received.elapsed().as_secs_f64() <= crate::metrics::REMOTE_STALE_S && lightly_loaded(&s))
             })
     }
@@ -1883,7 +1231,7 @@ impl Remote {
             if !groups.contains(&j.installation) { groups.push(j.installation.clone()); }
         }
         // Only the PC this connection's Clients row stands for; finished jobs of other PCs on its network stay hidden.
-        let listed = |id: &str| if self.local_host { Some(id) == self.me.as_deref() } else { self.target_host.is_empty() || id == self.target_host };
+        let listed = |id: &str| self.target_host.is_empty() || id == self.target_host;
         for group in groups {
             if !self.jobs.iter().any(|j| j.installation == group && !j.terminal()) && !group.as_deref().is_some_and(listed) {
                 continue;
@@ -1981,7 +1329,7 @@ impl Remote {
             acts.push(Action::Enable { creds: creds.clone(), on: en });
         }
         let mut rc = cfg.receive;
-        let accept = ui.add_enabled_ui(!self.leaving, |ui| crate::ui::theme::checkbox(ui, &mut rc, "")).inner.on_hover_text(if cfg.local_host { "This PC takes jobs that other PCs send to it" } else { "Automatic may send shots to this PC" });
+        let accept = ui.add_enabled_ui(!self.leaving, |ui| crate::ui::theme::checkbox(ui, &mut rc, "")).inner.on_hover_text("Automatic may send shots to this PC");
         if accept.changed() {
             acts.push(Action::Receive { creds: creds.clone(), on: rc });
         }
@@ -1989,30 +1337,22 @@ impl Remote {
         if ui.add_enabled_ui(!self.leaving, |ui| crate::ui::theme::checkbox(ui, &mut def, "")).inner.changed() && def {
             acts.push(Action::DefaultSubmit(creds.clone()));
         }
-        if !cfg.local_host {
-            let remove = ui.add_enabled(blocker.is_none() && !self.leaving, egui::Button::new(if self.leaving { "Removing…" } else { "Remove" }));
-            let remove = match &blocker { Some(b) => remove.on_disabled_hover_text(format!("Cannot remove now: {b}")), None => remove };
-            if remove.clicked() {
-                acts.push(Action::Remove(creds));
-            }
+        let remove = ui.add_enabled(blocker.is_none() && !self.leaving, egui::Button::new(if self.leaving { "Removing…" } else { "Remove" }));
+        let remove = match &blocker { Some(b) => remove.on_disabled_hover_text(format!("Cannot remove now: {b}")), None => remove };
+        if remove.clicked() {
+            acts.push(Action::Remove(creds));
         }
         acts
     }
 
     /// The Status cell's text: the connection's status line (hover: its notes) and, when an attempt is owned here, its reason and Forget.
     pub fn status_cell(&self, ui: &mut Ui, cfg: &Conn) -> Vec<Action> {
-        let mut acts = vec![];
+        let acts = vec![];
         let (line, up) = self.status_line(cfg);
-        let hover: Vec<&str> = [self.status.as_deref(), self.name_note.as_deref()].into_iter().flatten().collect();
+        let hover: Vec<&str> = [self.status.as_deref()].into_iter().flatten().collect();
         let status = ui.colored_label(if up { egui::Color32::from_rgb(150, 190, 150) } else { egui::Color32::from_rgb(224, 176, 80) }, line);
         if !hover.is_empty() {
             status.on_hover_text(hover.join("\n"));
-        }
-        if let Rx::Owned(m) = &self.rx {
-            ui.colored_label(egui::Color32::from_rgb(225, 110, 110), m);
-            if ui.small_button("Forget attempt").on_hover_text("I checked this computer: forget this attempt locally").clicked() {
-                acts.push(Action::ForgetAttempt(self.key.clone()));
-            }
         }
         acts
     }
@@ -2059,10 +1399,6 @@ mod discovery_tests {
     fn own_queue_does_not_offer_submitters_as_render_targets() {
         let mut r = Remote::blank(Source::Off, String::new());
         r.me = Some("this-pc".into());
-        r.local_host = true;
-        assert!(!r.host_only("submitter"));
-        assert!(!r.host_only("this-pc"));
-        r.local_host = false;
         r.target_host = "selected-host".into();
         assert!(r.host_only("selected-host"));
         assert!(!r.host_only("submitter"));
@@ -2082,7 +1418,7 @@ mod discovery_tests {
     fn own_ids_hide_this_pc() {
         let mut r = Remote::blank(Source::Off, String::new());
         r.me = Some("X1".into());
-        let inst = |id: &str| Install { id: id.into(), name: id.into(), gpu: None, connected: true, last_seen_s: None, stats: Value::Null, received: Instant::now() };
+        let inst = |id: &str| Install { id: id.into(), name: id.into(), gpu: None, connected: true, last_seen_s: None, stats: Value::Null, receiving: None, busy: None, held: None, received: Instant::now() };
         r.installs = vec![inst("X1"), inst("X2"), inst("B")];
         let left: Vec<String> = r.other_installations(&["X2".to_owned()]).into_iter().map(|i| i.id).collect();
         assert_eq!(left, ["B"]);
@@ -2113,8 +1449,9 @@ mod discovery_tests {
     fn free_remote(age: f64, connected: bool) -> Remote {
         let mut r = Remote::blank(Source::Off, String::new());
         let stats = json!({"gpus": [gpu(Some(10.0), 10, 100)], "measured_age_s": age});
-        r.installs = vec![Install { id: "X".into(), name: "X".into(), gpu: None, connected, last_seen_s: None, stats, received: Instant::now() }];
+        r.installs = vec![Install { id: "X".into(), name: "X".into(), gpu: None, connected, last_seen_s: None, stats, receiving: Some(true), busy: Some(false), held: Some(false), received: Instant::now() }];
         r.phase = Phase::Online;
+        r.contacted = true;
         r
     }
     fn job_on(iid: &str, state: &str) -> NetJob {
@@ -2135,22 +1472,6 @@ mod discovery_tests {
         assert_eq!(r.sent_outcome("refused"), Some(Err(Some("model not available on that PC".into()))), "a definite refusal keeps its reason, like a failure");
         assert_eq!(r.sent_outcome("cancelled"), Some(Err(None)), "cancelled stays ended-without-failing");
         assert_eq!(r.sent_outcome("running"), Some(Ok(())), "still running: followed");
-    }
-
-    fn recv() -> Recv {
-        Recv { last_phase: String::new(), attempt: "attempt".into(), job_id: "job".into(), meta: json!({}), stages: vec![], announced: 0, outbox: vec![], seq: 0, last_done: 0, last_total: 0, last_report: Instant::now(), last_progress: Instant::now(), inflight: false, retry_at: None, cancel_sent: false, terminal: false, report_saved: false }
-    }
-
-    #[test]
-    fn lost_terminal_requires_stopped_writer_and_is_idempotent() {
-        let mut stopped = recv();
-        let (state, msg) = Remote::lost_verdict("Key", "worker exited", true).unwrap();
-        Remote::push_terminal(&mut stopped, state, &msg);
-        Remote::push_terminal(&mut stopped, state, &msg);
-        assert_eq!(stopped.outbox.len(), 1);
-        assert_eq!(stopped.outbox[0]["type"], "terminal");
-        assert_eq!(stopped.outbox[0]["data"]["state"], "failed");
-        assert!(Remote::lost_verdict("Key", "worker exited", false).is_none());
     }
 
     #[test]
@@ -2240,28 +1561,6 @@ mod discovery_tests {
     }
 
     #[test]
-    fn the_claim_lists_the_key_model_only_when_the_apps_key_files_are_present() {
-        // The same literal is fed to the coordinator's job filter in tests/coordinator/test_store.py.
-        assert_eq!(Value::Object(Remote::claim_models(true)), json!({"corridorkey_v2": null}));
-        assert_eq!(Value::Object(Remote::claim_models(false)), json!({}));
-    }
-
-    #[test]
-    fn an_empty_claim_answer_starts_nothing_and_blocks_nothing() {
-        let mut r = free_remote(1.0, true);
-        let settings = Settings::default();
-        let mut ai = AiUi::new(&settings, None);
-        let view = View::Unavailable(String::new());
-        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-        let mut env = Env { settings: &settings, settings_path: None, ai: &mut ai, metrics: &view, repo: None, python: None, wake: &wake, cfg: Conn::default() };
-        r.claim_inflight = true;
-        r.on_claim(json!({"offer": null}), &mut env);
-        assert!(matches!(r.rx, Rx::Idle) && r.held.is_empty(), "nothing was taken");
-        assert!(!env.ai.scheduler().running() && env.ai.scheduler().all_stopped(), "no job, no worker started by the poll");
-        assert!(env.ai.model_asset_mutation_safe(), "the poll never gates a model change");
-    }
-
-    #[test]
     fn leave_blocks_new_work_and_waits_for_submit_reconciliation() {
         let mut r = free_remote(1.0, true);
         let cfg = Conn { enabled: true, receive: true, ..Conn::default() };
@@ -2310,6 +1609,34 @@ mod discovery_tests {
         }
         // Header, meters, one job line and one stage bar: a few hundred pixels at most, never the whole panel.
         assert!(used < 300.0, "client block is {used} px tall in a 2000 px panel");
+    }
+
+    #[test]
+    fn a_connection_is_online_only_after_the_pc_answered() {
+        let mut r = free_remote(1.0, true);
+        r.contacted = false; // credentials loaded and the link is up, but the PC has not answered yet
+        assert!(!r.online() && !r.is_free("X") && !r.accepts_work(&Conn { enabled: true, receive: true, ..Conn::default() }));
+        assert_eq!(r.status_line(&Conn::default()).0, "Connecting…");
+        r.contacted = true; // a successful status or push contact
+        assert!(r.online() && r.is_free("X"));
+        assert_eq!(r.status_line(&Conn::default()), ("Connected".to_owned(), true));
+        r.stop(); // the link dropped: the connection is kept, the PC is simply offline until it answers again
+        assert!(!r.online());
+    }
+
+    #[test]
+    fn automatic_needs_the_pcs_own_receiving_not_busy_not_held_answer() {
+        assert!(free_remote(1.0, true).is_free("X"));
+        for (name, edit) in [
+            ("Receive jobs off", (|i: &mut Install| i.receiving = Some(false)) as fn(&mut Install)),
+            ("busy with local or received work", |i| i.busy = Some(true)),
+            ("a shot is held", |i| i.held = Some(true)),
+            ("an older app that does not say", |i| i.receiving = None),
+        ] {
+            let mut r = free_remote(1.0, true);
+            edit(&mut r.installs[0]);
+            assert!(!r.is_free("X"), "{name}");
+        }
     }
 
     #[test]
