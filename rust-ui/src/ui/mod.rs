@@ -12,6 +12,7 @@ pub mod platform;
 pub mod settings;
 pub mod theme;
 pub mod thumbs;
+pub mod tray;
 pub mod viewer;
 
 pub use app::{App, AppOptions, CloseState, Tab};
