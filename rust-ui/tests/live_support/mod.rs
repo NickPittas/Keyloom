@@ -245,19 +245,22 @@ impl Drv {
     /// The window starts the model Catalog -> Check on open (not reachable from tests); the Models page does the same on first draw.
     pub fn warm(&mut self) {
         self.frames(3);
-        if !self.has("Settings") {
+        if !self.has("Models") {
             return;
         }
-        self.click("Settings");
+        self.click("Models");
         self.frames(5);
-        self.click("Models & runtime…");
         self.pump(180, "catalog+check", |d| d.has("Models & runtime") && !d.has("Waiting for the local model catalog…") && !d.screen().iter().any(|s| s.contains("running…")));
         self.pump(60, "model snapshot", |d| !d.app.ai().models_unknown());
-        for _ in 0..3 {
-            if self.has("‹ Back") {
-                self.click("‹ Back");
-                self.frames(5);
-            }
+        // Back to the page the test came from: the Shot page tab when a clip is open, else Board (the page tabs sit below the menu bar's "Shot").
+        let label = if self.app.in_workspace() { "Shot" } else { "Board" };
+        self.page_tab(label);
+    }
+    /// Click the page tab `label` (the lowest drawn match: the menu bar above it also has "Shot").
+    pub fn page_tab(&mut self, label: &str) {
+        if let Some(r) = self.texts.iter().filter(|t| t.0 == label).max_by(|a, b| a.1.min.y.total_cmp(&b.1.min.y)).map(|t| t.1) {
+            self.log(format!("CLICK page tab '{label}'"));
+            self.click_at(r.center());
         }
     }
     pub fn has(&self, label: &str) -> bool {
@@ -434,10 +437,10 @@ pub fn cfg(d: &mut Drv, g: ck::hints::Producer, f: ck::hints::Final) {
 pub fn key_click(d: &mut Drv, n: usize) {
     d.app.viewer_mut_for_test(|v| v.range = Some((0, n - 1)));
     d.frames(8);
-    d.pump(60, "Key gate ready", |d| d.texts.iter().any(|t| t.0.starts_with("Runs on")));
-    let at = d.app.ai().key_rect.expect("the Key button is drawn").center();
-    d.log("CLICK the Key button");
-    d.click_at(at);
+    d.pump(60, "Key button ready", |d| (d.has("Key shot") || d.has("Key again…")) && !d.has_containing("Checking the output folder"));
+    let label = if d.has("Key shot") { "Key shot" } else { "Key again…" };
+    d.log(format!("Key screen: {:?}", d.screen()));
+    d.click(label);
 }
 
 /// Find `*.ext` files under `dir`.
@@ -472,16 +475,10 @@ pub fn board_key_selected(d: &mut Drv, folders: &[&str], preset: &str) {
     d.frames(6);
     d.app.select_folders(folders);
     d.frames(4);
-    let at = d.app.ai().board_preset_rect.expect("the Board preset selector is drawn").center();
-    d.click_at(at);
+    d.app.ai_mut().batch_dialog_set_preset(&d.ctx, Some(preset.into()));
     d.frames(4);
-    let items = d.app.ai().board_preset_items.clone();
-    let it = items.iter().find(|i| i.0 == preset).unwrap_or_else(|| panic!("preset '{preset}' not listed: {:?}", items.iter().map(|i| &i.0).collect::<Vec<_>>())).1;
-    d.click_at(it.center());
-    d.frames(4);
-    let key = d.app.ai().board_key_rect.expect("the Board 'Key selected' button is drawn").center();
-    d.log("CLICK Board 'Key selected'");
-    d.click_at(key);
+    d.log("Board: Key selected");
+    d.app.key_selected(&d.ctx);
     d.pump(30, "review or queue", |d| d.app.ai().batch_ready() || !d.app.ai().scheduler().snapshot().is_empty());
     d.frames(12);
 }

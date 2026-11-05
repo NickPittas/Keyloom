@@ -1,0 +1,50 @@
+{
+  "project": "Night_exterior_greenscreen",
+  "shot": "V1-0062_A003C001_261012_R4LF",
+  "stage": "Review",
+  "view": "Comp",
+  "viewer_state": "comp",
+  "overlay": "Off",
+  "channel": "RGB",
+  "background": "Checkerboard",
+  "zoom": "Fit",
+  "focus": false,
+  "drawer": true,
+  "dock_tab": "Actions",
+  "dock_expanded": false,
+  "empty": false,
+  "wipe": false,
+  "busy_percent": null,
+  "blocker": null,
+  "first": 0,
+  "last": 64,
+  "frame": 12,
+  "fps": 24.0,
+  "in_point": 0,
+  "out_point": 64,
+  "marks": [
+    14,
+    30
+  ],
+  "cached": [
+    [
+      0,
+      22
+    ]
+  ],
+  "pixel_xy": [
+    1204,
+    388
+  ],
+  "pixel_rgba": [
+    0.612,
+    0.574,
+    0.482,
+    0.74
+  ],
+  "shell": {
+    "project": "Night_exterior_greenscreen",
+    "saved": true,
+    "models_missing": 0
+  }
+}

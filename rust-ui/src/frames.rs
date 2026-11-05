@@ -606,6 +606,7 @@ mod tests {
             rgba: vec![0; bytes],
             has_alpha: false,
             clipped_hdr: false,
+            out_of_range: None,
             info: String::new(),
         })
     }
@@ -712,6 +713,7 @@ mod tests {
             rgba: vec![0; 4],
             has_alpha: false,
             clipped_hdr: false,
+            out_of_range: None,
             info: info.into(),
         }
     }
@@ -881,6 +883,7 @@ mod tests {
                 rgba: vec![0; 40_000],
                 has_alpha: false,
                 clipped_hdr: false,
+                out_of_range: None,
                 info: String::new(),
             })
         });

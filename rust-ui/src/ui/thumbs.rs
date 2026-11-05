@@ -52,6 +52,7 @@ fn shrink(f: &DisplayFrame) -> DisplayFrame {
         rgba,
         has_alpha: f.has_alpha,
         clipped_hdr: f.clipped_hdr,
+        out_of_range: f.out_of_range,
         info: f.info.clone(),
     }
 }

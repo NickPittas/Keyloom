@@ -7,9 +7,11 @@ use ck::hints::{Final, HintCfg, Producer};
 use ck::presets::{pipeline_preset, Delivery, Pipeline, PipelineExport, VideoDelivery};
 use ck::project::{load_project, LoadOptions};
 use ck::tasks::TaskKind;
+use ck::settings::Settings;
+use ck::ui::shot_page::{Act, HintAct, PropAct};
 use ck::ui::{App, AppOptions, Tab};
 use ck::workflow::{OutputCfg, Params};
-use eframe::egui::{self, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
+use eframe::egui::{self, Event, Modifiers, RawInput, Rect, Vec2};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -33,11 +35,11 @@ fn pump(ctx: &egui::Context, app: &mut App, what: &str, mut done: impl FnMut(&Ap
     }
     frames(ctx, app, 4);
 }
-fn click(ctx: &egui::Context, app: &mut App, at: egui::Pos2) {
-    let b = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    run(ctx, app, vec![Event::PointerMoved(at)]);
-    run(ctx, app, vec![b(true)]);
-    run(ctx, app, vec![b(false)]);
+/// Back to the Board page (Ctrl+Shift+1, the page shortcut): leaves the open shot.
+fn back(ctx: &egui::Context, app: &mut App) {
+    let k = egui::Key::Num1;
+    let ev = [true, false].map(|pressed| Event::Key { key: k, physical_key: Some(k), pressed, repeat: false, modifiers: Modifiers::COMMAND | Modifiers::SHIFT });
+    run(ctx, app, ev.into());
     frames(ctx, app, 3);
 }
 
@@ -85,32 +87,20 @@ fn native(e: &Env, clip: &str) -> Value {
 fn video(codec: &str, quality: u32) -> Delivery {
     Delivery::Video(VideoDelivery { container: "mp4".into(), codec: codec.into(), quality })
 }
-fn preset(hint: HintCfg, matte: Delivery) -> Pipeline {
-    let o = OutputCfg { fg_enabled: false, comp_enabled: false, processed_enabled: false, matte_format: "png".into(), ..OutputCfg::default() };
-    let mut export = PipelineExport::for_outputs(&o);
-    export.outputs.insert("matte".into(), matte);
-    Pipeline { hint, params: Params { hint_mode: "full".into(), ..Params::default() }, export, outputs: o, location: None }
-}
 fn route(guide: Producer, finish: Final) -> HintCfg {
     let mut h = HintCfg::default();
     (h.guide, h.finish) = (guide, finish);
     h
 }
-/// Leave the open shot (the real Back button) and review both shots with a saved preset chosen on the Board: the
-/// app's own in-memory project, no reload, no explicit Save.
-fn board_batch(ctx: &egui::Context, app: &mut App, preset: &str) {
+/// Leave the open shot (back to the Board page) and review both shots with a saved preset chosen for the batch (what
+/// the Board's preset selector + Key send). The shot's own overrides are already on disk (written without Save).
+fn board_batch(ctx: &egui::Context, app: &mut App, e: &Env, preset: &str) {
     if app.in_workspace() {
-        let back = app.back_rect().expect("Back to batch drawn").center();
-        click(ctx, app, back);
+        back(ctx, app);
     }
-    app.select_folders(&["a", "b"]);
-    frames(ctx, app, 3);
-    let at = app.ai().board_preset_rect.expect("Board preset selector").center();
-    click(ctx, app, at);
-    let item = app.ai().board_preset_items.iter().find(|i| i.0 == preset).unwrap_or_else(|| panic!("preset {preset} listed")).1.center();
-    click(ctx, app, item);
-    let key = app.ai().board_key_rect.expect("Key button drawn").center();
-    click(ctx, app, key);
+    let proj = load_project(&e.project, &LoadOptions::default()).unwrap();
+    app.ai_mut().batch_dialog_set_preset(ctx, Some(preset.into()));
+    app.ai_mut().begin_board_batch(ctx, &proj, &Settings::default(), &[0, 1]);
     pump(ctx, app, "review", |a| a.ai().batch_ready());
 }
 /// Open a shot from the Board (its card's open button is not exposed: the app API opens it by index).
@@ -124,8 +114,8 @@ fn save_presets(e: &Env, list: &[(&str, Pipeline)]) {
     ck::presets::save(&e.base.join("presets.json"), &v).unwrap();
 }
 fn confirm(ctx: &egui::Context, app: &mut App) {
-    let at = app.ai().batch_confirm_rect.expect("Queue drawn").center();
-    click(ctx, app, at);
+    app.ai_mut().confirm_batch();
+    frames(ctx, app, 3);
 }
 fn tasks_of(app: &App, clip: &str, kind: TaskKind) -> Vec<Value> {
     app.ai()
@@ -165,12 +155,12 @@ fn a_real_bypass_click_then_the_board_batch_keeps_the_bypass_and_the_rest_follow
     save_presets(&e, &[("p", preset_p(false, true))]);
     let (ctx, mut app) = open(&e, Some("a"), Tab::Hint);
     assert!(app.override_state_for_test().0.is_empty(), "opening the page marks nothing");
-    let at = app.preset_rects().iter().find(|r| r.0 == "bypass").expect("bypass drawn").1.center();
-    click(&ctx, &mut app, at); // the real control
+    app.act_for_test(&ctx, Act::Props(PropAct::Hint(HintAct::Bypass(true)))); // what the Bypass checkbox sends
+    frames(&ctx, &mut app, 3);
     assert_eq!(app.override_state_for_test().0, ["bypass"], "only the field that changed is marked");
     assert_eq!(native(&e, "a")["route_override"]["fields"]["bypass"]["base"], false);
     // Back to the Board and review with the preset: the app's own project, no reload, no Save.
-    board_batch(&ctx, &mut app, "p");
+    board_batch(&ctx, &mut app, &e, "p");
     let sum = app.ai().batch_summary();
     assert!(sum.iter().any(|l| l.starts_with("a:") && l.contains("hint route: bypass")), "{sum:?}");
     assert!(!sum.iter().any(|l| l.starts_with("b:") && l.contains("hint route")), "the untouched shot inherits");
@@ -193,7 +183,7 @@ fn only_the_edited_route_fields_are_the_shots_the_others_inherit_the_preset_and_
     app.hint_apply_cfg_for_test(own);
     frames(&ctx, &mut app, 3);
     assert_eq!(app.override_state_for_test().0, ["mask_cleanup.grow"]);
-    board_batch(&ctx, &mut app, "p");
+    board_batch(&ctx, &mut app, &e, "p");
     confirm(&ctx, &mut app);
     let (ta, tb) = (tasks_of(&app, "a", TaskKind::Birefnet), tasks_of(&app, "b", TaskKind::Birefnet));
     assert_eq!((ta.len(), tb.len()), (1, 1), "the producer is inherited by both (only the grow field is a's own)");
@@ -247,10 +237,8 @@ fn route_reset_by_a_deliberate_apply_and_from_batch_for_a_never_opened_shot() {
     c.mask_cleanup.grow += 4;
     app.hint_apply_cfg_for_test(c);
     frames(&ctx, &mut app, 3);
-    app.switch_tab(Tab::Key);
-    frames(&ctx, &mut app, 8);
-    let at = app.preset_rects().iter().find(|r| r.0 == "apply").expect("Apply drawn").1.center();
-    click(&ctx, &mut app, at);
+    app.deliver_preset_for_test(&ctx, "apply", "looks").unwrap(); // what the preset Apply button sends
+    frames(&ctx, &mut app, 3);
     assert!(app.override_state_for_test().0.is_empty(), "Apply replaced the shot's own fields");
     let n = native(&e, "a");
     assert!(n.get("route_override").is_none() && n["route_override_src"] == "looks", "{n}");
@@ -265,10 +253,9 @@ fn route_reset_by_a_deliberate_apply_and_from_batch_for_a_never_opened_shot() {
     v["ck_native"]["route_override"] = json!({"fields": {"mask_cleanup.grow": {"base": 0, "preset": null}}});
     fs::write(&cj, v.to_string()).unwrap();
     let (ctx, mut app) = open(&e, None, Tab::Hint);
-    board_batch(&ctx, &mut app, "looks");
+    board_batch(&ctx, &mut app, &e, "looks");
     assert!(app.ai().batch_summary().iter().any(|l| l.starts_with("b:") && l.contains("hint route: mask_cleanup.grow")));
-    let at = app.ai().batch_reset_rects.iter().find(|r| r.0 == "b").expect("Use preset values drawn").1.center();
-    click(&ctx, &mut app, at);
+    app.ai_mut().batch_dialog_reset_to_preset(&ctx, "b"); // "Use preset values" on shot b
     // A clean batch queues by itself; otherwise the review is open.
     pump(&ctx, &mut app, "rebuilt", |a| !a.ai().batch_open() || a.ai().batch_ready() && !a.ai().batch_summary().iter().any(|l| l.starts_with("b:") && l.contains("hint route")));
     if !app.ai().batch_open() {
@@ -290,22 +277,22 @@ fn one_outputs_delivery_is_the_shots_own_and_survives_other_shots_the_board_and_
     save_presets(&e, &[("p", preset_p(true, true))]);
     let (ctx, mut app) = open(&e, Some("a"), Tab::Deliver);
     assert!(app.override_state_for_test().1.is_empty(), "showing the page marks nothing");
-    let at = app.deliver_format_rects().iter().find(|r| r.0 == "matte_video").expect("Video file drawn").1.center();
-    click(&ctx, &mut app, at); // the real control: matte as a video (MP4 H.264 default)
+    app.deliver_set_video_for_test(&ctx, 1, true).unwrap(); // matte (output 1) as a video (MP4 H.264 default)
+    frames(&ctx, &mut app, 3);
     assert_eq!(app.override_state_for_test().1, ["matte"], "only that output is the shot's own");
     let n = native(&e, "a"); // written without Save
     assert_eq!(n["delivery_override"]["fields"]["matte"]["base"], json!(Delivery::Sequence));
     assert!(n["delivery"]["outputs"]["matte"].to_string().contains("h264"), "{n}");
     // Board -> shot b -> Board -> shot a again: nothing was lost.
-    app.back_rect().map(|r| r.center()).map(|at| click(&ctx, &mut app, at));
+    back(&ctx, &mut app);
     open_shot(&ctx, &mut app, 1, Tab::Deliver);
     assert!(app.override_state_for_test().1.is_empty(), "b has none");
-    app.back_rect().map(|r| r.center()).map(|at| click(&ctx, &mut app, at));
+    back(&ctx, &mut app);
     open_shot(&ctx, &mut app, 0, Tab::Deliver);
     assert_eq!(app.override_state_for_test().1, ["matte"]);
     assert!(matches!(app.export_state_for_test().0["matte"], Delivery::Video(_)), "the edit is still shown");
     // Batch: a keeps its matte H.264, inherits processed and fps from the preset; b inherits everything.
-    board_batch(&ctx, &mut app, "p");
+    board_batch(&ctx, &mut app, &e, "p");
     assert!(app.ai().batch_summary().iter().any(|l| l.starts_with("a:") && l.contains("delivery: matte") && !l.contains("delivery: fps")));
     confirm(&ctx, &mut app);
     pump(&ctx, &mut app, "exports queued", |a| a.ai().scheduler().task_snapshot().len() >= 4);
@@ -328,8 +315,8 @@ fn delivery_reset_is_saved_and_reloads_and_a_batch_reset_uses_the_selected_prese
     let e = env("dom-delivery-reset");
     save_presets(&e, &[("p", preset_p(false, true))]);
     let (ctx, mut app) = open(&e, Some("a"), Tab::Deliver);
-    let at = app.deliver_format_rects().iter().find(|r| r.0 == "matte_video").unwrap().1.center();
-    click(&ctx, &mut app, at);
+    app.deliver_set_video_for_test(&ctx, 1, true).unwrap();
+    frames(&ctx, &mut app, 3);
     app.reset_delivery_for_test();
     frames(&ctx, &mut app, 3);
     assert!(matches!(app.export_state_for_test().0["matte"], Delivery::Sequence));
@@ -341,11 +328,10 @@ fn delivery_reset_is_saved_and_reloads_and_a_batch_reset_uses_the_selected_prese
     drop(app);
     // Edit again; Batch "Use preset values" on the unopened shot writes the preset's delivery back.
     let (ctx, mut app) = open(&e, Some("a"), Tab::Deliver);
-    let at = app.deliver_format_rects().iter().find(|r| r.0 == "matte_video").unwrap().1.center();
-    click(&ctx, &mut app, at);
-    board_batch(&ctx, &mut app, "p");
-    let at = app.ai().batch_reset_rects.iter().find(|r| r.0 == "a").expect("Use preset values drawn").1.center();
-    click(&ctx, &mut app, at);
+    app.deliver_set_video_for_test(&ctx, 1, true).unwrap();
+    frames(&ctx, &mut app, 3);
+    board_batch(&ctx, &mut app, &e, "p");
+    app.ai_mut().batch_dialog_reset_to_preset(&ctx, "a"); // "Use preset values" on shot a
     // A clean batch queues by itself; otherwise the review is open.
     pump(&ctx, &mut app, "rebuilt", |a| !a.ai().batch_open() || a.ai().batch_ready() && !a.ai().batch_summary().iter().any(|l| l.starts_with("a:") && l.contains("delivery:")));
     if !app.ai().batch_open() {
@@ -363,9 +349,8 @@ fn a_kept_delivery_the_presets_outputs_cannot_write_is_a_clear_refusal_not_a_sil
     let e = env("dom-incompat");
     save_presets(&e, &[("processed_only", preset_p(true, false))]);
     let (ctx, mut app) = open(&e, Some("a"), Tab::Deliver);
-    let at = app.deliver_format_rects().iter().find(|r| r.0 == "matte_video").unwrap().1.center();
-    click(&ctx, &mut app, at); // a wants a matte video; the preset writes no matte
-    board_batch(&ctx, &mut app, "processed_only");
+    app.deliver_set_video_for_test(&ctx, 1, true).unwrap(); // a wants a matte video; the preset writes no matte
+    board_batch(&ctx, &mut app, &e, "processed_only");
     let sum = app.ai().batch_summary();
     assert!(sum.iter().any(|l| l.starts_with("a:") && l.contains("export blocked") && l.contains("does not write that output")), "{sum:?}");
     confirm(&ctx, &mut app);

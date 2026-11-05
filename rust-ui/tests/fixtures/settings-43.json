@@ -1,0 +1,13 @@
+{
+  "pane": "Appearance",
+  "theme": "Dark",
+  "ui_scale": 1.0,
+  "background": false,
+  "start_at_login": false,
+  "reduce_motion": false,
+  "shell": {
+    "project": "Night_exterior_greenscreen",
+    "saved": true,
+    "models_missing": 0
+  }
+}

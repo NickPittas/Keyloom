@@ -2,6 +2,7 @@
 //! network, no SSH). Temp projects/settings only. Run through tools/isolated-test.sh.
 use ck::project::{load_project, ClipState, LoadOptions, View};
 use ck::scheduler::JobState;
+use ck::ui::ai::KeyCmd;
 use ck::ui::{App, AppOptions, Tab};
 use ck::worker::Outcome;
 use ck::workflow::*;
@@ -132,7 +133,7 @@ fn gate_ready(ctx: &egui::Context, app: &mut App) {
     settle(ctx, app);
 }
 
-/// Hover one frame, then press and release: the way a real pointer reaches a widget inside a scroll area.
+/// Hover one frame, then press and release (close dialog buttons only).
 fn click_on(ctx: &egui::Context, app: &mut App, at: egui::Pos2) {
     let b = |pressed| Event::PointerButton {
         pos: at,
@@ -143,6 +144,24 @@ fn click_on(ctx: &egui::Context, app: &mut App, at: egui::Pos2) {
     run(ctx, app, vec![Event::PointerMoved(at)]);
     run(ctx, app, vec![b(true)]);
     run(ctx, app, vec![b(false)]);
+}
+
+/// One Key command on the open shot, through the same controller the Shot page's buttons call.
+fn key_cmd(ctx: &egui::Context, app: &mut App, c: KeyCmd) -> Result<(), String> {
+    let clip = app.clip_for_test();
+    let project = load_project(&app.project_root_for_test(), &LoadOptions::default()).unwrap();
+    let st = app.settings_page().saved().clone();
+    app.ai_mut().key_cmd(&clip, &project, &st, ctx, c)
+}
+
+/// The shot's primary Key button: submits the intent `key_view` offers (asserts the button is enabled).
+fn key_primary(ctx: &egui::Context, app: &mut App) -> Result<(), String> {
+    let clip = app.clip_for_test();
+    let project = load_project(&app.project_root_for_test(), &LoadOptions::default()).unwrap();
+    let st = app.settings_page().saved().clone();
+    let v = app.ai().key_view(&clip, &project, &st);
+    assert!(v.primary_enabled, "Key button enabled: {:?}", v.blocker);
+    key_cmd(ctx, app, KeyCmd::Submit(v.primary_intent.expect("primary submits an intent")))
 }
 
 fn pump(ctx: &egui::Context, app: &mut App, what: &str, mut done: impl FnMut(&App) -> bool) {
@@ -161,8 +180,8 @@ fn confirm_batch(ctx: &egui::Context, app: &mut App) {
     app.key_selected(ctx);
     pump(ctx, app, "batch review", |a| a.ai().batch_ready());
     settle(ctx, app);
-    let r = app.ai().batch_confirm_rect.expect("Queue button drawn");
-    click_on(ctx, app, r.center());
+    app.ai_mut().confirm_batch();
+    run(ctx, app, vec![]);
     app.ai_mut().placement = session;
 }
 
@@ -213,8 +232,7 @@ fn key_button_runs_the_fake_worker_and_the_viewer_keeps_its_state() {
         v.b_view = View::Input;
     });
     gate_ready(&ctx, &mut app);
-    let rect = app.ai().key_rect.expect("Key clip button drawn");
-    click_on(&ctx, &mut app, rect.center());
+    key_primary(&ctx, &mut app).expect("queued");
     pump(&ctx, &mut app, "job done", all_terminal);
     // Let the final refresh land.
     for _ in 0..3 {
@@ -283,8 +301,7 @@ fn live_publication_appears_before_the_job_finishes() {
     });
     app.switch_tab(Tab::Key);
     gate_ready(&ctx, &mut app);
-    let r = app.ai().key_rect.unwrap();
-    click_on(&ctx, &mut app, r.center());
+    key_primary(&ctx, &mut app).expect("queued");
     let mut partial = false;
     pump(&ctx, &mut app, "done", |a| {
         let n = a.viewer().unwrap().index.view_frames(View::Matte);
@@ -325,61 +342,7 @@ fn an_idle_worker_never_gates_a_model_change() {
     fs::remove_dir_all(e.base).unwrap();
 }
 
-/// A clip's client is stored in the clip itself (not in the session), so Board, Key and the batch agree and
-/// the queued job goes to that machine.
-/// The node graph writes the same `HintCfg` the Hint page holds: a rewire is visible on the page at once and
-/// is on disk for the next session.
-/// The approved design's SAM tools: a vertical icon strip with the six prompts, preview/track and the edit
-/// actions; Chroma gets only its colour picker; the holdout tools never appear in either.
-#[test]
-fn the_hint_tool_strip_is_vertical_and_shows_only_the_route_s_tools() {
-    use ck::ui::annotate::Tool;
-    let e = env(
-        "strip",
-        &[
-            ("sam", 3, json!({"ck_native": {"hint": {"guide": "sam", "final": "matanyone2"}}})),
-            ("chroma", 3, json!({"ck_native": {"hint": {"guide": "chroma", "final": "direct"}}})),
-        ],
-        json!({"version": 2}),
-    );
-    let ctx = egui::Context::default();
-    let mut app = app_for(&e, &ctx, Some("sam"));
-    app.switch_tab(Tab::Hint);
-    settle(&ctx, &mut app);
-    let tools: Vec<Tool> = app.tool_strip_rects().iter().map(|(t, _)| *t).collect();
-    assert_eq!(
-        tools,
-        vec![
-            Tool::FgPoint,
-            Tool::BgPoint,
-            Tool::PaintFg,
-            Tool::PaintBg,
-            Tool::Erase,
-            Tool::Box
-        ],
-        "SAM prompts only: no holdout tools in the strip"
-    );
-    let rects: Vec<Rect> = app.tool_strip_rects().iter().map(|(_, r)| *r).collect();
-    assert!(
-        rects.windows(2).all(|w| (w[0].center().x - w[1].center().x).abs() < 0.5
-            && w[1].center().y > w[0].center().y),
-        "the tools are one column, top to bottom: {rects:?}"
-    );
-    assert!(rects.iter().all(|r| r.width() < 40.0), "icon buttons, not a row of labels");
-
-    // Chroma: exactly the screen-colour picker (clips are listed in name order).
-    let chroma = load_project(&e.project, &LoadOptions::default())
-        .unwrap()
-        .clips
-        .iter()
-        .position(|c| c.folder == "chroma")
-        .expect("chroma clip");
-    app.open_clip(&ctx, chroma);
-    app.switch_tab(Tab::Hint);
-    settle(&ctx, &mut app);
-    let tools: Vec<Tool> = app.tool_strip_rects().iter().map(|(t, _)| *t).collect();
-    assert_eq!(tools, vec![Tool::Pick], "Chroma's strip is the colour picker only");
-}
+// DELETED the_hint_tool_strip_is_vertical_and_shows_only_the_route_s_tools: old Hint tool-strip orientation/rects.
 
 #[test]
 fn a_graph_rewire_and_the_hint_page_are_one_config() {
@@ -507,8 +470,8 @@ fn batch_review_shows_paths_then_places_clips_and_offers_a_new_version_for_exist
     assert!(sum.contains("z: blocked: Needs hint"), "{sum}");
     assert!(states(&app).is_empty(), "review queues nothing");
     settle(&ctx, &mut app);
-    let r = app.ai().batch_confirm_rect.unwrap();
-    click_on(&ctx, &mut app, r.center());
+    app.ai_mut().confirm_batch();
+    run(&ctx, &mut app, vec![]);
     pump(&ctx, &mut app, "batch", all_terminal);
     let st = states(&app);
     assert_eq!(st.len(), 2);
@@ -541,8 +504,8 @@ fn batch_review_shows_paths_then_places_clips_and_offers_a_new_version_for_exist
     assert!(sum.contains("existing") && sum.contains("a_v002"), "{sum}");
     let before = fs::read(e.project.join("clips/a/Output/a_v001/Matte/a_1101.png")).unwrap();
     settle(&ctx, &mut app);
-    let r = app.ai().batch_confirm_rect.unwrap();
-    click_on(&ctx, &mut app, r.center());
+    app.ai_mut().confirm_batch();
+    run(&ctx, &mut app, vec![]);
     pump(&ctx, &mut app, "batch 2", |a| {
         states(a).len() == 4 && all_terminal(a)
     });
@@ -926,8 +889,7 @@ fn editing_settings_never_blocks_the_ui_and_stale_gate_results_are_discarded() {
     app.viewer_mut_for_test(|v| v.range = Some((3, 12))); // a newer edit while the first may still run
     gate_ready(&ctx, &mut app);
     // The shown job is for the LATEST range snapshot, never the discarded one.
-    let rect = app.ai().key_rect.unwrap();
-    click_on(&ctx, &mut app, rect.center());
+    key_primary(&ctx, &mut app).expect("queued");
     let id = app.ai().job_ids()[0].clone();
     let job = app.ai().scheduler().job(&id).unwrap().job.clone();
     assert_eq!((job.range.in_point, job.range.out_point), (3, 12));
@@ -1046,9 +1008,14 @@ fn missing_worker_setup_is_reported_with_the_fix_and_keying_is_refused() {
         t.contains("not a Keyloom checkout") && t.contains("Settings"),
         "{t}"
     );
-    let r = app.ai().key_rect.unwrap();
-    click_on(&ctx, &mut app, r.center());
-    assert!(states(&app).is_empty(), "disabled: nothing queued");
+    let clip = app.clip_for_test();
+    let project = load(&e);
+    let st = app.settings_page().saved().clone();
+    let v = app.ai().key_view(&clip, &project, &st);
+    assert!(!v.primary_enabled, "Key button disabled while the worker is not set up");
+    assert!(v.blocker.as_ref().is_some_and(|b| b.message.contains("not a Keyloom checkout")), "{:?}", v.blocker);
+    assert!(key_cmd(&ctx, &mut app, KeyCmd::Submit(ck::workflow::Intent::New)).is_err(), "keying is refused");
+    assert!(states(&app).is_empty(), "nothing queued");
     fs::remove_dir_all(e.base).unwrap();
 }
 
@@ -1164,10 +1131,11 @@ fn a_lock_owned_by_an_active_job_of_this_session_cannot_be_released_from_the_gat
     app.open_clip(&ctx, 0);
     app.switch_tab(Tab::Key);
     gate_ready(&ctx, &mut app);
-    let text: Vec<_> = texts_at(&ctx, &mut app).into_iter().map(|t| t.0).collect();
-    assert!(text.iter().any(|t| t == "Key is running for this clip"), "{text:?}");
-    assert!(!text.iter().any(|t| t == "Processing this clip…"), "progress belongs to the activity strip: {text:?}");
-    assert!(!text.iter().any(|t| t.contains("This folder is locked") || t.contains("Fix the items above")), "{text:?}");
+    let (clip, project, st) = (app.clip_for_test(), load(&e), app.settings_page().saved().clone());
+    let v = app.ai().key_view(&clip, &project, &st);
+    let msg = v.blocker.as_ref().map(|b| b.message.clone()).unwrap_or_default();
+    assert!(msg.starts_with("Key is running for this clip"), "{msg}");
+    assert!(!v.primary_enabled, "Key cannot start again while the job runs");
     // Even if a stale gate frame offered the button, the handler refuses a session-owned id.
     let r = app.ai_mut().release_lock(&dir, &id);
     assert!(r.is_err() && lock.exists(), "{r:?}");
@@ -1697,47 +1665,10 @@ fn a_clip_without_its_own_client_is_labelled_as_following_the_named_session_defa
     assert_eq!(app.ai().clip_placement(&clip), Placement::Target("r1".into()));
 }
 
-/// Text drawn this frame, with where it was drawn (later = on top, so an open popup comes last).
-fn texts_at(ctx: &egui::Context, app: &mut App) -> Vec<(String, egui::Rect)> {
-    fn walk(s: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
-        match s {
-            egui::Shape::Text(t) => {
-                out.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2())))
-            }
-            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
-            _ => {}
-        }
-    }
-    let raw = RawInput {
-        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 900.0))),
-        ..Default::default()
-    };
-    let mut out = ctx.run_ui(raw, |ui| app.frame(ui));
-    let mut v = vec![];
-    for c in &out.shapes {
-        let mut drawn = vec![];
-        walk(&c.shape, &mut drawn);
-        v.extend(drawn.into_iter().filter(|(_, r)| c.clip_rect.contains(r.center())));
-    }
-    out.textures_delta.clear();
-    v
-}
-
-fn click_text(ctx: &egui::Context, app: &mut App, text: &str) {
-    let r = texts_at(ctx, app)
-        .into_iter()
-        .rev()
-        .find(|(t, _)| t == text)
-        .unwrap_or_else(|| panic!("no {text:?} on screen"))
-        .1;
-    click_on(ctx, app, r.center());
-    settle(ctx, app);
-}
-
 /// The Hint panel saves the pick to disk; the open clip the Generate button reads must see it too, or
 /// generating "promotes" the draft back over the user's own `none`.
 #[test]
-fn picking_none_in_the_hint_panel_then_promoting_keeps_none() {
+fn picking_none_in_the_hint_mode_row_then_promoting_keeps_none() {
     let e = env("hint-pick-none", &[("c1", 2, {
             let mut c = hinted_clip(false, json!({}));
             c["ck_native"]["hint"] = json!({"guide": "chroma", "final": "direct", "bypass": false});
@@ -1756,19 +1687,9 @@ fn picking_none_in_the_hint_panel_then_promoting_keeps_none() {
     };
     assert_eq!(mode(&mut app), "full", "hints on disk and no choice yet");
 
-    // Scroll only the Properties area until the consumption control is actually visible.
-    for _ in 0..12 {
-        if texts_at(&ctx, &mut app).iter().any(|(t, _)| t == "full") {
-            break;
-        }
-        run(&ctx, &mut app, vec![
-            Event::PointerMoved(egui::pos2(1300.0, 500.0)),
-            Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -80.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel },
-        ]);
-        settle(&ctx, &mut app);
-    }
-    click_text(&ctx, &mut app, "full"); // open the Hint mode combo
-    click_text(&ctx, &mut app, "none"); // the user's own pick
+    // The user's own pick, through the same Key command the Shot page's Hint mode row sends.
+    key_cmd(&ctx, &mut app, KeyCmd::Edit(ck::ui::ai::KeyEdit::HintMode("none".into()))).expect("edit applied");
+    settle(&ctx, &mut app);
     assert_eq!(mode(&mut app), "none");
     assert_eq!(ck::persist::clip_hint_mode(&app.clip_for_test()).as_deref(), Some("none"), "open clip sees the saved pick");
 

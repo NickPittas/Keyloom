@@ -7,7 +7,7 @@ use crate::contracts::OutputKind;
 use crate::hints::HintCfg;
 use crate::presets::{self, Pipeline, Preset, PresetClass};
 use crate::jobs::JobMode;
-use crate::project::{Clip, Project};
+use crate::project::{Clip, ClipState, Project};
 use crate::scheduler::*;
 use crate::settings::{Settings, HINT_MODES, TEMPORAL_WINDOWS, VRAM_PROFILES};
 use crate::worker::{Target, TargetKind};
@@ -209,10 +209,11 @@ struct GateReq {
 
 pub struct GateOut {
     sig: String,
-    main: Result<Plan, Blocked>,
-    resume: Option<Plan>,
-    newver: Option<Plan>,
-    replace: Option<Plan>,
+    /// New run: the frozen plan, or why not (including the existing result and any lock).
+    pub main: Result<Plan, Blocked>,
+    pub resume: Option<Plan>,
+    pub newver: Option<Plan>,
+    pub replace: Option<Plan>,
 }
 
 fn run_gate(r: &GateReq) -> GateOut {
@@ -283,6 +284,152 @@ pub enum LockOwner {
     Session,
     /// A job of this session that has ended with its writer proven gone; the scheduler already did the cleanup.
     Ended,
+}
+
+/// A Key property value and whether this shot overrides it by hand (vs the Batch preset / seeded default).
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyValue<T> {
+    pub value: T,
+    pub overridden: bool,
+}
+
+/// One entry of the Render / Machine picker. `id` `None` = inherit the project (session) default.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MachineOption {
+    pub id: Option<String>,
+    pub label: String,
+    pub available: bool,
+    pub reason: Option<String>,
+}
+
+/// Where a blocker's fix button leads (typed: never dispatched by the message text).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyFix {
+    OpenModels,
+    OpenMachines,
+    ResultActions,
+    RecoveryDetails,
+    Relink,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyBlocker {
+    pub message: String,
+    pub fix: Option<KeyFix>,
+}
+
+/// One way to start Key (New / Resume / Replace / NewVersion) with whether it can run now.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IntentView {
+    pub intent: Intent,
+    pub label: String,
+    pub enabled: bool,
+    pub reason: Option<String>,
+}
+
+/// A lock holding the output folder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyLock {
+    pub job_id: Option<String>,
+    pub owner: Option<LockOwner>,
+    pub leftovers: usize,
+}
+
+/// Cached, read-only state of the Key properties and action bar (see `AiUi::key_view`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyView {
+    /// The shot's own machine (`None` = inherits).
+    pub machine: Option<String>,
+    /// What the shot actually renders on, in words (`Automatic`, a PC name...).
+    pub machine_effective: String,
+    /// Text of the inherit entry ("Automatic" / "Session default (<id>)").
+    pub machine_inherited: String,
+    pub machines: Vec<MachineOption>,
+    pub vram_profile: KeyValue<String>,
+    pub temporal_window: KeyValue<String>,
+    pub hint_mode: KeyValue<String>,
+    pub hint_quality: KeyValue<f64>,
+    pub carry_hint: KeyValue<bool>,
+    pub carry_hint_quality: KeyValue<f64>,
+    pub despill_strength: KeyValue<f64>,
+    pub cutout_linear: KeyValue<bool>,
+    /// What Reset would return to ("Reset to defaults"...); `None` when nothing is overridden.
+    pub reset_label: Option<String>,
+    pub primary_enabled: bool,
+    /// "Key shot" before any result, "Key again…" once one exists (then it opens the result actions).
+    pub primary_label: String,
+    /// The intent the primary submits; `None` = it opens the result actions.
+    pub primary_intent: Option<Intent>,
+    pub blocker: Option<KeyBlocker>,
+    /// The gate for the current inputs has not finished.
+    pub checking: bool,
+    pub status_line: Option<String>,
+    pub busy_percent: Option<u8>,
+    /// The Key job of this shot that Cancel would stop.
+    pub cancel_job: Option<String>,
+    pub result_exists: bool,
+    pub intents: Vec<IntentView>,
+    /// `Some(n)`: Replace waits for confirmation and would overwrite `n` owned files.
+    pub replace_pending: Option<usize>,
+    pub lock: Option<KeyLock>,
+    /// Lost jobs (any shot) still waiting for a human decision.
+    pub unresolved_jobs: usize,
+    pub notice: Option<String>,
+}
+
+/// One edit of a Key property (the closed set of rows).
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeyEdit {
+    VramProfile(String),
+    TemporalWindow(String),
+    HintMode(String),
+    HintQuality(f64),
+    CarryHint(bool),
+    CarryHintQuality(f64),
+    DespillStrength(f64),
+    CutoutLinear(bool),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeyCmd {
+    Edit(KeyEdit),
+    /// `None` = inherit the project default.
+    AssignMachine(Option<String>),
+    ResetOverrides,
+    Submit(Intent),
+    RequestReplace,
+    ConfirmReplace,
+    CancelReplace,
+    /// Cancel this shot's queued/running Key job.
+    CancelJob,
+}
+
+/// The `KeyEdit`s that turn `a` into `b` (what a widget changed).
+fn edits_between(a: &Params, b: &Params) -> Vec<KeyEdit> {
+    let mut v = vec![];
+    if a.vram_profile != b.vram_profile { v.push(KeyEdit::VramProfile(b.vram_profile.clone())); }
+    if a.temporal_window != b.temporal_window { v.push(KeyEdit::TemporalWindow(b.temporal_window.clone())); }
+    if a.hint_mode != b.hint_mode { v.push(KeyEdit::HintMode(b.hint_mode.clone())); }
+    if a.hint_quality != b.hint_quality { v.push(KeyEdit::HintQuality(b.hint_quality)); }
+    if a.carry_hint != b.carry_hint { v.push(KeyEdit::CarryHint(b.carry_hint)); }
+    if a.carry_hint_quality != b.carry_hint_quality { v.push(KeyEdit::CarryHintQuality(b.carry_hint_quality)); }
+    if a.despill_strength != b.despill_strength { v.push(KeyEdit::DespillStrength(b.despill_strength)); }
+    if a.cutout_linear != b.cutout_linear { v.push(KeyEdit::CutoutLinear(b.cutout_linear)); }
+    v
+}
+
+/// Everything the Key button and its blocker line derive from the gate result (shared by the old panel and `key_view`).
+struct KeyDecision {
+    running_here: Option<String>,
+    placement: Placement,
+    network: bool,
+    setup: Vec<String>,
+    can: bool,
+    why: String,
+    label: String,
+    new_version: Option<u32>,
+    /// Disabled only because the same Key already waits in the queue.
+    by_queue: bool,
 }
 
 /// What the user decided for one clip in the batch review.
@@ -434,6 +581,16 @@ fn network_target(p: &Placement) -> Option<&str> {
     match p { Placement::Target(id) => id.strip_prefix("network:"), Placement::Auto => None }
 }
 
+/// Same clock as the remote submission stamps (`remote.rs` `unix_ms`), so the two can be compared.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64)
+}
+
+/// A remote failure shows on the card only when it is at least as new as the shot's latest local attempt.
+pub(crate) fn remote_is_newest(remote_submitted_ms: u64, local_attempt_ms: Option<u64>) -> bool {
+    local_attempt_ms.map_or(true, |l| remote_submitted_ms >= l)
+}
+
 /// A network PC's picker label: ids are `network id/PC id`.
 fn net_label(targets: &[(String, String)], id: &str) -> Option<String> {
     targets.iter().find(|t| t.0 == id).map(|t| t.1.clone())
@@ -548,6 +705,52 @@ struct Batch {
     quick: bool,
 }
 
+/// The production Board's view of one planned batch row.
+#[derive(Clone, Debug)]
+pub struct BatchDialogRow {
+    pub folder: String,
+    pub name: String,
+    pub stage: String,
+    pub machine: Option<String>,
+    pub job: Option<BatchDialogJob>,
+    pub status: String,
+    pub reason: Option<String>,
+    pub included: bool,
+    pub can_include: bool,
+    pub accept: Option<String>,
+    pub offer: Option<String>,
+    pub reuse: bool,
+    pub mismatch: bool,
+    pub reset_to_preset: bool,
+    pub queueable: bool,
+    pub blocked: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchDialogJob {
+    Queued,
+    Rendering,
+    Preparing,
+    Blocked,
+}
+
+/// Snapshot used by the production batch dialog. Preset `None` is current settings.
+#[derive(Clone, Debug)]
+pub struct BatchDialog {
+    pub planning: bool,
+    pub preset: Option<String>,
+    pub presets: Vec<(Option<String>, String)>,
+    pub machines: Vec<BatchDialogMachine>,
+    pub rows: Vec<BatchDialogRow>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchDialogMachine {
+    pub id: Option<String>,
+    pub label: String,
+    pub available: bool,
+}
+
 mod queue_view;
 mod tasks;
 pub use queue_view::{pass_name, Cell, Phase, QueueRow, QueueRun, QueueSection, Stage};
@@ -631,6 +834,9 @@ pub struct AiUi {
     /// Confirmed Automatic shots waiting for a free PC, in order.
     // ponytail: dropped on quit, not saved; the user confirms them again.
     auto_pending: std::collections::VecDeque<AutoShot>,
+    /// Clip root → unix ms of its newest local or Automatic attempt (a newer remote failure is the only one shown).
+    // ponytail: in memory only; after a restart an older retained remote failure can show again until the next attempt. Persist per-clip attempt times if that matters.
+    local_attempt: std::collections::HashMap<std::path::PathBuf, u64>,
     /// Inline Cancel button rectangles from the last Queue frame (layout tests).
     pub cancel_rects: Vec<egui::Rect>,
     /// Each network send's shot by submission id, while a connection follows it: "Send again" puts it back in Automatic.
@@ -787,6 +993,7 @@ impl AiUi {
             sending_auto: false,
             net_outbox: vec![],
             auto_pending: Default::default(),
+            local_attempt: Default::default(),
             cancel_rects: vec![],
             sent_shots: Default::default(),
             refused: vec![],
@@ -1105,6 +1312,11 @@ impl AiUi {
         Ok(())
     }
 
+    /// The Render / Machine choice of one shot (`None` = inherit): saved, or the error to show.
+    fn assign_machine(&mut self, clip: &Clip, id: Option<&str>) -> Result<(), String> {
+        self.set_clip_client(clip, id).map_err(|e| format!("Client not saved: {e}"))
+    }
+
     /// Persist what the job uses, then queue the already frozen plan on the chosen placement. `Err` = nothing queued.
     fn submit_plan(
         &mut self,
@@ -1140,6 +1352,7 @@ impl AiUi {
                 min_vram_gb: None,
             })
             .map_err(|e| self.submit_error_text(clip, &e))?;
+        self.local_attempt.insert(clip.root.clone(), now_ms());
         self.tracked.push(Tracked {
             warnings: vec![],
             job_id: id.clone(),
@@ -1151,15 +1364,15 @@ impl AiUi {
         Ok(id)
     }
 
+    /// The gate result for the CURRENT inputs (`None` while it is being (re)computed). Cached: no IO, no re-run.
+    pub fn gate_result(&self) -> Option<Arc<GateOut>> {
+        self.gate.shown.clone().filter(|g| self.gate.want.as_ref().is_some_and(|w| w.1.sig == g.sig))
+    }
+
     /// Queue the open clip's job from the current gate result (narrow layout button). Never recomputes: the job
     /// is exactly the one the gate froze from the viewer's range at that moment.
     pub fn submit_current(&mut self, clip: &Clip, intent: Intent) -> Result<String, String> {
-        let g = self
-            .gate
-            .shown
-            .clone()
-            .filter(|g| self.gate.want.as_ref().is_some_and(|w| w.1.sig == g.sig));
-        let Some(g) = g else {
+        let Some(g) = self.gate_result() else {
             return Err("Still checking the output folder; try again in a moment".into());
         };
         let plan = match intent {
@@ -1202,6 +1415,18 @@ impl AiUi {
         picks: &[usize],
     ) {
         self.begin_with(ctx, project, st, picks, None, None);
+    }
+
+    pub fn begin_board_batch(&mut self, ctx: &egui::Context, project: &Project, st: &Settings, picks: &[usize]) {
+        let presets = self.batch_presets();
+        if self.board_preset.as_ref().is_some_and(|n| !presets.iter().any(|p| &p.name == n)) {
+            self.board_preset = None;
+        }
+        let name = self.board_preset.clone();
+        match resolve_preset(&presets, &name) {
+            Ok(preset) => self.begin_with(ctx, project, st, picks, preset, name),
+            Err(e) => self.notice = Some(e),
+        }
     }
 
     /// Batch review for a full pipeline preset (pre-matte -> Key -> optional export), applied per clip.
@@ -1575,6 +1800,163 @@ impl AiUi {
         self.batch.is_some()
     }
 
+    /// Consume the planner's answer and expose only the fields the Board review edits.
+    pub fn batch_dialog(&mut self) -> Option<BatchDialog> {
+        let received = self.batch.as_ref()?.pending.as_ref().map(|rx| rx.try_recv());
+        match received {
+            Some(Ok(rows)) => {
+                let b = self.batch.as_mut()?;
+                b.rows = rows;
+                b.pending = None;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.batch = None;
+                return None;
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+        let net = self.net_targets.clone();
+        if let Some(b) = self.batch.as_mut() {
+            for r in &mut b.rows {
+                if row_problem(r, &net).is_some_and(|(_, acceptable)| !acceptable) {
+                    r.choice = Choice::Skip;
+                }
+            }
+        }
+        let b = self.batch.as_ref()?;
+        let presets = std::iter::once((None, "Current settings (no preset)".to_owned()))
+            .chain(b.presets.iter().map(|p| (Some(p.name.clone()), presets::label(p).to_string())))
+            .collect();
+        let mut machines = vec![BatchDialogMachine { id: None, label: "Automatic".into(), available: true }];
+        machines.extend(self.net_targets.iter().map(|(id, name)| BatchDialogMachine {
+            id: Some(format!("network:{id}")), label: format!("{name} · network"), available: !name.ends_with("(offline)"),
+        }));
+        machines.extend(self.sched.targets().iter().map(|t| BatchDialogMachine {
+            id: Some(t.id.clone()),
+            label: format!("{} — {} · {}", t.id, if t.local { "This machine" } else { "machine" }, if t.enabled { target_state_word(&t.status, t.busy_with.is_some()) } else { "disabled" }),
+            available: t.enabled,
+        }));
+        if b.pending.is_some() {
+            return Some(BatchDialog { planning: true, preset: b.preset_name.clone(), presets, machines, rows: vec![] });
+        }
+
+        let net = self.net_targets.clone();
+        let queue = self.queue_view();
+        let has_machine = !self.sched.targets().is_empty() || !net.is_empty();
+        Some(BatchDialog {
+            planning: false,
+            preset: b.preset_name.clone(),
+            presets,
+            machines,
+            rows: b.rows.iter().map(|r| {
+                let problem = row_problem(r, &net);
+                let blocked = problem.as_ref().is_some_and(|(_, ok)| !ok);
+                let can_include = !blocked && match &r.state {
+                    RowState::Ready(_) => true,
+                    RowState::Existing { newver, .. } => newver.is_some(),
+                    RowState::Blocked(_) => false,
+                };
+                let offer = if matches!(r.state, RowState::Blocked(_)) { None } else { r.offer_text() };
+                let live = queue.iter().find(|s| s.root == r.clip.root)
+                    .into_iter()
+                    .flat_map(|s| s.runs.iter().filter(|run| run.active))
+                    .flat_map(|run| run.rows.iter().filter(|row| row.active))
+                    .next();
+                let live_job = live.map(|row| {
+                    if row.cell.text.ends_with('%') {
+                        (BatchDialogJob::Rendering, "Rendering".to_owned())
+                    } else if row.cell.bad {
+                        (BatchDialogJob::Blocked, row.cell.text.clone())
+                    } else {
+                        (BatchDialogJob::Queued, "In queue".to_owned())
+                    }
+                });
+                let no_machine = matches!(r.placement, crate::scheduler::Placement::Auto) && !has_machine;
+                let status = live_job.as_ref().map(|(_, text)| text.clone())
+                    .or_else(|| problem.as_ref().map(|(text, _)| text.clone()))
+                    .or_else(|| offer.clone())
+                    .unwrap_or_else(|| if no_machine { "No machine".into() } else if matches!(r.clip.state, ClipState::Masked) { "Hint first".into() } else { "—".into() });
+                let job = live_job.map(|(job, _)| job)
+                    .or_else(|| blocked.then_some(BatchDialogJob::Blocked))
+                    .or_else(|| (!r.steps.is_empty()).then_some(BatchDialogJob::Preparing));
+                let stage = match r.clip.state {
+                    ClipState::Masked => "mask",
+                    ClipState::Ready => "ready",
+                    ClipState::Complete => "done",
+                    _ => "raw",
+                }.to_owned();
+                BatchDialogRow {
+                    folder: r.clip.folder.clone(),
+                    name: r.clip.display_name.clone(),
+                    stage,
+                    machine: match &r.placement {
+                        crate::scheduler::Placement::Auto => None,
+                        crate::scheduler::Placement::Target(id) => Some(id.clone()),
+                    },
+                    job,
+                    status,
+                    reason: problem.as_ref().map(|(text, _)| text.clone()),
+                    included: r.choice != Choice::Skip && r.plan().is_some() && !blocked,
+                    can_include,
+                    accept: problem.as_ref().filter(|(_, ok)| *ok).map(|_| "OK".to_owned()),
+                    offer,
+                    reuse: r.reuse,
+                    mismatch: matches!(r.offer.as_ref().map(|o| &o.compat), Some(crate::hints::Compat::Mismatch(_))),
+                    reset_to_preset: !r.overrides.is_empty(),
+                    queueable: r.plan().is_some() && export_block(r).is_none() && !blocked,
+                    blocked,
+                }
+            }).collect(),
+        })
+    }
+
+    pub fn batch_dialog_set_included(&mut self, index: usize, included: bool) {
+        let net = self.net_targets.clone();
+        let Some(r) = self.batch.as_mut().and_then(|b| b.rows.get_mut(index)) else { return };
+        if !included {
+            r.choice = Choice::Skip;
+        } else if !row_problem(r, &net).is_some_and(|(_, ok)| !ok) {
+            r.choice = match &r.state {
+                RowState::Ready(_) => Choice::Queue,
+                RowState::Existing { newver: Some(_), .. } => Choice::NewVersion,
+                _ => Choice::Skip,
+            };
+        }
+    }
+
+    pub fn batch_dialog_set_reuse(&mut self, index: usize, reuse: bool) {
+        if let Some(r) = self.batch.as_mut().and_then(|b| b.rows.get_mut(index)) {
+            r.set_reuse(reuse);
+        }
+    }
+
+    pub fn batch_dialog_set_machine(&mut self, index: usize, id: Option<&str>) {
+        let Some(clip) = self.batch.as_ref().and_then(|b| b.rows.get(index)).map(|r| r.clip.clone()) else { return };
+        if let Err(e) = self.set_clip_client(&clip, id) {
+            self.notice = Some(format!("Client not saved: {e}"));
+            return;
+        }
+        let placement = self.clip_placement(&clip);
+        if let Some(r) = self.batch.as_mut().and_then(|b| b.rows.get_mut(index)) {
+            r.placement = placement;
+        }
+    }
+
+    pub fn batch_dialog_set_preset(&mut self, ctx: &egui::Context, name: Option<String>) {
+        self.board_preset = name.clone();
+        if self.batch.as_ref().is_some_and(|b| b.preset_name != name) {
+            self.reload_batch(ctx, name);
+        }
+    }
+
+    pub fn batch_dialog_reset_to_preset(&mut self, ctx: &egui::Context, folder: &str) {
+        let Some((name, has_base)) = self.batch.as_ref().and_then(|b| Some((b.preset_name.clone(), b.rows.iter().find(|r| r.clip.folder == folder)?.base.is_some()))) else { return };
+        if has_base {
+            self.reset_to_row_base(folder);
+            self.reload_batch(ctx, name);
+        }
+    }
+
     pub fn cancel(&mut self, id: &str) {
         self.sched.cancel(id);
         self.disk_gen += 1;
@@ -1611,8 +1993,8 @@ impl AiUi {
         .response
         .on_hover_text(hint);
         if let Some(w) = want {
-            if let Err(e) = self.set_clip_client(clip, w.as_deref()) {
-                self.notice = Some(format!("Client not saved: {e}"));
+            if let Err(e) = self.assign_machine(clip, w.as_deref()) {
+                self.notice = Some(e);
             }
         }
     }
@@ -1660,8 +2042,8 @@ impl AiUi {
             }
         }
         if let Some(w) = want {
-            if let Err(e) = self.set_clip_client(clip, w.as_deref()) {
-                self.notice = Some(format!("Client not saved: {e}"));
+            if let Err(e) = self.assign_machine(clip, w.as_deref()) {
+                self.notice = Some(e);
             }
         }
     }
@@ -1834,10 +2216,8 @@ impl AiUi {
 
     pub fn hint_controls(&mut self, ui: &mut Ui, clip: &Clip, project: &Project, st: &Settings) -> bool {
         let stale = self.stale_key;
-        let d = self.draft(clip, project, st);
-        let before = d.params.hint_mode.clone();
-        let snap = d.snapshot();
-        let p = &mut d.params;
+        let orig = self.draft(clip, project, st).params.clone();
+        let mut p = orig.clone();
         card(ui, "Hint consumption", stale, |ui| {
         pair(ui, "Hint mode", |ui| choice(ui, "hint_mode", &mut p.hint_mode, &HINT_MODES));
         ui.label(
@@ -1864,21 +2244,16 @@ impl AiUi {
         pair(ui, "Carry hint", |ui| { theme::checkbox(ui, &mut p.carry_hint, "between windows"); });
         r(ui, "Carry quality", &mut p.carry_hint_quality);
         });
-        let after = p.hint_mode.clone();
-        d.mark_edits(&snap);
-        notes(ui, &d.notes);
-        // A pick here is the clip's own decision: saved, and it wins over defaults and inferences.
-        if after != before {
-            let from_preset = clip.native.get("hint_mode_src").and_then(Value::as_str) == Some("preset");
-            match crate::persist::save_hint_pick(clip, &after, (&before, from_preset)) {
-                Ok(()) => {
-                    self.disk_gen += 1;
-                    return true;
-                }
-                Err(e) => self.notice = Some(format!("Hint mode not saved: {e}")),
+        // The same edit path the Shot page uses: what the widgets changed goes through `apply_edit`.
+        let mut saved = false;
+        for e in edits_between(&orig, &p) {
+            match self.apply_edit(clip, project, st, e) {
+                Ok(s) => saved |= s,
+                Err(e) => self.notice = Some(e),
             }
         }
-        false
+        notes(ui, &self.draft(clip, project, st).notes);
+        saved
     }
 
     pub fn key_controls(
@@ -1891,9 +2266,8 @@ impl AiUi {
         range_frames: Option<usize>,
     ) {
         let stale = self.stale_key;
-        let d = self.draft(clip, project, st);
-        let snap = d.snapshot();
-        let p = &mut d.params;
+        let orig = self.draft(clip, project, st).params.clone();
+        let mut p = orig.clone();
         let (mut temporal_rect, mut temporal_items) = (None, vec![]);
         card(ui, "Key engine", stale, |ui| {
             temporal_rect = Some(pair(ui, "Temporal window", |ui| temporal_choice_rects(ui, "temporal_window", &mut p.temporal_window, &mut temporal_items)));
@@ -1924,15 +2298,21 @@ impl AiUi {
                 .size(12.0),
             );
         });
-        d.mark_edits(&snap);
-        notes(ui, &d.notes);
+        for e in edits_between(&orig, &p) {
+            if let Err(e) = self.apply_edit(clip, project, st, e) {
+                self.notice = Some(e);
+            }
+        }
+        notes(ui, &self.draft(clip, project, st).notes);
         (self.temporal_rect, self.temporal_items) = (temporal_rect, temporal_items);
         let marked = self.shot_overrides(clip);
         if !marked.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(format!("Shot overrides (win over any Batch preset): {}", marked.join(", "))).color(theme::text_dim(ui)).size(12.0));
                 if ui.small_button(self.reset_label(clip)).clicked() {
-                    self.reset_overrides(clip, project, st);
+                    if let Err(e) = self.key_cmd(clip, project, st, &ui.ctx().clone(), KeyCmd::ResetOverrides) {
+                        self.notice = Some(e);
+                    }
                 }
             });
         }
@@ -2202,10 +2582,7 @@ impl AiUi {
                 ctx.request_repaint_after(Duration::from_millis(50));
             }
         }
-        self.gate
-            .shown
-            .clone()
-            .filter(|g| g.sig == self.gate.want.as_ref().unwrap().1.sig)
+        self.gate_result()
     }
 
     /// Poll the gate without drawing it (the narrow layout's button uses the result).
@@ -2258,6 +2635,44 @@ impl AiUi {
                 .unwrap_or_else(|| "nothing removed".into())
         };
         Ok(format!("Lock release for job {id}: {what}{left}"))
+    }
+
+    /// Recovery for a Key output lock (the gate's blocker): ownership-checked. A lock of this session is never
+    /// released here; one from a previous session needs the explicit confirmation (optional temp cleanup).
+    pub(crate) fn output_lock_recovery_ui(&mut self, ui: &mut Ui, g: &GateOut) {
+        let Err(b) = &g.main else { return };
+        let mut recover = None;
+        if let (Some(l), Some(dir)) = (&b.lock, &b.lock_dir) {
+            if let Some(id) = &l.job_id {
+                match self.lock_owner(id) {
+                    LockOwner::Session => {
+                        ui.label(RichText::new("This lock belongs to a job of this session whose worker may still be running. Use that job's own controls (Cancel, Force stop, or Confirm writer stopped); it cannot be released from here.").color(theme::text_dim(ui)).size(12.0));
+                    }
+                    LockOwner::Ended => {
+                        ui.label(RichText::new("This lock belongs to a finished job of this session; the cleanup result is shown with that job. It is not released from here.").color(theme::text_dim(ui)).size(12.0));
+                    }
+                    LockOwner::Unknown => {
+                        ui.label(RichText::new("The lock names a run from before this session. Releasing it is only safe if that process is really gone.").color(theme::text_dim(ui)).size(12.0));
+                        if !b.leftovers.is_empty() {
+                            ui.label(RichText::new(format!("That run left {} temp file(s) in the folder:", b.leftovers.len())).size(12.0));
+                            for t in b.leftovers.iter().take(5) {
+                                ui.label(RichText::new(t.display().to_string()).monospace().size(11.0).color(theme::text_dim(ui)));
+                            }
+                            theme::checkbox(ui, &mut self.lock_remove_temps, "Also delete these temp files (otherwise they are kept)");
+                        }
+                        if ui.button("I confirm that process is gone: release the lock").clicked() {
+                            recover = Some((dir.clone(), id.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((dir, id)) = recover {
+            self.notice = Some(match self.release_lock(&dir, &id) {
+                Ok(m) | Err(m) => m,
+            });
+            self.disk_gen += 1;
+        }
     }
 
     /// Setup problems that stop the chosen placement from ever starting a worker.
@@ -2327,11 +2742,7 @@ impl AiUi {
         action: &str,
     ) {
         let g = self.gate_poll(&ui.ctx().clone(), clip, project, st, range, linear);
-        let running_here = g.as_ref().and_then(|g| g.main.as_ref().err())
-            .and_then(|b| b.lock.as_ref()).and_then(|l| l.job_id.as_deref())
-            .filter(|id| matches!(self.sched.state_of(id),
-                Some(JobState::Dispatching { .. } | JobState::Running { .. })))
-            .map(str::to_owned);
+        let KeyDecision { running_here, placement, setup, can, why, label: primary_label, new_version, .. } = self.key_decision(clip, g.as_ref(), action);
         if running_here.is_some() {
             // Progress and Cancel live in the activity strip; this panel only explains the disabled button.
             let go = ui.add_enabled(false, egui::Button::new(action)
@@ -2341,54 +2752,7 @@ impl AiUi {
             self.key_rect = Some(go.rect);
             return;
         }
-        let placement = self.clip_placement(clip);
-        let network = network_target(&placement).is_some();
-        let setup = if network { vec![] } else { self.setup_blockers(&placement) };
-        let ready = g
-            .as_ref()
-            .and_then(|g| g.main.as_ref().ok())
-            .map(|p| self.sched.readiness(&placement, &p.job, None));
-        let mut intent = None;
-        let mut recover = None;
-        let (mut can, mut why) = {
-            match (&ready, &g) {
-                (_, None) => (false, "Checking the output folder…".to_string()),
-                _ if !setup.is_empty() => (false, "Worker setup needed (see above)".into()),
-                (
-                    Some(Readiness::Ready {
-                        busy,
-                        target,
-                    }),
-                    _,
-                ) => {
-                    let s = format!(
-                        "Runs on {target}{}",
-                        if *busy { " (busy: it will wait)" } else { "" }
-                    );
-                    (true, s)
-                }
-                (Some(Readiness::Pending(w)), _) => {
-                    (true, format!("Worker not ready yet: {}", trunc(w)))
-                }
-                (Some(Readiness::Blocked(r)), _) => (
-                    false,
-                    format!("No target can run this job: {}", trunc(&r.join("; "))),
-                ),
-                _ => (false, "Review output & result actions below".into()),
-            }
-        };
-        if network && g.as_ref().is_some_and(|g| g.main.is_ok() || g.newver.is_some()) {
-            can = self.net_online;
-            why = if can { format!("Send to {}", self.placement_text(&placement)) } else { "Connect to the coordinator in Clients first".into() };
-        }
-        let new_version = g.as_ref().and_then(|g| g.main.as_ref().err()).and_then(|b| b.existing.as_ref()).and_then(|e| e.next_version)
-            .filter(|_| g.as_ref().is_some_and(|g| g.newver.is_some()) && setup.is_empty());
-        if new_version.is_some() && !network { can = true; why = "Keeps the existing result in place".into(); }
-        let primary_label = new_version.map_or_else(|| action.to_string(), |v| format!("Key as v{v:03}"));
-        // Busy clip/PC -> "Queue Key"; the same Key already waiting -> disabled "Already queued".
-        let decision = crate::actions::decide(&self.sched, &clip.root, crate::actions::Action::Key, &primary_label, (!can).then(|| why.clone()));
-        let (can, primary_label) = (decision.enabled, decision.label.clone());
-        let why = if decision.reason.is_empty() { why } else { decision.reason.clone() };
+        let mut cmd: Option<KeyCmd> = None;
         ui.label(
             RichText::new(&why)
                 .color(if can { theme::text_dim(ui) } else { theme::error(ui) })
@@ -2406,7 +2770,7 @@ impl AiUi {
         if let Some(pulse) = self.stale_key {
             ui.painter().rect_stroke(go.rect.expand(1.0), 4.0, egui::Stroke::new(2.0 + pulse * 1.5, theme::warn(ui)), egui::StrokeKind::Outside);
         }
-        if go.clicked() { intent = Some(if new_version.is_some() { Intent::NewVersion } else { Intent::New }); }
+        if go.clicked() { cmd = Some(KeyCmd::Submit(if new_version.is_some() { Intent::NewVersion } else { Intent::New })); }
 
         // Details scroll; the verdict and the Key button below stay pinned and always reachable.
         let needs_fix = g.as_ref().is_some_and(|g| g.main.as_ref().err().is_some_and(|b| b.existing.is_none()));
@@ -2429,31 +2793,7 @@ impl AiUi {
                         for r in &b.reasons {
                             ui.colored_label(theme::warn(ui), format!("• {r}"));
                         }
-                        if let (Some(l), Some(dir)) = (&b.lock, &b.lock_dir) {
-                            if let Some(id) = &l.job_id {
-                                match self.lock_owner(id) {
-                                    LockOwner::Session => {
-                                        ui.label(RichText::new("This lock belongs to a job of this session whose worker may still be running. Use that job's own controls (Cancel, Force stop, or Confirm writer stopped); it cannot be released from here.").color(theme::text_dim(ui)).size(12.0));
-                                    }
-                                    LockOwner::Ended => {
-                                        ui.label(RichText::new("This lock belongs to a finished job of this session; the cleanup result is shown with that job. It is not released from here.").color(theme::text_dim(ui)).size(12.0));
-                                    }
-                                    LockOwner::Unknown => {
-                                        ui.label(RichText::new("The lock names a run from before this session. Releasing it is only safe if that process is really gone.").color(theme::text_dim(ui)).size(12.0));
-                                        if !b.leftovers.is_empty() {
-                                            ui.label(RichText::new(format!("That run left {} temp file(s) in the folder:", b.leftovers.len())).size(12.0));
-                                            for t in b.leftovers.iter().take(5) {
-                                                ui.label(RichText::new(t.display().to_string()).monospace().size(11.0).color(theme::text_dim(ui)));
-                                            }
-                                            theme::checkbox(ui, &mut self.lock_remove_temps, "Also delete these temp files (otherwise they are kept)");
-                                        }
-                                        if ui.button("I confirm that process is gone: release the lock").clicked() {
-                                            recover = Some((dir.clone(), id.clone()));
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        self.output_lock_recovery_ui(ui, g);
                         if let Some(e) = &b.existing {
                             if let Some((message, path)) = e.reason.split_once(" exists in ") {
                                 ui.colored_label(theme::warn(ui), format!("{message} exists."));
@@ -2469,10 +2809,10 @@ impl AiUi {
                                 // Buttons first (always visible); the folder is already shown in the line above.
                                 ui.horizontal(|ui| {
                                     if ui.button("Yes, replace").clicked() {
-                                        intent = Some(Intent::Replace);
+                                        cmd = Some(KeyCmd::ConfirmReplace);
                                     }
                                     if ui.button("Cancel").clicked() {
-                                        self.replace_confirm = false;
+                                        cmd = Some(KeyCmd::CancelReplace);
                                     }
                                 });
                                 ui.colored_label(theme::warn(ui), format!("Replace {} owned file(s)? Old files stay until the new ones are verified; unknown files are never touched; cancel or failure keeps the previous result.", e.replace_files));
@@ -2481,7 +2821,7 @@ impl AiUi {
                                 if g.resume.is_some()
                                     && ui.button("Resume previous run").clicked()
                                 {
-                                    intent = Some(Intent::Resume);
+                                    cmd = Some(KeyCmd::Submit(Intent::Resume));
                                 }
                                 // Replace: owned files only, explicit confirmation, disabled with its reason.
                                 let rep_ready = g.replace.as_ref().map(|p| self.sched.readiness(&placement, &p.job, None));
@@ -2497,14 +2837,14 @@ impl AiUi {
                                     }
                                     None => {
                                         if ui.button(label).on_hover_text("Overwrites the files this result owns, with the settings above").clicked() {
-                                            self.replace_confirm = !self.replace_confirm;
+                                            cmd = Some(if self.replace_confirm { KeyCmd::CancelReplace } else { KeyCmd::RequestReplace });
                                         }
                                     }
                                 }
                                 match (e.next_version, &g.newver) {
                                     (Some(v), Some(_)) => {
                                         if ui.button(format!("Write as v{v:03}")).on_hover_text("Same settings, next free version folder").clicked() {
-                                            intent = Some(Intent::NewVersion);
+                                            cmd = Some(KeyCmd::Submit(Intent::NewVersion));
                                         }
                                     }
                                     _ => {
@@ -2528,23 +2868,334 @@ impl AiUi {
             }
             self.unresolved_ui(ui);
         });
-        if let Some((dir, id)) = recover {
-            self.notice = Some(match self.release_lock(&dir, &id) {
-                Ok(m) | Err(m) => m,
-            });
-            self.disk_gen += 1;
-        }
-        if let Some(i) = intent {
-            self.replace_confirm = false;
-            if network {
-                if matches!(i, Intent::Resume | Intent::Replace) {
-                    self.notice = Some("Resume/Replace stay local. Choose a new result for the network client.".into());
-                } else if let Some(pick) = project.clips.iter().position(|c| c.root == clip.root) {
-                    self.begin_batch(&ui.ctx().clone(), project, st, &[pick]);
-                }
-            } else {
-                self.notice = self.submit_current(clip, i).err();
+        if let Some(c) = cmd {
+            if let Err(e) = self.key_cmd(clip, project, st, &ui.ctx().clone(), c) {
+                self.notice = Some(e);
             }
+        }
+    }
+
+    /// The Key button's verdict from a gate result: the single source for the old panel and `key_view`.
+    fn key_decision(&self, clip: &Clip, g: Option<&Arc<GateOut>>, idle: &str) -> KeyDecision {
+        let running_here = g
+            .and_then(|g| g.main.as_ref().err())
+            .and_then(|b| b.lock.as_ref())
+            .and_then(|l| l.job_id.as_deref())
+            .filter(|id| matches!(self.sched.state_of(id), Some(JobState::Dispatching { .. } | JobState::Running { .. })))
+            .map(str::to_owned);
+        let placement = self.clip_placement(clip);
+        let network = network_target(&placement).is_some();
+        let setup = if network { vec![] } else { self.setup_blockers(&placement) };
+        let ready = g.and_then(|g| g.main.as_ref().ok()).map(|p| self.sched.readiness(&placement, &p.job, None));
+        let (mut can, mut why) = match (&ready, g) {
+            (_, None) => (false, "Checking the output folder…".to_string()),
+            _ if !setup.is_empty() => (false, "Worker setup needed (see above)".into()),
+            (Some(Readiness::Ready { busy, target }), _) => (true, format!("Runs on {target}{}", if *busy { " (busy: it will wait)" } else { "" })),
+            (Some(Readiness::Pending(w)), _) => (true, format!("Worker not ready yet: {}", trunc(w))),
+            (Some(Readiness::Blocked(r)), _) => (false, format!("No target can run this job: {}", trunc(&r.join("; ")))),
+            _ => (false, "Review output & result actions below".into()),
+        };
+        if network && g.is_some_and(|g| g.main.is_ok() || g.newver.is_some()) {
+            can = self.net_online;
+            why = if can { format!("Send to {}", self.placement_text(&placement)) } else { "Connect to the coordinator in Clients first".into() };
+        }
+        let new_version = g
+            .and_then(|g| g.main.as_ref().err())
+            .and_then(|b| b.existing.as_ref())
+            .and_then(|e| e.next_version)
+            .filter(|_| g.is_some_and(|g| g.newver.is_some()) && setup.is_empty());
+        if new_version.is_some() && !network {
+            can = true;
+            why = "Keeps the existing result in place".into();
+        }
+        let idle = new_version.map_or_else(|| idle.to_string(), |v| format!("Key as v{v:03}"));
+        // Busy clip/PC -> "Queue Key"; the same Key already waiting -> disabled "Already queued".
+        let decision = crate::actions::decide(&self.sched, &clip.root, crate::actions::Action::Key, &idle, (!can).then(|| why.clone()));
+        let by_queue = can && !decision.enabled;
+        let why = if decision.reason.is_empty() { why } else { decision.reason.clone() };
+        KeyDecision { running_here, placement, network, setup, can: decision.enabled, why, label: decision.label, new_version, by_queue }
+    }
+
+    /// One Key property edit: validated, marked as a hand edit (`Draft.mark_edits`), and a hint-mode change is
+    /// saved as the clip's own pick. `Ok(true)` = the clip's metadata changed (the host re-reads the clip).
+    fn apply_edit(&mut self, clip: &Clip, project: &Project, st: &Settings, e: KeyEdit) -> Result<bool, String> {
+        let d = self.draft(clip, project, st);
+        let snap = d.snapshot();
+        let before = d.params.hint_mode.clone();
+        let mut p = d.params.clone();
+        match e {
+            KeyEdit::VramProfile(v) => p.vram_profile = v,
+            KeyEdit::TemporalWindow(v) => p.temporal_window = v,
+            KeyEdit::HintMode(v) => p.hint_mode = v,
+            KeyEdit::HintQuality(v) => p.hint_quality = r2(v),
+            KeyEdit::CarryHint(v) => p.carry_hint = v,
+            KeyEdit::CarryHintQuality(v) => p.carry_hint_quality = r2(v),
+            KeyEdit::DespillStrength(v) => p.despill_strength = r2(v),
+            KeyEdit::CutoutLinear(v) => p.cutout_linear = v,
+        }
+        p.validate()?;
+        d.params = p;
+        d.mark_edits(&snap);
+        let after = d.params.hint_mode.clone();
+        // A pick here is the clip's own decision: saved, and it wins over defaults and inferences.
+        if after == before {
+            return Ok(false);
+        }
+        let from_preset = clip.native.get("hint_mode_src").and_then(Value::as_str) == Some("preset");
+        crate::persist::save_hint_pick(clip, &after, (&before, from_preset)).map_err(|e| format!("Hint mode not saved: {e}"))?;
+        self.disk_gen += 1;
+        Ok(true)
+    }
+
+    /// Start Key with `i` from the current gate result (queue, or the Batch route for a network client).
+    fn key_intent(&mut self, ctx: &egui::Context, clip: &Clip, project: &Project, st: &Settings, i: Intent) -> Result<(), String> {
+        self.replace_confirm = false;
+        if network_target(&self.clip_placement(clip)).is_some() {
+            if matches!(i, Intent::Resume | Intent::Replace) {
+                return Err("Resume/Replace stay local. Choose a new result for the network client.".into());
+            }
+            if let Some(pick) = project.clips.iter().position(|c| c.root == clip.root) {
+                self.begin_batch(ctx, project, st, &[pick]);
+            }
+            return Ok(());
+        }
+        let r = self.submit_current(clip, i).map(|_| ());
+        self.notice = r.as_ref().err().cloned();
+        r
+    }
+
+    /// The Key job of `clip` that Cancel would stop (newest queued or running one).
+    fn cancellable_key_job(&self, clip: &Clip) -> Option<String> {
+        self.tracked
+            .iter()
+            .rev()
+            .filter(|t| t.folder == clip.folder && t.label.is_empty())
+            .filter_map(|t| self.sched.job(&t.job_id))
+            .find(|e| !e.cancel_requested && matches!(e.state, JobState::Queued | JobState::Dispatching { .. } | JobState::Running { .. }))
+            .map(|e| e.job.job_id.clone())
+    }
+
+    fn gate_now(&self) -> Result<Arc<GateOut>, String> {
+        self.gate_result().ok_or_else(|| "Still checking the output folder; try again in a moment".to_string())
+    }
+
+    /// Every Key property / action-bar command: the Shot page and the old Key panel both land here. Nothing is
+    /// enabled optimistically: submits re-check the CURRENT gate result first.
+    pub fn key_cmd(&mut self, clip: &Clip, project: &Project, st: &Settings, ctx: &egui::Context, c: KeyCmd) -> Result<(), String> {
+        match c {
+            KeyCmd::Edit(e) => {
+                if self.apply_edit(clip, project, st, e)? {
+                    self.refresh_clips.push(clip.folder.clone());
+                }
+                Ok(())
+            }
+            KeyCmd::AssignMachine(id) => self.assign_machine(clip, id.as_deref()),
+            KeyCmd::ResetOverrides => {
+                self.reset_overrides(clip, project, st);
+                Ok(())
+            }
+            KeyCmd::CancelReplace => {
+                self.replace_confirm = false;
+                Ok(())
+            }
+            KeyCmd::CancelJob => {
+                let id = self.cancellable_key_job(clip).ok_or("There is no Key job of this shot to cancel")?;
+                self.cancel(&id);
+                Ok(())
+            }
+            KeyCmd::RequestReplace => {
+                let g = self.gate_now()?;
+                let e = g.main.as_ref().err().and_then(|b| b.existing.as_ref()).ok_or("There is no existing result to replace")?;
+                let Some(p) = &g.replace else {
+                    return Err(e.replace_why.clone().unwrap_or_else(|| "Replace is not available for this result".into()));
+                };
+                let placement = self.clip_placement(clip);
+                if network_target(&placement).is_some() {
+                    return Err("Resume/Replace stay local. Choose a new result for the network client.".into());
+                }
+                if let Readiness::Blocked(r) = self.sched.readiness(&placement, &p.job, None) {
+                    return Err(r.join("; "));
+                }
+                self.replace_confirm = true;
+                Ok(())
+            }
+            KeyCmd::ConfirmReplace | KeyCmd::Submit(Intent::Replace) => {
+                let g = self.gate_now()?;
+                if !self.replace_confirm || g.replace.is_none() {
+                    return Err("Replace needs your confirmation first".into());
+                }
+                if let Some(Readiness::Blocked(r)) = g.replace.as_ref().map(|p| self.sched.readiness(&self.clip_placement(clip), &p.job, None)) {
+                    return Err(r.join("; "));
+                }
+                self.key_intent(ctx, clip, project, st, Intent::Replace)
+            }
+            KeyCmd::Submit(i) => {
+                let g = self.gate_now()?;
+                let d = self.key_decision(clip, Some(&g), "Key shot");
+                if d.running_here.is_some() {
+                    return Err("Key is running for this clip".into());
+                }
+                if matches!(i, Intent::New | Intent::NewVersion) && !d.can && (g.main.is_ok() || g.newver.is_some()) {
+                    return Err(d.why);
+                }
+                self.key_intent(ctx, clip, project, st, i)
+            }
+        }
+    }
+
+    /// Cached snapshot of the Key properties and the pinned action bar. No IO and no gate run: it reads the
+    /// draft, the scheduler and the last finished gate result for the current inputs (`watch_gate` keeps it fresh).
+    pub fn key_view(&self, clip: &Clip, project: &Project, st: &Settings) -> KeyView {
+        let p = self.drafts.get(&clip.folder).map_or_else(|| seed(clip, project, st).0, |d| d.params.clone());
+        let marked = self.shot_overrides(clip);
+        let val = |k: &str| marked.iter().any(|m| m == k);
+        let g = self.gate_result();
+        let d = self.key_decision(clip, g.as_ref(), "Key shot");
+        let blocked = g.as_ref().and_then(|g| g.main.as_ref().err());
+        let existing = blocked.and_then(|b| b.existing.as_ref());
+        let result_exists = existing.is_some() || clip.manifest.is_some();
+
+        // How each way of starting Key stands now.
+        let mut intents = vec![];
+        if let (Some(g), Some(e)) = (&g, existing) {
+            let local = |why: Option<String>| if d.network { Some("Resume/Replace stay local".to_string()) } else { why };
+            intents.push(IntentView {
+                intent: Intent::Resume,
+                label: "Resume previous run".into(),
+                enabled: g.resume.is_some() && !d.network,
+                reason: local(g.resume.is_none().then(|| "The previous run cannot be continued".to_string())),
+            });
+            let rep_block = match (&g.replace, g.replace.as_ref().map(|p| self.sched.readiness(&d.placement, &p.job, None))) {
+                (None, _) => Some(e.replace_why.clone().unwrap_or_else(|| "Replace is not available for this result".into())),
+                (Some(_), Some(Readiness::Blocked(r))) => Some(r.join("; ")),
+                _ => None,
+            };
+            intents.push(IntentView {
+                intent: Intent::Replace,
+                label: format!("Replace result ({} files)", e.replace_files),
+                enabled: rep_block.is_none() && !d.network,
+                reason: local(rep_block),
+            });
+            intents.push(IntentView {
+                intent: Intent::NewVersion,
+                label: e.next_version.map_or_else(|| "Write as new version".to_string(), |v| format!("Write as v{v:03}")),
+                enabled: e.next_version.is_some() && g.newver.is_some() && d.setup.is_empty() && (!d.network || self.net_online),
+                reason: (e.next_version.is_none() || g.newver.is_none()).then(|| "Needs an output location with {version} in the folder template".to_string()),
+            });
+        } else {
+            intents.push(IntentView { intent: Intent::New, label: d.label.clone(), enabled: d.can, reason: (!d.can).then(|| d.why.clone()) });
+        }
+
+        let lock = blocked.and_then(|b| b.lock.as_ref().map(|l| (l, b))).map(|(l, b)| KeyLock {
+            job_id: l.job_id.clone(),
+            owner: l.job_id.as_deref().map(|id| self.lock_owner(id)),
+            leftovers: b.leftovers.len(),
+        });
+        let unresolved_jobs = self.unresolved().len();
+
+        let primary_enabled = if d.running_here.is_some() || g.is_none() {
+            false
+        } else if existing.is_some() {
+            intents.iter().any(|i| i.enabled)
+        } else {
+            d.can
+        };
+        let (primary_label, primary_intent) = if existing.is_some() {
+            ("Key again…".to_string(), None)
+        } else if result_exists && d.label == "Key shot" {
+            ("Key again…".to_string(), Some(Intent::New))
+        } else {
+            (d.label.clone(), Some(if d.new_version.is_some() { Intent::NewVersion } else { Intent::New }))
+        };
+        let blocker = if let Some(id) = &d.running_here {
+            Some(KeyBlocker { message: format!("Key is running for this clip ({id})"), fix: None })
+        } else if g.is_none() {
+            Some(KeyBlocker { message: "Checking the output folder…".into(), fix: None })
+        } else if !d.setup.is_empty() {
+            Some(KeyBlocker { message: d.setup[0].clone(), fix: Some(KeyFix::OpenMachines) })
+        } else if let Some(b) = blocked {
+            if let Some(e) = existing {
+                (!primary_enabled).then(|| KeyBlocker { message: e.reason.clone(), fix: Some(KeyFix::ResultActions) })
+            } else {
+                let message = b.reasons.first().cloned().unwrap_or_else(|| "Key cannot start".into());
+                let fix = if b.lock.is_some() { Some(KeyFix::RecoveryDetails) } else if clip.input_files.is_empty() { Some(KeyFix::Relink) } else { None };
+                Some(KeyBlocker { message, fix })
+            }
+        } else if !d.can {
+            Some(KeyBlocker { message: d.why.clone(), fix: (!d.by_queue).then_some(KeyFix::OpenMachines) })
+        } else {
+            None
+        };
+
+        // Newest Key job of this shot: its progress, or how the last one ended.
+        let job = self.tracked.iter().rev().filter(|t| t.folder == clip.folder && t.label.is_empty()).find_map(|t| self.sched.job(&t.job_id));
+        let on = |t: &str| self.placement_text(&Placement::Target(t.to_owned()));
+        let (mut status_line, mut busy_percent) = (None, None);
+        if let Some(e) = job {
+            match &e.state {
+                JobState::Queued => status_line = Some("Queued".to_string()),
+                JobState::Dispatching { target } => status_line = Some(format!("Starting · {}", on(target))),
+                JobState::Running { target, done, total, .. } => {
+                    busy_percent = (*total > 0).then(|| (done * 100 / total).min(100) as u8);
+                    status_line = Some(match busy_percent {
+                        Some(pc) => format!("Keying {pc}% · frame {done} / {total} · {}", on(target)),
+                        None => format!("Keying · {}", on(target)),
+                    });
+                }
+                JobState::Done { target, info } if info.outcome == crate::worker::Outcome::Complete => status_line = Some(format!("Last keyed on {}", on(target))),
+                _ => status_line = e.failure_message(),
+            }
+        } else if let Some(m) = &clip.manifest {
+            status_line = Some(format!("Result on disk · {}{}", m.engine, if m.complete { "" } else { " (partial)" }));
+        }
+
+        // Machine picker: inherit, paired network PCs, then this computer's workers.
+        let own = self.own_client(clip);
+        let mut machines = vec![MachineOption { id: None, label: "Use project default".into(), available: true, reason: None }];
+        for (id, name) in &self.net_targets {
+            machines.push(MachineOption {
+                id: Some(format!("network:{id}")),
+                label: format!("{name} · network"),
+                available: self.net_online,
+                reason: (!self.net_online).then(|| "Connect to the coordinator in Clients first".to_string()),
+            });
+        }
+        for t in self.sched.targets() {
+            let ok = t.enabled && !matches!(t.status, TargetStatus::Refused(_) | TargetStatus::Down(_) | TargetStatus::Stopped);
+            machines.push(MachineOption { id: Some(t.id.clone()), label: t.id.clone(), available: ok, reason: (!ok).then(|| target_line(&t)) });
+        }
+        if let Some(id) = own.as_ref().filter(|id| !machines.iter().any(|m| m.id.as_ref() == Some(*id))) {
+            machines.push(MachineOption { id: Some(id.clone()), label: self.placement_text(&Placement::Target(id.clone())), available: false, reason: Some("Not configured any more".into()) });
+        }
+
+        KeyView {
+            machine_effective: self.placement_text(&d.placement),
+            machine_inherited: inherit_text(&self.placement),
+            machine: own,
+            machines,
+            vram_profile: KeyValue { overridden: val("vram_profile"), value: p.vram_profile },
+            temporal_window: KeyValue { overridden: val("temporal_window"), value: p.temporal_window },
+            hint_mode: KeyValue { overridden: val("hint_mode"), value: p.hint_mode },
+            hint_quality: KeyValue { overridden: val("hint_quality"), value: p.hint_quality },
+            carry_hint: KeyValue { overridden: val("carry_hint"), value: p.carry_hint },
+            carry_hint_quality: KeyValue { overridden: val("carry_hint_quality"), value: p.carry_hint_quality },
+            despill_strength: KeyValue { overridden: val("despill_strength"), value: p.despill_strength },
+            cutout_linear: KeyValue { overridden: val("cutout_linear"), value: p.cutout_linear },
+            reset_label: (!marked.is_empty()).then(|| self.reset_label(clip)),
+            primary_enabled,
+            primary_label,
+            primary_intent,
+            blocker,
+            checking: g.is_none(),
+            status_line,
+            busy_percent,
+            cancel_job: self.cancellable_key_job(clip),
+            result_exists,
+            intents,
+            replace_pending: self.replace_confirm.then(|| existing.map_or(0, |e| e.replace_files)),
+            lock,
+            unresolved_jobs,
+            notice: self.notice.clone(),
         }
     }
 
@@ -3008,10 +3659,20 @@ impl AiUi {
         self.notice = Some(m);
     }
 
+    pub fn local_attempt_ms(&self, root: &std::path::Path) -> Option<u64> {
+        self.local_attempt.get(root).copied()
+    }
+
+    /// Any shot going back to the Automatic wait is a new local attempt, so an older remote failure stays hidden.
+    fn push_waiting(&mut self, a: AutoShot) {
+        self.local_attempt.insert(a.row.clip.root.clone(), now_ms());
+        self.auto_pending.push_back(a);
+    }
+
     /// Automatic waits for a free PC (`Ok(true)`); a chosen client gets it now (`Ok(false)`).
     fn queue_row(&mut self, project: &Project, st: &Settings, preset_name: Option<&str>, r: BatchRow, p: Plan) -> Result<bool, String> {
         if matches!(r.placement, Placement::Auto) {
-            self.auto_pending.push_back(AutoShot { row: r, plan: p, project: project.clone(), st: st.clone(), preset_name: preset_name.map(str::to_owned), failed_on: vec![], paused: false, on: None });
+            self.push_waiting(AutoShot { row: r, plan: p, project: project.clone(), st: st.clone(), preset_name: preset_name.map(str::to_owned), failed_on: vec![], paused: false, on: None });
             return Ok(true);
         }
         self.submit_row(project, st, preset_name, &r, p).map(|_| false)
@@ -3039,6 +3700,9 @@ impl AiUi {
             self.submit_chain(&r.clip, r.steps.clone(), Some((p, r.params.clone(), r.out.clone())))
         };
         let id = res?;
+        if network_target(&r.placement).is_none() {
+            self.local_attempt.insert(r.clip.root.clone(), now_ms());
+        }
         if preset_name.is_some() || r.hint.is_some() {
             // The baked values equal the shot's overrides where it has any: keep their markers.
             let old = self.drafts.get(&r.clip.folder);
@@ -3099,7 +3763,7 @@ impl AiUi {
                     self.notice = Some(format!("{}: not queued on this PC yet, {e}", a.row.clip.display_name));
                 }
                 // To the back, so one failing shot never blocks the others.
-                self.auto_pending.push_back(a);
+                self.push_waiting(a);
             }
         }
         self.auto_wait = self.auto_pending.iter().any(|a| !a.paused).then(|| {
@@ -3139,7 +3803,7 @@ impl AiUi {
         a.on = None;
         a.row.placement = Placement::Auto;
         self.notice = Some(format!("{}: back in Automatic, it goes to the next free PC.", a.row.clip.display_name));
-        self.auto_pending.push_back(a);
+        self.push_waiting(a);
     }
 
     /// The PC refused this send for good: the shot stays visible with the reason (Clear / Send again) instead of
@@ -3244,7 +3908,7 @@ impl AiUi {
     fn resend_failed(&mut self, rp: Replan, why: String) {
         self.notice = Some(format!("{}: not sent, {why}", rp.shot.row.clip.display_name));
         if rp.was.is_none() {
-            self.auto_pending.push_back(rp.shot);
+            self.push_waiting(rp.shot);
         }
     }
 
@@ -3290,7 +3954,7 @@ impl AiUi {
         a.failed_on.push(pc);
         a.row.placement = Placement::Auto;
         self.notice = Some(format!("{name}: failed on {label} ({why}); back in Automatic for another PC."));
-        self.auto_pending.push_back(a);
+        self.push_waiting(a);
     }
 
     /// A PC as people know it: "this PC", or the client's name for a `network:` id.
@@ -4150,6 +4814,81 @@ mod tests {
             ai.auto_pending.push_back(AutoShot { row, plan, project: p.clone(), st: st.clone(), preset_name: None, failed_on: vec![], paused: false, on: None });
         }
         (ai, d)
+    }
+
+    #[test]
+    fn remote_is_newest_compares_against_latest_local_attempt() {
+        assert!(remote_is_newest(5, None), "no local attempt: remote shows");
+        assert!(remote_is_newest(10, Some(5)), "remote newer than local");
+        assert!(!remote_is_newest(5, Some(10)), "local newer than remote");
+        assert!(remote_is_newest(7, Some(7)), "equal shows");
+    }
+
+    #[test]
+    fn queue_row_automatic_records_local_attempt_for_clip_root() {
+        let (mut ai, d) = auto_fixture("attempt_stamp", 1);
+        let a = ai.auto_pending.pop_front().unwrap();
+        let root = a.row.clip.root.clone();
+        assert!(ai.local_attempt_ms(&root).is_none());
+        assert_eq!(ai.queue_row(&a.project, &a.st, None, a.row, a.plan), Ok(true));
+        assert!(ai.local_attempt_ms(&root).is_some(), "an Automatic wait is a local attempt");
+        drop(ai);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn failed_auto_shot_back_in_waiting_records_newer_local_attempt() {
+        let (mut ai, d) = auto_fixture("failed_waiting_stamp", 1);
+        let mut a = ai.auto_pending.pop_front().unwrap();
+        let root = a.row.clip.root.clone();
+        a.on = Some("network:pc1".into());
+        let old_remote = now_ms();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ai.auto_failed(a, "boom");
+        assert_eq!(ai.auto_pending.len(), 1, "the failed shot is back in Automatic");
+        assert!(!remote_is_newest(old_remote, ai.local_attempt_ms(&root)), "the older remote failure is hidden");
+        drop(ai);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn back_to_auto_records_newer_local_attempt() {
+        let (mut ai, d) = auto_fixture("back_waiting_stamp", 1);
+        let mut a = ai.auto_pending.pop_front().unwrap();
+        let root = a.row.clip.root.clone();
+        a.on = Some("network:pc1".into());
+        ai.sent_shots.insert("sid1".into(), a);
+        let old_remote = now_ms();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ai.back_to_auto("sid1");
+        assert_eq!(ai.auto_pending.len(), 1, "the refused shot is back in Automatic");
+        assert!(!remote_is_newest(old_remote, ai.local_attempt_ms(&root)), "the older remote failure is hidden");
+        drop(ai);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn automatic_retry_waiting_uses_real_roots_instead_of_an_old_failed_card_row() {
+        let (mut ai, d) = auto_fixture("board_retry_waiting", 1);
+        ai.dispatch_auto(&[], &busy_view());
+        let waiting_roots = ai.waiting_roots();
+        assert_eq!(waiting_roots.len(), 1);
+        assert_eq!(ai.waiting_count(), 1, "unavailable local load and no remote client leave it waiting");
+        assert!(matches!(ai.auto_pending.front().unwrap().row.placement, Placement::Auto));
+        let failed = crate::ui::ai::queue_view::QueueRun {
+            client: "local".into(),
+            rows: vec![crate::ui::ai::queue_view::QueueRow {
+                stage: crate::ui::ai::queue_view::Stage::Key,
+                heading: "Keying".into(),
+                cell: crate::ui::ai::queue_view::Cell { text: "Failed".into(), frac: 0.0, bad: true },
+                products: vec![], ids: vec![], precomputed: false, attention: true, active: false, executing: false,
+            }],
+            active: false,
+            reason: "failed".into(),
+        };
+        assert!(ai.board_row(&[failed], waiting_roots.contains(&ai.auto_pending.front().unwrap().row.clip.root)).is_none());
+        drop(ai);
+        let _ = std::fs::remove_dir_all(d);
     }
 
     fn busy_view() -> crate::metrics::View {

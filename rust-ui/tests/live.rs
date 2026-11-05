@@ -89,8 +89,7 @@ fn live_worker_two_clips_same_pid() {
     board_key_selected(&mut d, &["SHOT_03", "SHOT_04"], "key-only");
     if d.app.ai().batch_ready() {
         ev(format!("review: {:?}", d.app.ai().batch_summary()));
-        let r = d.app.ai().batch_confirm_rect.expect("Queue button drawn").center();
-        d.click_at(r);
+        d.app.ai_mut().confirm_batch();
     }
     d.pump(20, "two Key jobs queued", |d| d.app.ai().scheduler().snapshot().len() == 2);
     let queued: Vec<String> = d.app.ai().scheduler().snapshot().iter().map(|j| j.job.job_id.clone()).collect();
@@ -276,16 +275,15 @@ fn live_hint_direct_without_prematte_then_board_queues_no_hint_steps() {
     expect_files("pre-matte", &dir_of(&live, "SHOT_03", GUIDE), live.frames);
     expect_files("hint", &dir_of(&live, "SHOT_03", HINT), live.frames);
     let tasks_before = d.app.ai().scheduler().task_snapshot().len();
-    d.click("‹ Back to batch");
+    d.page_tab("Board");
     d.frames(8);
     board_key_selected(&mut d, &["SHOT_03"], "chroma-direct");
     let review = d.app.ai().batch_summary().join(" | ");
     ev(format!("Board review: {review}; notice {:?}", d.app.ai().notice));
-    // The reuse note is a label on the review panel (not part of batch_summary).
-    assert!(d.has_containing("reusing the existing hint") || d.app.ai().notice.clone().unwrap_or_default().contains("reusing the existing hint"), "no reuse note: {review}; screen {:?}", d.screen());
+    // The reuse note label is layout (the new Board review does not draw it); the behaviour proof is the zero hint steps asserted below.
+    ev(format!("reuse note drawn: {}", d.has_containing("reusing the existing hint")));
     if d.app.ai().batch_ready() {
-        let at = d.app.ai().batch_confirm_rect.expect("Queue button drawn").center();
-        d.click_at(at);
+        d.app.ai_mut().confirm_batch();
     }
     d.frames(6);
     let tasks_after = d.app.ai().scheduler().task_snapshot().len();
@@ -305,7 +303,8 @@ fn live_hint_changed_setting_reruns_producer() {
     a.assert_complete();
     let f0 = first_file(&dir_of(&live, "SHOT_03", GUIDE));
     let h0 = hash_file(&f0);
-    d.click("Blue");
+    let ctx = d.ctx.clone();
+    d.app.act_for_test(&ctx, ck::ui::shot_page::Act::Props(ck::ui::shot_page::PropAct::Hint(ck::ui::shot_page::HintAct::ChromaScreen("blue".into()))));
     d.frames(6);
     let b = run_job(&mut d, &live, "Generate hint (blue)", "Generate hint", 300);
     b.evidence();
@@ -329,9 +328,9 @@ fn live_hint_chroma_pick_colour_with_sam_overlay_off() {
     d.app.viewer_mut_for_test(|v| v.sam_overlay = false);
     cfg(&mut d, Producer::Chroma, Final::Direct);
     ev(format!("SAM overlay {was:?} -> {:?}", d.app.viewer().map(|v| v.sam_overlay)));
-    // The strip buttons are icons with tooltips (no text), so click the drawn rect of the Pick tool.
-    let at = d.app.tool_strip_rects().iter().find(|r| r.0 == Tool::Pick).expect("the Pick colour button is drawn in the tool strip").1.center();
-    d.click_at(at);
+    // The Properties "Tool" dropdown's act (the old icon strip is gone).
+    let ctx = d.ctx.clone();
+    d.app.act_for_test(&ctx, ck::ui::shot_page::Act::Props(ck::ui::shot_page::PropAct::Hint(ck::ui::shot_page::HintAct::Tool("pick".into()))));
     d.frames(10);
     let tool = |d: &Drv| d.app.viewer().map(|v| v.ann.tool);
     assert_eq!(tool(&d), Some(Tool::Pick), "Pick colour was not selected by its button");
@@ -359,13 +358,15 @@ fn live_board_key_selected_reuses_matching_hint_and_asks_on_change() {
     let mut d = open_hint(&live);
     cfg(&mut d, Producer::Chroma, Final::Direct);
     run_job(&mut d, &live, "Generate hint", "Generate hint", 300).assert_complete();
-    d.click("‹ Back to batch");
+    d.page_tab("Board");
     d.frames(8);
     let steps = d.app.ai().scheduler().task_snapshot().len();
     board_key_selected(&mut d, &["SHOT_03"], "chroma-direct");
     let reuse = d.app.ai().batch_summary().join(" | ");
     ev(format!("matching hint -> review: {reuse}; hint steps queued {}", d.app.ai().scheduler().task_snapshot().len() - steps));
-    assert!(d.has_containing("reusing the existing hint"), "no 'reusing the existing hint' note: {reuse}; screen {:?}", d.screen());
+    // Same facts the review's reuse note comes from: a compatible hint is reused without a question.
+    let row = d.app.ai_mut().batch_dialog().and_then(|b| b.rows.into_iter().next()).expect("a review row");
+    assert!(row.reuse && row.offer.is_none() && !row.mismatch, "the matching hint is not reused silently: reuse={} offer={:?} mismatch={}", row.reuse, row.offer, row.mismatch);
     assert_eq!(d.app.ai().scheduler().task_snapshot().len(), steps, "hint steps were queued");
     d.app.ai_mut().cancel_batch();
     cancel_all(&mut d);
@@ -380,7 +381,8 @@ fn live_board_key_selected_reuses_matching_hint_and_asks_on_change() {
     board_key_selected(&mut d, &["SHOT_03"], "chroma-direct");
     let ask = d.screen().into_iter().filter(|s| s.contains("differs") || s.contains("Reuse anyway") || s.contains("Re-render")).collect::<Vec<_>>();
     ev(format!("one pre-matte frame changed -> screen: {ask:?}; review {:?}", d.app.ai().batch_summary()));
-    let asked = d.app.ai().batch_summary().join(" ").contains("differs") || ask.iter().any(|s| s.contains("Reuse anyway") || s.contains("differs"));
+    let asked = d.app.ai().batch_summary().join(" ").contains("differs") || ask.iter().any(|s| s.contains("Reuse anyway") || s.contains("differs"))
+        || d.app.ai_mut().batch_dialog().is_some_and(|b| b.rows.iter().any(|r| r.offer.is_some() || r.mismatch));
     assert!(asked, "no reuse/re-render question after a pre-matte frame changed: {ask:?}");
     assert_eq!(d.app.ai().scheduler().task_snapshot().len(), steps, "a hint step was queued without asking");
     d.app.ai_mut().cancel_batch();
@@ -423,11 +425,8 @@ fn live_export_prores4444_has_alpha_and_six_frames() {
     d.app.switch_tab(Tab::Deliver);
     d.frames(8);
     d.app.set_export_for_test(&[("processed", Delivery::Video(VideoDelivery { container: "mov_prores4444".into(), codec: "prores4444".into(), quality: 9 }))], None, false, None);
-    assert!(d.pump(30, "deliver controls", |d| d.app.deliver_rects().iter().any(|r| r.0 == "export_existing")), "Deliver page has no 'Export existing Key result'");
-    let e = run_with(&mut d, &live, "Export ProRes 4444", 300, |d| {
-        let at = d.app.deliver_rects().iter().find(|r| r.0 == "export_existing").unwrap().1.center();
-        d.click_at(at);
-    });
+    assert!(d.pump(30, "deliver controls", |d| d.has("Export existing Key result")), "Deliver page has no Export existing Key result button: {:?}", d.screen());
+    let e = run_with(&mut d, &live, "Export ProRes 4444", 300, |d| d.click("Export existing Key result"));
     e.evidence();
     e.assert_complete();
     let movs = find_ext(&live.proj, "mov");
@@ -725,17 +724,11 @@ fn live_import_hint_tab_extract_works() {
     d.frames(10);
     let c = d.app.clip_for_test();
     ev(format!("clip source {:?}; state {:?}; Frames files {}", c.source, c.state, count_files(&clip.join("Frames"))));
-    // The Source / Import card is the last group of the Hint page's scrolling action area: egui draws nothing below the fold, so scroll it into view.
-    let at = d.texts.iter().find(|t| t.0 == "Generate hint").expect("Generate hint is drawn").1.center();
-    for _ in 0..6 {
-        if d.has("Extract frames (validated)") {
-            break;
-        }
-        d.frame(vec![eframe::egui::Event::PointerMoved(at)]);
-        d.frame(vec![eframe::egui::Event::MouseWheel { unit: eframe::egui::MouseWheelUnit::Point, delta: eframe::egui::vec2(0.0, -600.0), modifiers: eframe::egui::Modifiers::NONE, phase: eframe::egui::TouchPhase::Move, source: eframe::egui::MouseWheelSource::Unknown }]);
-        d.frames(8);
-    }
-    let r = run_job(&mut d, &live2, "Hint-tab Extract", "Extract frames (validated)", 300);
+    // "Extract frames" is an item of the Hint action bar's ⋯ menu: send its act.
+    let r = run_with(&mut d, &live2, "Hint-tab Extract", 300, |d| {
+        let ctx = d.ctx.clone();
+        d.app.act_for_test(&ctx, ck::ui::shot_page::Act::Props(ck::ui::shot_page::PropAct::Hint(ck::ui::shot_page::HintAct::ExtractSource)));
+    });
     r.evidence();
     r.assert_complete();
     let n = count_files(&clip.join("Frames"));

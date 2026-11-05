@@ -18,7 +18,7 @@ name = "ck-bench"
 path = "src/bin/ck-bench.rs"
 
 [dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts"] }
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "accesskit"] }
 exr = "1.74.2"
 png = "0.18"
 natord = "1.0.9"

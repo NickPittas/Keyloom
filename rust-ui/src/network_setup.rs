@@ -111,6 +111,8 @@ struct JoinMeta {
     local: bool,
     iid: Option<String>,
     eps: Vec<String>,
+    /// `pc_key` of the discovered PC being joined (None for this PC's own network).
+    key: Option<String>,
 }
 
 /// A login registered on this PC's own service (a PC that joined it).
@@ -203,6 +205,170 @@ pub enum Hosted {
     Running(Value),
 }
 
+/// What the service looks like to the user (one wording per state, shared by both screens).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceMode {
+    Starting,
+    AppHosted,
+    Unknown,
+    Checking,
+    NotInstalled,
+    Stopped,
+    Running,
+}
+
+fn mode_line(m: ServiceMode) -> &'static str {
+    match m {
+        ServiceMode::Starting => "Starting this app's network endpoint…",
+        ServiceMode::AppHosted => "Running inside this app; other PCs can find this PC while Keyloom is open.",
+        ServiceMode::Unknown => "Service state unknown after a timeout. Press Refresh.",
+        ServiceMode::Checking => "Checking the service…",
+        ServiceMode::NotInstalled => "Not installed. Start installs it and makes this PC visible to other PCs.",
+        ServiceMode::Stopped => "Stopped. Other PCs cannot reach this one until it is started (it also starts at sign-in).",
+        ServiceMode::Running => "Running; other PCs can find this PC on every network it is connected to.",
+    }
+}
+
+/// Stable identity of a discovered PC: the full certificate fingerprint plus the host installation (never the name).
+fn pc_key(p: &Pc) -> String {
+    format!("{}:{}", p.fingerprint_sha256, p.host_iid.as_deref().unwrap_or(""))
+}
+
+/// Scan summary line and the warning lines (partial scan, failed lookups).
+fn scan_lines(s: &Scan) -> (String, Vec<String>) {
+    let mut w = vec![];
+    if s.partial {
+        w.push("Scan incomplete; some addresses could not be checked in time".to_owned());
+    }
+    for (what, state) in [("Tailscale", &s.tailscale), ("Neighbours", &s.neighbors)] {
+        if state == "error" {
+            w.push(format!("{what} lookup failed"));
+        }
+    }
+    (format!("Scanned {} network interface(s) in {:.1} s", s.interfaces, s.elapsed_ms as f64 / 1000.0), w)
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapEp {
+    pub url: String,
+    pub host: String,
+    pub kind: String,
+    pub reachable: bool,
+    pub rtt_ms: Option<f64>,
+    pub error: Option<String>,
+}
+
+/// One PC found by the last scan (this PC itself is left out).
+#[derive(Clone, Debug)]
+pub struct SnapPc {
+    /// Stable key (full certificate fingerprint + host installation): pass it to `PageAction::Join`.
+    pub key: String,
+    pub network_id: String,
+    pub fingerprint_sha256: String,
+    pub host_iid: Option<String>,
+    pub name: String,
+    pub endpoints: Vec<SnapEp>,
+    /// Distinct hosts and kinds, in the order the old screen listed them.
+    pub hosts: Vec<String>,
+    pub kinds: Vec<String>,
+    pub reach_up: usize,
+    pub reach_total: usize,
+    pub best_rtt_ms: Option<f64>,
+    /// First endpoint error, only when nothing was reachable (old hover text, <= 200 chars).
+    pub reach_error: Option<String>,
+    pub receiver_online: bool,
+    pub join_allowed: bool,
+    /// A saved connection of this network/host exists.
+    pub saved: bool,
+    pub saved_credentials: Option<String>,
+    pub enabled: bool,
+    pub connected: bool,
+    /// Addresses for `PageAction::UsePc` (reachable first, https, <= 16).
+    pub urls: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapInstall {
+    pub id: String,
+    pub name: String,
+    pub joined: String,
+    pub last_seen: String,
+    pub connected: bool,
+    pub in_use: bool,
+    pub is_this_pc: bool,
+    pub can_retire: bool,
+    /// Why Retire is off (old hover text), empty when it is allowed.
+    pub retire_block: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallsState {
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
+/// Read-only copy of everything the network-setup screen shows. Holds no credentials and no `Ui`.
+#[derive(Clone, Debug)]
+pub struct PageSnapshot {
+    pub hosting: bool,
+    pub mode: ServiceMode,
+    pub status_line: String,
+    pub installed: bool,
+    pub running: bool,
+    pub port: u64,
+    /// The saved PC name (settings mirror) and join policy.
+    pub name: String,
+    pub allow_join: bool,
+    /// `(short address, kind)` of every address the service answers on (running only).
+    pub addresses: Vec<(String, String)>,
+    pub discovery: bool,
+    pub receiver_online: bool,
+    pub certificate: Option<String>,
+    pub host_installation_id: Option<String>,
+    /// `code: message` of the service error, if any.
+    pub error: Option<String>,
+    pub can_start: bool,
+    pub can_stop: bool,
+    pub can_remove: bool,
+    pub can_refresh: bool,
+    pub busy: bool,
+    pub joining: bool,
+    pub joining_key: Option<String>,
+    pub retiring: bool,
+    pub note: Option<String>,
+    pub scanning: bool,
+    pub scan_started: Option<Instant>,
+    pub scan_summary: Option<String>,
+    pub scan_warnings: Vec<String>,
+    pub pcs: Vec<SnapPc>,
+    pub installs_state: InstallsState,
+    pub installs: Vec<SnapInstall>,
+}
+
+/// Every network-setup operation the Machines page can trigger (see `Setup::handle`).
+#[derive(Clone, Debug)]
+pub enum PageAction {
+    SaveName(String),
+    AllowJoin(bool),
+    UsePc { credentials: String, network_id: String, host_iid: Option<String>, name: String, endpoints: Vec<String>, on: bool },
+    /// Once per time the page opens: first-open init and the one-time scan.
+    OpenPage,
+    Rescan,
+    CancelScan,
+    /// `SnapPc::key`.
+    Join(String),
+    RefreshService,
+    StartService,
+    StopService,
+    /// The page already asked for confirmation; acts at once.
+    RemoveServiceConfirmed,
+    /// The registered-PCs section opened: load the list once.
+    OpenJoined,
+    RefreshJoined,
+    RetireConfirmed { ids: Vec<String>, unused_only: bool },
+}
+
 pub struct Setup {
     hosted: Option<Svc>,
     hosting: bool,
@@ -245,6 +411,7 @@ pub struct Setup {
     out: Vec<Cmd>,
     updates: Vec<ScanUpdate>,
     installs: Option<Vec<Install>>,
+    installs_err: Option<String>,
     installs_open: bool,
     /// Logins waiting for the user's Retire confirmation.
     retire_ask: Option<Vec<String>>,
@@ -431,6 +598,7 @@ impl Setup {
             out: vec![],
             updates: vec![],
             installs: None,
+            installs_err: None,
             installs_open: false,
             retire_ask: None,
             retire_todo: VecDeque::new(),
@@ -817,10 +985,15 @@ impl Setup {
                 nlog(&format!("join failed: {} ({})", e.code, err_text(&e)));
                 self.note = Some(format!("Join failed; {why} ({})", err_text(&e)));
             }
-            (Pend::Installs, Ok(v)) => self.installs = Some(parse_installs(&v)),
+            (Pend::Installs, Ok(v)) => {
+                self.installs = Some(parse_installs(&v));
+                self.installs_err = None;
+            }
             (Pend::Installs, Err(e)) => {
                 nlog(&format!("registered PCs failed: {} ({})", e.code, err_text(&e)));
-                self.note = Some(format!("Could not read the PCs registered on this PC ({})", err_text(&e)));
+                let why = format!("Could not read the PCs registered on this PC ({})", err_text(&e));
+                self.installs_err = Some(why.clone());
+                self.note = Some(why);
             }
             (Pend::Retire, out) => {
                 match out {
@@ -893,8 +1066,241 @@ impl Setup {
             return;
         };
         let args = pc.join_args(&url, &self.reg_name);
-        let meta = JoinMeta { name: self.reg_name.clone(), host_name: pc.name.clone(), iid: pc.host_iid.clone(), eps: urls, ..Default::default() };
+        let meta = JoinMeta { name: self.reg_name.clone(), host_name: pc.name.clone(), iid: pc.host_iid.clone(), eps: urls, key: Some(pc_key(pc)), ..Default::default() };
         self.begin_join(Op::JoinAddress, args, meta);
+    }
+
+    fn mode(&self) -> ServiceMode {
+        if self.hosting {
+            return if self.hosted.is_none() { ServiceMode::Starting } else { ServiceMode::AppHosted };
+        }
+        match &self.svc {
+            _ if self.svc_unknown => ServiceMode::Unknown,
+            None => ServiceMode::Checking,
+            Some(s) if !s.installed => ServiceMode::NotInstalled,
+            Some(s) if !s.running => ServiceMode::Stopped,
+            Some(_) => ServiceMode::Running,
+        }
+    }
+
+    /// First-open work, guarded so it runs once per run (never in the background): the saved name and one scan.
+    fn open_init(&mut self, c: &Ctx) {
+        if !self.name_loaded {
+            self.name_loaded = true;
+            if !c.settings.network.name.trim().is_empty() {
+                self.name.clone_from(&c.settings.network.name);
+            }
+        }
+        if !self.scanned && self.source != Source::Off {
+            self.scanned = true;
+            self.known_urls.extend(c.connections.iter().filter_map(|k| k.url.clone()));
+            self.rescan();
+        }
+    }
+
+    /// Reload the registered-PC list (the same request the old Refresh and first open send).
+    fn refresh_joined(&mut self) {
+        if !self.dir.is_empty() {
+            self.push(Op::ServiceInstallations, json!({}), Pend::Installs);
+        }
+    }
+
+    /// Retire the given logins one at a time; unknown ids, this PC's own login and in-use logins are never sent.
+    fn retire(&mut self, ids: Vec<String>, unused_only: bool) {
+        let ok: Vec<String> = ids.into_iter().filter(|id| self.installs.iter().flatten().any(|i| i.id == *id && !i.is_this_pc && !i.in_use && !(unused_only && i.connected))).collect();
+        if ok.is_empty() {
+            return;
+        }
+        self.retire_todo = ok.into();
+        self.retire_next();
+    }
+
+    /// Plain copy of what the screen shows. No timers, no requests.
+    pub fn page_snapshot(&self, c: &Ctx) -> PageSnapshot {
+        let mode = self.mode();
+        let svc = self.svc().cloned().unwrap_or_default();
+        let idle = !self.busy();
+        let conns = c.settings.network.connections();
+        let (scan_summary, scan_warnings) = self.scan.as_ref().map_or((None, vec![]), |s| {
+            let (l, w) = scan_lines(s);
+            (Some(l), w)
+        });
+        let pcs = self.scan.iter().flat_map(|s| s.pcs.iter()).filter(|p| !p.is_self).map(|p| {
+            let k = find_conn(&conns, c.connections, &p.network_id, p.host_iid.as_deref());
+            let mut hosts: Vec<String> = vec![];
+            let mut kinds: Vec<String> = vec![];
+            for e in &p.endpoints {
+                let h = host_of(&e.url);
+                if !hosts.contains(&h) { hosts.push(h); }
+                if !e.kind.is_empty() && !kinds.contains(&e.kind) { kinds.push(e.kind.clone()); }
+            }
+            let up = p.endpoints.iter().filter(|e| e.reachable).count();
+            let best = p.endpoints.iter().filter(|e| e.reachable).filter_map(|e| e.rtt_ms).fold(f64::INFINITY, f64::min);
+            SnapPc {
+                key: pc_key(p),
+                network_id: p.network_id.clone(),
+                fingerprint_sha256: p.fingerprint_sha256.clone(),
+                host_iid: p.host_iid.clone(),
+                name: p.name.clone(),
+                endpoints: p.endpoints.iter().map(|e| SnapEp { url: e.url.clone(), host: host_of(&e.url), kind: e.kind.clone(), reachable: e.reachable, rtt_ms: e.rtt_ms, error: e.error.clone() }).collect(),
+                hosts,
+                kinds,
+                reach_up: up,
+                reach_total: p.endpoints.len(),
+                best_rtt_ms: (up > 0 && best.is_finite()).then_some(best),
+                reach_error: p.endpoints.iter().find_map(|e| e.error.as_ref()).filter(|_| up == 0).map(|e| e.chars().take(200).collect()),
+                receiver_online: p.receiver_online,
+                join_allowed: p.join,
+                saved: k.is_some(),
+                saved_credentials: k.map(|k| k.credentials.clone()),
+                enabled: k.is_some_and(|k| k.enabled),
+                connected: k.is_some_and(|k| k.enabled && c.connections.iter().any(|i| i.credentials == k.credentials && i.online)),
+                urls: p.urls(),
+            }
+        }).collect();
+        let installs = self.installs.iter().flatten().map(|i| {
+            let retire_block = if i.is_this_pc { "This is this PC's own login; it cannot be retired." } else if i.in_use { "This PC is in use; it cannot be retired." } else { "" };
+            SnapInstall {
+                id: i.id.clone(),
+                name: i.name.clone(),
+                joined: when(i.created_at),
+                last_seen: i.last_seen.map_or("never".to_owned(), when),
+                connected: i.connected,
+                in_use: i.in_use,
+                is_this_pc: i.is_this_pc,
+                can_retire: retire_block.is_empty(),
+                retire_block: retire_block.to_owned(),
+            }
+        }).collect();
+        let joining_key = self.pend.values().map(|p| &p.0).chain(self.queue.iter().map(|q| &q.p)).find_map(|p| match p {
+            Pend::Join(m) => m.key.clone(),
+            _ => None,
+        });
+        PageSnapshot {
+            hosting: self.hosting,
+            mode,
+            status_line: mode_line(mode).to_owned(),
+            installed: svc.installed,
+            running: svc.running,
+            port: svc.port,
+            name: self.reg_name.clone(),
+            allow_join: self.allow_join,
+            addresses: if svc.running { svc.endpoints.iter().map(|(u, k)| (short(u), k.clone())).collect() } else { vec![] },
+            discovery: svc.discovery,
+            receiver_online: svc.receiver_online,
+            certificate: svc.network_id.clone(),
+            host_installation_id: svc.host_installation_id.clone(),
+            error: svc.error_code.as_ref().map(|code| format!("{code}: {}", svc.message.chars().take(200).collect::<String>())),
+            can_start: !self.hosting && idle && !svc.running,
+            can_stop: !self.hosting && idle && svc.running,
+            can_remove: !self.hosting && idle && svc.installed,
+            can_refresh: !self.hosting && idle,
+            busy: !idle,
+            joining: self.joining(),
+            joining_key,
+            retiring: self.retiring(),
+            note: self.note.clone(),
+            scanning: self.scanning(),
+            scan_started: self.scan_started,
+            scan_summary,
+            scan_warnings,
+            pcs,
+            installs_state: match (&self.installs, &self.installs_err) {
+                (None, Some(e)) => InstallsState::Failed(e.clone()),
+                (None, None) => InstallsState::Loading,
+                _ => InstallsState::Loaded,
+            },
+            installs,
+        }
+    }
+
+    /// Every page/button operation, with the guards the old screen's buttons had. The old `ui` routes through here.
+    pub fn handle(&mut self, a: PageAction, c: &Ctx) -> Vec<Cmd> {
+        let mut cmds = vec![];
+        match a {
+            PageAction::SaveName(n) => {
+                let t = n.trim();
+                if !t.is_empty() && t.chars().count() <= 64 && !n.chars().any(char::is_control) && t != c.settings.network.name {
+                    let t = t.to_owned();
+                    self.name.clone_from(&t);
+                    self.pend_name = Some(t.clone());
+                    cmds.push(Cmd::SaveName(t));
+                }
+            }
+            PageAction::AllowJoin(on) => {
+                cmds.push(Cmd::AllowJoin(on));
+                self.pend_allow = Some(on);
+            }
+            PageAction::UsePc { credentials, network_id, host_iid, name, endpoints, on } => {
+                cmds.push(Cmd::UsePc { credentials, network_id, host_iid, name, endpoints, on });
+            }
+            PageAction::OpenPage => {
+                if state_dir(c.settings_path).is_some() {
+                    self.set_dir(c.settings_path);
+                    if !self.hosting && !self.busy() {
+                        self.push(Op::ServiceStatus, json!({}), Pend::Status { ensure: false });
+                    }
+                    self.seen = Some(Instant::now());
+                    self.open_init(c);
+                }
+            }
+            PageAction::Rescan => {
+                self.known_urls.extend(c.connections.iter().filter_map(|k| k.url.clone()));
+                self.rescan();
+            }
+            PageAction::CancelScan => {
+                if self.scanning() {
+                    self.cancel_scan();
+                }
+            }
+            PageAction::Join(key) => {
+                let conns = c.settings.network.connections();
+                let pc = self.scan.iter().flat_map(|s| s.pcs.iter()).find(|p| !p.is_self && pc_key(p) == key).cloned();
+                if let Some(pc) = pc {
+                    if pc.join && !self.joining() && find_conn(&conns, c.connections, &pc.network_id, pc.host_iid.as_deref()).is_none() {
+                        self.join_pc(&pc);
+                    }
+                }
+            }
+            PageAction::RefreshService => {
+                if !self.hosting && !self.busy() {
+                    self.push(Op::ServiceStatus, json!({}), Pend::Status { ensure: false });
+                }
+            }
+            PageAction::StartService => {
+                let svc = self.svc.clone().unwrap_or_default();
+                if !self.hosting && !self.busy() && !svc.running {
+                    cmds.push(Cmd::HostRemoved(false));
+                    if svc.installed {
+                        self.push(Op::ServiceStart, json!({}), Pend::Service("Start"));
+                    } else {
+                        self.install("Start");
+                    }
+                }
+            }
+            PageAction::StopService => {
+                if !self.hosting && !self.busy() && self.svc.as_ref().is_some_and(|s| s.running) {
+                    self.push(Op::ServiceStop, json!({}), Pend::Service("Stop"));
+                }
+            }
+            PageAction::RemoveServiceConfirmed => {
+                if !self.hosting && !self.busy() && self.svc.as_ref().is_some_and(|s| s.installed) {
+                    cmds.push(Cmd::HostRemoved(true));
+                    self.push(Op::ServiceRemove, json!({}), Pend::Service("Remove"));
+                }
+            }
+            PageAction::OpenJoined => {
+                self.installs_open = true;
+                self.refresh_joined();
+            }
+            PageAction::RefreshJoined => {
+                if !self.busy() {
+                    self.refresh_joined();
+                }
+            }
+            PageAction::RetireConfirmed { ids, unused_only } => self.retire(ids, unused_only),
+        }
+        cmds
     }
 
     pub fn ui(&mut self, ui: &mut Ui, c: &Ctx) -> Vec<Cmd> {
@@ -908,18 +1314,7 @@ impl Setup {
             self.push(Op::ServiceStatus, json!({}), Pend::Status { ensure: false });
         }
         self.seen = Some(Instant::now());
-        if !self.name_loaded {
-            self.name_loaded = true;
-            if !c.settings.network.name.trim().is_empty() {
-                self.name.clone_from(&c.settings.network.name);
-            }
-        }
-        // The first time Clients opens, look for other PCs once (never in the background).
-        if !self.scanned && self.source != Source::Off {
-            self.scanned = true;
-            self.known_urls.extend(c.connections.iter().filter_map(|k| k.url.clone()));
-            self.rescan();
-        }
+        self.open_init(c);
         let conns = c.settings.network.connections();
         let idle = !self.busy();
         let svc = self.svc().cloned().unwrap_or_default();
@@ -929,28 +1324,23 @@ impl Setup {
         ui.heading("This PC");
         let mut allow_join = c.settings.network.allow_join;
         if crate::ui::theme::checkbox(ui, &mut allow_join, "Let other PCs join this PC").changed() {
-            cmds.push(Cmd::AllowJoin(allow_join));
-            self.pend_allow = Some(allow_join);
+            cmds.extend(self.handle(PageAction::AllowJoin(allow_join), c));
         }
         ui.horizontal_wrapped(|ui| {
             ui.label("Name");
             ui.add(egui::TextEdit::singleline(&mut self.name).id_salt("net_pc_name").desired_width(180.0).char_limit(64));
             if ui.add_enabled(name_ok && self.name.trim() != c.settings.network.name, egui::Button::new("Save")).clicked() {
-                cmds.push(Cmd::SaveName(self.name.trim().to_owned()));
-                self.pend_name = Some(self.name.trim().to_owned());
+                cmds.extend(self.handle(PageAction::SaveName(self.name.clone()), c));
             }
         });
         ui.label(RichText::new("The name is shown to every PC you connect to. Two PCs may share a name; they are told apart by their certificate.").color(crate::ui::theme::text_dim(ui)).size(11.0));
-        let (line, colour) = match (&self.svc().cloned(), svc.installed, svc.running) {
-            _ if self.hosting && self.hosted.is_none() => ("Starting this app's network endpoint…".to_owned(), crate::ui::theme::text_dim(ui)),
-            _ if self.hosting => ("Running inside this app; other PCs can find this PC while Keyloom is open.".to_owned(), crate::ui::theme::ok(ui)),
-            _ if self.svc_unknown => ("Service state unknown after a timeout. Press Refresh.".to_owned(), crate::ui::theme::warn(ui)),
-            (None, ..) => ("Checking the service…".to_owned(), crate::ui::theme::text_dim(ui)),
-            (_, false, _) => ("Not installed. Start installs it and makes this PC visible to other PCs.".into(), crate::ui::theme::text_dim(ui)),
-            (_, true, false) => ("Stopped. Other PCs cannot reach this one until it is started (it also starts at sign-in).".into(), crate::ui::theme::warn(ui)),
-            (_, true, true) => ("Running; other PCs can find this PC on every network it is connected to.".into(), crate::ui::theme::ok(ui)),
+        let mode = self.mode();
+        let colour = match mode {
+            ServiceMode::Running | ServiceMode::AppHosted => crate::ui::theme::ok(ui),
+            ServiceMode::Unknown | ServiceMode::Stopped => crate::ui::theme::warn(ui),
+            _ => crate::ui::theme::text_dim(ui),
         };
-        ui.colored_label(colour, line);
+        ui.colored_label(colour, mode_line(mode));
         if svc.running {
             if svc.endpoints.is_empty() {
                 ui.label(RichText::new("Addresses: none reported").color(crate::ui::theme::text_dim(ui)).size(11.5));
@@ -970,26 +1360,21 @@ impl Setup {
         if !self.hosting {
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(idle && !svc.running, egui::Button::new("Start")).clicked() {
-                cmds.push(Cmd::HostRemoved(false));
-                if svc.installed {
-                    self.push(Op::ServiceStart, json!({}), Pend::Service("Start"));
-                } else {
-                    self.install("Start");
-                }
+                cmds.extend(self.handle(PageAction::StartService, c));
             }
             if ui.add_enabled(idle && svc.running, egui::Button::new("Stop")).clicked() {
-                self.push(Op::ServiceStop, json!({}), Pend::Service("Stop"));
+                cmds.extend(self.handle(PageAction::StopService, c));
             }
             let label = if self.remove_armed { "Click again to remove" } else { "Remove" };
             if ui.add_enabled(idle && svc.installed, egui::Button::new(label)).clicked() {
-                if self.remove_armed {
-                    cmds.push(Cmd::HostRemoved(true));
-                    self.push(Op::ServiceRemove, json!({}), Pend::Service("Remove"));
+                let was_armed = self.remove_armed;
+                self.remove_armed = !was_armed;
+                if was_armed {
+                    cmds.extend(self.handle(PageAction::RemoveServiceConfirmed, c));
                 }
-                self.remove_armed = !self.remove_armed;
             }
             if ui.add_enabled(idle, egui::Button::new("Refresh")).clicked() {
-                self.push(Op::ServiceStatus, json!({}), Pend::Status { ensure: false });
+                cmds.extend(self.handle(PageAction::RefreshService, c));
             }
         });
         }
@@ -1001,23 +1386,17 @@ impl Setup {
                 ui.spinner();
                 ui.label(RichText::new(format!("Scanning… {secs} s")).color(crate::ui::theme::text_dim(ui)));
                 if ui.button("Cancel").clicked() {
-                    self.cancel_scan();
+                    cmds.extend(self.handle(PageAction::CancelScan, c));
                 }
                 ui.ctx().request_repaint_after(Duration::from_millis(500));
             } else if ui.button("ReScan").clicked() {
-                self.known_urls.extend(c.connections.iter().filter_map(|k| k.url.clone()));
-                self.rescan();
+                cmds.extend(self.handle(PageAction::Rescan, c));
             }
         });
         if let Some(s) = &self.scan {
-            let mut line = format!("Scanned {} network interface(s) in {:.1} s", s.interfaces, s.elapsed_ms as f64 / 1000.0);
-            if s.partial {
-                line.push_str(" · Scan incomplete; some addresses could not be checked in time");
-            }
-            for (what, state) in [("Tailscale", &s.tailscale), ("Neighbours", &s.neighbors)] {
-                if state == "error" {
-                    line.push_str(&format!(" · {what} lookup failed"));
-                }
+            let (mut line, warnings) = scan_lines(s);
+            for w in warnings {
+                line.push_str(&format!(" · {w}"));
             }
             ui.label(RichText::new(line).color(crate::ui::theme::text_dim(ui)).size(11.5));
         }
@@ -1042,7 +1421,7 @@ impl Setup {
                 if changed {
                     match k {
                         Some(k) => cmds.push(Cmd::UsePc { credentials: k.credentials.clone(), network_id: pc.network_id.clone(), host_iid: pc.host_iid.clone(), name: pc.name.clone(), endpoints: pc.urls(), on }),
-                        None if on => joins.push((*pc).clone()),
+                        None if on => joins.push(pc_key(pc)),
                         None => {}
                     }
                 }
@@ -1081,8 +1460,8 @@ impl Setup {
         if rows == 0 {
             ui.label(RichText::new(if self.scan.is_some() { "No other Keyloom PCs were found. Check that the other PC is running Keyloom, then ReScan." } else { "Press ReScan to look for other PCs." }).color(crate::ui::theme::text_dim(ui)));
         }
-        for pc in joins {
-            self.join_pc(&pc);
+        for key in joins {
+            cmds.extend(self.handle(PageAction::Join(key), c));
         }
         if self.busy() { ui.label(RichText::new("Working…").color(crate::ui::theme::text_dim(ui))); }
         if let Some(n) = &self.note { ui.add(egui::Label::new(RichText::new(n).color(crate::ui::theme::text_dim(ui)).size(12.0)).selectable(true)); }
@@ -1100,7 +1479,7 @@ impl Setup {
             let mut ask = None;
             ui.horizontal(|ui| {
                 if ui.add_enabled(idle, egui::Button::new("Refresh").small()).clicked() {
-                    self.push(Op::ServiceInstallations, json!({}), Pend::Installs);
+                    self.refresh_joined();
                 }
                 let unused: Vec<String> = self.installs.iter().flatten().filter(|i| !i.in_use && !i.is_this_pc && !i.connected).map(|i| i.id.clone()).collect();
                 if ui.add_enabled(idle && !unused.is_empty() && self.retire_ask.is_none(), egui::Button::new("Retire all unused").small()).clicked() {
@@ -1111,8 +1490,7 @@ impl Setup {
                 ui.horizontal(|ui| {
                     ui.label(format!("Retire {} login(s)? Those PCs must Join again to use this PC.", ids.len()));
                     if ui.button("Retire").clicked() {
-                        self.retire_todo = ids.into();
-                        self.retire_next();
+                        self.retire(ids, false);
                         self.retire_ask = None;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1165,7 +1543,7 @@ impl Setup {
         }
         let open = resp.openness > 0.0;
         if open && !self.installs_open {
-            self.push(Op::ServiceInstallations, json!({}), Pend::Installs);
+            self.refresh_joined();
         }
         self.installs_open = open;
     }

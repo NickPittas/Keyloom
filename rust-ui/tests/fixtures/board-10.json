@@ -1,0 +1,177 @@
+{
+ "project": "V1_interview_finale",
+ "saved": 1,
+ "cards": [
+  {
+   "n": "V1-0062_A002C001_261012_R4LF",
+   "st": "raw",
+   "meta": "3200×1800 · 24 fps · 65 fr",
+   "s": "No result yet",
+   "pc": "This machine",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0046_A002C008_261012_R4LF",
+   "st": "mask",
+   "meta": "3200×1800 · 24 fps · 108 fr",
+   "s": "Pre-matte done",
+   "pc": "Automatic",
+   "dot": ""
+  },
+  {
+   "n": "A003C001_261012_R4LF_interview_wide",
+   "st": "ready",
+   "meta": "4096×2160 · 25 fps · 240 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0080_A003C004_261013_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Waiting for a free machine",
+   "pc": "Automatic",
+   "dot": "",
+   "job": "q",
+   "dash": 1
+  },
+  {
+   "n": "V1-0083_A003C006_261013_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 65 fr",
+   "s": "Keying 34% · frame 22 / 65",
+   "pc": "kamino3",
+   "dot": "ok",
+   "job": "r",
+   "prog": 34
+  },
+  {
+   "n": "V1-0086_A003C007_261013_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 80 fr",
+   "s": "Preparing · loading model",
+   "pc": "This machine",
+   "dot": "ok",
+   "job": "p",
+   "prep": 1
+  },
+  {
+   "n": "V1-0049_A002C009_261012_R4LF",
+   "st": "done",
+   "meta": "3200×1800 · 24 fps · 108 fr",
+   "s": "Re-key failed: out of VRAM",
+   "pc": "This machine",
+   "dot": "ok",
+   "job": "f",
+   "err": 1
+  },
+  {
+   "n": "V1-0090_A004C002_261014_R4LF",
+   "st": "ready",
+   "meta": "3840×2160 · 24 fps · 72 fr",
+   "s": "Can't key: machine offline",
+   "pc": "render-node-07-with-a-long-name",
+   "dot": "err",
+   "err": 1
+  },
+  {
+   "n": "V1-0092_A004C003_261014_R4LF",
+   "st": "raw",
+   "meta": "3200×1800 · 24 fps · 54 fr",
+   "s": "No result yet",
+   "pc": "Automatic",
+   "dot": ""
+  },
+  {
+   "n": "V1-0095_A004C005_261014_R4LF",
+   "st": "done",
+   "meta": "3200×1800 · 24 fps · 120 fr",
+   "s": "Result recorded 14:02",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0098_A005C001_261015_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 88 fr",
+   "s": "Waiting for kamino3",
+   "pc": "kamino3",
+   "dot": "ok",
+   "job": "q",
+   "dash": 1
+  },
+  {
+   "n": "V1-0101_A005C002_261015_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 64 fr",
+   "s": "Waiting for this machine",
+   "pc": "This machine",
+   "dot": "ok",
+   "job": "q",
+   "dash": 1
+  },
+  {
+   "n": "V1-0104_A005C007_261015_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 92 fr",
+   "s": "Can't key: no machine",
+   "pc": "",
+   "dot": "",
+   "err": 1
+  },
+  {
+   "n": "V1-0107_A006C001_261016_R4LF_pickup",
+   "st": "raw",
+   "meta": "6144×3160 · 23.976 fps · 1440 fr",
+   "s": "No result yet",
+   "pc": "render-node-07-with-a-long-name",
+   "dot": "err"
+  }
+ ],
+ "machines": [
+  {
+   "name": "This machine",
+   "local": 1,
+   "state": "busy",
+   "job": "Preparing V1-0086",
+   "gpu": 21,
+   "vram": 15,
+   "cpu": 7,
+   "ram": 28,
+   "vramt": "3.6 / 24.0 GB",
+   "ramt": "34.7 / 123.5 GB"
+  },
+  {
+   "name": "kamino3",
+   "state": "busy",
+   "job": "Keying V1-0083 · 34%",
+   "gpu": 96,
+   "vram": 71,
+   "cpu": 18,
+   "ram": 41,
+   "vramt": "17.0 / 24.0 GB",
+   "ramt": "26.2 / 63.9 GB"
+  },
+  {
+   "name": "render-node-07-with-a-long-name",
+   "state": "offline"
+  }
+ ],
+ "waiting": [
+  3,
+  10,
+  11
+ ],
+ "running": 2,
+ "activity": "Preparing V1-0086",
+ "notices": 0,
+ "sel": [
+  0
+ ],
+ "hov": 2,
+ "qtab": "machines",
+ "menu": null,
+ "dialog": 0,
+ "drawer": 0
+}

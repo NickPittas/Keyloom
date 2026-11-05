@@ -107,6 +107,7 @@ impl AiUi {
         self.sched
             .submit_task(job, after)
             .map_err(|e| self.submit_error_text(clip, &e))?;
+        self.local_attempt.insert(clip.root.clone(), super::now_ms());
         self.tracked.push(Tracked {
             warnings: vec![],
             job_id: id.clone(),

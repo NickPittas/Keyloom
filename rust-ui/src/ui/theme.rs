@@ -1,98 +1,112 @@
-//! Readable dark theme on neutral grey. Every button/checkbox/field has a border that holds >= 3:1
+//! Keyloom palette on neutral grey (DESIGN-BIBLE.md §2, §12). The colours live in `tokens.rs`; this module maps the
+//! helpers the screens already call onto them and installs the egui visuals. Every control border holds >= 3:1
 //! against the panel; text holds >= 4.5:1. Tests measure the visuals `apply` actually installs.
+use super::tokens::{tokens, DARK, LIGHT};
 use eframe::egui::{self, Color32, Stroke};
 
-pub const PANEL: Color32 = Color32::from_rgb(38, 46, 40);
-pub const CANVAS: Color32 = Color32::from_rgb(23, 31, 25);
-pub const FIELD: Color32 = Color32::from_rgb(30, 38, 32);
-pub const BUTTON: Color32 = Color32::from_rgb(54, 64, 57);
-pub const BUTTON_HOVER: Color32 = Color32::from_rgb(71, 84, 75);
-pub const BORDER: Color32 = Color32::from_rgb(125, 145, 132);
-pub const BORDER_HOVER: Color32 = Color32::from_rgb(166, 194, 175);
-pub const ACCENT: Color32 = Color32::from_rgb(145, 178, 154);
-pub const CHECKED: Color32 = Color32::from_rgb(145, 178, 154);
-pub const FOCUS: Color32 = Color32::from_rgb(224, 176, 80);
-pub const TEXT: Color32 = Color32::from_rgb(226, 232, 228);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(169, 187, 175);
-pub const CARD: Color32 = Color32::from_rgb(47, 57, 50);
-pub const CARD_HEADER: Color32 = Color32::from_rgb(65, 81, 69);
-/// The tick on a checked box: dark on the light CHECKED fill (white on it would be under 3:1).
-const CHECK_MARK: Color32 = Color32::from_rgb(21, 36, 26);
-/// Fade of disabled widgets; blended text must still hold 3:1 (tested).
-const DISABLED_ALPHA: f32 = 0.6;
-const DISABLED_BORDER: Color32 = Color32::from_rgb(84, 84, 88);
+// redesign: dark token; theme-aware replacement in a later step
+pub const PANEL: Color32 = DARK.bg_panel;
+// redesign: dark token; theme-aware replacement in a later step
+pub const CANVAS: Color32 = DARK.bg_app;
+// redesign: dark token; theme-aware replacement in a later step
+pub const FIELD: Color32 = DARK.bg_sunken;
+// redesign: dark token; theme-aware replacement in a later step
+pub const BUTTON: Color32 = DARK.bg_raised;
+// redesign: dark token; theme-aware replacement in a later step
+pub const BUTTON_HOVER: Color32 = DARK.bg_hover;
+// redesign: dark token; theme-aware replacement in a later step
+pub const BORDER: Color32 = DARK.border_control;
+// redesign: dark token; theme-aware replacement in a later step
+pub const BORDER_HOVER: Color32 = DARK.border_hover;
+// redesign: dark token; theme-aware replacement in a later step
+pub const ACCENT: Color32 = DARK.accent;
+// redesign: dark token; theme-aware replacement in a later step
+pub const CHECKED: Color32 = DARK.accent;
+// redesign: dark token; theme-aware replacement in a later step
+pub const FOCUS: Color32 = DARK.focus_ring;
+// redesign: dark token; theme-aware replacement in a later step
+pub const TEXT: Color32 = DARK.text_primary;
+// redesign: dark token; theme-aware replacement in a later step
+pub const TEXT_DIM: Color32 = DARK.text_secondary;
+// redesign: dark token; theme-aware replacement in a later step
+pub const CARD: Color32 = DARK.bg_raised;
+// redesign: dark token; theme-aware replacement in a later step
+pub const CARD_HEADER: Color32 = DARK.bg_raised;
+/// The tick on a checked box (white on `accent`).
+#[cfg(test)]
+const CHECK_MARK: Color32 = DARK.text_on_accent;
 
 /// A processing action, distinct from settings and secondary controls.
 pub fn primary_button(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
-    let edge = if ui.visuals().dark_mode { Color32::from_rgb(174, 204, 183) } else { Color32::from_rgb(45, 103, 61) };
+    let edge = tokens(ui).accent_bright;
     accent(ui, ui.is_enabled(), |ui| ui.add(egui::Button::new(text.into()).stroke(Stroke::new(1.0, edge))))
 }
 
-/// Raised card fill/outline for the current palette (the dark `CARD` constants are dark-mode only).
-pub fn card_fill(ui: &egui::Ui) -> Color32 { ui.visuals().window_fill }
-pub fn card_stroke(ui: &egui::Ui) -> Stroke {
-    Stroke::new(1.0, if ui.visuals().dark_mode { Color32::from_rgb(77, 94, 82) } else { Color32::from_rgb(160, 176, 163) })
-}
-/// Side-rail background: darker than the panel in Dark, slightly darker in Light.
-pub fn canvas_fill(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { CANVAS } else { Color32::from_rgb(232, 237, 232) } }
+/// Raised card fill/outline for the current palette.
+pub fn card_fill(ui: &egui::Ui) -> Color32 { tokens(ui).bg_raised }
+pub fn card_stroke(ui: &egui::Ui) -> Stroke { Stroke::new(1.0, tokens(ui).border_default) }
+/// Side-rail background (the window background grey).
+pub fn canvas_fill(ui: &egui::Ui) -> Color32 { tokens(ui).bg_app }
 /// Secondary text that holds >= 4.5:1 on the panel and card of the current palette.
-pub fn text_dim(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { TEXT_DIM } else { Color32::from_rgb(66, 82, 70) } }
+pub fn text_dim(ui: &egui::Ui) -> Color32 { tokens(ui).text_secondary }
 /// Warning (amber) and error (red) text for the current palette.
-pub fn warn(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { FOCUS } else { Color32::from_rgb(145, 91, 0) } }
-pub fn error(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::from_rgb(250, 130, 120) } else { Color32::from_rgb(170, 30, 25) } }
+pub fn warn(ui: &egui::Ui) -> Color32 { tokens(ui).warning }
+pub fn error(ui: &egui::Ui) -> Color32 { tokens(ui).error }
 
 /// Success (green) text for the current palette.
-pub fn ok(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::from_rgb(150, 190, 150) } else { Color32::from_rgb(25, 100, 45) } }
+pub fn ok(ui: &egui::Ui) -> Color32 { tokens(ui).success }
 /// Green status dot / accent mark that holds >= 3:1 on the panel and canvas of the current palette.
-pub fn accent_mark(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { ACCENT } else { Color32::from_rgb(45, 103, 61) } }
-/// Board stage identity: the card's edge colour, and the stage chip's fill and text (chip text >= 4.5:1 on its
-/// fill, edge >= 3:1 on the card, in both palettes; tested). One hue per stage: Raw blue, Masked violet,
-/// Ready amber, Complete green; extracting grey and error red.
+pub fn accent_mark(ui: &egui::Ui) -> Color32 { tokens(ui).success }
+/// Board stage identity: the card's edge colour, and the stage chip's fill and text (bible §2.6).
+/// Masked = Mask, Complete = Completed, Error = Failed; Extracting (not in the bible) is neutral `info`.
 pub struct StageColors { pub edge: Color32, pub chip: Color32, pub text: Color32 }
 pub fn stage(ui: &egui::Ui, s: crate::project::ClipState) -> StageColors {
     use crate::project::ClipState::*;
-    let c = |r, g, b| Color32::from_rgb(r, g, b);
-    let (chip, text, edge) = if ui.visuals().dark_mode {
-        match s {
-            Raw => (c(46, 84, 140), c(240, 244, 250), c(110, 160, 230)),
-            Masked => (c(96, 64, 140), c(244, 238, 252), c(176, 140, 230)),
-            Ready => (c(128, 84, 10), c(255, 244, 224), c(230, 170, 60)),
-            Complete => (c(30, 106, 60), c(236, 250, 240), c(110, 200, 140)),
-            Extracting => (c(70, 80, 92), c(236, 240, 244), c(150, 165, 180)),
-            Error => (c(140, 40, 40), c(255, 240, 238), c(240, 120, 110)),
-        }
-    } else {
-        match s {
-            Raw => (c(205, 222, 248), c(20, 40, 80), c(40, 100, 190)),
-            Masked => (c(226, 212, 246), c(60, 30, 100), c(120, 70, 190)),
-            Ready => (c(250, 226, 170), c(80, 50, 0), c(180, 110, 0)),
-            Complete => (c(190, 232, 200), c(10, 70, 30), c(30, 130, 60)),
-            Extracting => (c(215, 222, 230), c(40, 50, 62), c(100, 115, 130)),
-            Error => (c(248, 208, 204), c(120, 20, 15), c(190, 40, 35)),
-        }
+    let t = tokens(ui);
+    let (chip, text, edge) = match s {
+        Raw => (t.stage_raw_chip_fill, t.stage_raw_chip_text, t.stage_raw_bar),
+        Masked => (t.stage_mask_chip_fill, t.stage_mask_chip_text, t.stage_mask_bar),
+        Ready => (t.stage_ready_chip_fill, t.stage_ready_chip_text, t.stage_ready_bar),
+        Complete => (t.stage_completed_chip_fill, t.stage_completed_chip_text, t.stage_completed_bar),
+        Extracting => (t.info_tint, t.info, t.busy_queued),
+        Error => (t.stage_failed_chip_fill, t.stage_failed_chip_text, t.stage_failed_bar),
     };
     StageColors { edge, chip, text }
 }
-/// Outline of big panel frames (>= 3:1 on the panel of the current palette).
-pub fn panel_edge(ui: &egui::Ui) -> Color32 { if ui.visuals().dark_mode { Color32::from_rgb(110, 134, 118) } else { Color32::from_rgb(120, 140, 125) } }
+/// Outline of big panel frames.
+pub fn panel_edge(ui: &egui::Ui) -> Color32 { tokens(ui).border_divider }
 
 /// Runs `add` with the accent fill on stock buttons: the fill steps lighter on hover and darker when pressed
-/// (a plain `.fill(ACCENT)` would paint every state the same). Dark text, so disabled fading and focus stay egui's own.
-/// A disabled button keeps the stock (tested) disabled look: dark ink on a faded light fill would drop under 3:1.
+/// (a plain `.fill(ACCENT)` would paint every state the same). White text, so disabled look and focus stay egui's own.
 pub fn accent<R>(ui: &mut egui::Ui, enabled: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let t = tokens(ui);
     ui.scope(|ui| {
         if enabled {
             let w = &mut ui.visuals_mut().widgets;
-            for (s, fill) in [(&mut w.inactive, ACCENT), (&mut w.hovered, Color32::from_rgb(176, 208, 186)), (&mut w.active, Color32::from_rgb(126, 160, 136))] {
+            for (s, fill) in [(&mut w.inactive, t.accent), (&mut w.hovered, t.accent_hover), (&mut w.active, t.accent_pressed)] {
                 s.weak_bg_fill = fill;
-                s.fg_stroke = Stroke::new(1.0, ACCENT_TEXT);
+                s.fg_stroke = Stroke::new(1.0, t.text_on_accent);
             }
         }
         // Already-disabled parents are not faded a second time.
         if enabled || !ui.is_enabled() { add(ui) } else { ui.add_enabled_ui(false, add).inner }
     }).inner
 }
-pub const ACCENT_TEXT: Color32 = Color32::from_rgb(21, 36, 26);
+// redesign: dark token; theme-aware replacement in a later step
+pub const ACCENT_TEXT: Color32 = DARK.text_on_accent;
+
+/// Scope helper for scroll areas: the scroll handle is painted with `widgets.*.bg_fill`, so a scope sets those
+/// to the §5.14 thumb tokens (rest, hover, drag). Not applied to the screens yet.
+pub fn scroll_thumb_scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
+    let t = tokens(ui);
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.bg_fill = t.scroll_thumb;
+        w.hovered.bg_fill = t.scroll_thumb_hover;
+        w.active.bg_fill = t.scroll_thumb_drag;
+        add(ui)
+    })
+}
 
 /// Shared raised parameter group; every pane uses the same padding and title alignment.
 pub fn section<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -124,8 +138,8 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-/// Checkbox with the brief's states: empty = dark bordered box; checked = CHECKED fill + dark 2 px
-/// mark. Wraps the stock widget (scoped visuals only), so focus, hover, disabled state and
+/// Checkbox with the bible's states: empty = sunken box with a control border; checked = `accent` fill + white
+/// 1.5 px mark. Wraps the stock widget (scoped visuals only), so focus, hover, disabled state and
 /// accessibility info (checkbox role + checked flag) are egui's own.
 pub fn checkbox(
     ui: &mut egui::Ui,
@@ -133,17 +147,14 @@ pub fn checkbox(
     label: impl Into<egui::WidgetText>,
 ) -> egui::Response {
     let on = *checked;
+    let t = tokens(ui);
     let label = label.into().color(ui.visuals().widgets.noninteractive.fg_stroke.color);
     ui.scope(|ui| {
         if on {
             let w = &mut ui.visuals_mut().widgets;
-            for (s, fill) in [
-                (&mut w.inactive, CHECKED),
-                (&mut w.hovered, Color32::from_rgb(168, 200, 178)),
-                (&mut w.active, Color32::from_rgb(126, 160, 136)),
-            ] {
+            for (s, fill) in [(&mut w.inactive, t.accent), (&mut w.hovered, t.accent_hover), (&mut w.active, t.accent_pressed)] {
                 s.bg_fill = fill;
-                s.fg_stroke = Stroke::new(2.0, CHECK_MARK);
+                s.fg_stroke = Stroke::new(1.5, t.text_on_accent);
             }
         }
         ui.checkbox(checked, label)
@@ -153,28 +164,50 @@ pub fn checkbox(
 
 pub fn apply(ctx: &egui::Context) { apply_preference(ctx, "System"); }
 
+/// Bible §12: the egui `Visuals` of one theme.
 fn palette(light: bool) -> egui::Visuals {
+    let t = if light { &LIGHT } else { &DARK };
     let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
-    let (panel, card, field, button, hover, border, hover_border, text, focus) = if light {
-        (Color32::from_rgb(244,246,244), Color32::WHITE, Color32::WHITE, Color32::from_rgb(220,228,221), Color32::from_rgb(185,211,190), Color32::from_rgb(83,105,88), Color32::from_rgb(45,103,61), Color32::from_rgb(28,38,30), Color32::from_rgb(145,91,0))
-    } else { (PANEL, CARD, FIELD, BUTTON, BUTTON_HOVER, BORDER, BORDER_HOVER, TEXT, FOCUS) };
-    v.panel_fill = panel; v.window_fill = card; v.extreme_bg_color = field;
-    v.faint_bg_color = if light { Color32::from_rgb(235,239,235) } else { CARD };
-    v.selection.bg_fill = if light { Color32::from_rgb(185,211,190) } else { Color32::from_rgb(65,88,74) };
-    v.selection.stroke = Stroke::new(2.0, text);
-    v.disabled_alpha = DISABLED_ALPHA;
+    // Glyph weight vs the Chromium reference (ink mass within 0.95-1.05 at 11-12 px): Dark needs a lighter ramp than egui's
+    // default 2c-c^2 (which draws 20-35 % too heavy), Light is right with the raw coverage (Off).
+    v.text_options.color_transfer_function = if light {
+        egui::epaint::FontColorTransferFunction::Off // Light: coverage as rasterised, matches Chromium
+    } else {
+        egui::epaint::FontColorTransferFunction::Gamma(0.95) // Dark: alpha = coverage^0.95, matches Chromium
+    };
+    v.panel_fill = t.bg_panel;
+    v.window_fill = t.bg_overlay;
+    v.extreme_bg_color = t.bg_sunken;
+    v.faint_bg_color = t.bg_raised;
+    v.window_stroke = Stroke::new(1.0, t.border_overlay);
+    let shade = |dy: i8, blur: u8, a: u8| egui::epaint::Shadow { offset: [0, dy], blur, spread: 0, color: Color32::from_black_alpha(a) };
+    v.window_shadow = shade(8, 24, if light { 51 } else { 128 }); // dialog: 0 8 24 @ 50% (Light 20%)
+    v.popup_shadow = shade(4, 16, if light { 46 } else { 115 }); // menu: 0 4 16 @ 45% (Light 18%)
+    v.window_corner_radius = egui::CornerRadius::same(6);
+    v.menu_corner_radius = egui::CornerRadius::same(4);
+    v.selection.bg_fill = t.text_selection;
+    v.selection.stroke = Stroke::new(1.0, t.text_primary); // egui draws selected-label text in this colour: text.primary on text.selection
+    v.hyperlink_color = t.text_link;
+    v.warn_fg_color = t.warning;
+    v.error_fg_color = t.error;
+    v.disabled_alpha = 1.0; // the explicit disabled tokens are drawn exactly, never dimmed twice
     let w = &mut v.widgets;
-    w.noninteractive.bg_fill = panel; w.noninteractive.weak_bg_fill = panel;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, if light { border } else { DISABLED_BORDER });
-    w.noninteractive.fg_stroke = Stroke::new(1.0, text);
-    // bg_fill is also the slider rail: white on a white card hid it in Light.
-    w.inactive.weak_bg_fill = button; w.inactive.bg_fill = if light { Color32::from_rgb(196,208,199) } else { field };
-    w.inactive.bg_stroke = Stroke::new(1.0, border); w.inactive.fg_stroke = Stroke::new(1.0, text);
-    w.hovered.weak_bg_fill = hover; w.hovered.bg_fill = hover;
-    w.hovered.bg_stroke = Stroke::new(2.0, hover_border); w.hovered.fg_stroke = Stroke::new(1.0, text);
-    w.active.weak_bg_fill = if light { Color32::from_rgb(157,192,165) } else { Color32::from_rgb(65,88,74) };
-    w.active.bg_fill = w.active.weak_bg_fill; w.active.bg_stroke = Stroke::new(2.0, focus);
-    w.active.fg_stroke = Stroke::new(1.0, text); w.open = w.hovered;
+    let r = egui::CornerRadius::same(3);
+    w.noninteractive.bg_fill = t.bg_panel; w.noninteractive.weak_bg_fill = t.bg_panel;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, t.border_divider);
+    w.noninteractive.fg_stroke = Stroke::new(1.0, t.text_primary);
+    // bg_fill is also the slider rail and the checkbox box: bg.sunken.
+    w.inactive.weak_bg_fill = t.bg_raised; w.inactive.bg_fill = t.bg_sunken;
+    w.inactive.bg_stroke = Stroke::new(1.0, t.border_control); w.inactive.fg_stroke = Stroke::new(1.0, t.text_primary);
+    w.hovered.weak_bg_fill = t.bg_hover; w.hovered.bg_fill = t.bg_sunken;
+    w.hovered.bg_stroke = Stroke::new(1.0, t.border_hover); w.hovered.fg_stroke = Stroke::new(1.0, t.text_primary);
+    w.active.weak_bg_fill = t.bg_pressed; w.active.bg_fill = t.bg_sunken;
+    w.active.bg_stroke = Stroke::new(1.0, t.text_secondary); w.active.fg_stroke = Stroke::new(1.0, t.text_primary);
+    w.open = w.active;
+    for s in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+        s.corner_radius = r;
+        s.expansion = 0.0;
+    }
     v
 }
 
@@ -190,8 +223,17 @@ pub fn apply_preference(ctx: &egui::Context, preference: &str) {
         s.text_styles.insert(Small, FontId::proportional(12.0));
         s.text_styles.insert(Heading, FontId::proportional(18.0));
         s.text_styles.insert(Monospace, FontId::monospace(12.5));
-        s.spacing.interact_size.y = 26.0;
+        s.spacing.interact_size.y = 22.0;
         s.spacing.button_padding = egui::vec2(9.0, 4.0);
+        s.spacing.combo_width = 120.0;
+        s.spacing.text_edit_width = 160.0;
+        s.spacing.icon_width = 14.0;
+        s.spacing.icon_spacing = 6.0;
+        s.spacing.menu_margin = egui::Margin::same(4);
+        s.spacing.tooltip_width = 320.0;
+        s.spacing.scroll = egui::style::ScrollStyle { bar_width: 6.0, bar_inner_margin: 1.0, bar_outer_margin: 1.0, handle_min_length: 24.0, ..egui::style::ScrollStyle::solid() };
+        s.interaction.tooltip_delay = 0.5;
+        s.interaction.show_tooltips_only_when_still = true;
     });
     ctx.set_theme(pref);
 }
@@ -206,6 +248,7 @@ pub fn text_contrast_report(shapes: &[egui::epaint::ClippedShape], base: Color32
         match s {
             Shape::Vec(v) => v.iter().for_each(|x| flat(x, clip, out)),
             Shape::Rect(r) if r.fill.a() > 0 => out.push(Ev::Fill(r.rect.intersect(clip), r.fill)),
+            Shape::Circle(c) if c.fill.a() > 0 => out.push(Ev::Fill(egui::Rect::from_center_size(c.center, egui::vec2(c.radius * 2.0, c.radius * 2.0)).intersect(clip), c.fill)),
             Shape::Mesh(m) if !m.vertices.is_empty() => out.push(Ev::Image(m.calc_bounds().intersect(clip))),
             Shape::Text(t) => {
                 let cols = t.galley.job.sections.iter().map(|sec| {
@@ -234,7 +277,9 @@ pub fn text_contrast_report(shapes: &[egui::epaint::ClippedShape], base: Color32
                 for s in &seen { if let Ev::Fill(f, c) = s { if f.contains(at) { bg = over(*c, bg, 1.0); } } }
                 for c in cols.iter().filter(|c| c.a() > 0) {
                     checked += 1;
-                    let want = if *k < 1.0 || c.a() < 255 { 3.0 } else { min };
+                    // The disabled token (either theme) is exempt from the 4.5:1 text rule: bible §2.3 asks 3:1 for disabled text.
+                    let disabled = *c == DARK.text_disabled || *c == LIGHT.text_disabled;
+                    let want = if *k < 1.0 || c.a() < 255 || disabled { 3.0 } else { min };
                     let got = contrast(over(*c, bg, *k), bg);
                     if got < want { bad.push(format!("{text:?} {c:?} on {bg:?}: {got:.2} < {want}")); }
                 }
@@ -294,15 +339,14 @@ mod tests {
                 w.active.fg_stroke.color,
                 w.active.weak_bg_fill,
             ),
-            ("selected", v.selection.stroke.color, v.selection.bg_fill),
             ("label", w.noninteractive.fg_stroke.color, v.panel_fill),
             ("checkmark", w.inactive.fg_stroke.color, w.inactive.bg_fill),
         ] {
             assert!(contrast(fg, bg) >= 4.5, "{n} {}", contrast(fg, bg));
         }
         assert!(contrast(v.selection.stroke.color, v.panel_fill) >= 3.0);
-        // Disabled = the normal look at `disabled_alpha`: visibly different, text still >= 3:1.
-        assert!(v.disabled_alpha < 0.8, "{preference} disabled looks like enabled");
+        // Bible §12: explicit disabled tokens are drawn exactly, so egui adds no second dimming; text stays >= 3:1.
+        assert_eq!(v.disabled_alpha, 1.0, "{preference} disabled alpha");
         let blend = |fg: Color32, bg: Color32| {
             let m = |a: u8, b: u8| (a as f32 * v.disabled_alpha + b as f32 * (1.0 - v.disabled_alpha)).round() as u8;
             Color32::from_rgb(m(fg.r(), bg.r()), m(fg.g(), bg.g()), m(fg.b(), bg.b()))
@@ -330,7 +374,7 @@ mod tests {
             let mut out = ctx.run_ui(raw, |_| {});
             out.textures_delta.clear();
             assert_eq!(ctx.global_style().visuals.panel_fill, palette(light).panel_fill, "{os:?}");
-            assert_eq!(ctx.global_style().spacing.interact_size.y, 26.0, "{os:?} spacing");
+            assert_eq!(ctx.global_style().spacing.interact_size.y, 22.0, "{os:?} spacing");
         }
     }
 

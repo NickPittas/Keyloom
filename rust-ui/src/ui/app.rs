@@ -21,6 +21,10 @@ use std::time::Instant;
 
 mod driver;
 mod hint;
+mod machine_rows;
+mod machines_wire;
+mod models_wire;
+mod shot_wire;
 mod media;
 mod project_shell;
 mod strip;
@@ -156,6 +160,18 @@ pub struct AppOptions {
     /// Run the app's network endpoint (embedded Python, `app_api`) in this process. Off by default (tests, dev runs, and the old
     /// service path until the cutover); only the window path (`App::new`) starts it.
     pub endpoint: bool,
+    /// Dev/QA `--specimen`: show only the colour/type specimen page (no project).
+    pub specimen: bool,
+    /// Dev `--recent-fixture FILE.json`: Recent entries shown instead of the user's file (screenshots; never written).
+    pub recent_fixture: Option<PathBuf>,
+    /// Dev `--board-fixture FILE.json`: the Board shows synthetic shots, Queue data and UI state (screenshots; never written).
+    pub board_fixture: Option<PathBuf>,
+    /// Dev `--models-fixture` / `--settings-fixture` / `--machines-fixture` / `--shot-fixture FILE.json`: that page's body
+    /// shows the fixture (scaffold stub; the app opens on the page; the frame stays the app's own).
+    pub models_fixture: Option<PathBuf>,
+    pub settings_fixture: Option<PathBuf>,
+    pub machines_fixture: Option<PathBuf>,
+    pub shot_fixture: Option<PathBuf>,
 }
 
 /// A shot the user asked to remove: the confirmation's state. `blocked` = why it cannot be removed now.
@@ -180,6 +196,8 @@ pub struct App {
     node: Node,
     focus_mode: bool,
     props_sheet: bool,
+    /// Status-bar item that opened the Activity popover (its rect anchors it).
+    activity_anchor: Option<egui::Rect>,
     /// Per-clip (by folder) graph layout and view; kept across Back/open, not persisted.
     graphs: std::collections::BTreeMap<String, (graph::Graph, graph::View)>,
     graph_collapsed: bool,
@@ -220,12 +238,21 @@ pub struct App {
     new_project_error: Option<String>,
     new_project_create_rect: Option<egui::Rect>,
     /// "Open clip settings" button rectangles from the last Board frame: per-card (layout tests).
+    /// Dev `--board-fixture`: the synthetic Board page (no project).
+    board_fx: Option<super::board::Page>,
+    board_page: super::board::Page,
+    /// Dev `--models-fixture` / `--settings-fixture` / `--machines-fixture` / `--shot-fixture`: the page's body shows the fixture.
+    models_fx: Option<super::models_page::Page>,
+    models_page: super::models_page::Page,
+    settings_fx: Option<super::settings_page::Page>,
+    machines_fx: Option<super::machines_page::Page>,
+    machines_page: super::machines_page::Page,
+    shot_fx: Option<super::shot_page::Page>,
+    shot_page: super::shot_page::Page,
     open_rects: Vec<(Option<usize>, egui::Rect)>,
     /// Queue panel rectangle and each card's (index, card, thumbnail) rectangles from the last Board frame (layout tests).
     queue_rect: Option<egui::Rect>,
     card_rects: Vec<(usize, egui::Rect, egui::Rect)>,
-    /// The Board card being dragged to a new place.
-    board_drag: Option<usize>,
     /// "Remove shot…" waiting for its confirmation.
     shot_remove: Option<ShotRemove>,
     /// Settings and Models pages replace the Board/workspace while open, which stay untouched underneath.
@@ -284,6 +311,7 @@ pub struct App {
     /// Route/delivery edits of shots that could not be written when they were left (shown as unsaved).
     hint_unsaved: std::collections::BTreeMap<String, hint::Unsaved>,
     recent: project_shell::Recent,
+    shell: project_shell::Shell,
     /// Last explicit/implicit Save failure; the indicator stays Unsaved until a Save succeeds.
     save_error: Option<String>,
     /// Key-panel draft (params + output config) per clip: clips opened this load, what disk holds, and whether the open one differs.
@@ -407,6 +435,7 @@ impl App {
         let settings_path = opts.settings_path.clone().or_else(default_path);
         crate::queue::set_settings_path(settings_path.clone());
         let settings = SettingsPage::new(Store::load(settings_path));
+        super::fonts::install(ctx);
         super::theme::apply_preference(ctx, &settings.saved().interface.theme);
         ctx.set_zoom_factor(settings.saved().interface.ui_scale);
         let settings_saved = settings.saved().clone();
@@ -414,7 +443,10 @@ impl App {
         // Runtime resolution (descriptor / CK_REPO / checkout discovery) happens once here; import
         // and AI launching re-resolve on demand, never from a build-time path.
         let launch = crate::runtime::launch(opts.repo.as_deref());
-        let recent = project_shell::Recent::load(settings.store_path());
+        let recent = match &opts.recent_fixture {
+            Some(f) => project_shell::Recent::fixture(f),
+            None => project_shell::Recent::load(settings.store_path()),
+        };
         let mut app = App {
             path_input: opts
                 .project
@@ -432,6 +464,7 @@ impl App {
             node: Node::Media,
             focus_mode: false,
             props_sheet: false,
+            activity_anchor: None,
             graphs: Default::default(),
             graph_collapsed: false,
             graph_short_open: false,
@@ -475,16 +508,24 @@ impl App {
             new_project_draft: None,
             new_project_error: None,
             new_project_create_rect: None,
+            board_fx: opts.board_fixture.as_ref().and_then(|f| super::board::Page::load(f).map_err(|e| eprintln!("--board-fixture: {e}")).ok()),
+            board_page: super::board::Page::new(),
+            models_fx: opts.models_fixture.as_ref().and_then(|f| super::models_page::Page::load(f).map_err(|e| eprintln!("--models-fixture: {e}")).ok()),
+            models_page: super::models_page::Page::new(),
+            settings_fx: opts.settings_fixture.as_ref().and_then(|f| super::settings_page::Page::load(f).map_err(|e| eprintln!("--settings-fixture: {e}")).ok()),
+            machines_fx: opts.machines_fixture.as_ref().and_then(|f| super::machines_page::Page::load(f).map_err(|e| eprintln!("--machines-fixture: {e}")).ok()),
+            machines_page: super::machines_page::Page::new(),
+            shot_fx: opts.shot_fixture.as_ref().and_then(|f| super::shot_page::Page::load(f).map_err(|e| eprintln!("--shot-fixture: {e}")).ok()),
+            shot_page: super::shot_page::Page::new(),
             open_rects: vec![],
             queue_rect: None,
             card_rects: vec![],
-            board_drag: None,
             shot_remove: None,
             settings,
-            settings_open: false,
+            settings_open: opts.settings_fixture.is_some(),
             models,
-            models_open: false,
-            clients_open: false,
+            models_open: opts.models_fixture.is_some(),
+            clients_open: opts.machines_fixture.is_some(),
             remove_confirm: None,
             metrics: driver::Held::new(opts.metrics.supervisor(opts.repo.as_deref().or(launch.repo.as_deref()), launch.python.clone())),
             metrics_wake: None,
@@ -518,6 +559,7 @@ impl App {
             hint: Default::default(),
             hint_unsaved: Default::default(),
             recent,
+            shell: Default::default(),
             save_error: None,
             draft_clips: BTreeSet::new(),
             draft_saved: Default::default(),
@@ -690,6 +732,7 @@ impl App {
         self.tab = Tab::Media;
         self.node = Node::Media;
         self.focus_mode = false;
+        self.shot_page.set_focus(false);
     }
 
     pub fn switch_tab(&mut self, t: Tab) {
@@ -727,6 +770,10 @@ impl App {
 
     // ------------------------------------------------------------------ keyboard
     fn keys(&mut self, ctx: &egui::Context) {
+        // The delete dialog owns the keyboard while open: page shortcuts (Ctrl+Shift+1 etc.) must not close Shot under it.
+        if self.hint_delete_open() {
+            return;
+        }
         self.shortcuts(ctx);
         self.new_project_window(ctx);
         // A focused graph node is a button, not text entry: shortcuts (F, B, 1-5, Esc…) must keep working there.
@@ -756,313 +803,207 @@ impl App {
         if self.viewer.is_none() {
             return;
         }
-        if pressed(Key::B) {
-            self.viewer = None;
-            self.open = None;
-            return;
-        }
-        for (k, t) in [
-            (Key::Num1, Tab::Media),
-            (Key::Num2, Tab::Hint),
-            (Key::Num3, Tab::Key),
-            (Key::Num4, Tab::Review),
-            (Key::Num5, Tab::Deliver),
-        ] {
-            if pressed(k) {
-                self.switch_tab(t);
-            }
-        }
-        if pressed(Key::P) {
-            self.props_sheet = !self.props_sheet;
-        }
-        if pressed(Key::G) {
-            if self.graph_short { self.graph_short_open = !self.graph_short_open } else { self.graph_collapsed = !self.graph_collapsed }
-        }
-        if pressed(Key::F) {
-            self.focus_mode = !self.focus_mode;
-        }
-        if pressed(Key::Escape) {
-            self.focus_mode = false;
-            self.props_sheet = false;
-        }
-        // Shift read from the key event itself, so it also holds for synthetic (QA) events.
-        let shift = ctx.input(|i| {
-            i.events.iter().any(|e| {
-                matches!(e, egui::Event::Key { pressed: true, modifiers, .. } if modifiers.shift)
-            }) || i.modifiers.shift
-        });
-        let v = self.viewer.as_mut().unwrap();
-        if pressed(Key::R) {
-            v.retry_failed();
-        }
-        if pressed(Key::Space) {
-            v.toggle_play(1);
-        }
-        {
-            let d = if shift { 10 } else { 1 };
-            if pressed(Key::ArrowLeft) {
-                v.step(-d);
-            }
-            if pressed(Key::ArrowRight) {
-                v.step(d);
-            }
-        }
-        if pressed(Key::Home) {
-            v.set_playhead(0);
-        }
-        if pressed(Key::End) {
-            v.set_playhead(v.index.len().saturating_sub(1));
-        }
-        if pressed(Key::L) {
-            v.toggle_loop();
-        }
-        if pressed(Key::Num0) {
-            v.fit();
-        }
-        if pressed(Key::Equals) || pressed(Key::Plus) {
-            v.zoom_by(1.25, Vec2::ZERO);
-        }
-        if pressed(Key::Minus) {
-            v.zoom_by(0.8, Vec2::ZERO);
-        }
-        if pressed(Key::I) {
-            v.set_in();
-        }
-        if pressed(Key::O) {
-            v.set_out();
+        // Shot page: stages, playback, range/marks, zoom. View/channel/background/wipe/focus/fit are handled once,
+        // by the viewer toolbar's own shortcuts. B/G/R/Shift-arrows/Alt+number were removed (bible §10.1).
+        if self.open.is_some() {
+            self.shot_keys(ctx);
         }
     }
 
     // ------------------------------------------------------------------ board
-    fn board(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        // Buttons stay off while an import runs or a dialog is already open (one at a time).
-        let busy = self.imp.busy() || self.dialog_active();
-        let why = if self.picker.pending().is_some() {
-            "A file dialog is open"
-        } else if self.imp.busy_what().contains("running") {
-            "Import running"
-        } else {
-            "Checking the selected files"
+
+    fn refresh_board_status(&mut self) {
+        let Some(project) = self.project.as_ref() else { return };
+        let now = Instant::now();
+        let meters = self.local_meters(now);
+        let targets = self.ai.scheduler().targets();
+        let running = targets.iter().filter(|t| t.busy_with.is_some()).count() as u32 + self.remote.running_count() as u32;
+        let activity = if self.imp.busy() { self.imp.busy_what().to_owned() } else {
+            match self.ai.worker_activity() {
+                super::models::WorkerActivity::Working(step) => step,
+                super::models::WorkerActivity::Queued => "Queued".into(),
+                super::models::WorkerActivity::Idle | super::models::WorkerActivity::Stopped => String::new(),
+            }
         };
-        let mut want: Option<PickKind> = None;
-        self.open_rects.clear();
-        self.card_rects.clear();
-        let has_project = self.project.is_some();
-        if !has_project {
-            self.welcome(ui, busy, why, &mut want);
-        } else {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Import clips…"))
-                    .on_disabled_hover_text(why)
-                    .clicked()
-                {
-                    want = Some(PickKind::Clips);
-                }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Import folder…"))
-                    .on_disabled_hover_text(why)
-                    .clicked()
-                {
-                    want = Some(PickKind::Folder);
-                }
-            });
-        }
-        if let Some(k) = want {
-            self.request_pick(&ctx, k);
-        }
-        self.imp.ui(ui);
-        if let Some(k) = self.imp.dest_pick_requested.take() {
-            self.request_pick(&ctx, k);
-        }
-        let Some(p) = &self.project else { return };
-        let mut open_idx = None;
-        let mut resume_idx = None;
-        let mut sel = self.selected.clone();
-        ui.horizontal(|ui| {
-            ui.heading(&p.display_name);
-            ui.label(
-                RichText::new(format!(
-                    "{} · {} clips · {}",
-                    if p.is_v2 { "v2 project" } else { "v1 project" },
-                    p.clips.len(),
-                    p.root.display()
-                ))
-                .color(theme::text_dim(ui)),
-            );
-        });
-        for n in &p.notes {
-            ui.colored_label(theme::warn(ui), n);
-        }
-        let picks: Vec<usize> = sel.iter().copied().collect();
-        let chosen: Vec<&Clip> = picks.iter().filter_map(|i| p.clips.get(*i)).collect();
-        let every = !p.clips.is_empty() && sel.len() == p.clips.len();
-        self.ai.batch_ui(ui, p, self.settings.saved(), &picks);
-        ui.horizontal_wrapped(|ui| {
-            let mut all = every;
-            if super::theme::checkbox(ui, &mut all, "All").changed() {
-                sel = if all {
-                    (0..p.clips.len()).collect()
-                } else {
-                    BTreeSet::new()
-                };
-            }
-            self.ai.board_preset_ui(ui);
-            ui.separator();
-            self.ai.assign_selected_ui(ui, &chosen, every);
-        });
-        if let Some(n) = self.ai.notice.clone() {
-            ui.colored_label(theme::warn(ui), n);
-        }
-        if let Some(n) = self.ai.pending_note() {
-            ui.colored_label(theme::warn(ui), n);
-        }
-        self.ai.batch_review(ui);
-        self.ai.unresolved_ui(ui);
-        ui.separator();
-        // Thumbnails decode in the background; the grid draws placeholders until a frame arrives.
-        if self.thumbs.is_none() {
-            self.thumbs = Some(super::thumbs::Thumbs::new(&ctx));
-        }
-        let all_clips: Vec<&Clip> = p.clips.iter().collect();
-        if let Some(t) = &mut self.thumbs {
-            t.request(&all_clips);
-            t.tick();
-        }
-        let local_view = self.metrics.view(std::time::Instant::now());
-        let active = self.active_gpus();
-        let mut queue_actions = vec![];
-        if ui.available_width() > 760.0 {
-            let panel = Panel::right("board_queue")
-                .resizable(true)
-                .default_size(540.0)
-                .min_size(340.0)
-                .max_size(900.0)
-                .show_separator_line(true)
-                .show(ui, |ui| {
-                    queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active);
-                });
-            self.queue_rect = Some(panel.response.rect);
-        } else {
-            let panel = Panel::bottom("board_queue_bottom").resizable(true).default_size(280.0).min_size(150.0).show(ui, |ui| { queue_actions = Self::batch_queue(ui, &mut self.ai, &mut self.remote, &local_view, &active); });
-            self.queue_rect = Some(panel.response.rect);
-        }
-        let (mut drag, mut remove_idx): (Option<(usize, bool)>, Option<usize>) = (None, None);
-        let dragging = self.board_drag;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .show(ui, |ui| {
-                // Approved density: compact cards, five across when the queue panel leaves room.
-                let card_w = 220.0;
-                let gap = 10.0;
-                // Never more columns than clips, so a single clip gets a readable card instead of a stamp.
-                let fit = ((ui.available_width() + gap) / (card_w + gap)).floor().max(1.0) as usize;
-                let cols = fit.min(p.clips.len().max(1));
-                // A card never stretches past a readable width, even when the board holds one clip.
-                let w = ((ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32)
-                    .clamp(170.0, card_w);
-                let mut base = 0usize;
-                for row in p.clips.chunks(cols) {
-                    let first = base;
-                    base += row.len();
-                    ui.horizontal_top(|ui| {
-                        for (k, c) in row.iter().enumerate() {
-                            let i = first + k;
-                            let st = self.imp.card_state(c);
-                            // A cell is its own top-down layout: a group frame inside a horizontal row would
-                            // otherwise lay the card's lines out side by side.
-                            let sc = theme::stage(ui, c.state);
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(w, 0.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    if dragging == Some(i) {
-                                        ui.set_opacity(0.45);
-                                    }
-                                    let f = egui::Frame::group(ui.style()).stroke(egui::Stroke::new(2.0, sc.edge)).inner_margin(8.0).show(
-                                        ui,
-                                        |ui| {
-                                            ui.set_width(w - 18.0);
-                                            board_card(
-                                                ui,
-                                                i,
-                                                c,
-                                                st,
-                                                &mut sel,
-                                                &mut open_idx,
-                                                &mut resume_idx,
-                                                self.thumbs.as_mut(),
-                                                &mut self.ai,
-                                                &mut self.open_rects,
-                                                &mut self.card_rects,
-                                                &mut drag,
-                                                &mut remove_idx,
-                                                &p.root,
-                                                self.hint.board_export_root(),
-                                            );
-                                        },
-                                    );
-                                    if let Some(r) = self.card_rects.last_mut() {
-                                        r.1 = f.response.rect;
-                                    }
-                                },
-                            );
-                        }
-                    });
-                }
-                // Drop slot under the pointer while a card is dragged: a line between cards, the name beside the pointer.
-                if let (Some((src, _)), Some(pos)) = (drag, ui.ctx().pointer_latest_pos()) {
-                    let rects: Vec<egui::Rect> = self.card_rects.iter().map(|c| c.1).collect();
-                    let (slot, near) = drop_slot(&rects, pos);
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                    if slot != src && slot != src + 1 {
-                        let r = rects[near];
-                        let x = if slot == near { r.min.x - gap / 2.0 } else { r.max.x + gap / 2.0 };
-                        let ink = ui.visuals().widgets.noninteractive.fg_stroke.color;
-                        ui.painter().line_segment([egui::pos2(x, r.min.y), egui::pos2(x, r.max.y)], egui::Stroke::new(3.0, ink));
-                    }
-                    if let Some(c) = p.clips.get(src) {
-                        let lp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, ui.make_persistent_id("board_drag_ghost")));
-                        let ink = ui.visuals().text_color();
-                        let g = lp.layout_no_wrap(c.display_name.clone(), egui::FontId::proportional(12.0), ink);
-                        let r = egui::Rect::from_min_size(pos + Vec2::new(14.0, 14.0), g.size()).expand(5.0);
-                        lp.rect_filled(r, 4.0, theme::card_fill(ui));
-                        lp.rect_stroke(r, 4.0, theme::card_stroke(ui), egui::StrokeKind::Inside);
-                        lp.galley(r.min + Vec2::splat(5.0), g, ink);
-                    }
-                }
-            });
-        self.selected = sel;
-        self.board_drag = drag.and_then(|(i, stopped)| (!stopped).then_some(i));
-        let reorder = match (drag, ctx.pointer_latest_pos()) {
-            (Some((from, true)), Some(pos)) => {
-                let rects: Vec<egui::Rect> = self.card_rects.iter().map(|c| c.1).collect();
-                let (slot, _) = drop_slot(&rects, pos);
-                Some((from, if slot > from { slot - 1 } else { slot }))
-            }
-            _ => None,
+        let notices = project.notes.len() as u32 + u32::from(self.ai.notice.is_some()) + u32::from(self.ai.pending_note().is_some()) + u32::from(self.load_error.is_some()) + u32::from(self.opts.startup_notice.is_some()) + u32::from(self.save_error.is_some());
+        let activity = match self.activity_summary() {
+            Some((t, _)) if self.open.is_some() => t,
+            _ => activity,
         };
-        if let Some(i) = resume_idx {
-            if let Some(c) = p.clips.get(i) {
-                let root = p.root.clone();
-                self.imp.resume(&ctx, &root, c);
-            }
-        }
-        if let Some(i) = open_idx {
-            self.open_clip(&ctx, i);
-        }
-        if let Some((from, to)) = reorder {
-            self.move_clip(from, to);
-        }
-        if let Some(i) = remove_idx {
-            self.ask_remove_shot(i);
-        }
-        for action in queue_actions { self.net_action(action); }
+        self.board_page.update_global_status(activity, notices, running, self.ai.waiting_count() as u32, u8::from(!self.unsaved()), meters);
     }
 
-    /// Drag and drop: clip `from` takes place `to` in the Board. The order is saved in the project and work that
-    /// has not started follows it; running work never moves.
+    fn refresh_board_page(&mut self, ctx: &egui::Context) {
+        let Some(project) = self.project.as_ref() else { return };
+        let dialog = self.board_page.fx.dialog;
+        if self.thumbs.is_none() { self.thumbs = Some(super::thumbs::Thumbs::new(ctx)); }
+        let clips: Vec<&Clip> = project.clips.iter().collect();
+        if let Some(thumbs) = &mut self.thumbs { thumbs.request(&clips); thumbs.tick(); }
+        let queue = self.ai.queue_view();
+        let now = Instant::now();
+        let remote_jobs = self.remote.jobs_snapshot();
+        let mut machines = self.machine_rows(now, &queue, &remote_jobs);
+        let waiting_roots: BTreeSet<_> = self.ai.waiting_roots().into_iter().collect();
+        let waiting_count = self.ai.waiting_count() as u32;
+        let waiting: Vec<usize> = project.clips.iter().enumerate().filter_map(|(i, c)| waiting_roots.contains(&c.root).then_some(i)).collect();
+        let running = queue.iter().flat_map(|s| &s.runs).filter(|r| r.rows.iter().any(|x| x.executing)).count() as u32 + remote_jobs.iter().filter(|j| j.running).count() as u32;
+        let finished = self.ai.finished_count(&queue) as u32 + remote_jobs.iter().filter(|j| !j.active).count() as u32;
+        let mut cards = Vec::with_capacity(project.clips.len());
+        let mut activity = String::new();
+        for clip in &project.clips {
+            let import_state = self.imp.card_state(clip);
+            let import_activity = match &import_state { CardState::Busy(text, _) => Some(text.clone()), _ => None };
+            let section = queue.iter().find(|s| s.root == clip.root);
+            let row = section.and_then(|s| self.ai.board_row(&s.runs, waiting_roots.contains(&clip.root)));
+            let latest_run = section.and_then(|s| s.runs.last());
+            let net_job = remote_jobs.iter().filter(|j| j.matches_paths(&project.root, &clip.root)).max_by_key(|j| j.submitted_at);
+            let mut job = row.map_or("", |r| if r.cell.bad { "f" } else if r.executing && r.cell.text.ends_with('%') { "r" } else if r.executing { "p" } else if r.active { "q" } else { "" }).to_owned();
+            let mut prog = row.filter(|r| r.cell.text.ends_with('%')).map_or(0.0, |r| r.cell.frac * 100.0);
+            let mut status = row.map_or_else(|| board_status(clip), |r| format!("{} - {}", r.heading, r.cell.text));
+            let mut err = u8::from(row.is_some_and(|r| r.cell.bad) || clip.error.is_some() && latest_run.is_none());
+            let mut resume = false;
+            if let Some(net) = net_job.filter(|j| (j.active || j.failed()) && !row.is_some_and(|r| r.executing) && crate::ui::ai::remote_is_newest(j.submitted_at, self.ai.local_attempt_ms(&clip.root))) {
+                let state = net.state.as_str();
+                prog = net.progress.map_or(0.0, |p| p * 100.0);
+                if net.failed() {
+                    job = "f".into();
+                    status = format!("{} · {} · {}{}", net.network, net.name, state, net.reason.as_deref().filter(|r| !r.is_empty()).map_or_else(String::new, |r| format!(" · {r}")));
+                    err = 1;
+                } else {
+                    job = if net.running { if net.progress.is_some() { "r" } else { "p" } } else if state == "queued" { "q" } else { "p" }.into();
+                    status = format!("{} · {} · {}{}", net.network, net.name, net.stage.as_deref().unwrap_or(state), net.progress.map_or_else(String::new, |p| format!(" · {:.0}%", p * 100.0)));
+                    err = 0;
+                }
+            } else if row.is_none() && waiting_roots.contains(&clip.root) {
+                job = "q".into();
+                status = "Waiting for an Automatic machine".into();
+                err = 0;
+            }
+            match import_state {
+                CardState::Busy(text, f) => { job = "p".into(); prog = f * 100.0; status = text; }
+                CardState::Waiting => { job = "q".into(); status = "Waiting for extraction...".into(); }
+                CardState::Failed(text) => { job = "f".into(); status = text; err = 1; resume = true; }
+                CardState::NeedsFrames => { status = "Frames not extracted yet".into(); resume = true; }
+                CardState::Idle => {}
+            }
+            if let Some(error) = clip.error.as_ref().filter(|_| latest_run.is_none() && !waiting_roots.contains(&clip.root)) { job = "f".into(); err = 1; status = error.clone(); }
+            let pc = match self.ai.clip_placement(clip) {
+                crate::scheduler::Placement::Auto => "Automatic".to_owned(),
+                crate::scheduler::Placement::Target(id) => {
+                    if id.is_empty() { String::new() } else if let Some(m) = machines.iter().find(|m| m.id == id) { m.name.clone() } else {
+                        machines.push(super::board::FxMachine { id: id.clone(), name: id.clone(), state: "offline".into(), ..Default::default() }); id
+                    }
+                }
+            };
+            if row.is_some_and(|r| r.executing) && activity.is_empty() { activity = format!("{} - {}", clip.display_name, status); }
+            let meta = match clip.sample_size { Some((w,h)) => format!("{w}x{h} - {:.0} fps - {} fr", clip.fps, clip.input_files.len()), None => format!("{:.0} fps - {} fr", clip.fps, clip.input_files.len()) };
+            let (thumb, thumb_aspect) = self.thumbs.as_mut().and_then(|t| t.texture(ctx, clip)).map_or((None,0.0), |t| { let size = t.size_vec2(); (Some(t.id()), size.x / size.y) });
+            let (thumb_label, thumb_tooltip) = if thumb.is_some() { (String::new(), String::new()) }
+                else if clip.input_files.is_empty() { ("No frames".into(), "No source frames are available for this shot.".into()) }
+                else if let Some(error) = self.thumbs.as_ref().and_then(|t| t.failed(clip)) { ("Unreadable frame".into(), error.to_owned()) }
+                else { ("Loading preview…".into(), "The first source frame is still being decoded.".into()) };
+            let source_available = match &clip.source { Source::Video { path } => Some(path.exists()), Source::Sequence { dir, .. } => Some(dir.exists()), Source::Missing => Some(false) };
+            let exports_available = crate::pipeline::export_dir(clip, &project.root, self.hint.board_export_root()).is_dir();
+            if activity.is_empty() { activity = import_activity.unwrap_or_default(); }
+            let q = u8::from(job == "q");
+            let r = u8::from(job == "r");
+            cards.push(super::board::FxShot { n: clip.display_name.clone(), st: match clip.state { ClipState::Masked => "mask", ClipState::Ready => "ready", ClipState::Complete => "done", _ => "raw" }.into(), meta, s: status, pc, dot: String::new(), job, prog, err, q, r, thumb, thumb_aspect, thumb_label, thumb_tooltip, source_available, exports_available, resume });
+        }
+        let meters = self.local_meters(now);
+        let mut notice_text = project.notes.clone();
+        notice_text.extend(self.ai.notice.iter().cloned());
+        notice_text.extend(self.ai.pending_note().map(str::to_owned));
+        notice_text.extend(self.load_error.iter().cloned());
+        notice_text.extend(self.opts.startup_notice.iter().cloned());
+        notice_text.extend(self.save_error.iter().cloned());
+        let notices = notice_text.len() as u32;
+        if activity.is_empty() && self.imp.busy() { activity = self.imp.busy_what().to_owned(); }
+        if activity.is_empty() { activity = queue.iter().filter(|s| s.root == project.root).flat_map(|s| s.runs.iter().flat_map(|r| r.rows.iter().filter(|x| x.executing).map(|x| format!("{} - {} {}", s.title, x.heading, x.cell.text)))).next().unwrap_or_default(); }
+        let mut fx = super::board::Fixture { project: project.display_name.clone(), saved: u8::from(!self.unsaved()), activity, notices, running, waiting_total: waiting_count, finished, notice_text, cards, machines, waiting, live: true, details: !queue.is_empty(), meters, ..Default::default() };
+        fx.dialog = dialog;
+        self.board_page.update(fx, &self.selected);
+    }
+
+    fn board(&mut self, ui: &mut Ui) {
+        if let Some(page) = self.board_fx.as_mut() {
+            page.ui(ui);
+            self.card_rects = page.card_rects().iter().enumerate().map(|(i,r)| (i,*r,egui::Rect::from_min_size(r.min,egui::vec2(224.0,126.0)))).collect();
+            self.queue_rect = page.queue_rect();
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        if self.project.is_none() {
+            let busy = self.imp.busy() || self.dialog_active();
+            let why = if self.picker.pending().is_some() { "A file dialog is open" } else if self.imp.busy_what().contains("running") { "Import running" } else { "Checking the selected files" };
+            let mut want = None;
+            self.open_rects.clear();
+            self.card_rects.clear();
+            self.welcome(ui,busy,why,&mut want);
+            if let Some(kind) = want { self.request_pick(&ctx,kind); }
+            self.imp.ui(ui);
+            if let Some(kind) = self.imp.dest_pick_requested.take() { self.request_pick(&ctx,kind); }
+            return;
+        }
+        self.open_rects.clear();
+        self.imp.ui(ui);
+        if let Some(kind) = self.imp.dest_pick_requested.take() { self.request_pick(&ctx,kind); }
+        let area = egui::Rect::from_min_max(ui.cursor().min,ui.max_rect().max);
+        let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(area));
+        let queue_metrics = self.metrics.view(Instant::now());
+        let active_gpus = self.active_gpus();
+        let mut net_actions = Vec::new();
+        let acts = {
+            let (page, ai, remote) = (&mut self.board_page, &mut self.ai, &mut self.remote);
+            page.ui_with_queue(&mut page_ui, |queue_ui, tab| match tab {
+                "waiting" => ai.auto_waiting_ui(queue_ui),
+                "details" => {
+                    ai.queue_ui(queue_ui, &queue_metrics, &active_gpus);
+                    ai.unresolved_ui(queue_ui);
+                    ai.net_inactive_ui(queue_ui);
+                    ai.refused_ui(queue_ui);
+                    net_actions.extend(remote.queue_ui(queue_ui));
+                }
+                _ => {}
+            })
+        };
+        for action in net_actions { self.net_action(action); }
+        self.card_rects = self.board_page.card_rects().iter().enumerate().map(|(i,r)| (i,*r,egui::Rect::from_min_size(r.min,egui::vec2(224.0,126.0)))).collect();
+        self.queue_rect = self.board_page.queue_rect();
+        self.open_rects = self.card_rects.iter().map(|(i,r,_)| (Some(*i),egui::Rect::from_min_size(r.min+egui::vec2(8.0,229.0),egui::vec2(22.0,22.0)))).collect();
+        for act in acts {
+            match act {
+                super::board::Act::ImportShots => { self.request_pick(&ctx,PickKind::Clips); }
+                super::board::Act::ImportFolder => { self.request_pick(&ctx,PickKind::Folder); }
+                super::board::Act::Open(i) => self.open_clip(&ctx,i),
+                super::board::Act::Key(i) => if let Some(p) = &self.project { self.ai.begin_board_batch(&ctx,p,self.settings.saved(),&[i]); },
+                super::board::Act::KeySelected => self.key_selected(&ctx),
+                super::board::Act::Assign(i,choice) => {
+                    let target = if choice == 0 { None } else { self.board_page.fx.machines.get(choice-1).map(|m| m.id.as_str()) };
+                    if let Some(clip) = self.project.as_ref().and_then(|p| p.clips.get(i)).cloned() {
+                        if let Err(e) = self.ai.set_clip_client(&clip,target) { self.ai.notice = Some(format!("Could not assign {}: {e}",clip.display_name)); }
+                    }
+                }
+                super::board::Act::Select(i,on) => { if on { self.selected.insert(i); } else { self.selected.remove(&i); } }
+                super::board::Act::SelectAll(on) => { self.selected = if on { (0..self.project.as_ref().map_or(0,|p|p.clips.len())).collect() } else { BTreeSet::new() }; }
+                super::board::Act::RevealSource(i) => if let Some(clip) = self.project.as_ref().and_then(|p|p.clips.get(i)) {
+                    let source = match &clip.source { Source::Video { path } => Some((path.as_path(),true)), Source::Sequence { dir,.. } => Some((dir.as_path(),false)), Source::Missing => None };
+                    if let Some((path,select_file)) = source.filter(|(path,_)| path.exists()) { reveal(path,select_file,&mut self.ai); }
+                },
+                super::board::Act::RevealExports(i) => if let Some((clip,root)) = self.project.as_ref().and_then(|p|p.clips.get(i).map(|c|(c,p.root.as_path()))) {
+                    let path = crate::pipeline::export_dir(clip,root,self.hint.board_export_root());
+                    if path.is_dir() { reveal(&path,false,&mut self.ai); }
+                },
+                super::board::Act::Remove(i) => self.ask_remove_shot(i),
+                super::board::Act::Resume(i) => if let Some((root,clip)) = self.project.as_ref().and_then(|p|p.clips.get(i).map(|c|(p.root.clone(),c.clone()))) { self.imp.resume(&ctx,&root,&clip); },
+                super::board::Act::Move(from,to) => self.move_clip(from,to),
+                super::board::Act::ClearFinished => { self.ai.clear_finished(); self.remote.clear_finished(); }
+            }
+        }
+        if self.ai.batch_open() {
+            super::board_batch::live_dialog(ui, &mut self.ai);
+        }
+    }
+
     pub fn move_clip(&mut self, from: usize, to: usize) {
         let keep = self.selected_folders();
         let Some(p) = self.project.as_mut() else { return };
@@ -1165,49 +1106,8 @@ impl App {
         self.shot_remove.is_some()
     }
 
-    /// The Queue panel's content. It gets exactly the panel's inner area in a child that reports nothing back, so
-    /// no card, bar or long name can widen the panel (egui stores the content's width as the panel's width: a
-    /// too-wide row made the panel snap back and spill past the window edge); what does not fit is clipped.
-    fn batch_queue(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote_set::RemoteSet, local: &crate::metrics::View, active: &[u32]) -> Vec<crate::remote::Action> {
-        let area = ui.available_rect_before_wrap();
-        let mut inner = ui.new_child(egui::UiBuilder::new().id_salt("board_queue_body").max_rect(area).layout(egui::Layout::top_down(egui::Align::Min)));
-        inner.set_clip_rect(area.intersect(ui.clip_rect()));
-        let actions = Self::batch_queue_body(&mut inner, ai, remote, local, active);
-        ui.allocate_rect(area, Sense::hover());
-        actions
-    }
-
-    fn batch_queue_body(ui: &mut Ui, ai: &mut AiUi, remote: &mut crate::remote_set::RemoteSet, local: &crate::metrics::View, active: &[u32]) -> Vec<crate::remote::Action> {
-        // Two tabs: the machines and what they run, and the shots still waiting for a PC.
-        let tab_id = ui.make_persistent_id("queue_tab_waiting");
-        let mut waiting = ui.data(|d| d.get_temp::<bool>(tab_id)).unwrap_or(false);
-        // Wrapped: at the narrowest panel the buttons drop to a second line instead of widening the panel.
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("Queue");
-            ui.add_space(8.0);
-            if ui.selectable_label(!waiting, "Machines").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() { waiting = false; }
-            if ui.selectable_label(waiting, format!("Waiting ({})", ai.waiting_count())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() { waiting = true; }
-            if !waiting && ui.small_button("Clear finished").on_hover_text("Removes finished, failed and cancelled jobs from the queue and its logs. Running jobs stay.").clicked() {
-                ai.clear_finished();
-                remote.clear_finished();
-            }
-        });
-        ui.data_mut(|d| d.insert_temp(tab_id, waiting));
-        ai.net_inactive_ui(ui);
-        let mut actions = vec![];
-        egui::ScrollArea::vertical().id_salt("batch_work_queue").auto_shrink([false; 2]).show(ui, |ui| {
-            ai.refused_ui(ui);
-            if waiting {
-                ai.auto_waiting_ui(ui);
-            } else {
-                ai.queue_ui(ui, local, active);
-                actions = remote.queue_ui(ui);
-            }
-        });
-        actions
-    }
-
     // ------------------------------------------------------------------ workspace
+    #[allow(dead_code)] // replaced by `shot_workspace`; kept compiled
     fn workspace(&mut self, ui: &mut Ui) {
         let narrow = ui.available_width() < 900.0;
         let focus = self.focus_mode;
@@ -2135,6 +2035,11 @@ impl App {
 
     /// Active work cancels the close request; graceful stop keeps the window updating until it exits.
     fn close_tick(&mut self, ctx: &egui::Context) {
+        // A generated-frames deletion is running: keep the window open so its receive block finishes.
+        if ctx.input(|i| i.viewport().close_requested()) && self.hint_delete_open() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            return;
+        }
         // Close hides to the tray (Quit is the tray entry or File > Quit); without a tray it falls through to a normal close.
         if ctx.input(|i| i.viewport().close_requested())
             && !self.close_force
@@ -2350,7 +2255,7 @@ impl App {
     pub fn key_selected(&mut self, ctx: &egui::Context) {
         let picks: Vec<usize> = self.selected.iter().copied().collect();
         if let Some(p) = &self.project {
-            self.ai.begin_batch(ctx, p, self.settings.saved(), &picks);
+            self.ai.begin_board_batch(ctx, p, self.settings.saved(), &picks);
         }
     }
 }
@@ -2402,176 +2307,6 @@ fn card_summary(c: &Clip) -> String {
     )
 }
 
-/// One Board card: thumbnail, name/state, the compact facts, and the clip's own render client.
-#[allow(clippy::too_many_arguments)]
-fn board_card(
-    ui: &mut Ui,
-    i: usize,
-    c: &Clip,
-    st: CardState,
-    sel: &mut BTreeSet<usize>,
-    open: &mut Option<usize>,
-    resume: &mut Option<usize>,
-    mut thumbs: Option<&mut super::thumbs::Thumbs>,
-    ai: &mut AiUi,
-    open_rects: &mut Vec<(Option<usize>, egui::Rect)>,
-    card_rects: &mut Vec<(usize, egui::Rect, egui::Rect)>,
-    drag: &mut Option<(usize, bool)>,
-    remove: &mut Option<usize>,
-    project_root: &Path,
-    export_root: Option<&Path>,
-) {
-    let idle = matches!(st, CardState::Idle);
-    let mut on = sel.contains(&i);
-    let thumb_h = ((ui.available_width()) * 9.0 / 16.0).clamp(56.0, 118.0);
-    egui::Frame::new()
-        .fill(ui.visuals().extreme_bg_color)
-        .corner_radius(4.0)
-        .show(ui, |ui| {
-            // Double-click opens; dragging the thumbnail moves the card to another place in the Board.
-            let (rect, resp) = ui.allocate_exact_size(
-                Vec2::new(ui.available_width(), thumb_h),
-                Sense::click_and_drag(),
-            );
-            card_rects.push((i, egui::Rect::NOTHING, rect));
-            if resp.dragged() {
-                *drag = Some((i, false));
-            } else if resp.drag_stopped() {
-                *drag = Some((i, true));
-            }
-            resp.clone().on_hover_text("Drag to change this shot's place in the batch");
-            let tex = match thumbs.as_mut() {
-                Some(t) => t.texture(ui.ctx(), c),
-                None => None,
-            };
-            if let Some(t) = tex {
-                let img = t.size_vec2();
-                let scale = (rect.width() / img.x).min(rect.height() / img.y);
-                let size = img * scale;
-                let r = egui::Rect::from_center_size(rect.center(), size);
-                ui.painter().image(
-                    t.id(),
-                    r,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-            } else {
-                let why = thumbs
-                    .as_deref()
-                    .and_then(|t| t.failed(c))
-                    .map_or_else(
-                        || {
-                            if idle {
-                                "decoding thumbnail…".to_string()
-                            } else {
-                                "no frames yet".to_string()
-                            }
-                        },
-                        |e| format!("first frame unreadable: {e}"),
-                    );
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    why,
-                    egui::FontId::proportional(11.0),
-                    theme::text_dim(ui),
-                );
-            }
-            if idle && resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if idle && resp.double_clicked() {
-                *open = Some(i);
-            }
-            let source = match &c.source {
-                Source::Video { path } => Some((path.clone(), true)),
-                Source::Sequence { dir, .. } => Some((dir.clone(), false)),
-                Source::Missing => None,
-            };
-            let exports = crate::pipeline::export_dir(c, project_root, export_root);
-            resp.context_menu(|ui| {
-                if ui.button("Remove shot…").clicked() { *remove = Some(i); ui.close(); }
-                let source_exists = source.as_ref().is_some_and(|(path, _)| path.exists());
-                let source_entry = ui.add_enabled(source_exists, egui::Button::new("Reveal Source"));
-                if !source_exists { source_entry.clone().on_hover_text(source.as_ref().map_or_else(|| "Source not found".to_string(), |(path, _)| format!("Source not found at {}", path.display()))); }
-                if source_entry.clicked() { if let Some((path, select)) = &source { reveal(path, *select, ai); } ui.close(); }
-                let exports_exist = exports.is_dir();
-                let export_entry = ui.add_enabled(exports_exist, egui::Button::new("Reveal Exports"));
-                if !exports_exist { export_entry.clone().on_hover_text("No exports yet for this shot"); }
-                if export_entry.clicked() { reveal(&exports, false, ai); ui.close(); }
-            });
-        });
-    ui.horizontal_wrapped(|ui| {
-        let mut on_box = on;
-        if super::theme::checkbox(ui, &mut on_box, "").changed() {
-            if on_box {
-                sel.insert(i);
-            } else {
-                sel.remove(&i);
-            }
-            on = on_box;
-        }
-        ui.add(egui::Label::new(RichText::new(&c.display_name).strong().size(13.0)).truncate())
-            .on_hover_text(&c.display_name);
-        // The stage chip: its own colour per stage (Raw, Masked, Ready, Complete), readable in both themes.
-        let sc = theme::stage(ui, c.state);
-        egui::Frame::new().fill(sc.chip).corner_radius(8.0).inner_margin(egui::Margin::symmetric(6, 1)).show(ui, |ui| {
-            ui.add(egui::Label::new(RichText::new(c.state.label()).color(sc.text).size(11.0)).wrap());
-        });
-    });
-    match &st {
-        CardState::Busy(t, f) => {
-            ui.add(egui::ProgressBar::new(*f).text(t.as_str()));
-        }
-        CardState::Waiting => {
-            ui.label(RichText::new("Waiting for its turn to extract…").size(11.0).color(theme::warn(ui)));
-        }
-        CardState::Failed(m) => {
-            ui.colored_label(
-                theme::error(ui),
-                RichText::new(format!("Extraction failed: {m}")).size(11.0),
-            );
-        }
-        CardState::NeedsFrames => {
-            ui.label(RichText::new("Frames not extracted yet. The source movie is safe in this clip's Source folder.").size(11.0).color(theme::warn(ui)));
-        }
-        CardState::Idle => {}
-    }
-    if let Some(e) = &c.error {
-        ui.add(egui::Label::new(RichText::new(e).color(theme::error(ui)).size(10.5)).truncate()).on_hover_text(e);
-    }
-    if matches!(st, CardState::Idle) {
-        let facts = match c.sample_size {
-            Some((w, h)) => format!("{}×{} · {:.0} fps · {} fr", w, h, c.fps, c.input_files.len()),
-            None => format!("{:.0} fps · {} fr", c.fps, c.input_files.len()),
-        };
-        ui.label(RichText::new(facts).color(theme::text_dim(ui)).size(10.5));
-        ui.label(RichText::new(board_status(c)).color(theme::text_dim(ui)).size(10.5));
-    }
-    // One Open affordance (the thumbnail also opens on double-click) and the clip's client on the same row.
-    ui.horizontal_wrapped(|ui| {
-        let r = ui
-            .add_enabled(idle, egui::Button::new("Open").small())
-            .on_disabled_hover_text("Frames are not ready yet")
-            .on_hover_text("Open this clip (or double-click its thumbnail)");
-        open_rects.push((Some(i), r.rect));
-        if r.clicked() {
-            *open = Some(i);
-        }
-        if matches!(st, CardState::NeedsFrames | CardState::Failed(_))
-            && ui.small_button("Resume").clicked()
-        {
-            *resume = Some(i);
-        }
-        if idle {
-            ai.client_combo(ui, c);
-        }
-        if ui.small_button("Remove shot…").on_hover_text("Take this shot off the project (its files stay unless you choose to delete them)").clicked() {
-            *remove = Some(i);
-        }
-    });
-}
-
 fn reveal(path: &Path, select_file: bool, ai: &mut AiUi) {
     let result = if cfg!(target_os = "windows") {
         let mut cmd = std::process::Command::new("explorer");
@@ -2581,13 +2316,6 @@ fn reveal(path: &Path, select_file: bool, ai: &mut AiUi) {
         std::process::Command::new("xdg-open").arg(if select_file { path.parent().unwrap_or(path) } else { path }).spawn()
     };
     if let Err(e) = result { ai.notice = Some(format!("Could not open {}: {e}", path.display())); }
-}
-
-/// Where a card dropped at `pos` lands: (slot, nearest card). Slot `s` is the place before card `s`, `cards.len()`
-/// after the last; the pointer's half of the nearest card decides.
-fn drop_slot(cards: &[egui::Rect], pos: egui::Pos2) -> (usize, usize) {
-    let near = (0..cards.len()).min_by(|a, b| cards[*a].distance_to_pos(pos).total_cmp(&cards[*b].distance_to_pos(pos))).unwrap_or(0);
-    (near + usize::from(cards.get(near).is_some_and(|r| pos.x > r.center().x)), near)
 }
 
 /// One short line per clip, from what the load already read (no directory listings per frame): the generated
@@ -2615,6 +2343,13 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.net_logic(ctx);
         self.tray_tick(ctx); // logic() still runs while the window is hidden
+        // A close request while minimized/hidden reaches only logic() (eframe skips ui()),
+        // and eframe would close the window right away. Cancel it and restore the window so
+        // the rendered frame's close_tick runs its guards (deletion, hide-to-tray, active work).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            crate::background::show(ctx);
+        }
         // eframe skips ui() for hidden/occluded Windows windows, but keeps calling logic().
         if let Some(dir) = &self.opts.instance_dir {
             if std::fs::remove_file(dir.join("instance.show")).is_ok() {
@@ -2644,6 +2379,16 @@ impl eframe::App for App {
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         use egui::{Event, Modifiers, PointerButton, Pos2};
+        // Screenshot runs under a bare Xvfb get no OS focus; report the window focused so focus rings draw.
+        if self.opts.screenshot.is_some() {
+            raw.focused = true;
+            // The private Xvfb pointer rests over a widget: ignore real pointer moves (--keys inject their own
+            // below) and, without --keys, show no pointer at all (no hover).
+            raw.events.retain(|e| !matches!(e, Event::PointerMoved(_)));
+            if self.opts.keys.is_empty() {
+                raw.events.push(Event::PointerGone);
+            }
+        }
         // The release lands two frames after the press: egui opens a context menu on the release, and a
         // release in that very same frame would count as the click that closes it again.
         if let Some(pos) = self.inject_release {
@@ -2673,6 +2418,11 @@ impl eframe::App for App {
         // `text:abc` types into the focused field (QA: forms such as pairing).
         if let Some(t) = tok.strip_prefix("text:") {
             raw.events.push(Event::Text(t.to_owned()));
+            return;
+        }
+        // `move:XxY` = pointer rests there (QA evidence for hover and tooltips).
+        if let Some((x, y)) = tok.strip_prefix("move:").and_then(|xy| xy.split_once('x')) {
+            raw.events.push(Event::PointerMoved(Pos2::new(x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0))));
             return;
         }
         // `click:XxY` = primary, `rclick:XxY` = secondary (QA evidence for context menus).
@@ -2722,6 +2472,11 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        if self.opts.specimen {
+            let (shot, after, started) = (self.opts.screenshot.clone(), self.opts.screenshot_after, self.started);
+            super::specimen::frame(ui, shot.as_deref(), after, started, &mut self.shot_requested);
+            return;
+        }
         self.frame(ui);
         // ponytail: IME kept off. egui toggles it off/on on every focus change, and some fcitx5 / Windows IME
         // setups then stop delivering typed text until restart. Plain key text still works (layouts, dead keys);
@@ -2889,37 +2644,6 @@ impl App {
         self.project.as_ref().map(|p| p.root.as_path())
     }
 
-    /// Clients and Settings buttons: one global pair, shown in the Board and the workspace bar (not per clip).
-    fn clients_button(&mut self, ui: &mut Ui) -> egui::Rect {
-        let r = ui
-            .add_enabled(
-                !self.settings_open && !self.models_open && !self.clients_open,
-                egui::Button::new("Clients"),
-            )
-            .on_hover_text("Render clients: machines, connection, models, what each is running");
-        if r.clicked() {
-            if let Some(v) = &mut self.viewer {
-                v.pause();
-            }
-            self.clients_open = true;
-            self.retry_endpoint(); // one more try when the page opens (no-op while the endpoint runs)
-        }
-        self.clients_rect = Some(r.rect);
-        r.rect
-    }
-
-    /// The one global Settings button, shown in the Board and the workspace header (not per clip).
-    fn settings_button(&mut self, ui: &mut Ui) -> egui::Rect {
-        let r = ui
-            .add_enabled(
-                !self.settings_open && !self.models_open,
-                egui::Button::new("Settings"),
-            )
-            .on_hover_text("Preferences: playback, interface, defaults");
-        self.settings_rect = Some(r.rect);
-        self.settings_requested |= r.clicked();
-        r.rect
-    }
     fn open_settings(&mut self) {
         if let Some(v) = &mut self.viewer {
             v.pause();
@@ -3334,6 +3058,8 @@ impl App {
         let Some((kind, paths)) = self.held_pick.take() else {
             return;
         };
+        // Start › missing folder › Locate…: only this pick re-points the entry (a cancelled pick forgets it).
+        let locate = if kind == PickKind::Project { self.shell.locate_from.take() } else { None };
         if paths.is_empty() {
             return;
         }
@@ -3366,6 +3092,9 @@ impl App {
             ),
             PickKind::Project => {
                 self.open_project_path(ctx, paths[0].clone());
+                if let Some(from) = locate {
+                    self.located(from);
+                }
             }
             PickKind::Location => {
                 self.imp.set_dest(ctx, Dest::NewIn(paths[0].clone()));
@@ -3541,46 +3270,74 @@ impl App {
         if self.driver.is_none() {
             self.net_tick(now, &wake);
         }
-        let active = self.active_gpus();
-        let cells = crate::metrics::view_cells(&self.metrics.view(now), &active);
+        if self.board_fx.is_none() && self.project.is_some() {
+            self.refresh_board_status();
+            let board_visible = self.viewer.is_none() && !self.settings_open && !self.models_open && !self.clients_open
+                && self.settings_fx.is_none() && self.models_fx.is_none() && self.machines_fx.is_none() && self.shot_fx.is_none();
+            if board_visible { self.refresh_board_page(&ctx); }
+        }
         // Outermost bottom panel: on every page (Board, clip, Settings, Clients, Models), fixed height.
-        let metrics_panel = Panel::bottom("system_metrics")
-            .exact_size(super::metrics_bar::FOOTER_H)
-            .frame(egui::Frame::new().fill(theme::canvas_fill(ui)).inner_margin(egui::Margin::symmetric(8, 0)))
-            .show(ui, |ui| super::metrics_bar::footer(ui, &cells));
-        self.metrics_rect = Some(metrics_panel.response.rect);
-        let mut open_models = false;
-        Panel::top("banner").show(ui, |ui| {
-            self.chrome(ui);
-            if !self.models_open && self.models.startup_ui(ui) {
-                open_models = true;
+        if self.board_fx.is_some() {
+            Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| if let Some(b) = &self.board_fx { b.status(ui); });
+            self.metrics_rect = None;
+        } else if self.project.is_none() {
+            // §7.4: no hardware meters before a project is open; the status bar shows activity and notices only.
+            Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.start_status(ui));
+            self.metrics_rect = None;
+        } else {
+            // One 22 px status bar carries the CPU/RAM/GPU/VRAM meters (§8.8); no separate metrics footer.
+            self.metrics_rect = None;
+            let status = Panel::bottom("board_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.board_page.status(ui)).inner;
+            if let Some(seg) = status.clicked {
+                if matches!(seg, super::controls::statusbar::Segment::Activity | super::controls::statusbar::Segment::Notices) {
+                    self.activity_anchor = status.segments.iter().find(|(s, _)| *s == seg).map(|(_, r)| *r);
+                    self.activity_toggle();
+                }
             }
-        });
-        self.models_open |= open_models;
+        }
+        // §7.1: menu bar 24 + toolbar 36 (page tabs, Models button).
+        Panel::top("banner").exact_size(60.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.chrome(ui));
         if std::mem::take(&mut self.settings_requested) {
             self.open_settings();
         }
         if self.models_open {
-            Panel::top("models_nav").show(ui, |ui| {
-                let back = ui.button("‹ Back");
-                self.models_back_rect = Some(back.rect);
-                if back.clicked() {
-                    self.models_open = false;
+            // The page tabs replace the old "‹ Back" bar.
+            self.models_back_rect = None;
+            if let Some(p) = self.models_fx.as_mut() {
+                p.ui(ui);
+            } else {
+                self.refresh_models_page(&ui.ctx().clone());
+                let acts = self.models_page.ui(ui);
+                let ctx = ui.ctx().clone();
+                for a in acts {
+                    self.handle_models_act(&ctx, a);
                 }
-            });
-            if self.models_open {
-                self.models.ui(ui);
             }
         } else if self.settings_open {
-            Panel::top("settings_nav").show(ui, |ui| {
-                let back = ui.button("‹ Back");
-                self.settings_back_rect = Some(back.rect);
-                if back.clicked() {
-                    self.close_settings();
-                }
-            });
+            // The page tabs replace the old "‹ Back" bar on the live page.
+            self.settings_back_rect = None;
             if self.settings_open {
-                let ev = self.settings.ui(ui);
+                let ev = if let Some(p) = self.settings_fx.as_mut() {
+                    p.ui(ui);
+                    super::settings::Event::None
+                } else {
+                    let gpus: Vec<crate::ui::settings_page::GpuInfo> = match &self.metrics.view(std::time::Instant::now()) {
+                        crate::metrics::View::Live(s) | crate::metrics::View::Stale { sample: s, .. } => s
+                            .gpus
+                            .iter()
+                            .flatten()
+                            .enumerate()
+                            .map(|(i, g)| crate::ui::settings_page::GpuInfo {
+                                index: g.index.unwrap_or(i as u32),
+                                name: g.name.clone().unwrap_or_default(),
+                                vram_gb: g.vram_total.map(|b| b as f32 / 1024.0_f32.powi(3)),
+                            })
+                            .collect(),
+                        _ => vec![],
+                    };
+                    self.settings.set_hardware(gpus);
+                    self.settings.ui(ui)
+                };
                 if let Some((_, dir)) = self.settings.take_browse() {
                     let c = ctx.clone();
                     if !self.picker.start(PickKind::MappingRoot, dir, move || c.request_repaint()) {
@@ -3605,86 +3362,42 @@ impl App {
                     super::settings::Event::Closed => self.close_settings(),
                     super::settings::Event::None => {}
                 }
+                if let Some(p) = self.settings.take_reveal() {
+                    reveal(&p, p.is_file(), &mut self.ai);
+                }
             }
         } else if self.clients_open {
-            Panel::top("clients_nav").show(ui, |ui| {
-                let back = ui.button("‹ Back");
-                self.clients_back_rect = Some(back.rect);
-                if back.clicked() {
-                    self.clients_open = false;
-                }
-            });
-            if self.clients_open {
-                let default = self.ai.placement.clone();
-                let mut net_actions = vec![];
-                let mut setup_cmds = vec![];
-                let local_view = self.metrics.view(std::time::Instant::now());
-                let active_now = self.active_gpus();
-                egui::CentralPanel::default().show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| {
-                            if self.remote.available() {
-                                let infos = self.remote.infos();
-                                let cx = crate::network_setup::Ctx {
-                                    settings: self.settings.saved(),
-                                    settings_path: self.settings.store_path(),
-                                    connected: self.remote.online(),
-                                    connections: &infos,
-                                };
-                                setup_cmds = self.setup.ui(ui, &cx);
-                                ui.add_space(14.0);
-                            }
-                            let (own_net, own_iid) = self.setup.svc().map(|v| (v.network_id.clone(), v.host_installation_id.clone())).unwrap_or_default();
-                            let (placement, table_acts) = super::clients::ui(ui, &mut self.ai, &default, &local_view, &active_now, &self.remote, &self.inbound, self.settings.saved(), self.settings.store_path(), own_net.as_deref(), own_iid.as_deref());
-                            if let Some(p) = placement {
-                                self.ai.placement = p;
-                            }
-                            net_actions.extend(table_acts);
-                            if self.remote.available() {
-                                self.setup.installs_ui(ui);
-                            }
-                        });
-                });
-                for a in net_actions {
-                    self.net_action(a);
-                }
-                for c in setup_cmds {
-                    match c {
-                        crate::network_setup::Cmd::SaveName(n) => {
-                            self.net_draft().name = n;
-                            self.net_save("Name changed");
-                        }
-                        crate::network_setup::Cmd::AllowJoin(allow) => {
-                            self.net_draft().allow_join = allow;
-                            self.net_save("Updated");
-                        }
-                        crate::network_setup::Cmd::UsePc { credentials, network_id, host_iid, name, endpoints, on } => {
-                            self.net_use_pc(&credentials, &network_id, host_iid, &name, endpoints, on);
-                        }
-                        crate::network_setup::Cmd::HostRemoved(gone) => {
-                            let n = self.net_draft();
-                            n.host_removed = gone;
-                            if gone {
-                                n.connections.iter_mut().filter(|c| c.local_host).for_each(|c| c.enabled = false);
-                            } else {
-                                n.connections.iter_mut().filter(|c| c.local_host).for_each(|c| c.enabled = true);
-                            }
-                            self.net_save("Updated");
-                        }
-                    }
+            if let Some(p) = self.machines_fx.as_mut() {
+                egui::CentralPanel::default().show(ui, |ui| p.ui(ui));
+            } else {
+                self.clients_back_rect = None;
+                self.refresh_machines_page();
+                let mut acts = vec![];
+                egui::CentralPanel::default().show(ui, |ui| acts = self.machines_page.ui(ui));
+                for a in acts {
+                    self.handle_machines_act(&ctx, a);
                 }
             }
+        } else if let Some(p) = self.shot_fx.as_mut() {
+            egui::CentralPanel::default().show(ui, |ui| p.ui(ui));
         } else if self.viewer.is_some() && self.open.is_some() {
-            self.workspace(ui);
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.shot_workspace(ui));
             if std::mem::take(&mut self.back_requested) {
                 self.viewer = None;
                 self.open = None;
                 ctx.request_repaint();
             }
         } else {
-            egui::CentralPanel::default().show(ui, |ui| self.board(ui));
+            let frame = if self.board_fx.is_some() || self.project.is_some() { egui::Frame::NONE } else { egui::Frame::central_panel(ui.style()) };
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| self.board(ui));
         }
+        // Any page, Focus included: the status-bar Activity popover.
+        if self.activity_is_open() {
+            if let Some(anchor) = self.activity_anchor.or_else(|| self.shot_activity_anchor()) {
+                self.activity_popover(ui, anchor);
+            }
+        }
+        self.shell_dialogs(&ctx);
         self.tray_note_ui(&ctx);
         self.close_ui(&ctx);
         self.remove_ui(&ctx);
@@ -3761,42 +3474,27 @@ mod settings_handoff_tests {
         app.open_settings();
         let original = app.settings.draft().playback.loop_default;
         app.settings.draft_mut().playback.loop_default = !original;
-        let frame = |app: &mut App, events| {
+        let frame = |app: &mut App| {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(1000.0, 700.0),
                 )),
-                events,
                 ..Default::default()
             };
             ctx.run_ui(raw, |ui| app.frame(ui)).textures_delta.clear();
         };
-        frame(&mut app, vec![]);
-        let pos = app.settings.models_rect().unwrap().center();
-        frame(
-            &mut app,
-            vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: Default::default(),
-                },
-            ],
-        );
-        frame(
-            &mut app,
-            vec![egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: Default::default(),
-            }],
-        );
+        // Settings' Models link: the handler for Event::OpenModels sets models_open while Settings stays open.
+        app.models_open = true;
+        frame(&mut app);
         assert!(app.models_open && app.settings_open);
         assert!(app.settings.dirty());
+        // Back to Settings through its page tab: the draft is still there.
+        app.goto_page(4);
+        frame(&mut app);
+        assert!(!app.models_open && app.settings_open);
+        assert!(app.settings.dirty());
+        assert_eq!(app.settings.draft().playback.loop_default, !original);
     }
 
     #[test]
@@ -4271,6 +3969,17 @@ mod settings_handoff_tests {
         }
     }
 
+    /// Ctrl+<key> pressed once, as a keyboard sends it.
+    fn press_ctrl(ctx: &egui::Context, app: &mut App, key: egui::Key) {
+        let modifiers = egui::Modifiers::COMMAND;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+            events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
+            ..Default::default()
+        };
+        ctx.run_ui(raw, |ui| app.frame(ui)).textures_delta.clear();
+    }
+
     /// An app whose New project dialog answers `picked` (None = cancelled); any other dialog is a bug.
     fn new_project_app(tag: &str, project: Option<&str>, picked: Option<&str>) -> (egui::Context, App, PathBuf, PathBuf) {
         let (repo, log) = stub_repo(&format!("np-{tag}"));
@@ -4301,10 +4010,7 @@ mod settings_handoff_tests {
         let (ctx, mut app, cur, log) = new_project_app("menu", Some("clip"), Some("go"));
         app.open_clip(&ctx, 0);
         pump(&ctx, &mut app, |a| a.in_workspace());
-        let at = app.new_menu_rects()[0].expect("File drawn").center();
-        click(&ctx, &mut app, at);
-        let at = app.new_menu_rects()[1].expect("New project… in the open File menu").center();
-        click(&ctx, &mut app, at);
+        press_ctrl(&ctx, &mut app, egui::Key::N); // File > New project… (Ctrl+N)
         pump(&ctx, &mut app, |a| !a.in_workspace() && a.new_project_parent().is_some());
         assert_eq!(app.project_root(), Some(cur.as_path()), "old project stays open until Create");
         click_create(&ctx, &mut app);

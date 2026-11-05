@@ -4,7 +4,6 @@ use ck::scheduler::*;
 use ck::worker::*;
 use common::*;
 use serde_json::json;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 

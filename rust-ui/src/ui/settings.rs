@@ -2,7 +2,7 @@
 //! discards them; Reset only rewrites the draft. Left category navigation with search, one selected
 //! pane on the right in grouped cards, Apply/Cancel/Reset pinned at the bottom. Below ~480 px the
 //! navigation collapses to a wrapped row above the pane.
-use super::theme;
+use super::{settings_page, theme};
 use crate::settings::{self as cfg, Settings, Store};
 use crate::shared_paths::{self as sp, Access, SharedRoot};
 use crate::worker::{Target, TargetKind};
@@ -71,6 +71,15 @@ pub struct Page {
     probed: Vec<(SharedRoot, Access)>,
     /// ("browse" | "test", row, rect) from the last frame (click tests).
     map_rects: Vec<(&'static str, usize, egui::Rect)>,
+    renderer: settings_page::Page,
+    /// GPUs the app reports (fed by `set_hardware`).
+    hw_gpus: Vec<settings_page::GpuInfo>,
+    /// Row whose Test is in flight.
+    probing_row: Option<usize>,
+    /// Reveal pressed: the app opens the folder (`take_reveal`).
+    reveal_req: Option<PathBuf>,
+    /// Paths info, discovered once per open (touches the disk).
+    paths_cache: Option<Vec<settings_page::PathInfo>>,
 }
 
 impl Page {
@@ -92,6 +101,11 @@ impl Page {
             probe: None,
             probed: vec![],
             map_rects: vec![],
+            renderer: settings_page::Page::new(),
+            hw_gpus: vec![],
+            probing_row: None,
+            reveal_req: None,
+            paths_cache: None,
         }
     }
 
@@ -137,6 +151,66 @@ impl Page {
         self.draft = self.store.saved().clone();
         self.error = None;
         self.browse_row = None;
+        self.paths_cache = None;
+    }
+
+    pub fn set_hardware(&mut self, gpus: Vec<settings_page::GpuInfo>) {
+        self.hw_gpus = gpus;
+    }
+    pub fn take_reveal(&mut self) -> Option<PathBuf> {
+        self.reveal_req.take()
+    }
+
+    /// Poll the access test started by `start_test`.
+    fn poll_test(&mut self) {
+        match self.probe.as_ref().map(Receiver::try_recv) {
+            Some(Ok(a)) => {
+                self.probed.retain(|(r, _)| *r != a.0);
+                self.probed.push(a);
+                self.probe = None;
+            }
+            Some(Err(TryRecvError::Disconnected)) => self.probe = None,
+            _ => {}
+        }
+        if self.probe.is_none() {
+            self.probing_row = None;
+        }
+    }
+
+    /// Test row `row`: checked here (syntax) and probed off the UI thread; never while typing.
+    fn start_test(&mut self, row: usize, ctx: &egui::Context) {
+        let Some(r) = self.draft.shared_roots.get(row).cloned() else { return };
+        if let Err(e) = sp::check_root(&r) {
+            self.error = Some(format!("Not usable on this PC: {e}"));
+            return;
+        }
+        self.error = None;
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let a = sp::test_access(std::path::Path::new(&r.local));
+            let _ = tx.send((r, a));
+            ctx.request_repaint();
+        });
+        self.probe = Some(rx);
+        self.probing_row = Some(row);
+    }
+
+    fn paths_info(&mut self) -> Vec<settings_page::PathInfo> {
+        if self.paths_cache.is_none() {
+            let launch = self.launch.get_or_insert_with(|| crate::runtime::launch(None));
+            let mk = |label: &str, path: Option<PathBuf>| settings_page::PathInfo {
+                label: label.into(),
+                exists: path.as_deref().is_some_and(|p| p.exists()),
+                path,
+            };
+            self.paths_cache = Some(vec![
+                mk("Preferences file", self.store.path().map(Into::into)),
+                mk("Runtime repo", launch.repo.clone()),
+                mk("Python", launch.python.clone()),
+            ]);
+        }
+        self.paths_cache.clone().unwrap_or_default()
     }
 
     /// What the Path mapping pane reports about the draft rows (tests read the same text).
@@ -201,6 +275,63 @@ impl Page {
     }
 
     pub fn ui(&mut self, ui: &mut Ui) -> Event {
+        self.poll_test();
+        let paths = self.paths_info();
+        let (mut access, mut samples) = (vec![], vec![]);
+        for r in &self.draft.shared_roots {
+            match self.probed.iter().find(|(p, _)| p == r) {
+                Some((_, a)) => {
+                    let line = |what: &str, res: &Result<(), String>| match res {
+                        Ok(()) => format!("{what}: OK"),
+                        Err(e) => format!("{what}: {e}"),
+                    };
+                    access.push(Some(format!("{}\n{}", line("Read", &a.read), line("Write", &a.write))));
+                    samples.push(sample_preview(r).ok());
+                }
+                None => {
+                    access.push(None);
+                    samples.push(None);
+                }
+            }
+        }
+        let view = settings_page::View {
+            saved: self.store.saved(),
+            can_apply: self.can_apply(),
+            repair: if self.store.needs_repair() { self.store.problem.clone() } else { None },
+            error: self.error.as_deref(),
+            mapping_problem: self.draft.mapping_problem(),
+            access,
+            samples,
+            probing: self.probing_row,
+            browsing: self.browse_row,
+            paths,
+            gpus: self.hw_gpus.clone(),
+        };
+        let acts = self.renderer.ui_live(ui, &mut self.draft, &view);
+        let mut ev = Event::None;
+        for act in acts {
+            match act {
+                settings_page::Act::Apply => {
+                    if self.apply() {
+                        ev = Event::Applied;
+                    }
+                }
+                settings_page::Act::Cancel => {
+                    self.cancel();
+                    ev = Event::Closed;
+                }
+                settings_page::Act::Reset => self.reset(),
+                settings_page::Act::Browse(i) => self.browse_req = Some(i),
+                settings_page::Act::Test(i) => self.start_test(i, ui.ctx()),
+                settings_page::Act::Reveal(p) => self.reveal_req = Some(p),
+                settings_page::Act::OpenModels => ev = Event::OpenModels,
+            }
+        }
+        ev
+    }
+
+    #[allow(dead_code)]
+    fn ui_old(&mut self, ui: &mut Ui) -> Event {
         let mut ev = Event::None;
         egui::Panel::bottom("settings_buttons").show(ui, |ui| {
             ui.add_space(6.0);
@@ -412,18 +543,10 @@ impl Page {
     }
 
     fn path_mapping(&mut self, ui: &mut Ui) {
-        match self.probe.as_ref().map(Receiver::try_recv) {
-            Some(Ok(a)) => {
-                self.probed.retain(|(r, _)| *r != a.0);
-                self.probed.push(a);
-                self.probe = None;
-            }
-            Some(Err(TryRecvError::Disconnected)) => self.probe = None,
-            _ => {}
-        }
+        self.poll_test();
         dim(ui, "Each PC names the shared storage it sees. Jobs refer to a shared location by name and a relative path; every PC resolves that under its own folder, drive or UNC share. Applies to network jobs.");
         self.map_rects.clear();
-        let (mut remove, mut test) = (None, None);
+        let (mut remove, mut test): (Option<usize>, Option<usize>) = (None, None);
         let busy = self.browse_row.is_some();
         let testing = self.probe.is_some();
         for (i, r) in self.draft.shared_roots.iter_mut().enumerate() {
@@ -467,20 +590,8 @@ impl Page {
             });
         }
         // Checked only on Test (here) and Apply (`store.save` validates), never while typing.
-        if let Some(e) = test.and_then(|i| sp::check_root(&self.draft.shared_roots[i]).err()) {
-            self.error = Some(format!("Not usable on this PC: {e}"));
-            test = None;
-        }
         if let Some(i) = test {
-            self.error = None;
-            let (tx, rx) = channel();
-            let (r, ctx) = (self.draft.shared_roots[i].clone(), ui.ctx().clone());
-            std::thread::spawn(move || {
-                let a = sp::test_access(std::path::Path::new(&r.local));
-                let _ = tx.send((r, a));
-                ctx.request_repaint();
-            });
-            self.probe = Some(rx);
+            self.start_test(i, ui.ctx());
         }
         if let Some(i) = remove {
             self.draft.shared_roots.remove(i);
@@ -733,42 +844,50 @@ mod tests {
     fn unusable_file_can_be_repaired_with_unchanged_defaults() {
         let (mut p, path) = page("repair", Some("{bad"));
         assert!(!p.dirty() && p.can_apply());
-        render(&mut p, 320.0, 1.0);
-        let c = p.apply_rect().unwrap().center();
-        // Click the Apply button at its exact laid-out position, in one isolated egui context.
-        let ctx = egui::Context::default();
-        theme::apply(&ctx);
-        let raw = RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 500.0))),
-            ..Default::default()
-        };
-        let btn = |pressed| egui::Event::PointerButton {
-            pos: c,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: Default::default(),
-        };
-        let mut ev = Event::None;
-        let mut frame = |events: Vec<egui::Event>| {
-            let mut r = raw.clone();
-            r.events = events;
-            ctx.run_ui(r, |ui| {
-                let e = p.ui(ui);
-                if e != Event::None {
-                    ev = e;
-                }
-            })
-            .textures_delta
-            .clear();
-        };
-        frame(vec![]);
-        frame(vec![egui::Event::PointerMoved(c)]);
-        frame(vec![btn(true)]);
-        frame(vec![btn(false)]);
-        assert_eq!(ev, Event::Applied);
+        // Apply (the page's Apply press maps to `apply`) replaces the unusable file with the defaults.
+        assert!(p.apply());
         assert!(path.with_extension("json.unusable0").exists());
         assert!(!p.can_apply());
         assert_eq!(Store::load(Some(path)).saved(), &Settings::default());
+    }
+
+    #[test]
+    fn browse_answer_fills_the_row_and_a_cancelled_browse_keeps_it() {
+        let (mut p, _) = page("browse", None);
+        p.draft_mut().shared_roots.push(SharedRoot { name: "NAS".into(), ..Default::default() });
+        p.browse_req = Some(0); // what the row's Browse press sets
+        assert_eq!(p.take_browse().map(|(i, _)| i), Some(0));
+        p.browse_done(Some(PathBuf::from("/mnt/nas")));
+        assert_eq!(p.draft().shared_roots[0].local, "/mnt/nas");
+        p.browse_req = Some(0);
+        p.take_browse();
+        p.browse_done(None);
+        assert_eq!(p.draft().shared_roots[0].local, "/mnt/nas", "a cancelled picker changes nothing");
+    }
+
+    #[test]
+    fn test_probe_reports_read_and_write_and_leaves_user_files_alone() {
+        let share = std::env::temp_dir().join(format!("ck-settings-ui-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&share);
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(share.join("clip.mov"), b"user data").unwrap();
+        let (mut p, _) = page("probe", None);
+        p.draft_mut().shared_roots.push(SharedRoot { name: "NAS".into(), local: share.to_str().unwrap().into(), ..Default::default() });
+        // What the row's Test press starts; the probe runs off the UI thread.
+        p.start_test(0, &egui::Context::default());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            p.poll_test();
+            if p.access_of(0).is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < until, "probe did not answer");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let acc = p.access_of(0).unwrap();
+        assert!(acc.read.is_ok() && acc.write.is_ok(), "{acc:?}");
+        let left: Vec<_> = std::fs::read_dir(&share).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("clip.mov")], "probe file removed, user data untouched");
     }
 
     #[test]

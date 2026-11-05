@@ -1,0 +1,44 @@
+{
+ "project": "V1_interview_finale",
+ "saved": 1,
+ "cards": [],
+ "machines": [
+  {
+   "name": "This machine",
+   "local": 1,
+   "state": "idle",
+   "job": "Preparing V1-0086",
+   "gpu": 21,
+   "vram": 15,
+   "cpu": 7,
+   "ram": 28,
+   "vramt": "3.6 / 24.0 GB",
+   "ramt": "34.7 / 123.5 GB"
+  },
+  {
+   "name": "kamino3",
+   "state": "idle",
+   "job": "Keying V1-0083 · 34%",
+   "gpu": 0,
+   "vram": 4,
+   "cpu": 3,
+   "ram": 12,
+   "vramt": "17.0 / 24.0 GB",
+   "ramt": "26.2 / 63.9 GB"
+  },
+  {
+   "name": "render-node-07-with-a-long-name",
+   "state": "offline"
+  }
+ ],
+ "waiting": [],
+ "running": 0,
+ "activity": "",
+ "notices": 0,
+ "sel": [],
+ "hov": null,
+ "qtab": "machines",
+ "menu": null,
+ "dialog": 0,
+ "drawer": 0
+}

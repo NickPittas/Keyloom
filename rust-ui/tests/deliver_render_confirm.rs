@@ -1,11 +1,13 @@
 //! Deliver "Run full workflow": with results already on disk it must not rerun pre-matte/hint/Key without an
 //! explicit, informed choice; "Export existing Key result" stays encode-only. Matte MP4 + Processed MOV ProRes 4444.
+//! Driven through the Shot page's own acts (`act_for_test`, what a click sends); asserts state, not positions.
 //! Fake worker, headless egui; run through tools/isolated-test.sh.
 mod common;
 use ck::presets::{Delivery, VideoDelivery};
 use ck::tasks::TaskKind;
 use ck::ui::{App, AppOptions, Tab};
-use eframe::egui::{self, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
+use ck::ui::shot_page::{Act, BarAct, PropAct};
+use eframe::egui::{self, Event, RawInput, Rect, Vec2};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -28,13 +30,14 @@ fn pump(ctx: &egui::Context, app: &mut App, what: &str, mut done: impl FnMut(&Ap
         std::thread::sleep(Duration::from_millis(15));
     }
 }
-fn press(ctx: &egui::Context, app: &mut App, key: &str) {
-    let at = app.deliver_rects().iter().find(|r| r.0 == key).unwrap_or_else(|| panic!("{key} not drawn")).1.center();
-    let b = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    run(ctx, app, vec![Event::PointerMoved(at)]);
-    run(ctx, app, vec![b(true)]);
-    run(ctx, app, vec![b(false)]);
+/// One click on the Deliver action bar (Primary = Export / confirm, Secondary = export existing from the confirmation,
+/// Menu = the "…" items), then a few frames.
+fn press(ctx: &egui::Context, app: &mut App, bar: BarAct) {
+    app.act_for_test(ctx, Act::Props(PropAct::Bar(bar)));
     frames(ctx, app, 4);
+}
+fn menu(label: &str) -> BarAct {
+    BarAct::Menu(label.into())
 }
 fn video(container: &str, codec: &str, quality: u32) -> Delivery {
     Delivery::Video(VideoDelivery { container: container.into(), codec: codec.into(), quality })
@@ -109,9 +112,11 @@ fn open_with(tag: &str, have: Have) -> (egui::Context, App, PathBuf) {
 
     // The app starts its idle workers when it opens; nothing to wait for but the clip.
     // The clip is loaded; its actions follow the app's model snapshot.
-    pump(&ctx, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && !a.deliver_rects().is_empty());
+    pump(&ctx, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some());
+    // hint_sync loads the shot's hint state a few frames after the open; deliveries set earlier would be wiped.
+    pump(&ctx, &mut app, "hint state loaded", |a| a.hint_loaded_for_test());
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18)), ("processed", video("mov_prores4444", "prores4444", 9))], None, false, None);
-    pump(&ctx, &mut app, "deliver controls drawn", |a| a.deliver_rects().iter().any(|r| r.0 == "render"));
+    frames(&ctx, &mut app, 4);
     (ctx, app, base)
 }
 fn nothing_queued(app: &App) -> bool {
@@ -121,12 +126,12 @@ fn nothing_queued(app: &App) -> bool {
 #[test]
 fn render_with_existing_results_asks_first_and_cancel_queues_nothing() {
     let (ctx, mut app, base) = open("rc-cancel");
-    press(&ctx, &mut app, "render");
+    press(&ctx, &mut app, menu("Run full workflow…"));
     frames(&ctx, &mut app, 20); // a queued pipeline would resolve within a few frames
     assert!(nothing_queued(&app), "the first click must not queue anything");
     let said = app.render_confirm_text().expect("a confirmation is shown");
     assert!(said.contains("complete Key result"), "{said}");
-    press(&ctx, &mut app, "confirm_cancel");
+    press(&ctx, &mut app, menu("Cancel"));
     frames(&ctx, &mut app, 20);
     assert!(app.render_confirm_text().is_none());
     assert!(nothing_queued(&app), "cancel queues nothing");
@@ -137,9 +142,9 @@ fn render_with_existing_results_asks_first_and_cancel_queues_nothing() {
 #[test]
 fn only_the_explicit_full_workflow_choice_runs_the_pipeline() {
     let (ctx, mut app, base) = open("rc-run");
-    press(&ctx, &mut app, "render");
+    press(&ctx, &mut app, menu("Run full workflow…"));
     assert!(app.render_confirm_text().is_some() && nothing_queued(&app));
-    press(&ctx, &mut app, "confirm_run");
+    press(&ctx, &mut app, BarAct::Primary);
     pump(&ctx, &mut app, "full workflow queued", |a| !a.ai().scheduler().snapshot().is_empty() || a.ai().pipeline_block_reason().is_some());
     assert!(app.render_confirm_text().is_none());
     let keys = app.ai().scheduler().snapshot().len();
@@ -152,7 +157,7 @@ fn only_the_explicit_full_workflow_choice_runs_the_pipeline() {
 #[test]
 fn export_existing_is_encode_only_both_from_the_button_and_from_the_confirmation() {
     let (ctx, mut app, base) = open("rc-export");
-    press(&ctx, &mut app, "export_existing");
+    press(&ctx, &mut app, menu("Export existing"));
     assert!(app.ai().scheduler().snapshot().is_empty(), "no Key job");
     let kinds: Vec<TaskKind> = app.ai().scheduler().task_snapshot().iter().map(|t| t.job.kind).collect();
     assert_eq!(kinds, [TaskKind::ExportVideo, TaskKind::ExportVideo], "matte MP4 and processed ProRes only");
@@ -160,9 +165,9 @@ fn export_existing_is_encode_only_both_from_the_button_and_from_the_confirmation
     let _ = fs::remove_dir_all(base);
 
     let (ctx, mut app, base) = open("rc-export2");
-    press(&ctx, &mut app, "render");
+    press(&ctx, &mut app, menu("Run full workflow…"));
     assert!(app.render_confirm_text().is_some());
-    press(&ctx, &mut app, "confirm_export");
+    press(&ctx, &mut app, BarAct::Secondary);
     assert!(app.render_confirm_text().is_none());
     assert!(app.ai().scheduler().snapshot().is_empty(), "the confirmation's export choice runs no Key either");
     assert_eq!(app.ai().scheduler().task_snapshot().len(), 2);
@@ -173,7 +178,7 @@ fn export_existing_is_encode_only_both_from_the_button_and_from_the_confirmation
 #[test]
 fn the_confirmation_closes_when_the_settings_it_was_opened_for_change() {
     let (ctx, mut app, base) = open("rc-guard");
-    press(&ctx, &mut app, "render");
+    press(&ctx, &mut app, menu("Run full workflow…"));
     assert!(app.render_confirm_text().is_some());
     // The captured workflow is frozen; a different Deliver choice is not silently run or silently adopted.
     app.set_export_for_test(&[("matte", video("mp4", "hevc", 23)), ("processed", video("mov_prores4444", "prores4444", 9))], None, false, None);
@@ -186,7 +191,7 @@ fn the_confirmation_closes_when_the_settings_it_was_opened_for_change() {
 
 #[test]
 fn a_shot_without_results_still_runs_directly() {
-    let (ctx, mut app, base) = open("rc-fresh");
+    let (ctx, app, base) = open("rc-fresh");
     let c = base.join("proj/clips/a");
     fs::write(c.join("clip.json"), "{}").unwrap();
     drop(app);
@@ -196,10 +201,10 @@ fn a_shot_without_results_still_runs_directly() {
 
     // The app starts its idle workers when it opens; nothing to wait for but the clip.
     // The clip is loaded; its actions follow the app's model snapshot.
-    pump(&ctx2, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && !a.deliver_rects().is_empty());
+    pump(&ctx2, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some());
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, None);
-    pump(&ctx2, &mut app, "deliver controls drawn", |a| a.deliver_rects().iter().any(|r| r.0 == "render"));
-    press(&ctx2, &mut app, "render");
+    frames(&ctx2, &mut app, 4);
+    press(&ctx2, &mut app, BarAct::Primary);
     assert!(app.render_confirm_text().is_none(), "nothing exists, so nothing to confirm");
     let _ = ctx;
     drop(app);
@@ -210,12 +215,11 @@ fn a_shot_without_results_still_runs_directly() {
 fn pre_matte_only_and_hint_only_results_also_ask_before_a_full_run() {
     for (tag, have, says) in [("rc-pre", Have::PreMatteOnly, "3 pre-matte frame(s)"), ("rc-hint", Have::HintOnly, "3 hint (AlphaHint) frame(s)")] {
         let (ctx, mut app, base) = open_with(tag, have);
-        press(&ctx, &mut app, "render");
+        press(&ctx, &mut app, menu("Run full workflow…"));
         frames(&ctx, &mut app, 20);
         let text = app.render_confirm_text().unwrap_or_else(|| panic!("{tag}: no confirmation"));
         assert_eq!(text, says);
         assert!(nothing_queued(&app), "{tag}: the first click queues nothing");
-        assert!(app.deliver_rects().iter().all(|r| r.0 != "export_existing"), "no duplicate export button while asking");
         drop(app);
         let _ = fs::remove_dir_all(base);
     }

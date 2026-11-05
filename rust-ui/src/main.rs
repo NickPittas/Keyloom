@@ -94,12 +94,22 @@ fn main() -> eframe::Result {
             "--import" => o.import_videos.push(next(&mut i).into()),
             "--import-folder" => o.import_folders.push(next(&mut i).into()),
             "--auto-confirm" => o.auto_confirm = true,
+            "--specimen" => { o.specimen = true; o.endpoint = false; } // hidden: colour/type specimen page
+            "--specimen-controls" => { o.specimen = true; o.endpoint = false; ck::ui::specimen::CONTROLS_PAGE.store(true, std::sync::atomic::Ordering::Relaxed); } // hidden: the "5.1 · Buttons" sheet
+            "--specimen-part" => { o.specimen = true; o.endpoint = false; let _ = ck::ui::specimen::PART.set(next(&mut i)); } // hidden: one foundation control section
+            "--specimen-icons" => { o.specimen = true; o.endpoint = false; ck::ui::specimen::ICONS_PAGE.store(true, std::sync::atomic::Ordering::Relaxed); } // hidden: the "9 · Icons" sheet
             "--keys" => o.keys = next(&mut i).split(',').map(str::to_owned).collect(),
             "--frame" => o.frame = next(&mut i).parse().ok(),
             // The app hosts its own endpoint by default (it stays passive if an old service still owns the state).
             "--app-endpoint" => o.endpoint = true,
             "--no-app-endpoint" => o.endpoint = false,
             "--metrics-fixture" => o.metrics = ck::metrics::Source::Fixture(next(&mut i).into()),
+            "--recent-fixture" => o.recent_fixture = Some(next(&mut i).into()), // hidden: Start screenshots (Recent rows from a file)
+            "--board-fixture" => o.board_fixture = Some(next(&mut i).into()), // hidden: Board screenshots (synthetic shots from a file)
+            "--models-fixture" => o.models_fixture = Some(next(&mut i).into()), // hidden: Models page screenshots (scaffold stub)
+            "--settings-fixture" => o.settings_fixture = Some(next(&mut i).into()), // hidden: Settings page screenshots (scaffold stub)
+            "--machines-fixture" => o.machines_fixture = Some(next(&mut i).into()), // hidden: Machines page screenshots (scaffold stub)
+            "--shot-fixture" => o.shot_fixture = Some(next(&mut i).into()), // hidden: Shot page screenshots (scaffold stub)
             "--screenshot" => o.screenshot = Some(next(&mut i).into()),
             "--screenshot-after" => o.screenshot_after = next(&mut i).parse().ok(),
             "--window" => {
@@ -115,7 +125,7 @@ fn main() -> eframe::Result {
     }
     o.net = ck::netlink::Source::for_app(o.endpoint, o.repo.as_deref());
     // One window/receiver per user: a second launch shows the first window and exits. Dev/QA runs are exempt.
-    let dev = o.screenshot.is_some() || !o.keys.is_empty() || !matches!(o.metrics, ck::metrics::Source::Local);
+    let dev = o.screenshot.is_some() || !o.keys.is_empty() || o.recent_fixture.is_some() || o.board_fixture.is_some() || o.models_fixture.is_some() || o.settings_fixture.is_some() || o.machines_fixture.is_some() || o.shot_fixture.is_some() || !matches!(o.metrics, ck::metrics::Source::Local);
     let settings_dir = ck::settings::default_path().and_then(|p| p.parent().map(std::path::Path::to_path_buf));
     let mut _lock = None;
     if !dev {

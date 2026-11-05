@@ -1,0 +1,24 @@
+{
+  "pane": "GPUs",
+  "gpus": [
+    {
+      "name": "RTX 4090",
+      "memory": "24 GB",
+      "enabled": true,
+      "keying": true,
+      "hints": true
+    },
+    {
+      "name": "RTX 3090",
+      "memory": "24 GB",
+      "enabled": false,
+      "keying": false,
+      "hints": false
+    }
+  ],
+  "shell": {
+    "project": "Night_exterior_greenscreen",
+    "saved": true,
+    "models_missing": 0
+  }
+}

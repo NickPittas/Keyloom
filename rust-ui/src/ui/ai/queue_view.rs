@@ -148,6 +148,8 @@ pub struct QueueRow {
     /// Something the user may need to act on (failed, lost, cancel pending, stalled).
     pub attention: bool,
     pub active: bool,
+    /// The worker is executing or has been dispatched this stage (unlike a dependency-waiting job).
+    pub executing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +166,18 @@ pub struct QueueSection {
     pub root: PathBuf,
     pub title: String,
     pub runs: Vec<QueueRun>,
+}
+
+/// The newest run's visible card status: executing work, its failure, then queued work.
+pub fn board_row(runs: &[QueueRun], waiting: bool) -> Option<&QueueRow> {
+    let newest = runs.last()?;
+    if let Some(row) = newest.rows.iter().find(|r| r.executing) {
+        return Some(row);
+    }
+    if waiting {
+        return newest.rows.iter().find(|r| r.active);
+    }
+    newest.rows.iter().rev().find(|r| r.cell.bad).or_else(|| newest.rows.iter().find(|r| r.active))
 }
 
 impl QueueSection {
@@ -316,6 +330,7 @@ impl AiUi {
                 precomputed: false,
                 attention: of.iter().zip(&phases).any(|(f, p)| f.stalled || (f.cancel_requested && !f.state.is_terminal()) || unresolved.contains(&f.id) || matches!(p, Phase::Failed | Phase::Lost)),
                 active: of.iter().any(|f| !f.state.is_terminal()),
+                executing: of.iter().any(|f| matches!(&f.state, JobState::Dispatching { .. } | JobState::Running { .. })),
             });
         }
         // A manual SAM/Chroma pre-matte used as it is: shown as such, with no job behind it.
@@ -333,6 +348,7 @@ impl AiUi {
                         precomputed: true,
                         attention: false,
                         active: false,
+                        executing: false,
                     },
                 );
             }
@@ -362,6 +378,17 @@ impl AiUi {
     /// How many Automatic shots wait for a PC (the Queue's Waiting tab).
     pub fn waiting_count(&self) -> usize {
         self.auto_pending.len()
+    }
+
+    /// Roots in Automatic's real cross-project waiting order, used to join waiting shots to the Board.
+    pub fn waiting_roots(&self) -> Vec<PathBuf> {
+        self.auto_pending.iter().map(|a| a.row.clip.root.clone()).collect()
+    }
+
+    pub fn board_row<'a>(&self, runs: &'a [QueueRun], waiting: bool) -> Option<&'a QueueRow> { board_row(runs, waiting) }
+
+    pub fn finished_count(&self, sections: &[QueueSection]) -> usize {
+        sections.iter().flat_map(|s| &s.runs).filter(|r| !r.active && !r.rows.iter().flat_map(|row| &row.ids).all(|id| self.cleared.contains(id))).count()
     }
 
     /// The Queue's Waiting tab: Automatic's waiting shots in the order they are handed out; each can be paused,
@@ -413,7 +440,7 @@ impl AiUi {
             ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 20.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Cancel").clicked() { drop = Some(i); }
                 if ui.small_button(if a.paused { "Resume" } else { "Pause" }).clicked() { toggle = Some(i); }
-                let mut line = format!("{}. {}", i + 1, a.row.clip.display_name);
+                let mut line = format!("{}. {} · {}", i + 1, a.project.display_name, a.row.clip.display_name);
                 if a.paused { line += " · paused"; }
                 if !a.failed_on.is_empty() {
                     let pcs: Vec<String> = a.failed_on.iter().map(|p| self.pc_label(p)).collect();
@@ -603,7 +630,36 @@ mod tests {
     }
 
     fn row(text: &str, frac: f32, bad: bool, precomputed: bool) -> QueueRow {
-        QueueRow { stage: Stage::Key, heading: String::new(), cell: Cell { text: text.into(), frac, bad }, products: vec![], ids: vec![], precomputed, attention: false, active: false }
+        QueueRow { stage: Stage::Key, heading: String::new(), cell: Cell { text: text.into(), frac, bad }, products: vec![], ids: vec![], precomputed, attention: false, active: false, executing: false }
+    }
+
+    #[test]
+    fn board_uses_executing_stage_then_only_the_newest_run() {
+        let mut waiting = row("Waiting", 0.0, false, false);
+        waiting.active = true;
+        let mut running = row("42%", 0.42, false, false);
+        running.active = true;
+        running.executing = true;
+        let mut later = row("Queued", 0.0, false, false);
+        later.active = true;
+        let failed = row("Failed", 0.0, true, false);
+        let active_run = QueueRun { client: "pc".into(), rows: vec![waiting, running, later], active: true, reason: String::new() };
+        let old_failure = QueueRun { client: "pc".into(), rows: vec![failed], active: false, reason: "failed".into() };
+        assert_eq!(board_row(&[old_failure.clone(), active_run], false).map(|r| r.cell.text.as_str()), Some("42%"));
+        let success = QueueRun { client: "pc".into(), rows: vec![row("100%", 1.0, false, false)], active: false, reason: "Complete".into() };
+        assert!(board_row(&[old_failure, success], false).is_none());
+    }
+
+    #[test]
+    fn automatic_waiting_replaces_an_old_failure_but_keeps_active_work() {
+        let failed = QueueRun { client: "pc".into(), rows: vec![row("Failed", 0.0, true, false)], active: false, reason: "failed".into() };
+        assert_eq!(board_row(&[failed.clone()], false).map(|r| r.cell.text.as_str()), Some("Failed"));
+        assert!(board_row(&[failed], true).is_none(), "the card's Automatic waiting override can show Queued");
+
+        let mut queued = row("Queued", 0.0, false, false);
+        queued.active = true;
+        let active = QueueRun { client: "pc".into(), rows: vec![queued], active: true, reason: String::new() };
+        assert_eq!(board_row(&[active], true).map(|r| r.cell.text.as_str()), Some("Queued"));
     }
 
     #[test]

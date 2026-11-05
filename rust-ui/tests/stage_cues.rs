@@ -7,8 +7,9 @@ use ck::presets::{Delivery, Pipeline, PipelineExport, VideoDelivery};
 use ck::project::{load_project, LoadOptions};
 use ck::settings::Settings;
 use ck::ui::{App, AppOptions, Tab};
-use ck::workflow::{OutputCfg, Params};
-use eframe::egui::{self, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
+use ck::ui::ai::KeyCmd;
+use ck::workflow::{Intent, OutputCfg, Params};
+use eframe::egui::{self, Event, RawInput, Rect, Vec2};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -30,13 +31,6 @@ fn pump(ctx: &egui::Context, app: &mut App, what: &str, mut done: impl FnMut(&Ap
         run(ctx, app, vec![]);
         std::thread::sleep(Duration::from_millis(15));
     }
-}
-fn click(ctx: &egui::Context, app: &mut App, at: egui::Pos2) {
-    let b = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    run(ctx, app, vec![Event::PointerMoved(at)]);
-    run(ctx, app, vec![b(true)]);
-    run(ctx, app, vec![b(false)]);
-    frames(ctx, app, 3);
 }
 fn video(container: &str, codec: &str, quality: u32) -> Delivery {
     Delivery::Video(VideoDelivery { container: container.into(), codec: codec.into(), quality })
@@ -120,9 +114,18 @@ fn match_manifest(app: &mut App) {
         o.processed_format = "exr".into();
     });
 }
-fn press(ctx: &egui::Context, app: &mut App, key: &str) {
-    let at = app.deliver_rects().iter().find(|r| r.0 == key).unwrap_or_else(|| panic!("{key} not drawn")).1.center();
-    click(ctx, app, at);
+fn clip_a(e: &Env) -> (ck::project::Project, ck::project::Clip) {
+    let p = load_project(&e.project, &LoadOptions::default()).unwrap();
+    let c = p.clips.iter().find(|c| c.folder == "a").unwrap().clone();
+    (p, c)
+}
+/// "Export existing Key result": the controller's encode-only submission with the shot's current delivery choices
+/// (`deliver_cmd(ExportExisting)` ends in exactly this call; the cue tests cover what completing its jobs does).
+fn export_existing(app: &mut App, e: &Env) {
+    let (outputs, fps, allow_partial, root) = app.export_state_for_test();
+    let cfg = PipelineExport { fps, allow_partial, root, outputs };
+    let (proj, clip) = clip_a(e);
+    app.ai_mut().submit_existing_deliveries(&clip, &proj.root, (0, 2), &cfg).expect("encode-only export queued");
 }
 fn tasks_done(app: &App) -> usize {
     app.ai().scheduler().task_snapshot().iter().filter(|t| t.state.is_terminal()).count()
@@ -143,7 +146,7 @@ fn export_cue_tracks_each_output_with_its_frozen_settings() {
     frames(&ctx, &mut app, 4);
     assert_eq!(app.deliver_pending_for_test(), ["matte", "processed"]);
     assert!(app.ai().stale_deliver.is_some());
-    press(&ctx, &mut app, "export_existing");
+    export_existing(&mut app, &e);
     assert_eq!(app.ai().scheduler().task_snapshot().len(), 2);
     // The first success clears only its own output.
     pump(&ctx, &mut app, "first export done", |a| tasks_done(a) >= 1);
@@ -157,7 +160,7 @@ fn export_cue_tracks_each_output_with_its_frozen_settings() {
     frames(&ctx, &mut app, 4);
     assert_eq!(app.deliver_pending_for_test(), ["matte"], "processed was encoded as configured; the later matte edit is still pending");
     // Exporting again at the current settings finishes the job and the cue goes out.
-    press(&ctx, &mut app, "export_existing");
+    export_existing(&mut app, &e);
     pump(&ctx, &mut app, "third export done", |a| tasks_done(a) >= 3 || a.deliver_pending_for_test().is_empty());
     frames(&ctx, &mut app, 4);
     assert!(app.deliver_pending_for_test().is_empty());
@@ -176,7 +179,7 @@ fn failed_exports_never_clear_the_cue_and_sequence_choices_are_never_pending() {
     app.set_export_for_test(&[("matte", video("mp4", "hevc", 23))], None, false, None);
     frames(&ctx, &mut app, 4);
     assert_eq!(app.deliver_pending_for_test(), ["matte"]);
-    press(&ctx, &mut app, "export_existing");
+    export_existing(&mut app, &e);
     pump(&ctx, &mut app, "export failed", |a| tasks_done(a) >= 1);
     frames(&ctx, &mut app, 4);
     assert_eq!(app.deliver_pending_for_test(), ["matte"], "a failed export clears nothing");
@@ -256,12 +259,13 @@ fn an_edit_during_the_run_and_a_failed_run_keep_the_cue() {
 
 // ------------------------------------------------------------------------------------------------ Key
 
-fn run_key(ctx: &egui::Context, app: &mut App) {
+/// The Key button's command (`KeyCmd::Submit`): `New` for a shot without a result, `NewVersion` when one exists.
+fn run_key(ctx: &egui::Context, app: &mut App, e: &Env, intent: Intent) {
     app.switch_tab(Tab::Key);
     frames(ctx, app, 6);
-    pump(ctx, app, "key gate", |a| a.ai().gate_current() && a.ai().key_rect.is_some());
-    let at = app.ai().key_rect.unwrap().center();
-    click(ctx, app, at);
+    pump(ctx, app, "key gate", |a| a.ai().gate_current());
+    let (proj, clip) = clip_a(e);
+    app.ai_mut().key_cmd(&clip, &proj, &Settings::default(), ctx, KeyCmd::Submit(intent)).expect("Key queued");
     pump(ctx, app, "key queued", |a| !a.ai().scheduler().snapshot().is_empty());
 }
 
@@ -270,7 +274,7 @@ fn key_cue_clears_after_its_own_success_but_not_after_failure_or_a_later_edit() 
     let e = env("cue-key", json!({"manifest": true}), false);
     let (ctx, mut app) = open(&e, Tab::Key);
     assert!(app.stage_pending_for_test("key"), "no Key result yet");
-    run_key(&ctx, &mut app);
+    run_key(&ctx, &mut app, &e, Intent::New);
     pump(&ctx, &mut app, "result read back", |a| !a.stage_pending_for_test("key") && a.ai().scheduler().snapshot().iter().all(|j| j.state.is_terminal()));
     assert!(app.ai().stale_key.is_none(), "no outline after its own success");
     // A setting changed afterwards makes it pending again.
@@ -285,7 +289,7 @@ fn key_cue_clears_after_its_own_success_but_not_after_failure_or_a_later_edit() 
 fn key_failure_and_an_edit_made_while_it_runs_keep_the_cue() {
     let e = env("cue-key-fail", json!({"manifest": true, "modes": {"key": "fail"}}), false);
     let (ctx, mut app) = open(&e, Tab::Key);
-    run_key(&ctx, &mut app);
+    run_key(&ctx, &mut app, &e, Intent::New);
     pump(&ctx, &mut app, "key failed", |a| a.ai().scheduler().snapshot().iter().all(|j| j.state.is_terminal()));
     frames(&ctx, &mut app, 6);
     assert!(app.stage_pending_for_test("key"), "a failed Key clears nothing");
@@ -294,7 +298,7 @@ fn key_failure_and_an_edit_made_while_it_runs_keep_the_cue() {
 
     let e = env("cue-key-edit", json!({"manifest": true, "key_delay": 0.3}), false);
     let (ctx, mut app) = open(&e, Tab::Key);
-    run_key(&ctx, &mut app);
+    run_key(&ctx, &mut app, &e, Intent::New);
     app.draft_for_test(|p, _| p.despill_strength = 0.9); // while it runs
     pump(&ctx, &mut app, "key finished", |a| a.ai().scheduler().snapshot().iter().all(|j| j.state.is_terminal()));
     frames(&ctx, &mut app, 8);
@@ -366,7 +370,7 @@ fn a_video_encoded_from_an_older_key_result_is_pending_again_after_a_new_key() {
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, None);
     frames(&ctx, &mut app, 6);
     assert_eq!(app.deliver_pending_for_test(), ["matte"], "chosen after open and never encoded");
-    press(&ctx, &mut app, "export_existing");
+    export_existing(&mut app, &e);
     pump(&ctx, &mut app, "export done", all_settled);
     frames(&ctx, &mut app, 6);
     assert!(app.deliver_pending_for_test().is_empty(), "encoded from the current Key result at these settings");
@@ -384,13 +388,13 @@ fn a_video_encoded_from_an_older_key_result_is_pending_again_after_a_new_key() {
     frames(&ctx, &mut app, 4);
     assert!(app.deliver_pending_for_test().is_empty());
     // A new Key result (as a new version) finishes after the export: the video no longer matches it.
-    run_key(&ctx, &mut app);
+    run_key(&ctx, &mut app, &e, Intent::NewVersion);
     pump(&ctx, &mut app, "new key done", all_settled);
     app.switch_tab(Tab::Deliver);
     pump(&ctx, &mut app, "new result read", |a| a.stage_pending_for_test("deliver"));
     assert_eq!(app.deliver_pending_for_test(), ["matte"]);
     // Re-encoding from it makes the video current again; switching shots and back keeps that.
-    press(&ctx, &mut app, "export_existing");
+    export_existing(&mut app, &e);
     frames(&ctx, &mut app, 20);
     pump(&ctx, &mut app, "re-export done", |a| all_settled(a) && !a.stage_pending_for_test("deliver"));
     app.open_clip(&ctx, 1);
@@ -445,7 +449,7 @@ fn a_new_key_this_session_makes_a_video_configured_at_open_pending() {
     frames(&ctx, &mut app, 8);
     assert_eq!(app.deliver_unverified_for_test(), ["matte"], "configured at open, no Key seen: unverified, no cue");
     assert!(app.deliver_pending_for_test().is_empty());
-    run_key(&ctx, &mut app);
+    run_key(&ctx, &mut app, &e, Intent::NewVersion);
     pump(&ctx, &mut app, "new key done", all_settled);
     app.switch_tab(Tab::Deliver);
     pump(&ctx, &mut app, "new result read", |a| a.stage_pending_for_test("deliver"));
@@ -463,7 +467,7 @@ fn a_video_is_current_only_for_the_folder_it_was_actually_written_to() {
     let custom = e.base.join("custom exports");
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, Some(custom.clone()));
     frames(&ctx, &mut app, 6);
-    press(&ctx, &mut app, "export_existing");
+    export_existing(&mut app, &e);
     pump(&ctx, &mut app, "custom export done", all_settled);
     frames(&ctx, &mut app, 6);
     assert!(app.deliver_pending_for_test().is_empty(), "written to the chosen folder");
@@ -471,7 +475,7 @@ fn a_video_is_current_only_for_the_folder_it_was_actually_written_to() {
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, None);
     frames(&ctx, &mut app, 6);
     assert_eq!(app.deliver_pending_for_test(), ["matte"], "custom -> project default is not current");
-    press(&ctx, &mut app, "export_existing");
+    export_existing(&mut app, &e);
     pump(&ctx, &mut app, "default export done", |a| all_settled(a) && a.deliver_pending_for_test().is_empty());
     // And the other way round.
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, Some(custom));

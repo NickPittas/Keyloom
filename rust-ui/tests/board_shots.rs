@@ -291,11 +291,14 @@ fn remove_shot_keeps_every_file_by_default_and_the_option_deletes_only_inside_th
         std::os::unix::fs::symlink(&outside, b.join("VideoMamaMaskHint")).unwrap();
         let (ctx, mut app) = open(&e, pref);
         assert_eq!(order(&app), strs(&["a", "b", "c"]));
-        // The card's own button opens the confirmation.
-        let shapes = frames(&ctx, &mut app, 2);
-        let buttons: Vec<Rect> = texts(&shapes).into_iter().filter(|(_, t)| t == "Remove shot…").map(|(r, _)| r).collect();
-        assert_eq!(buttons.len(), 3, "{pref}: one Remove shot… button per card");
-        click(&ctx, &mut app, buttons[1].center());
+        // Remove is in the card menu on the new Board.
+        frames(&ctx, &mut app, 2);
+        let p = app.board_cards()[1].2.center();
+        frame_with(&ctx, &mut app, mv(p));
+        frame_with(&ctx, &mut app, vec![Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: true, modifiers: Default::default() }]);
+        frame_with(&ctx, &mut app, vec![Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: false, modifiers: Default::default() }]);
+        let menu = frames(&ctx, &mut app, 2);
+        click(&ctx, &mut app, text_rect(&menu, "Remove shot…").center());
         assert!(app.remove_shot_open(), "{pref}: the confirmation opened");
         let shapes = frames(&ctx, &mut app, 3);
         assert!(texts(&shapes).iter().any(|(_, t)| t.starts_with("Remove b from this project")), "{pref}: names the shot");
@@ -364,9 +367,66 @@ fn shot_context_menu_shows_remove_and_disabled_reveal_entries() {
     frame_with(&ctx, &mut app, vec![Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: false, modifiers: Default::default() }]);
     let menu = frames(&ctx, &mut app, 2);
     let labels = texts(&menu).into_iter().map(|(_, t)| t).collect::<Vec<_>>();
-    for label in ["Remove shot…", "Reveal Source", "Reveal Exports"] { assert!(labels.iter().any(|t| t == label), "missing {label}: {labels:?}"); }
+    for label in ["Remove shot…", "Reveal source", "Reveal exports"] { assert!(labels.iter().any(|t| t == label), "missing {label}: {labels:?}"); }
     click(&ctx, &mut app, text_rect(&menu, "Remove shot…").center());
     assert!(app.remove_shot_open());
+    drop(app);
+    let _ = fs::remove_dir_all(e.base);
+}
+
+#[test]
+fn key_selected_opens_the_real_batch_rows_and_cancel_clears_them() {
+    let e = env("bs-batch-dialog", &["a", "b"], json!({}));
+    let (ctx, mut app) = open(&e, "Dark");
+    app.select_folders(&["a", "b"]);
+    let board = frames(&ctx, &mut app, 2);
+    let key = texts(&board).into_iter().find(|(_, text)| text.starts_with("Key selected (2)"))
+        .unwrap_or_else(|| panic!("Key selected is not drawn: {:?}", texts(&board))).0;
+    click(&ctx, &mut app, key.center());
+    assert!(app.ai().batch_open(), "Key selected opens the production dialog");
+    pump(&ctx, &mut app, "two planned Board rows", |a| a.ai().batch_ready());
+    let dialog = app.ai_mut().batch_dialog().expect("the real batch is open");
+    assert_eq!(dialog.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    let shapes = frames(&ctx, &mut app, 2);
+    for shot in ["a", "b"] { assert!(texts(&shapes).iter().any(|(_, text)| text == shot), "real row {shot} is visible"); }
+    let cancel = texts(&shapes).into_iter().find(|(_, text)| text.trim() == "Cancel")
+        .unwrap_or_else(|| panic!("Cancel is not drawn: {:?}", texts(&shapes))).0;
+    click(&ctx, &mut app, cancel.center());
+    assert!(!app.ai().batch_open(), "Cancel clears the pending batch");
+    drop(app);
+    let _ = fs::remove_dir_all(e.base);
+}
+
+#[test]
+fn key_selected_queues_the_valid_subset_when_another_shot_has_an_unknown_network_target() {
+    let e = env("bs-batch-unknown-target", &["hold-a", "b"], json!({}));
+    let (ctx, mut app) = open(&e, "Dark");
+    let project = load_project(&e.project, &LoadOptions::default()).unwrap();
+    let bad = project.clips.iter().find(|c| c.folder == "b").unwrap();
+    app.ai_mut().set_clip_client(bad, Some("network:removed/pc")).unwrap();
+    app.select_folders(&["hold-a", "b"]);
+    let board = frames(&ctx, &mut app, 2);
+    let key = texts(&board).into_iter().find(|(_, text)| text.starts_with("Key selected (2)"))
+        .unwrap_or_else(|| panic!("Key selected is not drawn: {:?}", texts(&board))).0;
+    click(&ctx, &mut app, key.center());
+    pump(&ctx, &mut app, "two planned Board rows", |a| a.ai().batch_ready());
+
+    let rows = app.ai_mut().batch_dialog().unwrap().rows;
+    assert!(rows.iter().find(|r| r.name == "hold-a").unwrap().included);
+    assert!(!rows.iter().find(|r| r.name == "b").unwrap().included);
+    let bad = rows.iter().position(|r| r.name == "b").unwrap();
+    app.ai_mut().batch_dialog_set_machine(bad, Some("l0"));
+    app.ai_mut().batch_dialog_set_included(bad, true);
+    assert!(app.ai_mut().batch_dialog().unwrap().rows[bad].included, "a valid reassignment can opt the row back in");
+    app.ai_mut().batch_dialog_set_included(bad, false);
+    let dialog = frames(&ctx, &mut app, 2);
+    let queue = texts(&dialog).into_iter().find(|(_, text)| text.trim() == "Key 1 shots")
+        .unwrap_or_else(|| panic!("Key 1 shots is not drawn: {:?}", texts(&dialog))).0;
+    click(&ctx, &mut app, queue.center());
+
+    let sections = app.ai().queue_view();
+    assert_eq!(sections.len(), 1, "only the included shot entered the queue: {sections:?}");
+    assert_eq!(sections[0].root.file_name().unwrap(), "hold-a");
     drop(app);
     let _ = fs::remove_dir_all(e.base);
 }

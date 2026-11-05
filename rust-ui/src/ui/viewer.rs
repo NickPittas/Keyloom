@@ -1,8 +1,10 @@
 //! The one shared viewer: mode chips (top-right), A/B wipe (top-centre), icon transport (centred below),
 //! scrubbable timeline with In/Out band. One instance per open clip, shared by all workspace tabs.
+use crate::decode::DisplayFrame;
 use crate::frames::*;
 use crate::project::{Clip, View};
 use super::theme;
+use super::controls::viewer_toolbar::{Background, Channel};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, Sense, Shape, Stroke, TextureHandle,
     TextureOptions, Ui, UiBuilder, Vec2,
@@ -45,7 +47,72 @@ pub enum MarkReq {
     Clear,
 }
 
+/// What the Shot toolbar asks the picture to show. Default = untouched pixels over the checker (the old screen).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct DisplayOpts {
+    pub channel: Channel,
+    pub gain: f32,
+    pub gamma: f32,
+    pub background: Background,
+    pub wipe_horizontal: bool,
+}
+impl Default for DisplayOpts {
+    fn default() -> Self {
+        Self { channel: Channel::Rgb, gain: 1.0, gamma: 1.0, background: Background::Checker, wipe_horizontal: false }
+    }
+}
+impl DisplayOpts {
+    /// Channel/gain/gamma leave the pixels as decoded (background and wipe direction never touch the texture).
+    fn pixels_untouched(&self) -> bool {
+        self.channel == Channel::Rgb && self.gain == 1.0 && self.gamma == 1.0
+    }
+}
+
+/// The texture for `f` with channel/gain/gamma applied on the CPU. Straight alpha stays straight for alpha
+/// frames; opaque frames keep the old premultiplied constructor (alpha is 255 there).
+fn display_image(f: &DisplayFrame, o: &DisplayOpts) -> egui::ColorImage {
+    let size = [f.width, f.height];
+    if o.pixels_untouched() {
+        return if f.has_alpha {
+            egui::ColorImage::from_rgba_unmultiplied(size, &f.rgba)
+        } else {
+            egui::ColorImage::from_rgba_premultiplied(size, &f.rgba)
+        };
+    }
+    // gain, then pow(1/gamma), per 8-bit value.
+    let inv_g = 1.0 / (o.gamma.max(0.01) as f64);
+    let lut: Vec<u8> = (0..256)
+        .map(|v| (((v as f64 / 255.0) * o.gain as f64).max(0.0).powf(inv_g) * 255.0 + 0.5).clamp(0.0, 255.0) as u8)
+        .collect();
+    let mut out = Vec::with_capacity(f.rgba.len());
+    for px in f.rgba.chunks_exact(4) {
+        let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+        let (grey, alpha) = match o.channel {
+            Channel::Rgb => {
+                out.extend_from_slice(&[lut[r as usize], lut[g as usize], lut[b as usize], a]);
+                continue;
+            }
+            Channel::R => (r, a),
+            Channel::G => (g, a),
+            Channel::B => (b, a),
+            Channel::A => (a, 255), // alpha as an opaque grey picture
+            Channel::Luma => ((0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32 + 0.5) as u8, a),
+        };
+        let v = lut[grey as usize];
+        out.extend_from_slice(&[v, v, v, alpha]);
+    }
+    if f.has_alpha {
+        egui::ColorImage::from_rgba_unmultiplied(size, &out)
+    } else {
+        egui::ColorImage::from_rgba_premultiplied(size, &out)
+    }
+}
+
 struct Tex {
+    /// The decoded frame this texture was built from (rebuilt from it when the display options change; also the
+    /// pixel readout source).
+    frame: Arc<DisplayFrame>,
+    opts: DisplayOpts,
     handle: TextureHandle,
     size: [usize; 2],
     has_alpha: bool,
@@ -107,6 +174,16 @@ pub struct Viewer {
     held: Option<Key>,
     /// Height of the image area at the last draw (layout tests).
     pub draw_h: f32,
+    /// Screen points per image pixel at Fit, from the last draw (0 = nothing drawn yet).
+    fit_scale: f32,
+    /// Toolbar display choices; `Tex::opts` older than this means the texture is rebuilt from its cached frame.
+    disp: DisplayOpts,
+    /// Set by `set_display` (the Shot page): the checkerboard then uses the design-bible 8 px #666/#999 cells.
+    display_set: bool,
+    /// Where the image was drawn last frame (screen rect), for `pixel_at`.
+    img_rect: Rect,
+    /// True when `image_ui` (the Shot page) draws: the pixel readout owns the bottom-left corner.
+    readout: bool,
 }
 
 fn icon_btn(ui: &mut Ui, kind: u8, active: bool, tip: &str) -> egui::Response {
@@ -255,6 +332,11 @@ impl Viewer {
             tex_order: vec![],
             held: None,
             draw_h: 0.0,
+            fit_scale: 0.0,
+            disp: DisplayOpts::default(),
+            display_set: false,
+            img_rect: Rect::NOTHING,
+            readout: false,
         }
     }
 
@@ -355,7 +437,7 @@ impl Viewer {
         match self.store.lookup(&key) {
             Lookup::Failed(e) => {
                 let left = self.store.retries_left(&key);
-                Some(format!("Decode failed: {e}{}", if left > 0 { format!(" · press R to retry ({left} left)") } else { " · retries exhausted; reopen the clip".into() }))
+                Some(format!("Decode failed: {e}{}", if left > 0 { format!(" · use Retry in Activity ({left} left)") } else { " · retries exhausted; reopen the clip".into() }))
             }
             _ => None,
         }
@@ -631,19 +713,26 @@ impl Viewer {
     }
 
     fn texture(&mut self, ctx: &egui::Context, key: &Key) -> Option<&Tex> {
-        if !self.tex.contains_key(key) {
-            let Lookup::Ready(f) = self.store.lookup(key) else {
-                return None;
+        // Missing, or built with other display options: (re)build from the cached decoded frame. Runs once per
+        // frame/option change, never per repaint.
+        if self.tex.get(key).is_none_or(|t| t.opts != self.disp) {
+            let f = match self.tex.get(key) {
+                Some(t) => t.frame.clone(),
+                None => {
+                    let Lookup::Ready(f) = self.store.lookup(key) else {
+                        return None;
+                    };
+                    f
+                }
             };
-            let img = if f.has_alpha {
-                egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba)
-            } else {
-                egui::ColorImage::from_rgba_premultiplied([f.width, f.height], &f.rgba)
-            };
+            let img = display_image(&f, &self.disp);
             let handle = ctx.load_texture("frame", img, TextureOptions::LINEAR);
+            let fresh = !self.tex.contains_key(key);
             self.tex.insert(
                 key.clone(),
                 Tex {
+                    frame: f.clone(),
+                    opts: self.disp,
                     handle,
                     size: [f.width, f.height],
                     has_alpha: f.has_alpha,
@@ -651,7 +740,9 @@ impl Viewer {
                     info: f.info.clone(),
                 },
             );
-            self.tex_order.push(key.clone());
+            if fresh {
+                self.tex_order.push(key.clone());
+            }
             while self.tex_order.len() > 6 {
                 let old = self.tex_order.remove(0);
                 if Some(&old) != self.held.as_ref() {
@@ -692,8 +783,149 @@ impl Viewer {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui) {
+    /// Only the image area in `rect`: backdrop, frame, A/B wipe, pan/zoom/wheel input, annotation and tint hooks,
+    /// texture uploads. No toolbar, transport or timeline; does not advance `ui`'s cursor. Playback itself is
+    /// driven by `tick()` (the caller keeps repainting while it returns true).
+    /// Also draws the pixel readout (bottom-left) while the pointer is over the image.
+    pub fn image_ui(&mut self, ui: &mut Ui, rect: Rect) -> egui::Response {
+        let resp = ui.interact(rect, ui.scope_id().with("viewer_image"), Sense::click_and_drag());
+        self.readout = true;
+        self.image_body(ui, rect, &resp);
+        if let Some((x, y, px)) = resp.hover_pos().and_then(|p| self.pixel_at(p)) {
+            self.draw_readout(ui, rect, x, y, px);
+        }
+        resp
+    }
+
+    /// Toolbar choices (channel, gain, gamma, background, wipe direction). A change rebuilds the shown textures
+    /// from their cached decoded frames on the next draw; the same options cost nothing.
+    pub fn set_display(&mut self, o: DisplayOpts) {
+        self.disp = o;
+        self.display_set = true;
+    }
+
+    /// Source pixel under screen point `pos` and its decoded RGBA (before channel/gain/gamma); None outside the
+    /// image or before a frame is drawn. With A/B on it reads the A frame.
+    pub fn pixel_at(&self, pos: Pos2) -> Option<(u32, u32, [u8; 4])> {
+        let t = self.held.as_ref().and_then(|k| self.tex.get(k))?;
+        let r = self.img_rect;
+        if !r.is_positive() || !r.contains(pos) {
+            return None;
+        }
+        let x = (((pos.x - r.left()) / r.width() * t.size[0] as f32) as usize).min(t.size[0] - 1);
+        let y = (((pos.y - r.top()) / r.height() * t.size[1] as f32) as usize).min(t.size[1] - 1);
+        let i = (y * t.size[0] + x) * 4;
+        let px = t.frame.rgba.get(i..i + 4)?;
+        Some((x as u32, y as u32, [px[0], px[1], px[2], px[3]]))
+    }
+
+    /// (pixels below 0, pixels above 1) in the frame under `pixel_at`; None = unknown or an 8-bit source.
+    pub fn out_of_range(&self) -> Option<(usize, usize)> {
+        self.held.as_ref().and_then(|k| self.tex.get(k)).and_then(|t| t.frame.out_of_range)
+    }
+
+    fn draw_readout(&self, ui: &Ui, rect: Rect, x: u32, y: u32, px: [u8; 4]) {
+        use egui::text::{LayoutJob, TextFormat};
+        let t = super::tokens::tokens(ui);
+        let font = super::type_scale::mono();
+        let mut job = LayoutJob::default();
+        let put = |job: &mut LayoutJob, label: &str, val: String| {
+            job.append(label, 0.0, TextFormat::simple(font.clone(), t.text_tertiary));
+            job.append(&format!(" {val}  "), 0.0, TextFormat::simple(font.clone(), t.text_primary));
+        };
+        put(&mut job, "x", x.to_string());
+        put(&mut job, "y", y.to_string());
+        job.append("  ", 0.0, TextFormat::simple(font.clone(), t.text_primary));
+        let v = |i: usize| format!("{:.3}", px[i] as f32 / 255.0);
+        let chans: &[(&str, usize)] = match self.disp.channel {
+            Channel::R => &[("R", 0)],
+            Channel::G => &[("G", 1)],
+            Channel::B => &[("B", 2)],
+            Channel::A => &[("A", 3)],
+            _ => &[("R", 0), ("G", 1), ("B", 2), ("A", 3)],
+        };
+        for (l, i) in chans {
+            put(&mut job, l, v(*i));
+        }
+        let p = ui.painter_at(rect);
+        let galley = p.layout_job(job);
+        let r = Rect::from_min_size(
+            Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0 - 20.0),
+            Vec2::new(galley.size().x + 12.0, 20.0),
+        );
+        p.rect_filled(r, 0.0, t.bg_overlay.gamma_multiply(0.85));
+        p.galley(Pos2::new(r.left() + 6.0, r.center().y - galley.size().y / 2.0), galley, t.text_primary);
+    }
+
+    fn image_body(&mut self, ui: &mut Ui, rect: Rect, resp: &egui::Response) {
         let ctx = ui.ctx().clone();
+        ui.painter().rect_filled(rect, 2.0, Color32::from_gray(22));
+        self.draw_image(&ctx, ui, rect, resp);
+    }
+
+    /// Decoded size of the frame on screen, in pixels.
+    pub fn image_size(&self) -> Option<[usize; 2]> {
+        self.held.as_ref().and_then(|k| self.tex.get(k)).map(|t| t.size)
+    }
+    /// Current zoom, 100 = one image pixel per screen point; None until a frame has been drawn.
+    pub fn zoom_percent(&self) -> Option<f64> {
+        (self.image_size().is_some() && self.fit_scale > 0.0).then(|| (self.fit_scale * self.zoom) as f64 * 100.0)
+    }
+    /// e.g. "EXR · half · 3840×2160"; "" while no frame is decoded.
+    pub fn format_text(&self) -> String {
+        self.held
+            .as_ref()
+            .and_then(|k| self.tex.get(k))
+            .map(|t| format!("{} · {}×{}", t.info, t.size[0], t.size[1]))
+            .unwrap_or_default()
+    }
+    /// Timeline length in frames; None for an empty clip.
+    pub fn frame_count(&self) -> Option<i64> {
+        (!self.index.is_empty()).then_some(self.index.len() as i64)
+    }
+    /// Frame numbers (from the file names) of the first and last timeline frame and of the playhead.
+    pub fn first_frame(&self) -> i64 {
+        self.index.frame_number(0) as i64
+    }
+    pub fn last_frame(&self) -> i64 {
+        self.index.frame_number(self.index.len().saturating_sub(1)) as i64
+    }
+    pub fn current_frame(&self) -> i64 {
+        self.index.frame_number(self.playhead) as i64
+    }
+    /// Playing or buffering forward / in reverse (buffering counts, as the pause icon does).
+    pub fn playing(&self) -> bool {
+        self.playing_dir() != 0
+    }
+    pub fn playing_reverse(&self) -> bool {
+        self.playing_dir() < 0
+    }
+    fn playing_dir(&self) -> isize {
+        self.clock.as_ref().map(|c| c.dir).or(self.buffering).unwrap_or(0)
+    }
+    pub fn is_looping(&self) -> bool {
+        self.looping
+    }
+    pub fn go_first(&mut self) {
+        self.set_playhead(0);
+    }
+    pub fn go_last(&mut self) {
+        self.set_playhead(self.index.len().saturating_sub(1));
+    }
+    /// 100 % (one image pixel per point); never below Fit, which is the smallest zoom the viewer allows.
+    pub fn one_to_one(&mut self) {
+        self.set_zoom_percent(100.0);
+    }
+    pub fn set_zoom_percent(&mut self, p: f64) {
+        if self.fit_scale > 0.0 {
+            self.zoom = (p as f32 / 100.0 / self.fit_scale).clamp(1.0, MAX_ZOOM);
+            if self.zoom <= 1.0 {
+                self.pan = Vec2::ZERO;
+            }
+        }
+    }
+
+    pub fn ui(&mut self, ui: &mut Ui) {
         let full = ui.available_rect_before_wrap();
         let n = self.index.len();
 
@@ -830,8 +1062,7 @@ impl Viewer {
         let img_h = (full.bottom() - ui.cursor().top() - bottom_h).max(56.0);
         let (rect, resp) =
             ui.allocate_exact_size(Vec2::new(full.width(), img_h), Sense::click_and_drag());
-        ui.painter().rect_filled(rect, 2.0, Color32::from_gray(22));
-        self.draw_image(&ctx, ui, rect, &resp);
+        self.image_body(ui, rect, &resp);
 
         // ---- transport: the six icons are centred on the viewer by themselves; Set In / Set Out / Clear
         // live to their right on the same row when there is room, otherwise on a compact second row.
@@ -973,6 +1204,7 @@ impl Viewer {
 
     fn draw_image(&mut self, ctx: &egui::Context, ui: &mut Ui, rect: Rect, resp: &egui::Response) {
         self.draw_h = rect.height();
+        self.img_rect = Rect::NOTHING;
         let p = ui.painter_at(rect);
         let msg = |text: &str, c: Color32| {
             p.text(
@@ -1058,6 +1290,7 @@ impl Viewer {
             self.pan += resp.drag_delta();
         }
         let fit = (rect.width() / asz[0] as f32).min(rect.height() / asz[1] as f32);
+        self.fit_scale = fit;
         let size = Vec2::new(asz[0] as f32, asz[1] as f32) * fit * self.zoom;
         // Keep at least 64 pt of the image inside the viewport; at fit there is nothing to pan.
         let lim = ((size + rect.size()) / 2.0 - Vec2::splat(64.0)).max(Vec2::ZERO);
@@ -1067,9 +1300,22 @@ impl Viewer {
             self.pan.clamp(-lim, lim)
         };
         let img = Rect::from_center_size(rect.center() + self.pan, size);
-        if aalpha || b_tex.is_some_and(|b| b.2) {
+        self.img_rect = img;
+        let bg = self.disp.background;
+        if (aalpha || b_tex.is_some_and(|b| b.2)) && bg != Background::Checker {
+            let fill = match bg {
+                Background::Black => Color32::from_gray(0),
+                Background::Grey => super::tokens::tokens(&*ui).viewer_surround,
+                _ => Color32::from_gray(255),
+            };
+            p.rect_filled(img.intersect(rect), 0.0, fill);
+        } else if aalpha || b_tex.is_some_and(|b| b.2) {
             // Only the cells inside the viewport: a deep zoom must not walk a million off-screen cells.
-            let cell = 14.0;
+            let (cell, c_even, c_odd) = if self.display_set {
+                (8.0, Color32::from_gray(0x66), Color32::from_gray(0x99))
+            } else {
+                (14.0, Color32::from_gray(70), Color32::from_gray(96))
+            };
             let vis = img.intersect(rect);
             if vis.is_positive() {
                 let c0 = ((vis.left() - img.left()) / cell).floor() as i32;
@@ -1078,11 +1324,7 @@ impl Viewer {
                 while y < vis.bottom() {
                     let (mut x, mut c) = (img.left() + c0 as f32 * cell, c0);
                     while x < vis.right() {
-                        let col = if (r + c) % 2 == 0 {
-                            Color32::from_gray(70)
-                        } else {
-                            Color32::from_gray(96)
-                        };
+                        let col = if (r + c) % 2 == 0 { c_even } else { c_odd };
                         p.rect_filled(
                             Rect::from_min_max(
                                 Pos2::new(x.max(vis.left()), y.max(vis.top())),
@@ -1105,24 +1347,31 @@ impl Viewer {
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         let mut notices: Vec<String> = vec![];
         if let Some((bid, bsz, _)) = b_tex {
-            let sx = img.left() + img.width() * self.wipe;
             let split = (self.wipe).clamp(0.0, 1.0);
-            p.image(
-                aid,
-                Rect::from_min_max(img.min, Pos2::new(sx, img.bottom())),
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(split, 1.0)),
-                Color32::WHITE,
-            );
-            p.image(
-                bid,
-                Rect::from_min_max(Pos2::new(sx, img.top()), img.max),
-                Rect::from_min_max(Pos2::new(split, 0.0), Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-            p.line_segment(
-                [Pos2::new(sx, img.top()), Pos2::new(sx, img.bottom())],
-                Stroke::new(2.0, ACCENT),
-            );
+            let horiz = self.disp.wipe_horizontal;
+            // Vertical wipe: A left of the line, B right. Horizontal: A above, B below (same fraction, y axis).
+            let (a_r, a_uv, b_r, b_uv, line) = if horiz {
+                let sy = img.top() + img.height() * split;
+                (
+                    Rect::from_min_max(img.min, Pos2::new(img.right(), sy)),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, split)),
+                    Rect::from_min_max(Pos2::new(img.left(), sy), img.max),
+                    Rect::from_min_max(Pos2::new(0.0, split), Pos2::new(1.0, 1.0)),
+                    [Pos2::new(img.left(), sy), Pos2::new(img.right(), sy)],
+                )
+            } else {
+                let sx = img.left() + img.width() * split;
+                (
+                    Rect::from_min_max(img.min, Pos2::new(sx, img.bottom())),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(split, 1.0)),
+                    Rect::from_min_max(Pos2::new(sx, img.top()), img.max),
+                    Rect::from_min_max(Pos2::new(split, 0.0), Pos2::new(1.0, 1.0)),
+                    [Pos2::new(sx, img.top()), Pos2::new(sx, img.bottom())],
+                )
+            };
+            p.image(aid, a_r, a_uv, Color32::WHITE);
+            p.image(bid, b_r, b_uv, Color32::WHITE);
+            p.line_segment(line, Stroke::new(2.0, ACCENT));
             p.text(
                 img.left_top() + Vec2::new(6.0, 4.0),
                 Align2::LEFT_TOP,
@@ -1131,8 +1380,8 @@ impl Viewer {
                 Color32::WHITE,
             );
             p.text(
-                img.right_top() + Vec2::new(-6.0, 4.0),
-                Align2::RIGHT_TOP,
+                if self.disp.wipe_horizontal { img.left_bottom() + Vec2::new(6.0, -4.0) } else { img.right_top() + Vec2::new(-6.0, 4.0) },
+                if self.disp.wipe_horizontal { Align2::LEFT_BOTTOM } else { Align2::RIGHT_TOP },
                 format!("B {}", self.b_view.label()),
                 FontId::proportional(12.0),
                 Color32::WHITE,
@@ -1141,7 +1390,12 @@ impl Viewer {
                 && img.width() > 0.0
             {
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    self.wipe = ((pos.x - img.left()) / img.width()).clamp(0.0, 1.0);
+                    self.wipe = if self.disp.wipe_horizontal {
+                        (pos.y - img.top()) / img.height()
+                    } else {
+                        (pos.x - img.left()) / img.width()
+                    }
+                    .clamp(0.0, 1.0);
                 }
             }
             if bsz != asz {
@@ -1173,14 +1427,22 @@ impl Viewer {
             notices.push("HDR clipped display".into());
         }
         if aalpha {
-            notices.push("Alpha shown over checker".into());
+            notices.push(format!(
+                "Alpha shown over {}",
+                match bg {
+                    Background::Checker => "checker",
+                    Background::Black => "black",
+                    Background::Grey => "grey",
+                    Background::White => "white",
+                }
+            ));
         }
         if self.view == View::Input && self.linear {
             notices.push("Input interpreted as Linear, sRGB view".into());
         }
         for (k, n) in notices.iter().enumerate() {
             p.text(
-                rect.left_bottom() + Vec2::new(8.0, -6.0 - 15.0 * k as f32),
+                rect.left_bottom() + Vec2::new(8.0, -6.0 - 15.0 * k as f32 - if self.readout { 24.0 } else { 0.0 }),
                 Align2::LEFT_BOTTOM,
                 n,
                 FontId::proportional(12.0),
@@ -1245,8 +1507,19 @@ impl Viewer {
     }
 
     fn timeline(&mut self, ui: &mut Ui, width: f32) {
-        let n = self.index.len();
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::click_and_drag());
+        self.timeline_body(ui, rect, &resp);
+    }
+
+    /// Only the frame timeline (track, In/Out band, marks, playhead, scrubbing) in `rect`; the caller owns the
+    /// layout and draws the transport and properties itself. Does not advance `ui`'s cursor.
+    pub fn timeline_ui(&mut self, ui: &mut Ui, rect: Rect) {
+        let resp = ui.interact(rect, ui.scope_id().with("viewer_timeline"), Sense::click_and_drag());
+        self.timeline_body(ui, rect, &resp);
+    }
+
+    fn timeline_body(&mut self, ui: &mut Ui, rect: Rect, resp: &egui::Response) {
+        let n = self.index.len();
         let p = ui.painter_at(rect);
         let track = Rect::from_min_max(
             Pos2::new(rect.left() + 6.0, rect.top() + 14.0),

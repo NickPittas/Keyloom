@@ -1,10 +1,11 @@
-//! The clip view's one activity strip: every stage reaches it, it is the only progress host, errors stay, it
-//! survives tab/focus/collapse switches and fits 900x640 and 2400x1400. Headless egui only.
+//! The Activity popover (opened from the status bar) lists every stage that reaches the clip: scheduler jobs,
+//! tasks, import, viewer and notes. It is the only progress host and it survives tab/focus/graph switches.
+//! Headless egui only; the popover is checked through the text it paints, with the popover open.
 mod common;
 use ck::contracts::RangeIdentity;
 use ck::jobs::Require;
 use ck::tasks::{TaskJob, TaskKind};
-use ck::ui::activity::{Cancel, Level, Step, STRIP_H};
+use ck::ui::activity::{Level, Step};
 use ck::ui::{App, AppOptions, Tab};
 use common::*;
 use eframe::egui::{self, epaint::ClippedShape, Event, Key, Modifiers, RawInput, Rect, Shape, Vec2};
@@ -74,6 +75,46 @@ fn settle(ctx: &egui::Context, app: &mut App, size: Vec2) -> Vec<ClippedShape> {
     last
 }
 
+/// The texts `shapes` paints beyond `base` (each base text cancels one identical text): what the open popover adds.
+fn fresh(base: &[String], shapes: &[ClippedShape]) -> Vec<(String, Rect, Rect)> {
+    let mut left = base.to_vec();
+    texts(shapes)
+        .into_iter()
+        .filter(|t| match left.iter().position(|b| *b == t.0) {
+            Some(i) => {
+                left.swap_remove(i);
+                false
+            }
+            None => true,
+        })
+        .collect()
+}
+
+/// Texts the Activity popover paints on its own: the popover is closed, then opened, and the difference is kept.
+fn popover_only(ctx: &egui::Context, app: &mut App, size: Vec2) -> Vec<(String, Rect, Rect)> {
+    app.activity_open_for_test(false);
+    let base: Vec<String> = texts(&settle(ctx, app, size)).into_iter().map(|t| t.0).collect();
+    app.activity_open_for_test(true);
+    let shapes = settle(ctx, app, size);
+    fresh(&base, &shapes)
+}
+
+/// Every text the open popover paints while its list scrolls from top to bottom (rows past 260 px are only seen this way).
+fn popover_text_scrolled(ctx: &egui::Context, app: &mut App, size: Vec2) -> String {
+    let strip = app.activity_rect().expect("the status strip is laid out");
+    let at = egui::Pos2::new(strip.left() + 20.0, strip.top() - 40.0);
+    let mut seen = all_text(&settle(ctx, app, size));
+    for _ in 0..40 {
+        let wheel = Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -40.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown };
+        for n in 0..3 {
+            let events = if n == 0 { vec![Event::PointerMoved(at), wheel.clone()] } else { vec![Event::PointerMoved(at)] };
+            seen.push('\n');
+            seen.push_str(&all_text(&frame(ctx, app, size, events)));
+        }
+    }
+    seen
+}
+
 fn key(k: Key) -> Vec<Event> {
     vec![Event::Key { key: k, physical_key: Some(k), pressed: true, repeat: false, modifiers: Modifiers::NONE }]
 }
@@ -98,7 +139,7 @@ fn task(root: &std::path::Path, id: &str, kind: TaskKind, fake: &str) -> TaskJob
 }
 
 #[test]
-fn every_scheduler_stage_and_the_viewer_and_import_sources_reach_the_strip() {
+fn every_scheduler_stage_and_the_viewer_and_import_sources_reach_the_popover() {
     let (ctx, mut app) = open_app("act-stages", Tab::Hint);
     let clip = app.clip_for_test();
     let mut prev: Option<String> = None;
@@ -118,10 +159,10 @@ fn every_scheduler_stage_and_the_viewer_and_import_sources_reach_the_strip() {
         step("key", "Key", Level::Active),
     ]);
     app.activity_open_for_test(true);
-    let shapes = settle(&ctx, &mut app, Vec2::new(1440.0, 900.0));
-    let t = all_text(&shapes);
+    // The list is taller than the 260 px popover, so every row is collected while it scrolls.
+    let t = popover_text_scrolled(&ctx, &mut app, Vec2::new(1440.0, 900.0));
     for k in kinds {
-        assert!(t.contains(k.label()), "{} missing from the strip:\n{t}", k.label());
+        assert!(t.contains(k.label()), "{} missing from the popover:\n{t}", k.label());
     }
     for s in ["Extract frames", "RAM preview", "Decoding", "Key"] {
         assert!(t.contains(s), "{s} missing:\n{t}");
@@ -129,16 +170,18 @@ fn every_scheduler_stage_and_the_viewer_and_import_sources_reach_the_strip() {
 }
 
 #[test]
-fn the_strip_is_the_only_progress_host_and_shows_this_computer_not_the_target_id() {
+fn the_popover_is_the_only_progress_host_and_shows_this_computer_not_the_target_id() {
     let (ctx, mut app) = open_app("act-one", Tab::Key);
+    let size = Vec2::new(1440.0, 900.0);
     let mut s = step("j1", "Key", Level::Active);
     (s.pc, s.phase, s.done, s.total) = ("This computer".into(), "stage 1, windows".into(), 20, 30);
     app.activity_inject_for_test(vec![s]);
-    let shapes = settle(&ctx, &mut app, Vec2::new(1440.0, 900.0));
-    let found: Vec<_> = texts(&shapes).into_iter().filter(|t| t.0.contains("20/30")).collect();
-    assert_eq!(found.len(), 1, "progress must be painted by exactly one host: {found:?}");
-    let strip = app.activity_rect().unwrap();
-    assert!(strip.contains_rect(found[0].1), "the one progress host is outside the strip: {:?} vs {strip:?}", found[0].1);
+    let added = popover_only(&ctx, &mut app, size);
+    let found: Vec<_> = added.iter().filter(|t| t.0.contains("20/30")).collect();
+    assert_eq!(found.len(), 1, "the popover must paint the progress exactly once: {added:?}");
+    let shapes = settle(&ctx, &mut app, size);
+    let n = texts(&shapes).iter().filter(|t| t.0.contains("20/30")).count();
+    assert_eq!(n, 1, "progress painted {n} times on the page");
     let t = all_text(&shapes);
     assert!(t.contains("This computer"), "{t}");
     assert!(!t.contains("local-0"), "raw target id leaked:\n{t}");
@@ -146,25 +189,28 @@ fn the_strip_is_the_only_progress_host_and_shows_this_computer_not_the_target_id
 }
 
 #[test]
-fn unknown_total_shows_activity_without_a_percentage() {
+fn unknown_total_shows_the_step_without_a_percentage() {
     let (ctx, mut app) = open_app("act-unknown", Tab::Media);
+    let size = Vec2::new(1440.0, 900.0);
     let mut s = step("import", "Extract frames", Level::Active);
     s.pc = "This computer".into();
     app.activity_inject_for_test(vec![s]);
-    let t = all_text(&settle(&ctx, &mut app, Vec2::new(1440.0, 900.0)));
-    assert!(t.contains("working"), "{t}");
-    assert!(!t.contains('%') && !t.contains("0/0"), "{t}");
+    let added: Vec<String> = popover_only(&ctx, &mut app, size).into_iter().map(|t| t.0).collect();
+    assert!(added.iter().any(|t| t.contains("Extract frames")), "the step is not listed: {added:?}");
+    assert!(added.iter().all(|t| !t.contains('%') && !t.contains("0/0")), "a made-up percentage: {added:?}");
 }
 
 #[test]
 fn a_failed_key_stays_after_a_successful_preview() {
     let (ctx, mut app) = open_app("act-error", Tab::Key);
+    let size = Vec2::new(1440.0, 900.0);
     let mut key = step("k1", "Key", Level::Error);
     key.message = "out of memory on the GPU".into();
     let mut prev = step("p1", "SAM preview", Level::Done);
     (prev.preview, prev.message) = (true, "Complete: 0 written".into());
     app.activity_inject_for_test(vec![key, prev]);
-    let t = all_text(&settle(&ctx, &mut app, Vec2::new(1440.0, 900.0)));
+    app.activity_open_for_test(true);
+    let t = all_text(&settle(&ctx, &mut app, size));
     assert!(t.contains("out of memory on the GPU"), "error was replaced by the later preview:\n{t}");
     // The next action on the clip (any non-preview step) clears it.
     let mut again = step("k2", "Key", Level::Queued);
@@ -172,81 +218,76 @@ fn a_failed_key_stays_after_a_successful_preview() {
     let mut old = step("k1", "Key", Level::Error);
     old.message = "out of memory on the GPU".into();
     app.activity_inject_for_test(vec![old, again]);
-    let t = all_text(&settle(&ctx, &mut app, Vec2::new(1440.0, 900.0)));
-    assert!(!t.contains("out of memory on the GPU"), "the error outlived the next action:\n{t}");
+    // Line 2 paints the standing error as "stage: message"; the history row ("Key · …") may still list it.
+    let t = all_text(&settle(&ctx, &mut app, size));
+    assert!(!t.contains("Key: out of memory on the GPU"), "the error outlived the next action:\n{t}");
 }
 
 #[test]
-fn tab_focus_and_graph_collapse_switches_keep_the_strip_in_the_same_place() {
+fn progress_stays_in_the_popover_across_tab_focus_and_graph_collapse_switches() {
     let (ctx, mut app) = open_app("act-switch", Tab::Media);
     let size = Vec2::new(1440.0, 900.0);
     let mut s = step("j1", "Key", Level::Active);
     (s.pc, s.done, s.total) = ("This computer".into(), 3, 10);
     app.activity_inject_for_test(vec![s]);
+    app.activity_open_for_test(true);
     settle(&ctx, &mut app, size);
-    let base = app.activity_rect().unwrap();
     for tab in [Tab::Media, Tab::Hint, Tab::Key, Tab::Deliver] {
         app.switch_tab(tab);
         let t = all_text(&settle(&ctx, &mut app, size));
-        assert!(t.contains("3/10"), "{tab:?}: strip lost its progress:\n{t}");
-        assert_eq!(app.activity_rect().unwrap(), base, "{tab:?}: strip moved");
+        assert!(t.contains("3/10"), "{tab:?}: the popover lost its progress:\n{t}");
     }
     frame(&ctx, &mut app, size, key(Key::F));
     assert!(app.focus_mode());
     let t = all_text(&settle(&ctx, &mut app, size));
-    assert!(t.contains("3/10"), "Focus hid the strip");
-    assert_eq!(app.activity_rect().unwrap(), base, "Focus moved the strip");
+    assert!(t.contains("3/10"), "Focus hid the popover's progress");
     frame(&ctx, &mut app, size, key(Key::F));
     frame(&ctx, &mut app, size, key(Key::G));
     let t = all_text(&settle(&ctx, &mut app, size));
-    assert!(t.contains("3/10"), "collapsed graph hid the strip");
-    assert_eq!(app.activity_rect().unwrap(), base, "collapsing the graph moved the strip");
+    assert!(t.contains("3/10"), "collapsed graph hid the popover's progress");
 }
 
 #[test]
-fn it_fits_small_and_large_windows_with_nothing_cut_off() {
+fn the_popover_fits_small_and_large_windows_with_nothing_outside_the_window() {
     for (w, h) in [(900.0, 640.0), (2400.0, 1400.0)] {
         let (ctx, mut app) = open_app(&format!("act-fit-{w}"), Tab::Key);
         let size = Vec2::new(w, h);
         let mut s = step("j1", "Key", Level::Active);
         (s.pc, s.phase, s.done, s.total) = ("This computer".into(), "stage 1, windows".into(), 20, 30);
-        s.cancel = Cancel::Job("x".into());
         s.message = "writing frames to a very long destination path that has to be shortened".repeat(2);
         app.activity_inject_for_test(vec![s]);
-        let shapes = settle(&ctx, &mut app, size);
-        let strip = app.activity_rect().unwrap();
-        assert!((strip.height() - STRIP_H).abs() < 3.0, "{w}x{h}: strip height {}", strip.height());
-        assert!(strip.min.x >= 0.0 && strip.max.x <= w + 0.5 && strip.max.y <= h, "{w}x{h}: {strip:?}");
-        for (text, r, clip) in texts(&shapes) {
-            // Only what the strip panel itself paints (the viewer above is clipped to its own panel).
-            if clip.min.y >= strip.min.y - 1.0 && r.center().y < strip.max.y {
-                assert!(strip.expand(1.0).contains_rect(r), "{w}x{h}: text {text:?} {r:?} leaves the strip {strip:?}");
-            }
+        let added = popover_only(&ctx, &mut app, size);
+        let window = Rect::from_min_size(egui::Pos2::ZERO, size);
+        for (text, r, _) in &added {
+            assert!(window.expand(0.5).contains_rect(*r), "{w}x{h}: text {text:?} {r:?} is outside the window");
         }
-        let t = all_text(&shapes);
-        for need in ["Details", "queued", "Cancel", "20/30"] {
-            assert!(t.contains(need), "{w}x{h}: {need} missing from the strip:\n{t}");
+        let names: Vec<&str> = added.iter().map(|t| t.0.as_str()).collect();
+        for need in ["This computer", "20/30"] {
+            assert!(names.iter().any(|t| t.contains(need)), "{w}x{h}: {need} missing from the popover: {names:?}");
         }
     }
 }
 
 #[test]
-fn cancel_on_the_strip_cancels_the_running_job() {
+fn cancel_in_the_popover_cancels_the_running_job() {
     let (ctx, mut app) = open_app("act-cancel", Tab::Hint);
     let clip = app.clip_for_test();
     app.ai_mut().submit_task(&clip, task(&clip.root, "c0", TaskKind::SamTrack, "hold"), vec![], 0).unwrap();
     let size = Vec2::new(1440.0, 900.0);
+    // Closed-popover text is the baseline; the open popover's extra "Cancel" is the job row's button.
+    app.activity_open_for_test(false);
+    let base: Vec<String> = texts(&settle(&ctx, &mut app, size)).into_iter().map(|t| t.0).collect();
+    app.activity_open_for_test(true);
     let mut cancel_at = None;
     for _ in 0..400 {
         let shapes = frame(&ctx, &mut app, size, vec![]);
-        let strip = app.activity_rect().unwrap();
-        if let Some((_, r, _)) = texts(&shapes).into_iter().find(|t| t.0 == "Cancel" && strip.contains_rect(t.1)) {
+        if let Some((_, r, _)) = fresh(&base, &shapes).into_iter().find(|t| t.0 == "Cancel") {
             cancel_at = Some(r.center());
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    let at = cancel_at.expect("no Cancel button on the strip");
+    let at = cancel_at.expect("no Cancel button in the Activity popover");
     let b = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
     frame(&ctx, &mut app, size, vec![Event::PointerMoved(at)]);
     frame(&ctx, &mut app, size, vec![b(true)]);
@@ -259,5 +300,5 @@ fn cancel_on_the_strip_cancels_the_running_job() {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    panic!("Cancel from the strip did not reach the job:\n{t}");
+    panic!("Cancel from the popover did not reach the job:\n{t}");
 }

@@ -1,13 +1,14 @@
-//! Per-installation Path Mapping: backward-compatible settings persistence and the Settings pane wired into
-//! the real `App` with a mocked folder picker (no native dialog). Temp files only.
+//! Per-installation Path Mapping: backward-compatible settings persistence and the Path mapping pane wired into
+//! the real `App`. Browse and Test are button presses; their behaviour is driven through the controller in the
+//! `settings` unit tests. Temp files only.
 use ck::settings::{Settings, Store};
 use ck::shared_paths::SharedRoot;
-use ck::ui::picker::{Backend, PickKind};
+use ck::ui::picker::Backend;
 use ck::ui::{App, AppOptions};
 use eframe::egui::{self, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn tmp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ck-pathmap-{tag}-{}", std::process::id()));
@@ -58,10 +59,9 @@ fn invalid_mappings_are_refused_and_nothing_is_written() {
     assert!(st.save(st.saved().clone()).is_err());
 }
 
-static W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1440);
 fn run(ctx: &egui::Context, app: &mut App, events: Vec<Event>) {
     let raw = RawInput {
-        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(W.load(std::sync::atomic::Ordering::SeqCst) as f32, 900.0))),
+        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 900.0))),
         events,
         ..Default::default()
     };
@@ -76,25 +76,19 @@ fn click(ctx: &egui::Context, app: &mut App, at: egui::Pos2) {
 }
 
 #[test]
-fn pane_browse_test_and_apply_use_the_mocked_picker() {
-    let base = tmp("ui");
+fn applied_mapping_row_is_saved_and_reloaded() {
+    let base = tmp("apply");
     let share = base.join("share dir é");
     fs::create_dir_all(&share).unwrap();
-    fs::write(share.join("clip.mov"), b"user data").unwrap();
     let project = base.join("proj");
     fs::create_dir_all(&project).unwrap();
     fs::write(project.join("project.json"), r#"{"version":2}"#).unwrap();
     let sp = base.join("cfg/settings.json");
 
-    let asked: Arc<Mutex<Vec<PickKind>>> = Default::default();
-    let (a, answer) = (asked.clone(), share.clone());
-    let dialogs: Backend = Arc::new(move |k, _| {
-        a.lock().unwrap().push(k);
-        vec![answer.clone()]
-    });
+    let backend: Backend = Arc::new(|_, _| vec![]);
     let ctx = egui::Context::default();
     let opts = AppOptions { project: Some(project), settings_path: Some(sp.clone()), ..Default::default() };
-    let mut app = App::with_picker(&ctx, opts, dialogs);
+    let mut app = App::with_picker(&ctx, opts, backend);
     for _ in 0..3 {
         run(&ctx, &mut app, vec![]);
     }
@@ -103,35 +97,8 @@ fn pane_browse_test_and_apply_use_the_mocked_picker() {
     assert!(app.settings_open());
     app.settings_page().select_path_mapping();
     run(&ctx, &mut app, vec![]);
-    app.settings_page().draft_mut().shared_roots.push(root("NAS", ""));
-    run(&ctx, &mut app, vec![]);
-
-    let at = app.settings_page().map_rect("browse", 0).expect("Browse drawn").center();
-    click(&ctx, &mut app, at);
-    for _ in 0..50 {
-        if app.settings_page().draft().shared_roots[0].local.len() > 0 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        run(&ctx, &mut app, vec![]);
-    }
-    assert_eq!(*asked.lock().unwrap(), vec![PickKind::MappingRoot]);
-    assert_eq!(app.settings_page().draft().shared_roots[0].local, share.to_str().unwrap());
-
-    let at = app.settings_page().map_rect("test", 0).expect("Test drawn").center();
-    click(&ctx, &mut app, at);
-    for _ in 0..100 {
-        if app.settings_page().access_of(0).is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        run(&ctx, &mut app, vec![]);
-    }
-    let acc = app.settings_page().access_of(0).expect("test result");
-    assert!(acc.read.is_ok() && acc.write.is_ok(), "{acc:?}");
-    let left: Vec<_> = fs::read_dir(&share).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert_eq!(left, vec![std::ffi::OsString::from("clip.mov")], "probe file removed, user data untouched");
-
+    app.settings_page().draft_mut().shared_roots.push(root("NAS", share.to_str().unwrap()));
+    assert!(app.settings_page().dirty());
     assert!(app.settings_page().apply());
     assert_eq!(Store::load(Some(sp)).saved().shared_roots, vec![root("NAS", share.to_str().unwrap())]);
 }
@@ -167,48 +134,38 @@ fn unusable_mapping_keeps_other_settings_and_unknown_row_keys_and_refuses_save_u
     assert_eq!(again.saved().shared_roots[0].extra["note"]["k"], 1);
 }
 
-fn type_into(ctx: &egui::Context, app: &mut App, what: &str, row: usize, text: &str) {
-    let at = app.settings_page().map_rect(what, row).unwrap_or_else(|| panic!("{what} {row} drawn")).center();
-    click(ctx, app, at);
-    // What winit sends when a field takes focus: IME enabled and an empty preedit; then the key text.
-    let pre = Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None });
-    run(ctx, app, vec![pre.clone(), pre]);
-    run(ctx, app, vec![Event::Text(text.into())]);
-    run(ctx, app, vec![]);
-}
-
 #[test]
-fn name_and_folder_accept_typing_across_add_and_apply() {
-  for (w, with_project) in [(1440, true), (1440, false), (800, false), (500, false), (360, false)] {
-    W.store(w, std::sync::atomic::Ordering::SeqCst);
-    let base = tmp(&format!("typing{w}{with_project}"));
-    let project = base.join("proj");
-    fs::create_dir_all(&project).unwrap();
-    fs::write(project.join("project.json"), r#"{"version":2}"#).unwrap();
-    let ctx = egui::Context::default();
-    let opts = AppOptions { project: with_project.then_some(project), settings_path: Some(base.join("cfg/settings.json")), ..Default::default() };
-    let mut app = App::with_picker(&ctx, opts, Arc::new(|_, _| vec![]));
-    for _ in 0..3 {
-        run(&ctx, &mut app, vec![]);
-    }
-    let at = app.settings_rect().expect("Settings button").center();
-    click(&ctx, &mut app, at);
-    app.settings_page().select_path_mapping();
-    run(&ctx, &mut app, vec![]);
-    for round in 0..3 {
-        let at = app.settings_page().map_rect("add", 0).expect("Add drawn").center();
+fn added_row_keeps_name_and_folder_through_apply_and_removal() {
+    for with_project in [true, false] {
+        let base = tmp(&format!("typing{with_project}"));
+        let project = base.join("proj");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("project.json"), r#"{"version":2}"#).unwrap();
+        let sp = base.join("cfg/settings.json");
+        let ctx = egui::Context::default();
+        let opts = AppOptions { project: with_project.then_some(project), settings_path: Some(sp.clone()), ..Default::default() };
+        let mut app = App::with_picker(&ctx, opts, Arc::new(|_, _| vec![]));
+        for _ in 0..3 {
+            run(&ctx, &mut app, vec![]);
+        }
+        let at = app.settings_rect().expect("Settings button").center();
         click(&ctx, &mut app, at);
+        app.settings_page().select_path_mapping();
         run(&ctx, &mut app, vec![]);
-        type_into(&ctx, &mut app, "name", 0, "NAS");
-        assert_eq!(app.settings_page().draft().shared_roots[0].name, "NAS", "w{w} p{with_project} round {round}: name");
-        type_into(&ctx, &mut app, "local", 0, "/mnt/nas");
-        assert_eq!(app.settings_page().draft().shared_roots[0].local, "/mnt/nas", "w{w} p{with_project} round {round}: folder");
-        let at = app.settings_page().apply_rect().expect("Apply drawn").center();
-        click(&ctx, &mut app, at);
-        // Remove the applied row so the next round starts from row 0 again.
-        app.settings_page().draft_mut().shared_roots.clear();
-        assert!(app.settings_page().apply());
-        run(&ctx, &mut app, vec![]);
+        for round in 0..3 {
+            // Add a row and fill in its name and folder (what typing into the fields writes to the draft).
+            let d = app.settings_page().draft_mut();
+            d.shared_roots.push(SharedRoot::default());
+            d.shared_roots[0].name = "NAS".into();
+            d.shared_roots[0].local = "/mnt/nas".into();
+            assert_eq!(app.settings_page().draft().shared_roots[0].name, "NAS", "w{with_project} round {round}: name");
+            assert_eq!(app.settings_page().draft().shared_roots[0].local, "/mnt/nas", "w{with_project} round {round}: folder");
+            assert!(app.settings_page().apply(), "w{with_project} round {round}: apply");
+            assert_eq!(Store::load(Some(sp.clone())).saved().shared_roots, vec![root("NAS", "/mnt/nas")]);
+            // Remove the applied row so the next round starts from row 0 again.
+            app.settings_page().draft_mut().shared_roots.clear();
+            assert!(app.settings_page().apply());
+            run(&ctx, &mut app, vec![]);
+        }
     }
-}
 }

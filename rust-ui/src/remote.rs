@@ -130,6 +130,10 @@ pub struct NetJob {
     pub submission_id: String,
     submission: Option<Value>,
     installation: Option<String>,
+    namespace: Option<String>,
+    project_root: Option<PathBuf>,
+    clip_root: Option<PathBuf>,
+    submitted_at: u64,
     stages: Vec<NetStage>,
     active_stage: Option<usize>,
     cancel_requested: bool,
@@ -151,6 +155,69 @@ pub struct NetJob {
     inflight: bool,
 }
 
+/// Read-only UI snapshot of one submitted job; it never exposes the saved credentials path.
+#[derive(Clone, Debug)]
+pub struct JobSnapshot {
+    pub network: String,
+    pub namespace: Option<String>,
+    pub installation: Option<String>,
+    pub submission_id: String,
+    pub project_root: Option<PathBuf>,
+    pub clip_root: Option<PathBuf>,
+    pub submitted_at: u64,
+    pub folder: String,
+    pub name: String,
+    pub state: String,
+    pub on: Option<String>,
+    pub stage: Option<String>,
+    pub progress: Option<f32>,
+    pub reason: Option<String>,
+    pub active: bool,
+    pub running: bool,
+    pub cancel_requested: bool,
+}
+
+impl JobSnapshot {
+    pub fn matches_paths(&self, project_root: &Path, clip_root: &Path) -> bool {
+        self.project_root.as_deref() == Some(project_root) && self.clip_root.as_deref() == Some(clip_root)
+    }
+
+    pub fn failed(&self) -> bool { matches!(self.state.as_str(), "failed" | "not sent") }
+}
+
+#[derive(Clone, Debug)]
+pub struct MachineSnapshot {
+    pub namespace: Option<String>,
+    pub installation: String,
+    pub name: String,
+    pub gpu: Option<String>,
+    pub busy: Option<bool>,
+    pub telemetry: ClientTelemetry,
+}
+
+pub fn telemetry_status_at(telemetry: &ClientTelemetry, now: Instant) -> String {
+    crate::metrics::client_cells_at(telemetry, &[], now).status.unwrap_or_default()
+}
+
+fn origin_paths(clip_ref: &str, roots: &[crate::shared_paths::SharedRoot]) -> Option<(PathBuf, PathBuf)> {
+    let clip = crate::shared_paths::resolve(roots, &crate::shared_paths::SharedRef::decode(clip_ref).ok()?).ok()?;
+    let clip = crate::project::clean_abs(&clip);
+    let project = if clip.parent().and_then(Path::file_name).is_some_and(|n| n.to_string_lossy() == "clips") {
+        clip.parent()?.parent()?.to_path_buf()
+    } else {
+        clip.clone()
+    };
+    Some((project, clip))
+}
+
+fn submission_origin(submission: &Value, roots: &[crate::shared_paths::SharedRoot]) -> Option<(PathBuf, PathBuf)> {
+    origin_paths(submission.get("spec")?.get("clip_root")?.as_str()?, roots)
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64)
+}
+
 impl NetJob {
     fn terminal(&self) -> bool {
         // "forwarded": an old host moved this shot to the PC's own app at the upgrade (the reason says where).
@@ -159,6 +226,32 @@ impl NetJob {
 
     fn can_take_unsent(&self) -> bool {
         self.job_id.is_none() && self.submission.is_some() && !self.submission_attempted && !self.inflight && self.last_poll.is_none() && !self.terminal()
+    }
+}
+
+impl Remote {
+    pub fn running_count(&self) -> usize { self.jobs.iter().filter(|j| j.state == "running").count() }
+
+    pub fn jobs_snapshot(&self) -> Vec<JobSnapshot> {
+        let network = self.label();
+        self.jobs.iter().map(|j| {
+            let stage = j.active_stage.and_then(|i| j.stages.get(i)).map(|s| s.label.clone()).or_else(|| j.stage.clone());
+            let progress = (j.total > 0).then(|| (j.done as f32 / j.total as f32).clamp(0.0, 1.0));
+            JobSnapshot {
+                network: network.clone(), namespace: j.namespace.clone(), installation: j.installation.clone(), submission_id: j.submission_id.clone(),
+                project_root: j.project_root.clone(), clip_root: j.clip_root.clone(), submitted_at: j.submitted_at,
+                folder: j.folder.clone(), name: j.name.clone(), state: j.state.clone(), on: j.on.clone(), stage,
+                progress, reason: j.reason.clone(), active: !j.terminal(), running: j.state == "running", cancel_requested: j.cancel_requested,
+            }
+        }).collect()
+    }
+
+    pub fn machines_snapshot(&self) -> Vec<MachineSnapshot> {
+        let namespace = self.ns();
+        self.installs.iter().map(|i| MachineSnapshot {
+            namespace: namespace.clone(), installation: i.id.clone(), name: i.name.clone(), gpu: i.gpu.clone(), busy: i.busy,
+            telemetry: self.telemetry(&i.id),
+        }).collect()
     }
 }
 
@@ -234,6 +327,36 @@ impl Conn {
     pub(crate) fn is_alias(&self, ns: &str, iid: &str) -> bool {
         !self.alias_id.is_empty() && !self.target_host.is_empty() && self.alias_ns == ns && self.alias_id == iid
     }
+}
+
+/// One saved connection as the Clients table shows it: read-only data for the Machines page (never the credentials file's contents).
+#[derive(Clone, Debug)]
+pub struct ConnRow {
+    /// The routing key the `Action` variants use.
+    pub creds: PathBuf,
+    pub name: String,
+    pub namespace: Option<String>,
+    pub installation_ids: Vec<String>,
+    pub enabled: bool,
+    pub receive: bool,
+    pub default_submit: bool,
+    pub connected: bool,
+    /// The status line (`Remote::status_line`).
+    pub status_text: String,
+    /// The hover diagnostics, joined with newlines (empty when there are none).
+    pub status_detail: String,
+    pub notes: Vec<String>,
+    pub leaving: bool,
+    /// Address choices: the saved endpoints plus the live address when it is not among them.
+    pub endpoints: Vec<String>,
+    /// The user's pick (`None` = Automatic).
+    pub preferred: Option<String>,
+    /// The address the connection is using right now.
+    pub live_url: Option<String>,
+    /// Names of the other PCs this connection reports.
+    pub machines: Vec<String>,
+    /// GPU names the reporting PCs give (PCs without one are left out).
+    pub gpus: Vec<String>,
 }
 
 pub struct Env<'a> {
@@ -641,7 +764,7 @@ impl Remote {
         self.target_host.clone_from(&env.cfg.target_host);
         self.legacy_ns.clone_from(&env.cfg.legacy_ns);
         self.legacy_id.clone_from(&env.cfg.legacy_id);
-        self.load_jobs(env.cfg.creds.as_deref());
+        self.load_jobs(env.cfg.creds.as_deref(), &env.settings.shared_roots);
         // The same submission id is the same shot: handing it over again (an old shot moved at the upgrade) never makes a second one.
         if self.jobs.iter().any(|j| j.submission_id == n.submission_id) {
             return;
@@ -727,7 +850,7 @@ impl Remote {
         self.legacy_ns.clone_from(&env.cfg.legacy_ns);
         self.legacy_id.clone_from(&env.cfg.legacy_id);
         let creds = env.cfg.creds.clone();
-        self.load_jobs(creds.as_deref());
+        self.load_jobs(creds.as_deref(), &env.settings.shared_roots);
         let enabled = env.cfg.enabled && creds.as_ref().is_some_and(|c| c.exists());
         if !enabled {
             if self.link.is_some() || self.phase != Phase::Off {
@@ -1071,6 +1194,9 @@ impl Remote {
 
     fn send(&mut self, n: NetSubmit, env: &Env) {
         let stages = stage_list(&n.spec);
+        let (project_root, clip_root) = origin_paths(&n.spec.clip_root, &env.settings.shared_roots).map_or((None, None), |(p, c)| (Some(p), Some(c)));
+        let namespace = self.ns();
+        let submitted_at = unix_ms();
         let installation = n.target.clone();
         // A destination is shown under its old registration id; the PC's own app knows itself by its own id.
         let wire = if !self.legacy_id.is_empty() && n.target.as_deref() == Some(self.legacy_id.as_str()) { Some(self.target_host.clone()) } else { n.target.clone() };
@@ -1078,7 +1204,7 @@ impl Remote {
         if n.automatic {
             body["automatic"] = json!(true); // the receiver refuses it (not_free) if it is no longer free
         }
-        self.jobs.push(NetJob { submission_id: n.submission_id.clone(), submission: Some(body), installation, stages, active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: n.folder, name: n.name, state: "sending".into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, submission_attempted: false, inflight: false });
+        self.jobs.push(NetJob { submission_id: n.submission_id.clone(), submission: Some(body), installation, namespace, project_root, clip_root, submitted_at, stages, active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: n.folder, name: n.name, state: "sending".into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, submission_attempted: false, inflight: false });
         self.save_jobs(env);
     }
 
@@ -1128,7 +1254,7 @@ impl Remote {
     }
 
     /// Read the saved list of sent jobs once (before anything is added to it, so a save can never drop them).
-    fn load_jobs(&mut self, creds: Option<&Path>) {
+    fn load_jobs(&mut self, creds: Option<&Path>, roots: &[crate::shared_paths::SharedRoot]) {
         let Some(c) = creds else { return };
         if std::mem::replace(&mut self.jobs_loaded, true) {
             return;
@@ -1156,10 +1282,18 @@ impl Remote {
         {
             {
                 for j in &saved {
+                    let recovered = j.get("submission").and_then(|v| submission_origin(v, roots));
+                    let namespace = j.get("namespace").and_then(Value::as_str).map(str::to_owned).or_else(|| self.ns());
+                    let project_root = j.get("project_root").and_then(Value::as_str).map(PathBuf::from).or_else(|| recovered.as_ref().map(|(p, _)| p.clone()));
+                    let clip_root = j.get("clip_root").and_then(Value::as_str).map(PathBuf::from).or_else(|| recovered.map(|(_, c)| c));
                     self.jobs.push(NetJob {
                         submission_id: j["submission_id"].as_str().unwrap_or("").into(),
                         submission: j.get("submission").filter(|v| v.is_object()).cloned(),
                         installation: j.get("installation").and_then(Value::as_str).map(str::to_owned),
+                        namespace,
+                        project_root,
+                        clip_root,
+                        submitted_at: j.get("submitted_at").and_then(Value::as_u64).unwrap_or(0),
                         stages: j.get("stages").cloned().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default(),
                         active_stage: j.get("active_stage").and_then(Value::as_u64).map(|n| n as usize),
                         cancel_requested: j.get("cancel_requested").and_then(Value::as_bool).unwrap_or(false),
@@ -1205,7 +1339,7 @@ impl Remote {
             return false;
         };
         let owner = c.to_string_lossy().into_owned();
-        let add = self.jobs.iter().map(|j| sent_entry(&owner, json!({"submission_id": j.submission_id, "submission": j.submission, "submission_attempted": j.submission_attempted, "installation": j.installation, "stages": j.stages, "cursor": j.cursor, "active_stage": j.active_stage, "cancel_requested": j.cancel_requested, "on": j.on, "done": j.done, "total": j.total, "reason": j.reason, "job_id": j.job_id, "folder": j.folder, "name": j.name, "state": j.state}))).collect();
+        let add = self.jobs.iter().map(|j| sent_entry(&owner, json!({"submission_id": j.submission_id, "submission": j.submission, "submission_attempted": j.submission_attempted, "installation": j.installation, "namespace": j.namespace, "project_root": j.project_root, "clip_root": j.clip_root, "submitted_at": j.submitted_at, "stages": j.stages, "cursor": j.cursor, "active_stage": j.active_stage, "cancel_requested": j.cancel_requested, "on": j.on, "done": j.done, "total": j.total, "reason": j.reason, "job_id": j.job_id, "folder": j.folder, "name": j.name, "state": j.state}))).collect();
         match crate::queue::replace(&hp, |e| e.kind == "sent" && e.owner == owner, add) {
             Ok(()) => true,
             Err(e) => {
@@ -1387,12 +1521,58 @@ impl Remote {
         acts
     }
 
+    /// The hover notes of this connection's status (its last diagnostic, if any).
+    pub fn notes(&self) -> Vec<String> {
+        self.status.iter().cloned().collect()
+    }
+
+    /// The Address picker's choices: the saved endpoints plus the live address when it is not among them.
+    pub fn endpoint_choices(&self, cfg: &Conn) -> Vec<String> {
+        let mut opts = cfg.endpoints.clone();
+        let url = self.url().unwrap_or_default();
+        if !url.is_empty() && !opts.contains(&url) {
+            opts.push(url);
+        }
+        opts
+    }
+
+    /// One connection as read-only data for the Machines page (`own` empty: no own-id filter).
+    pub fn conn_row(&self, cfg: &Conn) -> ConnRow {
+        self.conn_row_for(cfg, false, &[])
+    }
+
+    /// The shared source of a connection's values: the Clients row draws these, `conn_row` and `RemoteSet::conn_rows` return them.
+    pub(crate) fn conn_row_for(&self, cfg: &Conn, is_default: bool, own: &[String]) -> ConnRow {
+        let (status_text, connected) = self.status_line(cfg);
+        let notes = self.notes();
+        let installs = self.other_installations(own);
+        ConnRow {
+            creds: PathBuf::from(&self.key),
+            name: self.label(),
+            namespace: self.ns(),
+            installation_ids: installs.iter().map(|i| i.id.clone()).collect(),
+            enabled: cfg.enabled,
+            receive: cfg.receive,
+            default_submit: is_default,
+            connected,
+            status_detail: notes.join("\n"),
+            status_text,
+            notes,
+            leaving: self.leaving(),
+            endpoints: self.endpoint_choices(cfg),
+            preferred: (!cfg.preferred.is_empty()).then(|| cfg.preferred.clone()),
+            live_url: self.url().filter(|u| !u.is_empty()),
+            machines: installs.iter().map(|i| i.name.clone()).collect(),
+            gpus: installs.iter().filter_map(|i| i.gpu.clone()).collect(),
+        }
+    }
+
     /// The Status cell's text: the connection's status line (hover: its notes) and, when an attempt is owned here, its reason and Forget.
     pub fn status_cell(&self, ui: &mut Ui, cfg: &Conn) -> Vec<Action> {
         let acts = vec![];
         let (line, up) = self.status_line(cfg);
-        let hover: Vec<&str> = [self.status.as_deref()].into_iter().flatten().collect();
         let status = ui.colored_label(if up { egui::Color32::from_rgb(150, 190, 150) } else { egui::Color32::from_rgb(224, 176, 80) }, line);
+        let hover = self.notes();
         if !hover.is_empty() {
             status.on_hover_text(hover.join("\n"));
         }
@@ -1403,17 +1583,13 @@ impl Remote {
     pub fn row(&self, ui: &mut Ui, cfg: &Conn, is_default: bool, blocker: Option<String>, own: &[String]) -> Vec<Action> {
         let mut acts = vec![];
         let creds = self.key.clone();
-        let installs = self.other_installations(own);
-        let names: Vec<String> = installs.iter().map(|i| i.name.clone()).collect();
-        ui.label(if names.is_empty() { self.label() } else { names.join(", ") });
-        let url = self.url().unwrap_or_default();
+        let view = self.conn_row_for(cfg, is_default, own);
+        ui.label(if view.machines.is_empty() { self.label() } else { view.machines.join(", ") });
+        let url = view.live_url.clone().unwrap_or_default();
         let shown = if cfg.preferred.is_empty() { url.as_str() } else { cfg.preferred.as_str() };
         ui.label(ep_kind(shown));
         let mut cur = cfg.preferred.clone();
-        let mut opts = cfg.endpoints.clone();
-        if !url.is_empty() && !opts.contains(&url) {
-            opts.push(url.clone());
-        }
+        let opts = view.endpoints.clone();
         let label = |u: &str| format!("{} ({})", host_of(u), ep_kind(u));
         let text = if cur.is_empty() { "Automatic".to_owned() } else { label(&cur) };
         egui::ComboBox::from_id_salt(("conn_ep", &self.key)).selected_text(text).show_ui(ui, |ui| {
@@ -1426,8 +1602,7 @@ impl Remote {
             acts.push(Action::Prefer { creds: creds.clone(), url: cur });
         }
         ui.vertical(|ui| acts.extend(self.status_cell(ui, cfg)));
-        let gpus: Vec<String> = installs.iter().filter_map(|i| i.gpu.clone()).collect();
-        ui.label(if gpus.is_empty() { "Not reported".to_owned() } else { gpus.join(", ") });
+        ui.label(if view.gpus.is_empty() { "Not reported".to_owned() } else { view.gpus.join(", ") });
         acts.extend(self.controls(ui, cfg, is_default, blocker));
         acts
     }
@@ -1497,7 +1672,35 @@ mod discovery_tests {
         r
     }
     fn job_on(iid: &str, state: &str) -> NetJob {
-        NetJob { submission_id: "s".into(), submission: None, installation: Some(iid.into()), stages: vec![], active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: String::new(), name: String::new(), state: state.into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, submission_attempted: false, inflight: false }
+        NetJob { submission_id: "s".into(), submission: None, installation: Some(iid.into()), namespace: Some("network-a".into()), project_root: None, clip_root: None, submitted_at: 0, stages: vec![], active_stage: None, cancel_requested: false, events_done: false, job_id: None, folder: String::new(), name: String::new(), state: state.into(), on: None, done: 0, total: 0, reason: None, stage: None, cursor: 0, refreshed: false, last_poll: None, submission_attempted: false, inflight: false }
+    }
+
+    #[test]
+    fn project_a_shot_01_does_not_match_project_b_card() {
+        let mut job = job_on("pc", "running");
+        job.folder = "shot_01".into();
+        job.project_root = Some(PathBuf::from("/projects/A"));
+        job.clip_root = Some(PathBuf::from("/projects/A/clips/shot_01"));
+        let mut remote = Remote::blank(Source::Off, String::new());
+        remote.jobs.push(job);
+        let snapshot = remote.jobs_snapshot().remove(0);
+
+        assert_eq!(snapshot.folder, "shot_01");
+        assert!(snapshot.matches_paths(Path::new("/projects/A"), Path::new("/projects/A/clips/shot_01")));
+        assert!(std::iter::once(snapshot).filter(|j| j.matches_paths(Path::new("/projects/B"), Path::new("/projects/B/clips/shot_01"))).max_by_key(|j| j.submitted_at).is_none(), "Project B's same-named card has no remote progress");
+    }
+
+    #[test]
+    fn mapped_clip_identity_keeps_project_and_clip_roots() {
+        let roots = [crate::shared_paths::SharedRoot { name: "Share".into(), local: "/mnt/share".into(), ..Default::default() }];
+        assert_eq!(origin_paths("shared:Share/Project/clips/shot_01", &roots), Some((PathBuf::from("/mnt/share/Project"), PathBuf::from("/mnt/share/Project/clips/shot_01"))));
+    }
+
+    #[test]
+    fn remote_telemetry_ages_from_injected_receipt_clock() {
+        let received = Instant::now();
+        let telemetry = ClientTelemetry::reported_at(Sample::default(), Some(10.0), Some(0.0), received);
+        assert_eq!(telemetry_status_at(&telemetry, received + Duration::from_secs(6)), "stale 16 s");
     }
 
     #[test]

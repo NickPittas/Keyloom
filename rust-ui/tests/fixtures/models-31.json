@@ -1,0 +1,49 @@
+{
+  "shell": { "project": "Night_exterior_greenscreen", "saved": true, "models_missing": 2 },
+  "selected": "GVM",
+  "groups": [
+    {
+      "name": "Required models",
+      "expanded": true,
+      "models": [
+        {
+          "name": "CorridorKey v2",
+          "depth": 1,
+          "state": "present",
+          "path": "/home/artist/.local/share/keyloom/models/CorridorKey/corridorkey_v2.pth",
+          "size": "2.7 GB"
+        }
+      ]
+    },
+    {
+      "name": "Optional models",
+      "expanded": true,
+      "models": [
+        {
+          "name": "GVM",
+          "depth": 1,
+          "state": "downloading",
+          "path": "/home/artist/.local/share/keyloom/models/GVM/gvm.safetensors",
+          "size": "3.2 GB",
+          "progress": 0.34,
+          "downloaded": "1.1 of 3.2 GB"
+        },
+        { "name": "MatAnyone2", "depth": 1, "state": "missing" },
+        {
+          "name": "SAM 2.1",
+          "depth": 1,
+          "state": "present",
+          "expandable": true,
+          "expanded": true,
+          "children": [
+            { "name": "Fast", "depth": 2, "state": "present" },
+            { "name": "Base+", "depth": 2, "state": "present" },
+            { "name": "Highest quality", "depth": 2, "state": "present" }
+          ]
+        },
+        { "name": "BiRefNet", "depth": 1, "state": "present" },
+        { "name": "VideoMaMa", "depth": 1, "state": "present" }
+      ]
+    }
+  ]
+}

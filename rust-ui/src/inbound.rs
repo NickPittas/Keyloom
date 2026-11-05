@@ -220,6 +220,30 @@ enum HeldState {
     Release(Reply),
 }
 
+/// One held attempt as the Clients page shows it (see `Inbound::held_items`).
+#[derive(Clone, Debug)]
+pub struct HeldItem {
+    pub attempt_id: String,
+    pub job_id: String,
+    /// The exact message the page shows.
+    pub text: String,
+    /// The release button is offered (the user may Forget / Clear this attempt).
+    pub actionable: bool,
+    /// Another PC's shot from an old database (see `Held::foreign`).
+    pub foreign: bool,
+    pub button_label: String,
+}
+
+/// The message a held attempt shows, and whether the user may release it.
+fn held_text(h: &Held) -> (String, bool) {
+    match &h.state {
+        HeldState::Owned(m) if h.foreign.is_some() => (format!("Shot {} is held: {m}", h.job_id), true),
+        HeldState::Owned(m) => (format!("Shot {} was running when the app closed and is still held: {m} Nothing new is received until it is settled. Check this computer and the storage.", h.job_id), true),
+        HeldState::Inspect(_) => (format!("Shot {} was running when the app closed: checking its storage…", h.job_id), false),
+        HeldState::Report { .. } | HeldState::Release(_) => (format!("Shot {}: closing it…", h.job_id), false),
+    }
+}
+
 pub struct Inbound {
     rx: Rx,
     queue: VecDeque<Item>,
@@ -937,6 +961,35 @@ impl Inbound {
 
     // ---- UI -----------------------------------------------------------------------------------------------------
 
+    /// The receiving, waiting and notice lines, in display order. The held attempts are `held_items`.
+    pub fn status_lines(&self) -> Vec<String> {
+        let (receiving, waiting, note) = self.status_parts();
+        receiving.into_iter().chain(waiting).chain(note).collect()
+    }
+
+    /// Every held attempt, in order, with its exact message and whether the user may release it.
+    pub fn held_items(&self) -> Vec<HeldItem> {
+        self.held.iter().map(|h| {
+            let (text, actionable) = held_text(h);
+            let foreign = h.foreign.is_some();
+            HeldItem {
+                attempt_id: h.attempt_id.clone(),
+                job_id: h.job_id.clone(),
+                text,
+                actionable,
+                foreign,
+                button_label: (if foreign { "Clear" } else { "Forget attempt" }).to_owned(),
+            }
+        }).collect()
+    }
+
+    /// (receiving, waiting, notice) lines: the one place their wording lives.
+    fn status_parts(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let receiving = self.receiving().map(|r| format!("Receiving: {r}"));
+        let waiting = (!self.queue.is_empty()).then(|| format!("{} shot(s) from other PCs waiting", self.queue.len()));
+        (receiving, waiting, self.note.clone())
+    }
+
     /// This PC's receiving status for the Clients page (its row's Status cell).
     pub fn status_ui(&self, ui: &mut Ui) -> Vec<Action> {
         let mut acts = vec![];
@@ -946,26 +999,20 @@ impl Inbound {
                 acts.push(Action::RetryEndpoint);
             }
         }
-        if let Some(r) = self.receiving() {
-            ui.label(RichText::new(format!("Receiving: {r}")).size(11.5));
+        let (receiving, waiting, note) = self.status_parts();
+        if let Some(r) = receiving {
+            ui.label(RichText::new(r).size(11.5));
         }
-        if !self.queue.is_empty() {
-            ui.label(RichText::new(format!("{} shot(s) from other PCs waiting", self.queue.len())).size(11.5));
+        if let Some(w) = waiting {
+            ui.label(RichText::new(w).size(11.5));
         }
-        for h in &self.held {
-            let (msg, ask) = match &h.state {
-                HeldState::Owned(m) if h.foreign.is_some() => (format!("Shot {} is held: {m}", h.job_id), true),
-                HeldState::Owned(m) => (format!("Shot {} was running when the app closed and is still held: {m} Nothing new is received until it is settled. Check this computer and the storage.", h.job_id), true),
-                HeldState::Inspect(_) => (format!("Shot {} was running when the app closed: checking its storage…", h.job_id), false),
-                HeldState::Report { .. } | HeldState::Release(_) => (format!("Shot {}: closing it…", h.job_id), false),
-            };
-            ui.colored_label(egui::Color32::from_rgb(225, 110, 110), msg);
-            let label = if h.foreign.is_some() { "Clear" } else { "Forget attempt" };
-            if ask && ui.small_button(label).on_hover_text("I checked: release this shot (it is marked failed, and never run again)").clicked() {
+        for h in self.held_items() {
+            ui.colored_label(egui::Color32::from_rgb(225, 110, 110), h.text);
+            if h.actionable && ui.small_button(h.button_label.as_str()).on_hover_text("I checked: release this shot (it is marked failed, and never run again)").clicked() {
                 acts.push(Action::ReleaseHeld(h.attempt_id.clone()));
             }
         }
-        if let Some(n) = &self.note {
+        if let Some(n) = note {
             ui.label(RichText::new(n).color(egui::Color32::from_rgb(169, 187, 175)).size(11.0));
         }
         acts

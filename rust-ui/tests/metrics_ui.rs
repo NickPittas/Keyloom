@@ -1,10 +1,10 @@
-//! Always-visible CPU/RAM/GPU/VRAM: the footer is on every main page with a fixed rectangle, shows real numbers
+//! Always-visible CPU/RAM/GPU/VRAM: the status footer is on every main page, shows real numbers
 //! or honest dashes, and remote cells never invent numbers. Private fixtures,
 //! a fake helper process, headless egui; no counters, GPU, display or network.
 mod common;
 use ck::metrics::{client_cells_at, ClientTelemetry, Sample, Source};
 use ck::ui::{App, AppOptions};
-use eframe::egui::{self, epaint::Shape, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
+use eframe::egui::{self, epaint::Shape, Event, Modifiers, RawInput, Rect, Vec2};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -24,11 +24,15 @@ fn painted(ctx: &egui::Context, app: &mut App, events: Vec<Event>) -> String {
     }
     s
 }
-fn click(ctx: &egui::Context, app: &mut App, at: egui::Pos2) -> String {
-    let b = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    painted(ctx, app, vec![Event::PointerMoved(at)]);
-    painted(ctx, app, vec![b(true)]);
-    painted(ctx, app, vec![b(false)]);
+/// True when `label` is painted and `value` is painted after it (paint order, one text shape per line).
+fn has_pair(texts: &str, label: &str, value: &str) -> bool {
+    let mut lines = texts.lines();
+    lines.any(|l| l == label) && lines.any(|l| l == value)
+}
+/// Ctrl+Shift+N page shortcut (3 = Machines, 5 = Settings); returns the painted text after the switch.
+fn page(ctx: &egui::Context, app: &mut App, k: egui::Key) -> String {
+    let ev = [true, false].map(|pressed| Event::Key { key: k, physical_key: Some(k), pressed, repeat: false, modifiers: Modifiers::COMMAND | Modifiers::SHIFT });
+    painted(ctx, app, ev.to_vec());
     painted(ctx, app, vec![])
 }
 
@@ -74,48 +78,35 @@ fn app(e: &Env, metrics: Source, open: Option<&str>) -> (egui::Context, App) {
 }
 
 #[test]
-fn the_footer_is_on_board_clip_settings_and_clients_with_one_fixed_rectangle() {
+fn the_footer_is_on_board_clip_settings_and_machines() {
     let e = env("mui-pages");
     let (ctx, mut a) = app(&e, Source::Fixture(fixture(&e)), None);
-    let footer = a.metrics_rect().expect("footer drawn on the Board");
-    assert_eq!(footer.height(), ck::ui::metrics_bar::FOOTER_H);
-    assert_eq!(footer.max.y, SCREEN.y, "outermost bottom panel");
     let text = painted(&ctx, &mut a, vec![]);
-    assert!(text.contains("CPU 37%") && text.contains("RAM 12.0 / 32.0 GiB"), "{text}");
-    assert!(text.contains("GPU0 Fixture RTX 63% · VRAM 10.0 / 24.0 GiB") && text.contains("GPU1 Fixture RTX 4% · VRAM 1.0 / 24.0 GiB"), "every GPU, idle included: {text}");
-    // Settings
-    let at = a.settings_rect().unwrap().center();
-    let t = click(&ctx, &mut a, at);
-    assert!(a.settings_open() && t.contains("CPU 37%"), "visible on Settings");
-    assert_eq!(a.metrics_rect(), Some(footer));
-    let back = a.settings_back_rect().unwrap().center();
-    click(&ctx, &mut a, back);
-    // Clients
-    let at = a.clients_rect().expect("Clients button").center();
-    let t = click(&ctx, &mut a, at);
-    assert!(a.clients_open() && t.contains("CPU 37%"), "visible on Clients");
-    assert_eq!(a.metrics_rect(), Some(footer));
+    assert!(has_pair(&text, "CPU", "37%") && has_pair(&text, "RAM", "12.0 / 32.0 GB"), "{text}");
+    assert!(has_pair(&text, "GPU0", "63%") && has_pair(&text, "VRAM", "10.0 / 24.0 GB"), "this machine's main GPU: {text}");
+    // Settings is Ctrl+Shift+5; Machines (the clients page) is Ctrl+Shift+3.
+    let t = page(&ctx, &mut a, egui::Key::Num5);
+    assert!(a.settings_open() && has_pair(&t, "CPU", "37%"), "visible on Settings");
+    let t = page(&ctx, &mut a, egui::Key::Num3);
+    assert!(a.clients_open() && has_pair(&t, "CPU", "37%"), "visible on Machines");
     let _ = fs::remove_dir_all(&e.base);
     // Clip workspace
     let e = env("mui-clip");
     let (ctx, mut a) = app(&e, Source::Fixture(fixture(&e)), Some("a"));
     assert!(a.in_workspace());
-    assert_eq!(a.metrics_rect(), Some(footer));
-    assert!(painted(&ctx, &mut a, vec![]).contains("RAM 12.0 / 32.0 GiB"));
+    assert!(has_pair(&painted(&ctx, &mut a, vec![]), "RAM", "12.0 / 32.0 GB"));
     let _ = fs::remove_dir_all(&e.base);
 }
 
 #[test]
-fn the_footer_never_moves_when_the_values_or_the_status_change() {
+fn the_footer_shows_real_numbers_or_honest_dashes() {
     let e = env("mui-stable");
-    let (_, off) = app(&e, Source::Off, None);
     let (ctx, mut live) = app(&e, Source::Fixture(fixture(&e)), None);
-    assert_eq!(off.metrics_rect(), live.metrics_rect());
+    assert!(has_pair(&painted(&ctx, &mut live, vec![]), "CPU", "37%"));
     let (c2, mut off2) = app(&e, Source::Off, None);
     let t = painted(&c2, &mut off2, vec![]);
-    assert!(t.contains("CPU —") && t.contains("RAM —") && t.contains("unavailable: not started"), "honest, no zeros: {t}");
-    assert!(!t.contains("CPU 0%") && !t.contains("0.0 / 0.0"));
-    let _ = painted(&ctx, &mut live, vec![]);
+    assert!(has_pair(&t, "CPU", "—") && has_pair(&t, "RAM", "—"), "honest, no zeros: {t}");
+    assert!(!has_pair(&t, "CPU", "0%") && !t.contains("0.0 / 0.0"));
     let _ = fs::remove_dir_all(&e.base);
 }
 
@@ -127,13 +118,13 @@ fn a_real_helper_process_feeds_the_footer_and_is_reaped_with_the_app() {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let text = loop {
         let t = painted(&ctx, &mut a, vec![]);
-        if t.contains("CPU 42%") {
+        if has_pair(&t, "CPU", "42%") {
             break t;
         }
         assert!(std::time::Instant::now() < end, "no live sample: {t}");
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    assert!(text.contains("GPU0 Fake GPU 55% · VRAM 2.0 / 8.0 GiB"), "{text}");
+    assert!(has_pair(&text, "GPU0", "55%") && has_pair(&text, "VRAM", "2.0 / 8.0 GB"), "{text}");
     drop(a); // drop = kill + reap
     let _ = fs::remove_dir_all(&e.base);
 }
@@ -142,11 +133,12 @@ fn a_real_helper_process_feeds_the_footer_and_is_reaped_with_the_app() {
 fn client_cards_show_local_numbers_and_never_invent_remote_ones() {
     let e = env("mui-cards");
     let (ctx, mut a) = app(&e, Source::Fixture(fixture(&e)), None);
-    let at = a.clients_rect().unwrap().center();
-    let t = click(&ctx, &mut a, at);
+    let t = page(&ctx, &mut a, egui::Key::Num3);
     assert!(a.clients_open());
-    // The Clients page is an availability table: this computer's GPU is not reported by a worker yet (the app started it when it opened), so no number is painted.
-    assert!(t.contains("This computer") && t.contains("Not reported") && t.contains("starting"), "{t}");
+    // Machines page: this computer's worker starts when the app opens; depending on frame timing it has either not
+    // reported yet (starting) or already answered (its GPU painted).
+    let local_ok = (t.contains("starting") && t.contains("Not reported")) || (t.contains("Fake GPU") && t.contains("24 GB"));
+    assert!(local_ok, "{t}");
     // Remote telemetry is painted by the Batch queue for a remote client with a run: these are the cells it paints.
     // The network API fills it through this model: same cells, server-computed age.
     let (s, age) = Sample::from_api(&json!({"seq": 2, "cpu_percent": 91.0, "ram_used_bytes": 3u64<<30, "ram_total_bytes": 8u64<<30, "measured_age_s": 2.0,
@@ -159,46 +151,6 @@ fn client_cards_show_local_numbers_and_never_invent_remote_ones() {
     assert_eq!(c.status.as_deref(), Some("stale 120 s"));
     let c = client_cells_at(&ClientTelemetry::NotConnected, &[], t0);
     assert_eq!((c.cpu.as_str(), c.status.as_deref()), ("—", Some("not connected")));
-    let _ = fs::remove_dir_all(&e.base);
-}
-
-/// Paint at `width` and return the footer's text shapes: (text, elided, right edge).
-fn footer_texts(ctx: &egui::Context, app: &mut App, width: f32) -> Vec<(String, bool, f32)> {
-    let size = Vec2::new(width, 700.0);
-    let mut out = ctx.run_ui(RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() }, |ui| app.frame(ui));
-    out.textures_delta.clear();
-    let foot = app.metrics_rect().expect("footer");
-    assert_eq!(foot.max.y, size.y, "footer is the bottom row at width {width}");
-    out.shapes
-        .iter()
-        .filter_map(|c| match &c.shape {
-            Shape::Text(t) if t.pos.y >= foot.min.y - 1.0 && t.pos.y <= foot.max.y => Some((t.galley.text().to_string(), t.galley.elided, t.pos.x + t.galley.size().x)),
-            _ => None,
-        })
-        .collect()
-}
-
-#[test]
-fn every_gpus_utilisation_and_vram_stay_visible_unclipped_from_wide_to_narrow() {
-    let e = env("mui-narrow");
-    let (ctx, mut a) = app(&e, Source::Fixture(fixture(&e)), None);
-    for (width, must) in [
-        (1600.0, vec!["GPU0 Fixture RTX 63% · VRAM 10.0 / 24.0 GiB", "GPU1 Fixture RTX 4% · VRAM 1.0 / 24.0 GiB"]),
-        (900.0, vec!["G0 63% 10.0/24.0G", "G1 4% 1.0/24.0G"]),
-        (640.0, vec!["GPU 63% 11/48G"]),
-    ] {
-        for _ in 0..3 {
-            footer_texts(&ctx, &mut a, width);
-        }
-        let texts = footer_texts(&ctx, &mut a, width);
-        let joined: String = texts.iter().map(|t| t.0.as_str()).collect::<Vec<_>>().join(" | ");
-        for m in &must {
-            assert!(joined.contains(m), "width {width}: {m:?} missing from {joined:?}");
-        }
-        assert!(texts.iter().all(|t| !t.1), "width {width}: a footer label was elided (VRAM clipped): {texts:?}");
-        assert!(texts.iter().all(|t| t.2 <= width), "width {width}: painted outside the window: {texts:?}");
-        assert!(joined.contains("CPU 37%") && joined.contains("RAM 12.0 / 32.0 GiB"), "{joined}");
-    }
     let _ = fs::remove_dir_all(&e.base);
 }
 

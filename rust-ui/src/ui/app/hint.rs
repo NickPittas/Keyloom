@@ -24,6 +24,8 @@ pub struct State {
     ann: Annotations,
     undo: Vec<Annotations>,
     note: Option<String>,
+    /// The last `hint_note` error since `hint_cmd` started: what a command reports as its `Err`.
+    cmd_err: Option<String>,
     /// The marked-frame choice could not be saved: new requests wait until it is (or is changed back).
     marks_err: Option<String>,
     /// Picked companion movie waiting for its kind/channel to be confirmed.
@@ -39,6 +41,8 @@ pub struct State {
     presets_loaded: bool,
     preset_name: String,
     preset_sel: String,
+    /// A workflow preset waiting for its delete confirmation.
+    preset_del: Option<String>,
     /// Selection the name field was last filled from: the field follows the selection only when it changes.
     preset_name_for: String,
     /// Preset controls drawn this frame (name field, Save, Rename, Delete), for layout/interaction tests.
@@ -297,9 +301,9 @@ struct ExportDone {
 }
 
 /// The video outputs as configured now (sequence outputs have nothing for Deliver to render).
-fn current_products(h: &State, fps: f64, range: Option<(usize, usize)>) -> std::collections::BTreeMap<String, ProductCfg> {
+fn current_products(h: &State, exp: &PipelineExport, fps: f64, range: Option<(usize, usize)>) -> std::collections::BTreeMap<String, ProductCfg> {
     let fps = (h.export_fps.unwrap_or(fps) * 1000.0).round() as i64;
-    h.deliveries
+    exp.outputs
         .iter()
         .filter_map(|(k, d)| match d {
             Delivery::Video(v) => Some((k.clone(), ProductCfg(v.container.clone(), v.codec.clone(), v.quality, fps, h.export_partial, range))),
@@ -593,7 +597,15 @@ impl State {
 
 impl App {
     fn hint_note(&mut self, m: impl Into<String>) {
-        self.hint.note = Some(m.into());
+        let m = m.into();
+        self.hint.cmd_err = Some(m.clone());
+        self.hint.note = Some(m);
+    }
+
+    /// True once the per-shot hint state is loaded for the open clip (test hook).
+    #[doc(hidden)]
+    pub fn hint_loaded_for_test(&self) -> bool {
+        self.clip().is_some_and(|c| self.hint.folder.as_deref() == Some(c.folder.as_str()))
     }
 
     /// The Hint page's config for the open clip (tests: the node graph and the page must be one value).
@@ -1167,7 +1179,7 @@ impl App {
     }
 
     /// "This shot's own hint route fields" line with its Reset (Hint page).
-    pub(super) fn route_override_ui(&mut self, ui: &mut Ui, clip: &Clip) {
+    pub(super) fn route_override_ui(&mut self, ui: &mut Ui, _clip: &Clip) {
         if self.hint.route_ov.is_empty() {
             return;
         }
@@ -1176,7 +1188,8 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(format!("Hint route, this shot's own (win over a Batch preset): {}", names.join(", "))).color(theme::text_dim(ui)).size(12.0));
             if ui.small_button(label).clicked() {
-                self.reset_route(clip);
+                let ctx = ui.ctx().clone();
+                let _ = self.hint_cmd(&ctx, HintCmd::ResetRoute);
             }
         });
     }
@@ -1210,7 +1223,9 @@ impl App {
         let key_wants_hint = self.project.as_ref().is_some_and(|p| self.ai.draft(&clip, p, self.settings.saved()).params.hint_mode != "none");
         let first = self.hint.rc.base_pre.is_none();
         let range_now = self.ai_open_range().ok();
-        let products = current_products(&self.hint, clip.fps, range_now);
+        // Read the enabled outputs through the synced clone (`export_now`); nothing is written to `hint.deliveries`.
+        let exp = self.deliver_out_cfg(&clip).map(|o| self.export_now(&o)).unwrap_or_else(|| self.current_export());
+        let products = current_products(&self.hint, &exp, clip.fps, range_now);
         if first {
             let (p, h) = prov_base(&clip, &cur);
             let rc = &mut self.hint.rc;
@@ -1218,7 +1233,7 @@ impl App {
             rc.key_manifest = Some(manifest);
         }
         // The video outputs configured at open: known, but never verified as encoded.
-        if !self.hint.rc.deliver_seeded && !self.hint.deliveries.is_empty() {
+        if !self.hint.rc.deliver_seeded && !exp.outputs.is_empty() {
             self.hint.rc.deliver_seeded = true;
             self.hint.rc.deliver_open = products.clone();
         }
@@ -1232,7 +1247,7 @@ impl App {
                 (id, kind, dir, job, at)
             })
             .collect();
-        let delivery_sig = delivery_json(&self.hint);
+        let delivery_sig = serde_json::to_string(&exp).unwrap_or_default();
         // The current Key result's job, as this session's scheduler knows it: when it was dispatched and finished.
         let key_id = clip.manifest.as_ref().and_then(|m| m.raw.get("job_id")?.as_str().map(str::to_owned));
         let live_key = key_id.as_ref().and_then(|id| {
@@ -1366,6 +1381,236 @@ impl App {
         }
         r
     }
+}
+
+// ------------------------------------------------------------------- typed Hint state + commands (Shot page)
+
+fn task_ok(caps: &Option<crate::models::Capabilities>, lazy: bool, k: TaskKind) -> bool {
+    lazy || caps.as_ref().is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false))
+}
+
+fn cleanup_note(fin: Final) -> &'static str {
+    if fin.needs_guide() {
+        "Grow / fill holes: regenerate pre-matte. Feather: regenerate hint. Guides stay binary."
+    } else {
+        "Regenerate to apply changes. Feather softens the final hint; guides stay binary."
+    }
+}
+
+/// A slider that reports a changed value instead of writing it (the caller sends it as a `HintEdit`).
+fn slide<N: egui::emath::Numeric>(ui: &mut Ui, cur: N, range: std::ops::RangeInclusive<N>, suffix: &str) -> Option<N> {
+    let mut v = cur;
+    fill_slider(ui);
+    ui.add(egui::Slider::new(&mut v, range).suffix(suffix));
+    (v != cur).then_some(v)
+}
+
+/// One option of a dropdown: `ready` is false only when the worker reported the model missing (an unknown or
+/// not-yet-started worker counts as ready, like the old panel).
+#[derive(Clone)]
+pub(crate) struct Choice<T> {
+    pub value: T,
+    pub label: String,
+    pub ready: bool,
+}
+
+/// One action: its enabled state, label ("Queue ...", "Already queued") and the reason it is off or waits.
+#[derive(Clone)]
+pub(crate) struct HintAct {
+    pub enabled: bool,
+    pub label: String,
+    pub reason: String,
+}
+impl From<&crate::actions::Decision> for HintAct {
+    fn from(d: &crate::actions::Decision) -> Self {
+        Self { enabled: d.enabled, label: d.label.clone(), reason: d.reason.clone() }
+    }
+}
+
+/// Pre-matte or Hint card: frames on disk, stale flag and its actions.
+#[derive(Clone)]
+pub(crate) struct HintStage {
+    pub frames_on_disk: usize,
+    pub stale: bool,
+    /// SAM single-frame preview (Pre-matte with SAM only).
+    pub preview: Option<HintAct>,
+    /// Track (SAM) / Generate pre-matte, or Generate hint.
+    pub generate: HintAct,
+    /// Always enabled: it opens the delete dialog, which states any refusal (`reason`).
+    pub delete: HintAct,
+}
+
+#[derive(Clone)]
+pub(crate) struct ChromaView {
+    pub cfg: crate::hints::Chroma,
+    /// Legacy holdout strokes (fg, bg), or the load error.
+    pub holdout: Result<(usize, usize), String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MarkedView {
+    pub pre: bool,
+    pub hint: bool,
+    /// MatAnyone2: two rows (pre-matte, same marks as hints); otherwise one row "pre-matte and hint".
+    pub two_rows: bool,
+    pub show_hint_row: bool,
+    /// MatAnyone2 with marked pre-matte but full-range hints: "Full-range hints use In-frame pre-matte."
+    pub in_frame_note: bool,
+    pub key_uses_marked: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct MovieView {
+    pub path: PathBuf,
+    pub as_mask: bool,
+    pub alpha_channel: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct RouteView {
+    /// The shot's own route fields (names), with the label of the Reset that gives them up.
+    pub overrides: Vec<String>,
+    pub reset_label: Option<String>,
+    /// The shown route differs from the saved one / the last save failed (kept, retried on the next edit or Save).
+    pub unsaved: bool,
+    pub save_failed: bool,
+}
+
+/// Read-only snapshot of the Hint stage of the open shot (cached state only; nothing is probed or written).
+#[derive(Clone)]
+pub(crate) struct HintView {
+    pub bypass: bool,
+    /// The worker has not been asked yet: readiness is unknown, not missing.
+    pub worker_unknown: bool,
+    pub producer: Producer,
+    pub producers: Vec<Choice<Producer>>,
+    /// Model the selected producer needs when the app's check found it missing ("GVM", "SAM Base+").
+    pub producer_missing: Option<String>,
+    pub birefnet_variant: Option<String>,
+    pub birefnet_variants: Vec<Choice<String>>,
+    pub sam_model: Option<String>,
+    pub sam_models: Vec<Choice<String>>,
+    pub chroma: Option<ChromaView>,
+    pub finish: Final,
+    pub finishes: Vec<Choice<Final>>,
+    pub finish_missing: Option<String>,
+    pub videomama_chunk: Option<u32>,
+    /// None for an imported alpha (nothing to generate).
+    pub marked: Option<MarkedView>,
+    pub marked_gate: Option<String>,
+    pub marks_err: Option<String>,
+    pub cleanup: crate::hints::MaskCleanup,
+    pub cleanup_note: &'static str,
+    pub movie: Option<MovieView>,
+    pub tool: Tool,
+    pub tools: Vec<(Tool, &'static str, &'static str)>,
+    /// Some when the brush row applies (the producer has paint/point tools).
+    pub brush: Option<f32>,
+    pub prompt_frames: usize,
+    pub frame_annotated: bool,
+    pub can_undo: bool,
+    pub prematte: HintStage,
+    pub hint: HintStage,
+    /// None when the source is not a movie.
+    pub extract: Option<HintAct>,
+    /// Some while a companion movie is picked.
+    pub import: Option<HintAct>,
+    pub route: RouteView,
+    pub note: Option<String>,
+}
+
+/// Every editable Hint row (route rows are saved through `save_route`; the two movie rows are page state).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HintEdit {
+    Bypass(bool),
+    Producer(Producer),
+    BirefnetVariant(String),
+    SamModel(String),
+    Finish(Final),
+    VideomamaChunk(u32),
+    ChromaScreen(String),
+    ChromaStrength(f64),
+    ChromaClipBlack(f64),
+    ChromaClipWhite(f64),
+    ChromaShrinkGrow(i64),
+    ChromaEdgeBlur(i64),
+    CleanupGrow(i64),
+    CleanupFill(bool),
+    CleanupFeather(f64),
+    MovieAsMask(bool),
+    MovieAlphaChannel(bool),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HintCmd {
+    Edit(HintEdit),
+    MarkedMode { pre: bool, hint: bool },
+    ResetRoute,
+    /// Selects the tool (selecting the active one again deselects it); `Tool::None` deselects.
+    Tool(Tool),
+    Brush(f32),
+    UndoPrompt,
+    ClearPrompts { all: bool },
+    PreviewSam,
+    /// `marked` must equal the shown Marked-frames choice (change that row first); it is not a second setting.
+    GeneratePreMatte { marked: bool },
+    GenerateHint { marked: bool },
+    ExtractSource,
+    ImportMovie,
+    CancelMovie,
+    RequestDelete { prematte: bool },
+    ClearLegacyHoldout,
+    ResetChromaColour,
+}
+
+fn finite_in(v: f64, lo: f64, hi: f64, what: &str) -> Result<f64, String> {
+    if v.is_finite() { Ok(v.clamp(lo, hi)) } else { Err(format!("{what} must be a number")) }
+}
+
+impl HintEdit {
+    /// The value as the old controls allowed it (same ranges); an impossible value is refused, not guessed.
+    fn apply(self, cfg: &mut HintCfg) -> Result<(), String> {
+        match self {
+            HintEdit::Bypass(b) => cfg.bypass = b,
+            HintEdit::Producer(p) => cfg.guide = p,
+            HintEdit::BirefnetVariant(v) if BIREFNET_VARIANTS.contains(&v.as_str()) => cfg.birefnet_variant = v,
+            HintEdit::BirefnetVariant(v) => return Err(format!("Unknown BiRefNet variant {v}")),
+            HintEdit::SamModel(m) if SAM_MODELS.iter().any(|s| s.0 == m) => cfg.sam_model = m,
+            HintEdit::SamModel(m) => return Err(format!("Unknown SAM model {m}")),
+            HintEdit::Finish(f) => cfg.finish = f,
+            HintEdit::VideomamaChunk(n) => cfg.videomama_chunk = n.clamp(1, 64),
+            HintEdit::ChromaScreen(s) if s == "green" || s == "blue" => cfg.chroma.screen_type = s,
+            HintEdit::ChromaScreen(s) => return Err(format!("Screen must be green or blue, not {s}")),
+            HintEdit::ChromaStrength(v) => cfg.chroma.strength = finite_in(v, 0.1, 10.0, "Strength")?,
+            HintEdit::ChromaClipBlack(v) => cfg.chroma.clip_black = finite_in(v, 0.0, 1.0, "Clip black")?,
+            HintEdit::ChromaClipWhite(v) => cfg.chroma.clip_white = finite_in(v, 0.0, 1.0, "Clip white")?,
+            HintEdit::ChromaShrinkGrow(v) => cfg.chroma.shrink_grow = v.clamp(-100, 100),
+            HintEdit::ChromaEdgeBlur(v) => cfg.chroma.edge_blur = v.clamp(0, 100),
+            HintEdit::CleanupGrow(v) => cfg.mask_cleanup.grow = v.clamp(-100, 100),
+            HintEdit::CleanupFill(b) => cfg.mask_cleanup.fill_holes = b,
+            HintEdit::CleanupFeather(v) => cfg.mask_cleanup.feather = finite_in(v, 0.0, 100.0, "Feather")?,
+            HintEdit::MovieAsMask(_) | HintEdit::MovieAlphaChannel(_) => {}
+        }
+        Ok(())
+    }
+}
+
+/// Availability of every Hint action: the one set of rules the action area, the graph menus and the Shot page use.
+struct HintGates {
+    local: Option<crate::models::Capabilities>,
+    lazy: bool,
+    miss_guide: Option<String>,
+    miss_fin: Option<String>,
+    src: Option<PathBuf>,
+    /// Why a companion movie cannot be imported now (None = it can).
+    import_reason: Option<String>,
+    /// In-frame / marked-hint gate of the Hint run.
+    gate: Option<String>,
+    d_preview: crate::actions::Decision,
+    d_track: crate::actions::Decision,
+    d_guide: crate::actions::Decision,
+    d_hint: crate::actions::Decision,
+    d_extract: crate::actions::Decision,
 }
 
 impl App {
@@ -1597,95 +1842,13 @@ impl App {
         }
     }
 
-    // ------------------------------------------------------------------- tool strip (beside the viewer)
+    // ------------------------------------------------------------------- typed read + commands (Shot page)
 
-    /// Vertical, Photoshop-style tool strip left of the viewer (Hint page). Icons are drawn with primitives so
-    /// nothing depends on an icon font; every button has a tooltip and a selected state. Prompts (points, paint,
-    /// erase, box) sit in the first group, Undo/Clear in a second group. Processing (SAM Preview/Track) is in the bottom
-    /// action area and the brush size in Properties. Chroma gets exactly one tool: pick the screen colour. The holdout tools are not part
-    /// of SAM's prompt set and never appear here.
-    pub(super) fn hint_tool_strip(&mut self, ui: &mut Ui) {
-        let Some(clip) = self.open_clip_snapshot() else {
-            return;
-        };
-        if self.tab != Tab::Hint {
-            return;
-        }
-        let guide = self.hint.cfg.guide;
-        let Some(v) = self.viewer.as_mut() else {
-            return;
-        };
-        let stem_now = v.index.stems.get(v.playhead).cloned();
-        let tools = tools_for(guide);
-        self.hint.strip_rects.clear();
-        if tools.is_empty() {
-            return; // automatic producers take no prompts: no empty column beside the viewer
-        }
-        let (mut undo, mut clr_frame, mut clr_all) = (false, false, false);
-        let strip_h = ui.available_height();
-        egui::Frame::new()
-            .fill(ui.visuals().faint_bg_color)
-            .corner_radius(5.0)
-            .inner_margin(4.0)
-            .show(ui, |ui| {
-                ui.set_width(STRIP_W - 8.0);
-                ui.set_min_height((strip_h - 8.0).max(0.0));
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.vertical_centered(|ui| {
-                    for (t, _short, tip) in tools {
-                        let icon = icon_for(*t);
-                        let r = strip_button(ui, v.ann.tool == *t, icon, tip);
-                        self.hint.strip_rects.push((*t, r.rect));
-                        if r.clicked() {
-                            v.ann.tool = if v.ann.tool == *t { Tool::None } else { *t };
-                            if v.ann.tool != Tool::None {
-                                v.view = View::Input; // prompts are stored in source pixels of Input
-                                v.ab = false;
-                            }
-                        }
-                    }
-                    if guide == Producer::Sam {
-                        ui.add_space(4.0);
-                        ui.separator();
-                        undo = strip_button(ui, false, Icon::Undo, "Undo the last prompt edit").clicked();
-                        clr_frame = strip_button(ui, false, Icon::ClearFrame, "Clear this frame's prompts").clicked();
-                        clr_all = strip_button(
-                            ui,
-                            false,
-                            Icon::ClearAll,
-                            "Clear all SAM prompts (source and generated masks are untouched)",
-                        )
-                        .clicked();
-                    }
-                });
-            });
-        if undo {
-            self.undo_annotation();
-        }
-        if clr_frame || clr_all {
-            self.hint.undo.push(self.hint.ann.clone());
-            match (clr_all, stem_now) {
-                (true, _) => self.hint.ann.frames.clear(),
-                (false, Some(s)) => {
-                    self.hint.ann.frames.remove(&s);
-                }
-                _ => {}
-            }
-            if let Err(e) = self.hint.ann.save(&clip) {
-                self.hint_note(format!("Annotations not saved: {e}"));
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------- page bar (under the viewer)
-
-    /// The Hint page's processing actions, one group per module in the shared action area: Pre-matte | Final hint,
-    /// then Source / Import when there is something to prepare. The inspector only chooses; every run starts here.
-    pub(super) fn hint_actions(&mut self, ui: &mut Ui, clip: &Clip) {
+    fn hint_gates(&self, clip: &Clip) -> HintGates {
         let local = self.ai.local_caps();
         // A worker that was never started reports nothing: actions queue and the worker starts with the job.
         let lazy = local.is_none() && self.ai.models_unknown();
-        let ready = |k: TaskKind| lazy || local.as_ref().is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false));
+        let ready = |k: TaskKind| task_ok(&local, lazy, k);
         // A busy clip no longer disables the buttons: they say "Queue ..." (actions::decide). Only a companion
         // import writing the hint folders still refuses new work.
         let ext = self.ai.external_writer(&clip.root).then(|| "A companion-sequence import is writing this clip's hints; wait for it to finish".to_string());
@@ -1698,21 +1861,16 @@ impl App {
         let guide_name = miss_guide.clone().unwrap_or_else(|| guide.label().to_string());
         let fin_name = miss_fin.clone().unwrap_or_else(|| fin.label().to_string());
         let bypass = self.hint.cfg.bypass;
-        let sam = guide == Producer::Sam;
-        let tool_on = sam && self.viewer.as_ref().is_some_and(|v| v.ann.tool != Tool::None);
         let sam_ok = ready(TaskKind::SamPreview) && ready(TaskKind::SamTrack) && miss_guide.is_none();
-        let annotated = self
-            .viewer
-            .as_ref()
-            .and_then(|v| v.index.stems.get(v.playhead))
-            .and_then(|s| self.hint.ann.frames.get(s))
-            .is_some_and(|f| !f.is_empty());
+        let annotated = self.frame_annotated();
         let src = Self::source_movie(clip).filter(|_| !matches!(clip.source, Source::Sequence { .. }));
-        let movie = self.hint.movie.clone();
-        let import_ok = ready(TaskKind::ImportHint) && src.is_some();
-        let ctx = ui.ctx().clone();
-        let (mut run, mut preview, mut extract, mut import, mut cancel_import) = (None, false, false, false, false);
-        let mut del_open: Option<bool> = None;
+        let import_reason = if src.is_none() {
+            Some("Companion movies need a movie source; import PNG/EXR sequences by placing them in AlphaHint".to_string())
+        } else if !ready(TaskKind::ImportHint) {
+            Some("the worker cannot import movies (FFmpeg)".to_string())
+        } else {
+            ext.clone()
+        };
         let marks_in: Vec<usize> = match self.ai_open_range() {
             Ok(r) => clip.keyframes.iter().copied().filter(|k| (r.0..=r.1).contains(k)).collect(),
             Err(_) => vec![],
@@ -1741,7 +1899,322 @@ impl App {
             },
         );
         let d_extract = decide(sched, root, Action::Extract, "Extract frames (validated)", if !ready(TaskKind::PrepareSource) { Some(reason(&local, "FFmpeg")) } else { ext.clone() });
-        let import_ok = import_ok && ext.is_none();
+        HintGates { local, lazy, miss_guide, miss_fin, src, import_reason, gate, d_preview, d_track, d_guide, d_hint, d_extract }
+    }
+
+    /// The playhead frame has prompts.
+    fn frame_annotated(&self) -> bool {
+        self.viewer
+            .as_ref()
+            .and_then(|v| v.index.stems.get(v.playhead))
+            .and_then(|s| self.hint.ann.frames.get(s))
+            .is_some_and(|f| !f.is_empty())
+    }
+
+    /// Typed snapshot of the Hint stage for the open shot; `None` while no shot is open or its hint state is
+    /// not loaded yet. Reads cached state only.
+    pub(crate) fn hint_view(&self) -> Option<HintView> {
+        let clip = self.clip()?;
+        let h = &self.hint;
+        if h.folder.as_deref() != Some(clip.folder.as_str()) {
+            return None;
+        }
+        let g = self.hint_gates(clip);
+        let cfg = &h.cfg;
+        let ok = |k: TaskKind| task_ok(&g.local, g.lazy, k);
+        let (guide, fin) = (cfg.guide, cfg.finish);
+        let sam = guide == Producer::Sam;
+        let installed_variant = |v: &str| g.lazy || g.local.as_ref().is_some_and(|c| c.birefnet_variants.iter().any(|x| x.as_str() == v));
+        let installed_sam = |id: &str| g.lazy || g.local.as_ref().is_some_and(|c| c.sam_models.iter().any(|x| x.as_str() == id));
+        let tools = tools_for(guide);
+        let stage = |frames: usize, node: Node, preview: Option<&crate::actions::Decision>, gen: &crate::actions::Decision| {
+            let refusal = delete_refusal(self.ai.clip_active(&clip.root) || self.ai.task_busy(&clip.folder), self.ai.external_writer(&clip.root));
+            HintStage {
+                frames_on_disk: frames,
+                stale: self.stage_pending(node),
+                preview: preview.map(HintAct::from),
+                generate: gen.into(),
+                delete: HintAct { enabled: true, label: "Delete frames…".into(), reason: refusal.unwrap_or_default().into() },
+            }
+        };
+        let marked = (fin != Final::Import).then(|| {
+            let two = fin == Final::Matanyone2;
+            MarkedView {
+                pre: cfg.marks_pre,
+                hint: cfg.marks_hint,
+                two_rows: two,
+                show_hint_row: two && cfg.marks_pre,
+                in_frame_note: two && cfg.marks_pre && !cfg.marks_hint,
+                key_uses_marked: cfg.hint_on_marks() && h.marks_err.is_none(),
+            }
+        });
+        let movie = h.movie.clone().map(|path| MovieView { path, as_mask: h.movie_mask, alpha_channel: h.movie_alpha_channel });
+        Some(HintView {
+            bypass: cfg.bypass,
+            worker_unknown: g.lazy,
+            producer: guide,
+            producers: Producer::ALL.iter().map(|&p| Choice { value: p, label: p.label().into(), ready: ok(p.task()) }).collect(),
+            producer_missing: g.miss_guide.clone(),
+            birefnet_variant: (guide == Producer::Birefnet).then(|| cfg.birefnet_variant.clone()),
+            birefnet_variants: if guide == Producer::Birefnet { BIREFNET_VARIANTS.iter().map(|v| Choice { value: v.to_string(), label: v.to_string(), ready: installed_variant(*v) }).collect() } else { vec![] },
+            sam_model: sam.then(|| cfg.sam_model.clone()),
+            sam_models: if sam { SAM_MODELS.iter().map(|(id, l)| Choice { value: id.to_string(), label: l.to_string(), ready: installed_sam(*id) }).collect() } else { vec![] },
+            chroma: (guide == Producer::Chroma).then(|| ChromaView {
+                cfg: cfg.chroma.clone(),
+                holdout: crate::hints::Holdout::load(clip).map(|ho| (ho.strokes.iter().filter(|s| s.fg).count(), ho.strokes.iter().filter(|s| !s.fg).count())),
+            }),
+            finish: fin,
+            finishes: Final::ALL.iter().map(|&f| Choice { value: f, label: f.label().into(), ready: f.task().is_none_or(ok) }).collect(),
+            finish_missing: g.miss_fin.clone(),
+            videomama_chunk: (fin == Final::Videomama).then_some(cfg.videomama_chunk),
+            marked_gate: marked.as_ref().and(g.gate.clone()),
+            marked,
+            marks_err: h.marks_err.clone(),
+            cleanup: cfg.mask_cleanup.clone(),
+            cleanup_note: cleanup_note(fin),
+            movie,
+            tool: self.viewer.as_ref().map_or(Tool::None, |v| v.ann.tool),
+            tools: tools.to_vec(),
+            brush: self.viewer.as_ref().filter(|_| tools.iter().any(|t| !matches!(t.0, Tool::Pick | Tool::Box))).map(|v| v.ann.brush as f32),
+            prompt_frames: h.ann.frames.values().filter(|f| !f.is_empty()).count(),
+            frame_annotated: self.frame_annotated(),
+            can_undo: !h.undo.is_empty(),
+            prematte: stage(clip.mask_frames, Node::PreMatte, sam.then_some(&g.d_preview), if sam { &g.d_track } else { &g.d_guide }),
+            hint: stage(clip.alpha_frames, Node::Hint, None, &g.d_hint),
+            extract: g.src.is_some().then(|| (&g.d_extract).into()),
+            import: h.movie.is_some().then(|| HintAct { enabled: g.import_reason.is_none(), label: "Import movie".into(), reason: g.import_reason.clone().unwrap_or_default() }),
+            route: RouteView {
+                overrides: h.route_ov.keys().cloned().collect(),
+                reset_label: (!h.route_ov.is_empty()).then(|| Self::reset_label("these route fields", &h.route_ov)),
+                unsaved: h.cfg != h.route_saved,
+                save_failed: h.route_failed.is_some(),
+            },
+            note: h.note.clone(),
+        })
+    }
+
+    /// Run one Hint command through the same paths the old panel used. `Err` = refused or failed (the reason is
+    /// also in the Hint note, as before); nothing is changed on refusal.
+    pub(crate) fn hint_cmd(&mut self, _ctx: &egui::Context, c: HintCmd) -> Result<(), String> {
+        let Some(clip) = self.open_clip_snapshot() else {
+            return Err("Open a shot first.".into());
+        };
+        if self.hint.folder.as_deref() != Some(clip.folder.as_str()) {
+            return Err("This shot's hint settings are still loading.".into());
+        }
+        self.hint.cmd_err = None;
+        let refuse = |d: &crate::actions::Decision| if d.enabled { Ok(()) } else { Err(d.reason.clone()) };
+        match c {
+            HintCmd::Edit(e) => return self.hint_edit(&clip, e),
+            HintCmd::MarkedMode { pre, hint } => {
+                if self.hint.cfg.finish == Final::Import {
+                    return Err("An imported alpha has no marked-frame generation.".into());
+                }
+                if self.hint.cfg.bypass {
+                    return Err("Bypass is on".into());
+                }
+                // Only MatAnyone2 can have marked pre-matte with full-range hints; the others use the same marks.
+                let hint = hint || self.hint.cfg.finish != Final::Matanyone2;
+                self.set_marked(&clip, pre, hint);
+                return self.hint.marks_err.clone().map_or(Ok(()), Err);
+            }
+            HintCmd::ResetRoute => self.reset_route(&clip),
+            HintCmd::Tool(t) => {
+                let guide = self.hint.cfg.guide;
+                let Some(v) = self.viewer.as_mut() else { return Err("No frames are open.".into()) };
+                if t != Tool::None && !tool_allowed(guide, v.sam_overlay, t) {
+                    return Err("That tool is not available for this producer (SAM tools need the SAM overlay on).".into());
+                }
+                v.ann.tool = if v.ann.tool == t { Tool::None } else { t };
+                if v.ann.tool != Tool::None {
+                    v.view = View::Input; // prompts are stored in source pixels of Input
+                    v.ab = false;
+                }
+            }
+            HintCmd::Brush(b) => {
+                if !b.is_finite() {
+                    return Err("Brush size must be a number.".into());
+                }
+                let Some(v) = self.viewer.as_mut() else { return Err("No frames are open.".into()) };
+                v.ann.brush = b.clamp(2.0, 120.0) as f64;
+            }
+            HintCmd::UndoPrompt => {
+                if self.hint.undo.is_empty() {
+                    return Err("Nothing to undo.".into());
+                }
+                self.undo_annotation();
+            }
+            HintCmd::ClearPrompts { all } => {
+                if self.hint.cfg.guide != Producer::Sam {
+                    return Err("Only SAM takes prompts.".into());
+                }
+                let stem = self.viewer.as_ref().and_then(|v| v.index.stems.get(v.playhead).cloned());
+                if !all && stem.is_none() {
+                    return Err("No frame is selected.".into());
+                }
+                self.hint.undo.push(self.hint.ann.clone());
+                match (all, stem) {
+                    (true, _) => self.hint.ann.frames.clear(),
+                    (false, Some(s)) => {
+                        self.hint.ann.frames.remove(&s);
+                    }
+                    _ => {}
+                }
+                if let Err(e) = self.hint.ann.save(&clip) {
+                    self.hint_note(format!("Annotations not saved: {e}"));
+                }
+            }
+            HintCmd::PreviewSam => {
+                let g = self.hint_gates(&clip);
+                refuse(&g.d_preview)?;
+                self.hint_preview();
+            }
+            HintCmd::GeneratePreMatte { marked } => {
+                if marked != self.hint.cfg.pre_on_marks() {
+                    return Err("The Marked frames choice differs from the request: change that row first.".into());
+                }
+                let g = self.hint_gates(&clip);
+                refuse(if self.hint.cfg.guide == Producer::Sam { &g.d_track } else { &g.d_guide })?;
+                self.hint_run(Run::Guide);
+            }
+            HintCmd::GenerateHint { marked } => {
+                if marked != self.hint.cfg.hint_on_marks() {
+                    return Err("The Marked frames choice differs from the request: change that row first.".into());
+                }
+                let g = self.hint_gates(&clip);
+                refuse(&g.d_hint)?;
+                self.hint_run(Run::Hint);
+            }
+            HintCmd::ExtractSource => {
+                let g = self.hint_gates(&clip);
+                let Some(src) = g.src.clone() else { return Err("This shot has no movie source to extract.".into()) };
+                refuse(&g.d_extract)?;
+                let job = Ctx { clip: &clip, range: (0, 0), job_id: new_id(), staging: PathBuf::new() }.prepare_source(&src);
+                self.submit_task_job(&clip, Ok(job), 0, "Frame extraction", Action::Extract);
+            }
+            HintCmd::ImportMovie => {
+                let g = self.hint_gates(&clip);
+                if let Some(why) = g.import_reason.clone() {
+                    return Err(why);
+                }
+                let (Some(m), Some(src)) = (self.hint.movie.clone(), g.src.clone()) else { return Err("Choose a companion movie first.".into()) };
+                let job = Ctx { clip: &clip, range: (0, 0), job_id: new_id(), staging: PathBuf::new() }.import_hint(&m, &src, self.hint.movie_mask, self.hint.movie_alpha_channel);
+                self.submit_task_job(&clip, Ok(job), 0, "Hint movie import", Action::Hint);
+                self.hint.movie = None;
+            }
+            HintCmd::CancelMovie => self.hint.movie = None,
+            // Opens the existing dialog (scope, exact file plan, refusals); never deletes by itself.
+            HintCmd::RequestDelete { prematte } => {
+                self.hint.dele = Some(Del { folder: clip.folder.clone(), prematte, scope: DelScope::All, movies: false, plan_key: String::new(), plan: None, rx: None, done: None });
+            }
+            HintCmd::ClearLegacyHoldout => match crate::hints::Holdout::default().save(&clip) {
+                Ok(()) => self.hint.note = Some("Chroma holdout cleared.".into()),
+                Err(e) => self.hint_note(format!("Holdout not cleared: {e}")),
+            },
+            HintCmd::ResetChromaColour => {
+                self.hint.cfg.chroma.screen_color = None;
+                return self.save_route(&clip);
+            }
+        }
+        self.hint.cmd_err.take().map_or(Ok(()), Err)
+    }
+
+    fn hint_edit(&mut self, clip: &Clip, e: HintEdit) -> Result<(), String> {
+        match e {
+            HintEdit::MovieAsMask(b) => return Ok(self.hint.movie_mask = b),
+            HintEdit::MovieAlphaChannel(b) => return Ok(self.hint.movie_alpha_channel = b),
+            _ => {}
+        }
+        let mut cfg = self.hint.cfg.clone();
+        e.apply(&mut cfg)?;
+        if cfg == self.hint.cfg {
+            return Ok(());
+        }
+        self.hint.cfg = cfg; // shown at once; on a failed save it stays as unsaved (save_route)
+        self.save_route(clip)
+    }
+
+    // ------------------------------------------------------------------- tool strip (beside the viewer)
+
+    /// Vertical, Photoshop-style tool strip left of the viewer (Hint page). Icons are drawn with primitives so
+    /// nothing depends on an icon font; every button has a tooltip and a selected state. Prompts (points, paint,
+    /// erase, box) sit in the first group, Undo/Clear in a second group. Processing (SAM Preview/Track) is in the bottom
+    /// action area and the brush size in Properties. Chroma gets exactly one tool: pick the screen colour. The holdout tools are not part
+    /// of SAM's prompt set and never appear here.
+    pub(super) fn hint_tool_strip(&mut self, ui: &mut Ui) {
+        let Some(_clip) = self.open_clip_snapshot() else {
+            return;
+        };
+        if self.tab != Tab::Hint {
+            return;
+        }
+        let guide = self.hint.cfg.guide;
+        let Some(v) = self.viewer.as_ref() else {
+            return;
+        };
+        let tools = tools_for(guide);
+        self.hint.strip_rects.clear();
+        if tools.is_empty() {
+            return; // automatic producers take no prompts: no empty column beside the viewer
+        }
+        let mut cmds: Vec<HintCmd> = vec![];
+        let strip_h = ui.available_height();
+        egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .corner_radius(5.0)
+            .inner_margin(4.0)
+            .show(ui, |ui| {
+                ui.set_width(STRIP_W - 8.0);
+                ui.set_min_height((strip_h - 8.0).max(0.0));
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.vertical_centered(|ui| {
+                    for (t, _short, tip) in tools {
+                        let icon = icon_for(*t);
+                        let r = strip_button(ui, v.ann.tool == *t, icon, tip);
+                        self.hint.strip_rects.push((*t, r.rect));
+                        if r.clicked() {
+                            cmds.push(HintCmd::Tool(*t));
+                        }
+                    }
+                    if guide == Producer::Sam {
+                        ui.add_space(4.0);
+                        ui.separator();
+                        if strip_button(ui, false, Icon::Undo, "Undo the last prompt edit").clicked() {
+                            cmds.push(HintCmd::UndoPrompt);
+                        }
+                        if strip_button(ui, false, Icon::ClearFrame, "Clear this frame's prompts").clicked() {
+                            cmds.push(HintCmd::ClearPrompts { all: false });
+                        }
+                        if strip_button(ui, false, Icon::ClearAll, "Clear all SAM prompts (source and generated masks are untouched)").clicked() {
+                            cmds.push(HintCmd::ClearPrompts { all: true });
+                        }
+                    }
+                });
+            });
+        let ctx = ui.ctx().clone();
+        for c in cmds {
+            let _ = self.hint_cmd(&ctx, c);
+        }
+    }
+
+    // ------------------------------------------------------------------- page bar (under the viewer)
+
+    /// The Hint page's processing actions, one group per module in the shared action area: Pre-matte | Final hint,
+    /// then Source / Import when there is something to prepare. The inspector only chooses; every run starts here.
+    pub(super) fn hint_actions(&mut self, ui: &mut Ui, clip: &Clip) {
+        let g = self.hint_gates(clip);
+        let (guide, fin) = (self.hint.cfg.guide, self.hint.cfg.finish);
+        let bypass = self.hint.cfg.bypass;
+        let sam = guide == Producer::Sam;
+        let tool_on = sam && self.viewer.as_ref().is_some_and(|v| v.ann.tool != Tool::None);
+        let src = g.src.clone();
+        let movie = self.hint.movie.clone();
+        let ctx = ui.ctx().clone();
+        let (mut run, mut preview, mut extract, mut import, mut cancel_import) = (None, false, false, false, false);
+        let mut del_open: Option<bool> = None;
+        let gate = g.gate.clone();
+        let import_ok = g.import_reason.is_none();
+        let (d_preview, d_track, d_guide, d_hint, d_extract) = (&g.d_preview, &g.d_track, &g.d_guide, &g.d_hint, &g.d_extract);
         let this = &*self;
         ui.columns(2, |cols| {
             let ui = &mut cols[0];
@@ -1751,18 +2224,18 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         if sam {
                             // SAM preview/tracking belong to SAM only: Track is the pre-matte run, so no second Generate.
-                            preview = decided_button(this, ui, &d_preview, Node::PreMatte, false, "Run SAM on this frame's prompts (nothing is written)");
-                            if decided_button(this, ui, &d_track, Node::PreMatte, true, "Track the saved prompts over In/Out into the pre-matte") {
+                            preview = decided_button(this, ui, d_preview, Node::PreMatte, false, "Run SAM on this frame's prompts (nothing is written)");
+                            if decided_button(this, ui, d_track, Node::PreMatte, true, "Track the saved prompts over In/Out into the pre-matte") {
                                 run = Some(Run::Guide);
                             }
-                        } else if decided_button(this, ui, &d_guide, Node::PreMatte, true, "Run the Pre-matte over In/Out into VideoMamaMaskHint") {
+                        } else if decided_button(this, ui, d_guide, Node::PreMatte, true, "Run the Pre-matte over In/Out into VideoMamaMaskHint") {
                             run = Some(Run::Guide);
                         }
                     });
                     if sam {
-                        reason_line(ui, &[&d_preview, &d_track]);
+                        reason_line(ui, &[d_preview, d_track]);
                     } else {
-                        reason_line(ui, &[&d_guide]);
+                        reason_line(ui, &[d_guide]);
                     }
                     ui.label(RichText::new(format!("{} frames on disk", clip.mask_frames)).color(theme::text_dim(ui)).size(12.0));
                     if ui.small_button("Delete frames…").on_hover_text("Delete generated pre-matte or hint frames from disk").clicked() {
@@ -1777,11 +2250,11 @@ impl App {
             let stale = this.stale(&ctx, Node::Hint);
             card(ui, &format!("Hint · {}", fin.label()), stale, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if decided_button(this, ui, &d_hint, Node::Hint, true, if fin.needs_guide() { "Refine the Pre-matte over In/Out into AlphaHint (needs the Pre-matte first)" } else { "Publish the Pre-matte straight into AlphaHint" }) {
+                    if decided_button(this, ui, d_hint, Node::Hint, true, if fin.needs_guide() { "Refine the Pre-matte over In/Out into AlphaHint (needs the Pre-matte first)" } else { "Publish the Pre-matte straight into AlphaHint" }) {
                         run = Some(Run::Hint);
                     }
                 });
-                reason_line(ui, &[&d_hint]);
+                reason_line(ui, &[d_hint]);
                 ui.label(RichText::new(format!("{} frames on disk", clip.alpha_frames)).color(theme::text_dim(ui)).size(12.0));
                 if ui.small_button("Delete frames…").on_hover_text("Delete generated pre-matte or hint frames from disk").clicked() {
                     del_open = Some(false);
@@ -1789,7 +2262,7 @@ impl App {
             });
         });
         if let Some(prematte) = del_open {
-            self.hint.dele = Some(Del { folder: clip.folder.clone(), prematte, scope: DelScope::All, movies: false, plan_key: String::new(), plan: None, rx: None, done: None });
+            let _ = self.hint_cmd(&ctx, HintCmd::RequestDelete { prematte });
         }
         self.hint_delete_ui(ui, clip);
         let mut marked = None;
@@ -1822,14 +2295,14 @@ impl App {
                 marked = Some((p, h));
             }
         }
-        if let Some((p, h)) = marked {
-            self.set_marked(clip, p, h);
+        if let Some((pre, hint)) = marked {
+            let _ = self.hint_cmd(&ctx, HintCmd::MarkedMode { pre, hint });
         }
         if src.is_some() || movie.is_some() {
             card(ui, "Source / Import", None, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if movie.is_some() {
-                        let tip = if src.is_none() { "Companion movies need a movie source; import PNG/EXR sequences by placing them in AlphaHint" } else { "the worker cannot import movies (FFmpeg)" };
+                        let tip = g.import_reason.clone().unwrap_or_default();
                         import = theme::accent(ui, import_ok, |ui| ui.add(egui::Button::new("Import movie"))).on_disabled_hover_text(tip).clicked();
                         cancel_import = ui.button("Cancel").clicked();
                         if let Some(m) = &movie {
@@ -1837,35 +2310,51 @@ impl App {
                         }
                     }
                     if src.is_some() {
-                        extract = decided_button(&*self, ui, &d_extract, Node::Media, false, "Reads the source movie from where it is and writes a verified Frames/ sequence; cancellable and resumable");
+                        extract = decided_button(&*self, ui, d_extract, Node::Media, false, "Reads the source movie from where it is and writes a verified Frames/ sequence; cancellable and resumable");
                     }
                 });
-                reason_line(ui, &[&d_extract]);
+                reason_line(ui, &[d_extract]);
             });
         }
+        let (pre_marks, hint_marks) = (self.hint.cfg.pre_on_marks(), self.hint.cfg.hint_on_marks());
+        let mut cmds: Vec<HintCmd> = vec![];
         if preview {
-            self.hint_preview();
+            cmds.push(HintCmd::PreviewSam);
         }
         if extract {
-            if let Some(src) = src.clone() {
-                let job = Ctx { clip, range: (0, 0), job_id: new_id(), staging: PathBuf::new() }.prepare_source(&src);
-                let c = clip.clone();
-                self.submit_task_job(&c, Ok(job), 0, "Frame extraction", Action::Extract);
-            }
+            cmds.push(HintCmd::ExtractSource);
         }
         if import {
-            if let (Some(m), Some(src)) = (movie, src) {
-                let job = Ctx { clip, range: (0, 0), job_id: new_id(), staging: PathBuf::new() }.import_hint(&m, &src, self.hint.movie_mask, self.hint.movie_alpha_channel);
-                let c = clip.clone();
-                self.submit_task_job(&c, Ok(job), 0, "Hint movie import", Action::Hint);
-                self.hint.movie = None;
-            }
+            cmds.push(HintCmd::ImportMovie);
         }
         if cancel_import {
-            self.hint.movie = None;
+            cmds.push(HintCmd::CancelMovie);
         }
-        if let Some(r) = run {
-            self.hint_run(r);
+        match run {
+            Some(Run::Guide) => cmds.push(HintCmd::GeneratePreMatte { marked: pre_marks }),
+            Some(Run::Hint) => cmds.push(HintCmd::GenerateHint { marked: hint_marks }),
+            None => {}
+        }
+        for c in cmds {
+            let _ = self.hint_cmd(&ctx, c);
+        }
+    }
+
+    /// True while the generated-frames delete dialog is open (global shortcuts must not run then).
+    pub(super) fn hint_delete_open(&self) -> bool {
+        self.hint.dele.is_some()
+    }
+
+    /// The delete plan as a modal over the Shot page (the old panel drew it inline). Closing (X / Esc) is ignored while the helper runs.
+    pub(super) fn hint_delete_dialog(&mut self, ctx: &egui::Context, clip: &Clip) {
+        if self.hint.dele.is_none() {
+            return;
+        }
+        let out = crate::ui::controls::dialog::Dialog::new("hint-delete-dialog", "Delete generated frames", crate::ui::controls::dialog::DialogSize::M)
+            .body(|body| self.hint_delete_ui(body, clip))
+            .show(ctx);
+        if out.closed && self.hint.dele.as_ref().is_some_and(|d| d.rx.is_none()) {
+            self.hint.dele = None;
         }
     }
 
@@ -1961,7 +2450,8 @@ impl App {
             }
             ui.horizontal_wrapped(|ui| {
                 go = ui.add_enabled(can && d.rx.is_none(), egui::Button::new("Delete")).clicked();
-                close = ui.button("Cancel").clicked();
+                // Cancel stays off while the helper runs: dropping `d` here would lose its answer and the texture/clip refresh.
+                close = ui.add_enabled(d.rx.is_none(), egui::Button::new("Cancel")).on_disabled_hover_text("Deleting… wait for it to finish").clicked();
             });
         });
         if go {
@@ -2015,22 +2505,30 @@ impl App {
     pub(super) fn hint_props(&mut self, ui: &mut Ui, clip: &Clip) {
         let caps = self.ai.local_caps();
         let lazy = caps.is_none() && self.ai.models_unknown();
-        let cfg_before = self.hint.cfg.clone();
         let ctx = ui.ctx().clone();
+        let mut edits: Vec<HintEdit> = vec![];
         let (pre_stale, hint_stale) = (self.stale(&ctx, Node::PreMatte), self.stale(&ctx, Node::Hint));
-        let bypass = theme::checkbox(ui, &mut self.hint.cfg.bypass, "Bypass hint (keeps every setting and asset)");
+        let mut byp = self.hint.cfg.bypass;
+        let bypass = theme::checkbox(ui, &mut byp, "Bypass hint (keeps every setting and asset)");
         self.hint.preset_rects.push(("bypass", bypass.rect));
+        if byp != self.hint.cfg.bypass {
+            let _ = self.hint_cmd(&ctx, HintCmd::Edit(HintEdit::Bypass(byp)));
+        }
         ui.add_space(4.0);
-        let ok = |k: TaskKind| lazy || caps.as_ref().is_some_and(|c| c.tasks.get(k.wire()).copied().unwrap_or(false));
+        let ok = |k: TaskKind| task_ok(&caps, lazy, k);
         ui.add_enabled_ui(!self.hint.cfg.bypass, |ui| {
             card(ui, "Pre-matte", pre_stale, |ui| {
                 pair(ui, "Producer", |ui| {
-                    egui::ComboBox::from_id_salt("hint_guide").selected_text(self.hint.cfg.guide.label()).show_ui(ui, |ui| {
+                    let mut g = self.hint.cfg.guide;
+                    egui::ComboBox::from_id_salt("hint_guide").selected_text(g.label()).show_ui(ui, |ui| {
                         for p in Producer::ALL {
                             let l = if ok(p.task()) { p.label().to_string() } else { format!("{} (not ready)", p.label()) };
-                            ui.selectable_value(&mut self.hint.cfg.guide, p, l);
+                            ui.selectable_value(&mut g, p, l);
                         }
                     });
+                    if g != self.hint.cfg.guide {
+                        edits.push(HintEdit::Producer(g));
+                    }
                 });
                 if let Some(m) = missing_guide(&caps, lazy, &self.hint.cfg) {
                     ui.label(RichText::new(format!("{m} is missing — download it on the Models page")).color(theme::FOCUS).size(12.0));
@@ -2039,24 +2537,32 @@ impl App {
                     Producer::Birefnet => {
                         let have = caps.as_ref().map(|c| c.birefnet_variants.clone()).unwrap_or_default();
                         pair(ui, "Variant", |ui| {
-                            egui::ComboBox::from_id_salt("birefnet_variant").selected_text(self.hint.cfg.birefnet_variant.clone()).show_ui(ui, |ui| {
+                            let mut sel = self.hint.cfg.birefnet_variant.clone();
+                            egui::ComboBox::from_id_salt("birefnet_variant").selected_text(sel.clone()).show_ui(ui, |ui| {
                                 for v in BIREFNET_VARIANTS {
                                     let l = if have.iter().any(|h| h == v) { v.to_string() } else { format!("{v} (not installed)") };
-                                    ui.selectable_value(&mut self.hint.cfg.birefnet_variant, v.to_string(), l);
+                                    ui.selectable_value(&mut sel, v.to_string(), l);
                                 }
                             });
+                            if sel != self.hint.cfg.birefnet_variant {
+                                edits.push(HintEdit::BirefnetVariant(sel));
+                            }
                         });
                     }
                     Producer::Chroma => self.chroma_controls(ui, clip),
                     Producer::Sam => {
                         let sam = caps.as_ref().map(|c| c.sam_models.clone()).unwrap_or_default();
                         pair(ui, "Tracker model", |ui| {
-                            egui::ComboBox::from_id_salt("sam_model").selected_text(SAM_MODELS.iter().find(|m| m.0 == self.hint.cfg.sam_model).map_or("Select model", |m| m.1)).show_ui(ui, |ui| {
+                            let mut sel = self.hint.cfg.sam_model.clone();
+                            egui::ComboBox::from_id_salt("sam_model").selected_text(SAM_MODELS.iter().find(|m| m.0 == sel).map_or("Select model", |m| m.1)).show_ui(ui, |ui| {
                                 for (id, l) in SAM_MODELS {
                                     let t = if sam.iter().any(|s| s == id) { l.to_string() } else { format!("{l} (not installed)") };
-                                    ui.selectable_value(&mut self.hint.cfg.sam_model, id.to_string(), t);
+                                    ui.selectable_value(&mut sel, id.to_string(), t);
                                 }
                             });
+                            if sel != self.hint.cfg.sam_model {
+                                edits.push(HintEdit::SamModel(sel));
+                            }
                         });
                     }
                     Producer::Gvm => {}
@@ -2065,24 +2571,23 @@ impl App {
             ui.add_space(6.0);
             card(ui, "Final hint", hint_stale, |ui| {
                 pair(ui, "Method", |ui| {
-                    egui::ComboBox::from_id_salt("hint_final").selected_text(self.hint.cfg.finish.label()).show_ui(ui, |ui| {
-                        for f in Final::ALL {
-                            let l = if f.task().is_none_or(ok) { f.label().to_string() } else { format!("{} (not ready)", f.label()) };
-                            ui.selectable_value(&mut self.hint.cfg.finish, f, l);
+                    let mut f = self.hint.cfg.finish;
+                    egui::ComboBox::from_id_salt("hint_final").selected_text(f.label()).show_ui(ui, |ui| {
+                        for x in Final::ALL {
+                            let l = if x.task().is_none_or(ok) { x.label().to_string() } else { format!("{} (not ready)", x.label()) };
+                            ui.selectable_value(&mut f, x, l);
                         }
                     });
+                    if f != self.hint.cfg.finish {
+                        edits.push(HintEdit::Finish(f));
+                    }
                 });
                 if let Some(m) = missing_final(&caps, lazy, self.hint.cfg.finish) {
                     ui.label(RichText::new(format!("{m} is missing — download it on the Models page")).color(theme::FOCUS).size(12.0));
                 }
                 match self.hint.cfg.finish {
                     Final::Videomama => {
-                        let mut c = self.hint.cfg.videomama_chunk as i32;
-                        pair(ui, "Chunk size", |ui| {
-                            fill_slider(ui);
-                            ui.add(egui::Slider::new(&mut c, 1..=64));
-                        });
-                        self.hint.cfg.videomama_chunk = c as u32;
+                        pair(ui, "Chunk size", |ui| edits.extend(slide(ui, self.hint.cfg.videomama_chunk, 1..=64, "").map(HintEdit::VideomamaChunk)));
                         ui.label(RichText::new("Refines the Pre-matte: generate it over In/Out first.").color(theme::text_dim(ui)).size(12.0));
                     }
                     Final::Matanyone2 => {
@@ -2092,8 +2597,8 @@ impl App {
                 }
             });
         });
-        if self.hint.cfg != cfg_before {
-            let _ = self.save_route(clip);
+        for e in edits.drain(..) {
+            let _ = self.hint_cmd(&ctx, HintCmd::Edit(e));
         }
         self.route_override_ui(ui, clip);
         ui.add_space(6.0);
@@ -2107,15 +2612,26 @@ impl App {
             if let Some(m) = self.hint.movie.clone() {
                 ui.label(RichText::new(m.display().to_string()).monospace().size(11.0));
                 pair(ui, "Imports as", |ui| {
-                    ui.radio_value(&mut self.hint.movie_mask, false, "AlphaHint");
-                    ui.radio_value(&mut self.hint.movie_mask, true, "Pre-matte");
+                    let mut mk = self.hint.movie_mask;
+                    ui.radio_value(&mut mk, false, "AlphaHint");
+                    ui.radio_value(&mut mk, true, "Pre-matte");
+                    if mk != self.hint.movie_mask {
+                        edits.push(HintEdit::MovieAsMask(mk));
+                    }
                 });
                 pair(ui, "Matte channel", |ui| {
-                    theme::checkbox(ui, &mut self.hint.movie_alpha_channel, "In the alpha channel (else gray)");
+                    let mut a = self.hint.movie_alpha_channel;
+                    theme::checkbox(ui, &mut a, "In the alpha channel (else gray)");
+                    if a != self.hint.movie_alpha_channel {
+                        edits.push(HintEdit::MovieAlphaChannel(a));
+                    }
                 });
                 ui.label(RichText::new("Run Import from the Source / Import group in the action area.").color(theme::text_dim(ui)).size(12.0));
             }
         });
+        for e in edits {
+            let _ = self.hint_cmd(&ctx, HintCmd::Edit(e));
+        }
         if !self.hint.cfg.bypass {
             ui.add_space(4.0);
             ui.label(RichText::new("Consumption mode and quality are below (applied by Key).").color(theme::text_dim(ui)).size(12.0));
@@ -2123,60 +2639,63 @@ impl App {
     }
 
     /// Brush size and the mask cleanup shared by every producer/refiner (after the mode controls).
-    pub(super) fn hint_cleanup_props(&mut self, ui: &mut Ui, clip: &Clip) {
-        let cfg_before = self.hint.cfg.clone();
-        let stale = self.stale(&ui.ctx().clone(), Node::Hint);
+    pub(super) fn hint_cleanup_props(&mut self, ui: &mut Ui, _clip: &Clip) {
+        let ctx = ui.ctx().clone();
+        let mut cmds: Vec<HintCmd> = vec![];
+        let stale = self.stale(&ctx, Node::Hint);
         ui.add_space(6.0);
         if tools_for(self.hint.cfg.guide).iter().any(|t| !matches!(t.0, Tool::Pick | Tool::Box)) {
-            if let Some(v) = self.viewer.as_mut() {
+            if let Some(v) = self.viewer.as_ref() {
                 card(ui, "Brush", None, |ui| {
                     let mut b = v.ann.brush as f32;
                     pair(ui, "Size", |ui| {
                         fill_slider(ui);
                         ui.add(egui::Slider::new(&mut b, 2.0..=120.0).suffix(" px")).on_hover_text("Size of points, paint and erase strokes");
                     });
-                    v.ann.brush = b as f64;
+                    if b as f64 != v.ann.brush {
+                        cmds.push(HintCmd::Brush(b));
+                    }
                 });
                 ui.add_space(6.0);
             }
         }
-        let cleanup_note = if self.hint.cfg.finish.needs_guide() {
-            "Grow / fill holes: regenerate pre-matte. Feather: regenerate hint. Guides stay binary."
-        } else {
-            "Regenerate to apply changes. Feather softens the final hint; guides stay binary."
-        };
+        let cleanup_note = cleanup_note(self.hint.cfg.finish);
+        let mc = self.hint.cfg.mask_cleanup.clone();
         card(ui, "Mask cleanup", stale, |ui| {
             ui.label(RichText::new(cleanup_note).color(theme::text_dim(ui)).size(12.0));
-            let mc = &mut self.hint.cfg.mask_cleanup;
-            pair(ui, "Grow / shrink", |ui| {
-                fill_slider(ui);
-                ui.add(egui::Slider::new(&mut mc.grow, -100..=100).suffix(" px"));
-            });
+            pair(ui, "Grow / shrink", |ui| cmds.extend(slide(ui, mc.grow, -100..=100, " px").map(|v| HintCmd::Edit(HintEdit::CleanupGrow(v)))));
             pair(ui, "Fill holes", |ui| {
-                theme::checkbox(ui, &mut mc.fill_holes, "Fill holes");
+                let mut f = mc.fill_holes;
+                theme::checkbox(ui, &mut f, "Fill holes");
+                if f != mc.fill_holes {
+                    cmds.push(HintCmd::Edit(HintEdit::CleanupFill(f)));
+                }
             });
-            pair(ui, "Feather", |ui| {
-                fill_slider(ui);
-                ui.add(egui::Slider::new(&mut mc.feather, 0.0..=100.0).suffix(" px"));
-            });
+            pair(ui, "Feather", |ui| cmds.extend(slide(ui, mc.feather, 0.0..=100.0, " px").map(|v| HintCmd::Edit(HintEdit::CleanupFeather(v)))));
         });
-        if self.hint.cfg != cfg_before {
-            let _ = self.save_route(clip);
+        for c in cmds {
+            let _ = self.hint_cmd(&ctx, c);
         }
     }
 
     fn chroma_controls(&mut self, ui: &mut Ui, clip: &Clip) {
-        let c = &mut self.hint.cfg.chroma;
+        let ctx = ui.ctx().clone();
+        let c = self.hint.cfg.chroma.clone();
+        let mut cmds: Vec<HintCmd> = vec![];
         pair(ui, "Screen", |ui| {
-            ui.selectable_value(&mut c.screen_type, "green".to_string(), "Green");
-            ui.selectable_value(&mut c.screen_type, "blue".to_string(), "Blue");
+            let mut t = c.screen_type.clone();
+            ui.selectable_value(&mut t, "green".to_string(), "Green");
+            ui.selectable_value(&mut t, "blue".to_string(), "Blue");
+            if t != c.screen_type {
+                cmds.push(HintCmd::Edit(HintEdit::ChromaScreen(t)));
+            }
         });
         match c.screen_color {
             Some(rgb) => {
                 pair(ui, "Screen colour", |ui| {
                     ui.label(format!("{:?}", rgb));
                     if ui.small_button("auto").clicked() {
-                        c.screen_color = None;
+                        cmds.push(HintCmd::ResetChromaColour);
                     }
                 });
             }
@@ -2184,26 +2703,11 @@ impl App {
                 ui.label(RichText::new("Screen colour: automatic. Use the “Pick colour” tool on the frame to sample one.").color(theme::text_dim(ui)).size(12.0));
             }
         }
-        pair(ui, "Strength", |ui| {
-            fill_slider(ui);
-            ui.add(egui::Slider::new(&mut c.strength, 0.1..=10.0));
-        });
-        pair(ui, "Clip black", |ui| {
-            fill_slider(ui);
-            ui.add(egui::Slider::new(&mut c.clip_black, 0.0..=1.0));
-        });
-        pair(ui, "Clip white", |ui| {
-            fill_slider(ui);
-            ui.add(egui::Slider::new(&mut c.clip_white, 0.0..=1.0));
-        });
-        pair(ui, "Shrink / grow", |ui| {
-            fill_slider(ui);
-            ui.add(egui::Slider::new(&mut c.shrink_grow, -100..=100).suffix(" px"));
-        });
-        pair(ui, "Edge blur", |ui| {
-            fill_slider(ui);
-            ui.add(egui::Slider::new(&mut c.edge_blur, 0..=100).suffix(" px"));
-        });
+        pair(ui, "Strength", |ui| cmds.extend(slide(ui, c.strength, 0.1..=10.0, "").map(|v| HintCmd::Edit(HintEdit::ChromaStrength(v)))));
+        pair(ui, "Clip black", |ui| cmds.extend(slide(ui, c.clip_black, 0.0..=1.0, "").map(|v| HintCmd::Edit(HintEdit::ChromaClipBlack(v)))));
+        pair(ui, "Clip white", |ui| cmds.extend(slide(ui, c.clip_white, 0.0..=1.0, "").map(|v| HintCmd::Edit(HintEdit::ChromaClipWhite(v)))));
+        pair(ui, "Shrink / grow", |ui| cmds.extend(slide(ui, c.shrink_grow, -100..=100, " px").map(|v| HintCmd::Edit(HintEdit::ChromaShrinkGrow(v)))));
+        pair(ui, "Edge blur", |ui| cmds.extend(slide(ui, c.edge_blur, 0..=100, " px").map(|v| HintCmd::Edit(HintEdit::ChromaEdgeBlur(v)))));
         // A holdout drawn in the old editor is still read by the generator. It is not a tool here (the user
         // wants only the picker), but it must not be invisible: show it and let it be cleared.
         match crate::hints::Holdout::load(clip) {
@@ -2226,12 +2730,7 @@ impl App {
                     .on_hover_text("Deletes the stored chroma holdout strokes for this clip. Hints and prompts are untouched.")
                     .clicked()
                 {
-                    match crate::hints::Holdout::default().save(clip) {
-                        Ok(()) => {
-                            self.hint_note("Chroma holdout cleared.");
-                        }
-                        Err(e) => self.hint_note(format!("Holdout not cleared: {e}")),
-                    }
+                    cmds.push(HintCmd::ClearLegacyHoldout);
                 }
             }
             Ok(_) => {}
@@ -2242,6 +2741,9 @@ impl App {
                         .size(11.5),
                 );
             }
+        }
+        for c in cmds {
+            let _ = self.hint_cmd(&ctx, c);
         }
     }
 
@@ -2257,146 +2759,139 @@ impl App {
     }
 
     /// One card per enabled output: sequence (format) or video (file type, codec, quality), chosen independently.
+    /// Reads `deliver_view`; every control is a `DeliverCmd` run through `deliver_run` (the Shot page's path).
     pub(super) fn deliver_ui(&mut self, ui: &mut Ui, clip: &Clip) {
         self.sync_deliveries(clip);
-        let export_before = self.current_export();
-        let stale = self.stale(&ui.ctx().clone(), Node::Out(View::Fg));
-        let Some(pr) = self.project.as_ref() else { return };
-        let dr = self.ai.draft(clip, pr, self.settings.saved());
-        let snap = dr.snapshot();
-        let o = &mut dr.out;
-        if self.hint.deliveries.is_empty() {
+        let ctx = ui.ctx().clone();
+        let stale = self.stale(&ctx, Node::Out(View::Fg));
+        let Some(v) = self.deliver_view() else { return };
+        if !v.outputs.iter().any(|o| o.enabled) {
             ui.label(RichText::new("No output is enabled in the Key outputs.").color(theme::text_dim(ui)));
             return;
         }
-        self.hint.deliver_rects.clear();
+        let mut cmds: Vec<DeliverCmd> = vec![];
+        let mut rects: Vec<(String, egui::Rect)> = vec![];
         let mut fmt_rects: Vec<(String, egui::Rect)> = vec![];
-        for key in ["fg", "matte", "comp", "processed"].map(str::to_string) {
-            let Some(d) = self.hint.deliveries.get_mut(&key) else { continue };
-            let title = match key.as_str() {
-                "fg" => "FG (foreground)",
-                "matte" => "Matte",
-                "comp" => "Comp",
-                _ => "Processed (RGBA)",
-            };
-            let fmt = match key.as_str() {
-                "fg" => &mut o.fg_format,
-                "matte" => &mut o.matte_format,
-                "comp" => &mut o.comp_format,
-                _ => &mut o.processed_format,
-            };
-            let card = ui.scope(|ui| card(ui, title, stale, |ui| {
-                let is_video = matches!(d, Delivery::Video(_));
+        for ov in v.outputs.iter().filter(|o| o.enabled) {
+            let (key, output) = (ov.output.key(), ov.output);
+            let card = ui.scope(|ui| card(ui, ov.title, stale, |ui| {
                 pair(ui, "Deliver as", |ui| {
-                    if ui.selectable_label(!is_video, "Image sequence").clicked() {
-                        *d = Delivery::Sequence;
+                    if ui.selectable_label(ov.video.is_none(), "Image sequence").clicked() {
+                        cmds.push(DeliverCmd::SetKind { output, video: false });
                     }
-                    let v = ui.selectable_label(is_video, "Video file");
-                    fmt_rects.push((format!("{key}_video"), v.rect));
-                    if v.clicked() && !is_video {
-                        *d = Delivery::Video(VideoDelivery::default_for("mp4"));
+                    let b = ui.selectable_label(ov.video.is_some(), "Video file");
+                    fmt_rects.push((format!("{key}_video"), b.rect));
+                    if b.clicked() && ov.video.is_none() {
+                        cmds.push(DeliverCmd::SetKind { output, video: true });
                     }
                 });
-                match d {
-                    Delivery::Sequence => {
-                        pair(ui, "Format", |ui| {
-                            let e = ui.selectable_value(fmt, "exr".to_string(), "EXR");
-                            let p = ui.selectable_value(fmt, "png".to_string(), "PNG");
-                            fmt_rects.push((format!("{key}_exr"), e.rect));
-                            fmt_rects.push((format!("{key}_png"), p.rect));
-                        });
-                    }
-                    Delivery::Video(v) => {
-                        if !VIDEO_CODECS.iter().any(|c| c.container == v.container && c.id == v.codec) {
-                            *v = VideoDelivery::default_for("mp4");
+                let Some(vv) = &ov.video else {
+                    pair(ui, "Format", |ui| {
+                        let e = ui.selectable_label(ov.exr, "EXR");
+                        let p = ui.selectable_label(!ov.exr, "PNG");
+                        fmt_rects.push((format!("{key}_exr"), e.rect));
+                        fmt_rects.push((format!("{key}_png"), p.rect));
+                        if e.clicked() && !ov.exr {
+                            cmds.push(DeliverCmd::SetSeqFormat { output, exr: true });
                         }
-                        pair(ui, "File type", |ui| {
-                            for (id, l) in [("mp4", "MP4"), ("mov_prores4444", "MOV"), ("webm_alpha", "WebM")] {
-                                if ui.selectable_label(v.container == id, l).clicked() && v.container != id {
-                                    *v = VideoDelivery::default_for(id);
+                        if p.clicked() && ov.exr {
+                            cmds.push(DeliverCmd::SetSeqFormat { output, exr: false });
+                        }
+                    });
+                    return;
+                };
+                if vv.custom {
+                    // An unknown container/codec pair is reset to the default MP4 (as before).
+                    cmds.push(DeliverCmd::SetContainer { output, container: "mp4".into() });
+                    return;
+                }
+                pair(ui, "File type", |ui| {
+                    for c in &vv.containers {
+                        if ui.selectable_label(vv.container == c.value, c.label.as_str()).clicked() && vv.container != c.value {
+                            cmds.push(DeliverCmd::SetContainer { output, container: c.value.clone() });
+                        }
+                    }
+                });
+                pair(ui, "Codec", |ui| {
+                    egui::ComboBox::from_id_salt(("codec", key))
+                        .width(ui.available_width()).truncate()
+                        .selected_text(vv.codec_label.as_str())
+                        .show_ui(ui, |ui| {
+                            for c in &vv.codecs {
+                                if ui.selectable_label(c.value == vv.codec, c.label.as_str()).clicked() && c.value != vv.codec {
+                                    cmds.push(DeliverCmd::SetCodec { output, codec: c.value.clone() });
                                 }
                             }
                         });
-                        let cur = VIDEO_CODECS.iter().find(|c| c.container == v.container && c.id == v.codec).unwrap();
-                        pair(ui, "Codec", |ui| {
-                            egui::ComboBox::from_id_salt(("codec", key.as_str()))
-                                .width(ui.available_width()).truncate()
-                                .selected_text(codec_text(cur))
-                                .show_ui(ui, |ui| {
-                                    for c in VIDEO_CODECS.iter().filter(|c| c.container == v.container) {
-                                        if ui.selectable_label(c.id == v.codec, codec_text(c)).clicked() && c.id != v.codec {
-                                            (v.codec, v.quality) = (c.id.into(), c.default);
-                                        }
-                                    }
-                                });
-                        });
-                        let name = match cur.quality {
-                            QualityKind::Crf => "CRF",
-                            QualityKind::Qscale => "qscale",
-                        };
-                        let note = format!("{name} {}-{}: lower = better quality, bigger file", cur.min, cur.max);
-                        pair(ui, "Quality", |ui| {
-                            ui.spacing_mut().slider_width = (ui.available_width() - 100.0).max(40.0);
-                            ui.add(egui::Slider::new(&mut v.quality, cur.min..=cur.max).text(name)).on_hover_text(&note);
-                        });
-                        ui.label(RichText::new(note).color(theme::text_dim(ui)).size(11.5));
-                        if key == "processed" && !cur.alpha {
-                            ui.colored_label(theme::warn(ui), "This codec has no alpha: transparency is not retained. Use MOV ProRes 4444 or WebM VP9 to keep it.");
-                        }
+                });
+                pair(ui, "Quality", |ui| {
+                    ui.spacing_mut().slider_width = (ui.available_width() - 100.0).max(40.0);
+                    let mut q = vv.quality;
+                    ui.add(egui::Slider::new(&mut q, vv.min..=vv.max).text(vv.quality_name)).on_hover_text(&vv.quality_note);
+                    if q != vv.quality {
+                        cmds.push(DeliverCmd::SetQuality { output, quality: q as f32 });
                     }
+                });
+                ui.label(RichText::new(&vv.quality_note).color(theme::text_dim(ui)).size(11.5));
+                if let (DeliverOutput::Processed, Some(w)) = (output, vv.alpha_warning) {
+                    ui.colored_label(theme::warn(ui), w);
                 }
             }));
-            self.hint.deliver_rects.push((key.clone(), card.response.rect));
+            rects.push((key.to_string(), card.response.rect));
             ui.add_space(6.0);
         }
         card(ui, "EXR", stale, |ui| {
             pair(ui, "Compression", |ui| {
-                egui::ComboBox::from_id_salt("exr_comp_deliver")
-                    .selected_text(o.exr_compression.clone())
-                    .show_ui(ui, |ui| {
-                        for c in crate::workflow::EXR_COMPRESSIONS {
-                            ui.selectable_value(&mut o.exr_compression, c.to_string(), c);
-                        }
-                    });
+                let mut cur = v.compression.value.clone();
+                egui::ComboBox::from_id_salt("exr_comp_deliver").selected_text(cur.clone()).show_ui(ui, |ui| {
+                    for c in &v.compression.choices {
+                        ui.selectable_value(&mut cur, c.to_string(), *c);
+                    }
+                });
+                if cur != v.compression.value {
+                    cmds.push(DeliverCmd::SetCompression(cur));
+                }
             });
-            ui.label(RichText::new("Applies to every EXR sequence (shared).").color(theme::text_dim(ui)).size(12.0));
-            if o.exr_compression == "dwab" {
-                ui.colored_label(theme::warn(ui), "DWAB is lossy: HDR values are not bit-exact.");
+            ui.label(RichText::new(v.compression.shared_note).color(theme::text_dim(ui)).size(12.0));
+            if let Some(n) = v.compression.lossy_note {
+                ui.colored_label(theme::warn(ui), n);
             }
         });
-        self.hint.deliver_fmt_rects = fmt_rects;
-        // Formats and compression are the same draft fields as in the Key panel's Outputs: same override rule.
-        dr.mark_edits(&snap);
-        if self.hint.deliveries.values().any(|d| matches!(d, Delivery::Video(_))) {
+        if v.has_video {
             ui.add_space(6.0);
             card(ui, "Video options (all video outputs)", stale, |ui| {
                 // `None` = each clip's own source fps; an override is stored only when chosen.
-                let mut source_fps = self.hint.export_fps.is_none();
+                let mut source_fps = v.fps.stored.is_none();
                 pair(ui, "Frame rate", |ui| {
                     if theme::checkbox(ui, &mut source_fps, "Use source").changed() {
-                        self.hint.export_fps = if source_fps { None } else { Some(clip.fps) };
+                        cmds.push(if source_fps { DeliverCmd::UseSourceFps } else { DeliverCmd::SetFps(v.fps.source) });
                     }
-                    if let Some(fps) = &mut self.hint.export_fps {
-                        ui.add(egui::DragValue::new(fps).speed(0.01).range(0.001..=1000.0).suffix(" fps"));
+                    if let Some(fps) = v.fps.stored {
+                        let mut f = fps;
+                        ui.add(egui::DragValue::new(&mut f).speed(0.01).range(0.001..=1000.0).suffix(" fps"));
+                        if f != fps {
+                            cmds.push(DeliverCmd::SetFps(f));
+                        }
                     }
                 });
                 pair(ui, "Range", |ui| {
                     ui.scope(|ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                        theme::checkbox(ui, &mut self.hint.export_partial, "Export the partial result (explicit range, no gaps)");
+                        let mut done = v.done_frames;
+                        if theme::checkbox(ui, &mut done, "Export the partial result (explicit range, no gaps)").changed() {
+                            cmds.push(DeliverCmd::SetRange { done_frames: done });
+                        }
                     });
                 });
-                let dest_dir = self.project.as_ref().map(|p| crate::pipeline::export_dir(&clip, &p.root, self.hint.export_dir.as_deref()));
                 pair(ui, "Folder", |ui| {
                     ui.vertical(|ui| {
-                        ui.add(egui::Label::new(dest_dir.as_ref().map_or("?".into(), |d| d.display().to_string())).wrap());
+                        ui.add(egui::Label::new(v.destination.resolved.as_str()).wrap());
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Choose…").clicked() {
-                                let ctx = ui.ctx().clone();
-                                self.request_pick(&ctx, PickKind::ExportFolder);
+                                cmds.push(DeliverCmd::ChooseExportDir);
                             }
-                            if self.hint.export_dir.is_some() && ui.button("Project default").clicked() {
-                                self.hint.export_dir = None;
+                            if v.destination.dir.is_some() && ui.button("Project default").clicked() {
+                                cmds.push(DeliverCmd::ResetExportDir);
                             }
                         });
                     });
@@ -2404,26 +2899,19 @@ impl App {
                 ui.label(RichText::new("Audio is not included. Files: <clip>_<output>_<in>-<out>.<mp4|mov|webm>; an existing file is never replaced.").color(theme::text_dim(ui)).size(12.0));
             });
         }
-        // Each field the user really changed (one output's delivery, fps, partial flag, folder) is the shot's own and
-        // keeps winning over a Batch preset until Reset; the others stay inherited.
-        let keys = shot_domains::export_diff(&export_before, &self.current_export());
-        if !keys.is_empty() {
-            let preset = self.hint.delivery_src.clone();
-            for k in keys {
-                self.hint.delivery_ov.entry(k.clone()).or_insert_with(|| Field { base: shot_domains::export_get(&export_before, &k), preset: preset.clone() });
-            }
-        }
-        // (The write itself is the per-frame step in `hint_pending_refresh`: as soon as the pointer settles,
-        // atomically with the markers, and kept and retried if it fails.)
-        if !self.hint.delivery_ov.is_empty() {
-            let names: Vec<String> = self.hint.delivery_ov.keys().cloned().collect();
-            let label = Self::reset_label("these delivery fields", &self.hint.delivery_ov);
+        // Each field the user really changed is the shot's own and keeps winning over a Batch preset until Reset;
+        // the write itself is the per-frame step in `hint_pending_refresh` (once the pointer settles).
+        if let Some(label) = &v.reset_label {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("Delivery, this shot's own (win over a Batch preset): {}", names.join(", "))).color(theme::text_dim(ui)).size(12.0));
+                ui.label(RichText::new(format!("Delivery, this shot's own (win over a Batch preset): {}", v.overridden.join(", "))).color(theme::text_dim(ui)).size(12.0));
                 if ui.small_button(label).clicked() {
-                    self.reset_delivery(clip);
+                    cmds.push(DeliverCmd::ResetDelivery);
                 }
             });
+        }
+        (self.hint.deliver_rects, self.hint.deliver_fmt_rects) = (rects, fmt_rects);
+        for c in cmds {
+            let _ = self.deliver_run(&ctx, c);
         }
         if let Some(n) = &self.hint.note {
             ui.label(RichText::new(n).color(theme::warn(ui)).size(12.0));
@@ -2433,47 +2921,24 @@ impl App {
     /// Deliver action when any output is a video: Key, then every video output (core queues the chain).
     pub(super) fn deliver_action(&mut self, ui: &mut Ui, clip: &Clip) {
         self.sync_deliveries(clip);
-        let ffmpeg = self.ai.models_unknown() || self.ai.local_caps().is_some_and(|c| c.tasks.get("export_video").copied().unwrap_or(false));
-        let busy = self.ai.task_busy(&clip.folder);
-        let range = self.ai_open_range();
-        let pl = self.capture_pipeline(clip);
-        let why = match (&pl, &range) {
-            (Err(e), _) | (_, Err(e)) => e.clone(),
-            _ if !ffmpeg => reason(&self.ai.local_caps(), "FFmpeg"),
-            _ if busy => "A job is running for this clip".into(),
-            _ => String::new(),
-        };
+        let ctx = ui.ctx().clone();
         // A confirmation only ever applies to the shot, results, range and settings it was opened for.
-        let sig = result_sig(clip, &range);
-        if let Some(c) = &self.hint.render_confirm {
-            let same = c.folder == clip.folder && c.sig == sig && pl.as_ref().is_ok_and(|p| *p == c.pipeline) && why.is_empty();
-            if !same {
-                self.hint.render_confirm = None;
-                self.hint_note("The confirmation was closed because the shot, its results or the Deliver settings changed. Press the button again.");
-            }
+        let g = self.deliver_gates(clip);
+        if self.hint.render_confirm.is_some() && !self.confirm_valid(clip, &g) {
+            self.hint.render_confirm = None;
+            self.hint_note("The confirmation was closed because the shot, its results or the Deliver settings changed. Press the button again.");
         }
-        let confirming = self.hint.render_confirm.is_some();
-        let go = ui.vertical_centered(|ui| ui.add_enabled(why.is_empty() && !confirming, egui::Button::new("Run full workflow").min_size(egui::vec2(220.0, 30.0)))).inner;
+        let Some(v) = self.deliver_view() else { return };
+        let mut cmd: Option<DeliverCmd> = None;
+        let go = ui.vertical_centered(|ui| ui.add_enabled(v.workflow.enabled, egui::Button::new("Run full workflow").min_size(egui::vec2(220.0, 30.0)))).inner;
         self.hint.deliver_rects.push(("render".into(), go.rect));
-        let go = go.on_hover_text("Runs this shot's whole workflow: pre-matte, hint, Key, then every enabled video output. To encode from an existing Key result without running Key again, use “Export existing Key result”.").on_disabled_hover_text(why.clone());
+        let go = go.on_hover_text("Runs this shot's whole workflow: pre-matte, hint, Key, then every enabled video output. To encode from an existing Key result without running Key again, use “Export existing Key result”.").on_disabled_hover_text(v.workflow.reason.clone());
         ui.vertical_centered(|ui| ui.label(RichText::new("Full workflow: pre-matte → hint → Key → export").color(theme::text_dim(ui)).size(11.5)));
         if go.clicked() {
-            if let (Ok(pl), Some(i), Some(p)) = (&pl, self.open, self.project.as_ref()) {
-                let existing = existing_stage_results(clip);
-                if existing.is_empty() {
-                    let ctx = ui.ctx().clone();
-                    self.ai.queue_pipeline(&ctx, p, self.settings.saved(), i, pl);
-                } else {
-                    self.hint.render_confirm = Some(RenderConfirm { folder: clip.folder.clone(), sig: sig.clone(), pipeline: pl.clone(), existing });
-                }
-            }
+            cmd = Some(DeliverCmd::RunWorkflow);
         }
-        let mut export_now = false;
-        let queued_export = decide(self.ai.scheduler(), &clip.root, Action::Export, "", None).label == "Already queued";
-        if let Some(c) = &self.hint.render_confirm {
+        if let Some(c) = &v.confirm {
             let existing = c.existing.join(", ");
-            let can_export = clip.manifest.is_some() && ffmpeg && range.is_ok() && !queued_export;
-            let (mut run, mut cancel) = (false, false);
             egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.colored_label(theme::warn(ui), format!("This shot already has {existing}."));
@@ -2481,55 +2946,44 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     let a = ui.button("Cancel");
                     self.hint.deliver_rects.push(("confirm_cancel".into(), a.rect));
-                    cancel = a.clicked();
+                    if a.clicked() {
+                        cmd = Some(DeliverCmd::CancelWorkflow);
+                    }
                     let b = ui.button("Run full workflow again");
                     self.hint.deliver_rects.push(("confirm_run".into(), b.rect));
-                    run = b.clicked();
-                    let e = ui.add_enabled(can_export, egui::Button::new("Export existing Key result instead"));
+                    if b.clicked() {
+                        cmd = Some(DeliverCmd::ConfirmWorkflow);
+                    }
+                    let e = ui.add_enabled(c.can_export_existing, egui::Button::new("Export existing Key result instead"));
                     self.hint.deliver_rects.push(("confirm_export".into(), e.rect));
-                    export_now = e.clicked();
+                    if e.clicked() {
+                        cmd = Some(DeliverCmd::ExportExisting);
+                    }
                 });
             });
-            if cancel || export_now {
-                self.hint.render_confirm = None;
-            } else if run {
-                if let (Some(c), Some(i), Some(p)) = (self.hint.render_confirm.take(), self.open, self.project.as_ref()) {
-                    let ctx = ui.ctx().clone();
-                    self.ai.queue_pipeline(&ctx, p, self.settings.saved(), i, &c.pipeline);
-                }
-            }
         }
         // While the confirmation is open its own export choice is the only one (no duplicate export buttons).
-        let mut export_click = export_now;
-        if clip.manifest.is_some() && !confirming {
-            let blocked = if !ffmpeg { Some(reason(&self.ai.local_caps(), "FFmpeg")) } else { range.as_ref().err().cloned() };
-            let d = decide(self.ai.scheduler(), &clip.root, Action::Export, "Export existing Key result", blocked);
+        if clip.manifest.is_some() && v.confirm.is_none() {
+            let x = &v.export_existing;
+            let d = crate::actions::Decision { enabled: x.enabled, label: x.label.clone(), reason: x.reason.clone() };
             let export = ui.vertical_centered(|ui| ui.add_enabled(d.enabled, egui::Button::new(d.label.as_str()).min_size(egui::vec2(220.0, 30.0)))).inner;
             self.hint.deliver_rects.push(("export_existing".into(), export.rect));
             let tip = "Encode the selected video outputs from the current Key result, without running Key again.";
-            export_click |= if d.enabled {
+            let clicked = if d.enabled {
                 export.on_hover_text(if d.reason.is_empty() { tip.to_string() } else { format!("{tip}\n{}", d.reason) }).clicked()
             } else {
                 export.on_disabled_hover_text(d.reason.as_str()).clicked()
             };
+            if clicked {
+                cmd = Some(DeliverCmd::ExportExisting);
+            }
             reason_line(ui, &[&d]);
         }
-        if export_click {
-            if let (Ok(r), Some(p)) = (range, self.project.as_ref()) {
-                let cfg = PipelineExport {
-                    outputs: self.hint.deliveries.clone(),
-                    fps: self.hint.export_fps,
-                    allow_partial: self.hint.export_partial,
-                    root: self.hint.export_dir.clone(),
-                };
-                self.hint.note = Some(match self.ai.submit_existing_deliveries(clip, &p.root, r, &cfg) {
-                    Ok(ids) => format!("Queued {} video output(s) from the existing Key result.", ids.len()),
-                    Err(e) => format!("Existing result not exported: {e}"),
-                });
-            }
+        if let Some(c) = cmd {
+            let _ = self.deliver_run(&ctx, c);
         }
-        if !why.is_empty() {
-            ui.label(RichText::new(&why).color(theme::text_dim(ui)).size(12.0));
+        if !v.workflow.reason.is_empty() {
+            ui.label(RichText::new(&v.workflow.reason).color(theme::text_dim(ui)).size(12.0));
         }
         // Why the Deliver cue is on: each reason separately, never blended into one claim.
         let rc = &self.hint.rc;
@@ -2542,8 +2996,817 @@ impl App {
         if rc.key {
             ui.label(RichText::new("The Key result is older than the current pre-matte/hint/Key settings (or missing): outputs encoded from it would be outdated.").color(theme::text_dim(ui)).size(12.0));
         }
-        if let Some(b) = self.ai.pipeline_block_reason() {
+        if let Some(b) = &v.block {
             ui.colored_label(theme::warn(ui), b);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------- Deliver: typed snapshot + commands
+
+/// The four Key outputs, in the order Deliver shows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliverOutput {
+    Fg,
+    Matte,
+    Comp,
+    Processed,
+}
+
+impl DeliverOutput {
+    pub(crate) const ALL: [DeliverOutput; 4] = [Self::Fg, Self::Matte, Self::Comp, Self::Processed];
+    /// The key used by `PipelineExport.outputs` and the shot's delivery markers.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Fg => "fg",
+            Self::Matte => "matte",
+            Self::Comp => "comp",
+            Self::Processed => "processed",
+        }
+    }
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::Fg => "FG (foreground)",
+            Self::Matte => "Matte",
+            Self::Comp => "Comp",
+            Self::Processed => "Processed (RGBA)",
+        }
+    }
+    fn enabled_mut(self, o: &mut crate::workflow::OutputCfg) -> &mut bool {
+        match self {
+            Self::Fg => &mut o.fg_enabled,
+            Self::Matte => &mut o.matte_enabled,
+            Self::Comp => &mut o.comp_enabled,
+            Self::Processed => &mut o.processed_enabled,
+        }
+    }
+    fn format_mut(self, o: &mut crate::workflow::OutputCfg) -> &mut String {
+        match self {
+            Self::Fg => &mut o.fg_format,
+            Self::Matte => &mut o.matte_format,
+            Self::Comp => &mut o.comp_format,
+            Self::Processed => &mut o.processed_format,
+        }
+    }
+}
+
+/// A video delivery with the exact stored numbers. `custom`: the container/codec pair is not one the export knows.
+#[derive(Clone)]
+pub(crate) struct DeliverVideo {
+    pub container: String,
+    pub container_label: &'static str,
+    pub codec: String,
+    pub codec_label: String,
+    pub quality: u32,
+    pub custom: bool,
+    /// "CRF" / "qscale" (empty when custom).
+    pub quality_name: &'static str,
+    pub min: u32,
+    pub max: u32,
+    /// "CRF 0-51: lower = better quality, bigger file".
+    pub quality_note: String,
+    pub alpha_warning: Option<&'static str>,
+    pub containers: Vec<Choice<String>>,
+    /// The codecs of the current container.
+    pub codecs: Vec<Choice<String>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DeliverOutputView {
+    pub output: DeliverOutput,
+    pub title: &'static str,
+    pub enabled: bool,
+    /// Sequence format: EXR (true) or PNG.
+    pub exr: bool,
+    /// `Some` = delivered as a video file, `None` = image sequence.
+    pub video: Option<DeliverVideo>,
+    pub summary: String,
+    pub enabled_overridden: bool,
+    pub format_overridden: bool,
+    pub delivery_overridden: bool,
+}
+
+/// The one EXR compression every EXR sequence shares.
+#[derive(Clone)]
+pub(crate) struct DeliverCompression {
+    pub value: String,
+    pub choices: Vec<&'static str>,
+    pub shared_note: &'static str,
+    pub lossy_note: Option<&'static str>,
+    pub overridden: bool,
+}
+
+/// The one frame rate every video shares: `stored` is exact (None = each shot's own `source`).
+#[derive(Clone)]
+pub(crate) struct DeliverFps {
+    pub stored: Option<f64>,
+    pub source: f64,
+    pub overridden: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct DeliverDestination {
+    /// The shot's own video folder (None = the project default).
+    pub dir: Option<PathBuf>,
+    pub resolved: String,
+    pub overridden: bool,
+}
+
+/// Project-wide image output templates (`App.loc`); a project setting, not a per-shot one.
+#[derive(Clone)]
+pub(crate) struct DeliverLocation {
+    pub root: String,
+    pub folder: String,
+    pub file: String,
+    /// The first output's resolved path, or why it cannot be resolved.
+    pub preview: Result<String, String>,
+    pub saved: bool,
+    pub note: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DeliverPreset {
+    pub name: String,
+    pub label: String,
+    /// Parameters/outputs only (partial apply).
+    pub legacy: bool,
+}
+
+/// "Run full workflow" while results exist: waits on frozen settings for an explicit choice.
+#[derive(Clone)]
+pub(crate) struct DeliverConfirm {
+    pub existing: Vec<String>,
+    pub can_export_existing: bool,
+}
+
+/// Read-only snapshot of the Deliver stage of the open shot (cached state only; nothing is probed or written).
+#[derive(Clone)]
+pub(crate) struct DeliverView {
+    pub outputs: Vec<DeliverOutputView>,
+    pub compression: DeliverCompression,
+    pub fps: DeliverFps,
+    pub has_video: bool,
+    /// In/Out frames (false) or the Done frames of a partial result (true).
+    pub done_frames: bool,
+    pub done_frames_overridden: bool,
+    pub destination: DeliverDestination,
+    pub location: DeliverLocation,
+    /// Outputs badge: the written outputs are older than the settings. Reasons are listed separately below.
+    pub out_of_date: bool,
+    pub out_of_date_why: Vec<String>,
+    /// Outputs with no export seen in this session: unverified, not out of date.
+    pub unverified: Vec<String>,
+    pub key_older: bool,
+    /// Export primary: existing result for video, the Key render for sequence-only.
+    pub export: HintAct,
+    pub export_existing: HintAct,
+    pub workflow: HintAct,
+    pub confirm: Option<DeliverConfirm>,
+    pub presets: Vec<DeliverPreset>,
+    /// A preset waiting for delete confirmation.
+    pub preset_delete: Option<String>,
+    pub overridden: Vec<String>,
+    pub reset_label: Option<String>,
+    pub block: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DeliverCmd {
+    SetEnabled { output: DeliverOutput, on: bool },
+    SetSeqFormat { output: DeliverOutput, exr: bool },
+    SetKind { output: DeliverOutput, video: bool },
+    SetContainer { output: DeliverOutput, container: String },
+    SetCodec { output: DeliverOutput, codec: String },
+    SetQuality { output: DeliverOutput, quality: f32 },
+    SetCompression(String),
+    SetFps(f64),
+    /// Back to each shot's own frame rate.
+    UseSourceFps,
+    SetRange { done_frames: bool },
+    ChooseExportDir,
+    ResetExportDir,
+    EditLocation { root: String, folder: String, file: String },
+    SaveLocation,
+    ResetLocation,
+    ResetDelivery,
+    Export,
+    ExportExisting,
+    RunWorkflow,
+    ConfirmWorkflow,
+    CancelWorkflow,
+    SavePreset(String),
+    ApplyPreset(String),
+    RequestDeletePreset(String),
+    CancelDeletePreset,
+    ConfirmDeletePreset(String),
+}
+
+struct DeliverGates {
+    ffmpeg: bool,
+    range: Result<(usize, usize), String>,
+    pl: Result<crate::presets::Pipeline, String>,
+    /// Why the full workflow cannot start now (empty = it can).
+    why: String,
+}
+
+fn video_view(v: &VideoDelivery) -> DeliverVideo {
+    let cur = VIDEO_CODECS.iter().find(|c| c.container == v.container && c.id == v.codec);
+    let name = cur.map_or("", |c| if matches!(c.quality, QualityKind::Crf) { "CRF" } else { "qscale" });
+    let (min, max) = cur.map_or((0, 0), |c| (c.min, c.max));
+    DeliverVideo {
+        container: v.container.clone(),
+        container_label: match v.container.as_str() {
+            "mp4" => "MP4",
+            "mov_prores4444" => "MOV",
+            "webm_alpha" => "WebM",
+            _ => "Custom",
+        },
+        codec: v.codec.clone(),
+        codec_label: cur.map_or_else(|| "Custom".to_string(), codec_text),
+        quality: v.quality,
+        custom: cur.is_none(),
+        quality_name: name,
+        min,
+        max,
+        quality_note: if cur.is_some() { format!("{name} {min}-{max}: lower = better quality, bigger file") } else { String::new() },
+        alpha_warning: cur.is_some_and(|c| !c.alpha).then_some("This codec has no alpha: transparency is not retained. Use MOV ProRes 4444 or WebM VP9 to keep it."),
+        containers: [("mp4", "MP4"), ("mov_prores4444", "MOV"), ("webm_alpha", "WebM")]
+            .iter()
+            .map(|(id, l)| Choice { value: id.to_string(), label: l.to_string(), ready: true })
+            .collect(),
+        codecs: VIDEO_CODECS
+            .iter()
+            .filter(|c| c.container == v.container)
+            .map(|c| Choice { value: c.id.to_string(), label: codec_text(c), ready: true })
+            .collect(),
+    }
+}
+
+impl App {
+    /// Output settings of the shot without creating its draft.
+    fn deliver_out_cfg(&self, clip: &Clip) -> Option<crate::workflow::OutputCfg> {
+        let pr = self.project.as_ref()?;
+        Some(self.ai.draft_of(&clip.folder).map_or_else(|| crate::workflow::seed(clip, pr, self.settings.saved()).1, |d| d.out.clone()))
+    }
+
+    /// The shot's export settings following the enabled outputs (what `sync_deliveries` stores), without writing.
+    fn export_now(&self, o: &crate::workflow::OutputCfg) -> PipelineExport {
+        let mut e = self.current_export();
+        e.sync_outputs(o);
+        e
+    }
+
+    /// The full pipeline from the live state, read-only (`capture_pipeline` is this plus the syncing).
+    fn pipeline_now(&self, clip: &Clip) -> Result<crate::presets::Pipeline, String> {
+        let pr = self.project.as_ref().ok_or("no project open")?;
+        let (params, outputs) = self
+            .ai
+            .draft_of(&clip.folder)
+            .map(|d| (d.params.clone(), d.out.clone()))
+            .unwrap_or_else(|| {
+                let (p, o, _) = crate::workflow::seed(clip, pr, self.settings.saved());
+                (p, o)
+            });
+        let p = crate::presets::Pipeline {
+            hint: self.hint_cfg_for(clip),
+            params,
+            location: pr.output_location.clone().filter(|l| !l.is_null()),
+            export: self.export_now(&outputs),
+            outputs,
+        };
+        p.validate()?;
+        Ok(p)
+    }
+
+    fn deliver_gates(&self, clip: &Clip) -> DeliverGates {
+        let ffmpeg = self.ai.models_unknown() || self.ai.local_caps().is_some_and(|c| c.tasks.get("export_video").copied().unwrap_or(false));
+        let busy = self.ai.task_busy(&clip.folder);
+        let range = self.ai_open_range();
+        let pl = self.pipeline_now(clip);
+        let why = match (&pl, &range) {
+            (Err(e), _) | (_, Err(e)) => e.clone(),
+            _ if !ffmpeg => reason(&self.ai.local_caps(), "FFmpeg"),
+            _ if busy => "A job is running for this clip".into(),
+            _ => String::new(),
+        };
+        DeliverGates { ffmpeg, range, pl, why }
+    }
+
+    /// The "Export existing Key result" decision; `None` = this shot has no Key result.
+    fn export_existing_decision(&self, clip: &Clip, g: &DeliverGates) -> Option<crate::actions::Decision> {
+        clip.manifest.as_ref()?;
+        let blocked = if !g.ffmpeg { Some(reason(&self.ai.local_caps(), "FFmpeg")) } else { g.range.as_ref().err().cloned() };
+        Some(decide(self.ai.scheduler(), &clip.root, Action::Export, "Export existing Key result", blocked))
+    }
+
+    /// A confirmation only ever applies to the shot, results, range and settings it was opened for.
+    fn confirm_valid(&self, clip: &Clip, g: &DeliverGates) -> bool {
+        self.hint.render_confirm.as_ref().is_some_and(|c| {
+            c.folder == clip.folder && c.sig == result_sig(clip, &g.range) && g.pl.as_ref().is_ok_and(|p| *p == c.pipeline) && g.why.is_empty()
+        })
+    }
+
+    /// Every frame while a shot is open: read-only (the gates read the live state through `export_now`, so nothing is
+    /// synced into `hint.deliveries`, which would make a freshly opened shot unsaved); only closes a stale confirmation.
+    pub(crate) fn deliver_tick(&mut self) {
+        let Some(clip) = self.clip().cloned() else { return };
+        if self.hint.folder.as_deref() == Some(clip.folder.as_str()) {
+            let g = self.deliver_gates(&clip);
+            if self.hint.render_confirm.is_some() && !self.confirm_valid(&clip, &g) {
+                self.hint.render_confirm = None;
+                self.hint_note("The confirmation was closed because the shot, its results or the Deliver settings changed. Press the button again.");
+            }
+        }
+    }
+
+    /// Once per frame before `deliver_view` (loads the presets file the first time; nothing else is read).
+    pub(crate) fn deliver_prepare(&mut self) {
+        self.ensure_presets();
+    }
+
+    pub(crate) fn deliver_view(&self) -> Option<DeliverView> {
+        let clip = self.clip()?;
+        let h = &self.hint;
+        if h.folder.as_deref() != Some(clip.folder.as_str()) {
+            return None;
+        }
+        let o = self.deliver_out_cfg(clip)?;
+        let pr = self.project.as_ref()?;
+        let exp = self.export_now(&o);
+        let ex = self.ai.draft_of(&clip.folder).map(|d| d.explicit.clone()).unwrap_or_default();
+        let outputs = DeliverOutput::ALL
+            .map(|out| {
+                let k = out.key();
+                let enabled = exp.outputs.contains_key(k);
+                let exr = match out {
+                    DeliverOutput::Fg => &o.fg_format,
+                    DeliverOutput::Matte => &o.matte_format,
+                    DeliverOutput::Comp => &o.comp_format,
+                    DeliverOutput::Processed => &o.processed_format,
+                } == "exr";
+                let video = match exp.outputs.get(k) {
+                    Some(Delivery::Video(v)) => Some(video_view(v)),
+                    _ => None,
+                };
+                let summary = match (&video, enabled) {
+                    (_, false) => "Not written".to_string(),
+                    (None, _) => format!("{} sequence", if exr { "EXR" } else { "PNG" }),
+                    (Some(v), _) if v.custom => format!("Custom video ({} / {}, {})", v.container, v.codec, v.quality),
+                    (Some(v), _) => format!("{} · {} · {} {}", v.container_label, v.codec_label, v.quality_name, v.quality),
+                };
+                DeliverOutputView {
+                    output: out,
+                    title: out.title(),
+                    enabled,
+                    exr,
+                    video,
+                    summary,
+                    enabled_overridden: ex.contains_key(&format!("{k}_enabled")),
+                    format_overridden: ex.contains_key(&format!("{k}_format")),
+                    delivery_overridden: h.delivery_ov.contains_key(k),
+                }
+            })
+            .to_vec();
+        let g = self.deliver_gates(clip);
+        let has_video = exp.has_video();
+        let ex_dec = self.export_existing_decision(clip, &g);
+        let export_existing = if !has_video {
+            HintAct { enabled: false, label: "Export existing Key result".into(), reason: "No output is delivered as a video file.".into() }
+        } else {
+            ex_dec.as_ref().map_or_else(
+                || HintAct { enabled: false, label: "Export existing Key result".into(), reason: "This shot has no Key result to export yet.".into() },
+                HintAct::from,
+            )
+        };
+        let export = if has_video {
+            export_existing.clone()
+        } else {
+            let kv = self.ai.key_view(clip, pr, self.settings.saved());
+            let reason = match (&kv.blocker, kv.primary_intent.is_none()) {
+                (Some(b), _) => b.message.clone(),
+                (None, true) => "A result already exists: choose what to do with it in Key / Render.".into(),
+                _ => kv.status_line.clone().unwrap_or_default(),
+            };
+            HintAct { enabled: kv.primary_enabled && kv.primary_intent.is_some(), label: kv.primary_label.clone(), reason }
+        };
+        let confirming = self.confirm_valid(clip, &g);
+        let location = {
+            let preview = self.location_resolved(clip, &o);
+            DeliverLocation {
+                root: self.loc.root.display().to_string(),
+                folder: self.loc.folder_template.clone(),
+                file: self.loc.file_template.clone(),
+                preview,
+                saved: pr.output_location.as_ref().is_some_and(|v| !v.is_null()),
+                note: self.loc_note.clone(),
+            }
+        };
+        let rc = &h.rc;
+        Some(DeliverView {
+            outputs,
+            compression: DeliverCompression {
+                lossy_note: (o.exr_compression == "dwab").then_some("DWAB is lossy: HDR values are not bit-exact."),
+                value: o.exr_compression.clone(),
+                choices: crate::workflow::EXR_COMPRESSIONS.to_vec(),
+                shared_note: "Applies to every EXR sequence (shared).",
+                overridden: ex.contains_key("exr_compression"),
+            },
+            fps: DeliverFps { stored: exp.fps, source: clip.fps, overridden: h.delivery_ov.contains_key("fps") },
+            has_video,
+            done_frames: exp.allow_partial,
+            done_frames_overridden: h.delivery_ov.contains_key("partial"),
+            destination: DeliverDestination {
+                resolved: crate::pipeline::export_dir(clip, &pr.root, exp.root.as_deref()).display().to_string(),
+                dir: exp.root.clone(),
+                overridden: h.delivery_ov.contains_key("root"),
+            },
+            location,
+            out_of_date: self.stage_pending(Node::Out(View::Fg)),
+            out_of_date_why: rc.deliver_why.clone(),
+            unverified: rc.deliver_unverified.clone(),
+            key_older: rc.key,
+            export,
+            export_existing,
+            workflow: HintAct { enabled: g.why.is_empty() && !confirming, label: "Run full workflow".into(), reason: g.why.clone() },
+            confirm: confirming
+                .then(|| h.render_confirm.as_ref())
+                .flatten()
+                .map(|c| DeliverConfirm { existing: c.existing.clone(), can_export_existing: ex_dec.as_ref().is_some_and(|d| d.enabled) }),
+            presets: h
+                .presets
+                .iter()
+                .filter(|p| p.kind == "workflow")
+                .map(|p| DeliverPreset { name: p.name.clone(), label: crate::presets::label(p), legacy: crate::presets::class_of(p) == crate::presets::PresetClass::LegacyWorkflow })
+                .collect(),
+            preset_delete: h.preset_del.clone().filter(|n| h.presets.iter().any(|p| p.kind == "workflow" && &p.name == n)),
+            overridden: h.delivery_ov.keys().cloned().collect(),
+            reset_label: (!h.delivery_ov.is_empty()).then(|| Self::reset_label("these delivery fields", &h.delivery_ov)),
+            block: self.ai.pipeline_block_reason(),
+            note: h.note.clone(),
+        })
+    }
+
+    /// First output's resolved image path under the templates in `self.loc` (what the old editor showed).
+    fn location_resolved(&self, clip: &Clip, o: &crate::workflow::OutputCfg) -> Result<String, String> {
+        let (w, h) = clip.sample_size.unwrap_or((0, 0));
+        let sv = |k: &str| clip.output_values.as_ref().and_then(|v| v.get(k)).and_then(Value::as_str).map(str::to_owned);
+        let vals = ClipOutputValues {
+            project: self.project.as_ref().map(|p| p.display_name.clone()).unwrap_or_default(),
+            name: clip.name.clone(),
+            resolution: sv("resolution").unwrap_or_else(|| resolution_label(w, h)),
+            date: sv("date").unwrap_or_else(crate::workflow::today),
+            version: clip.output_values.as_ref().and_then(|v| v.get("version")).and_then(Value::as_u64).map_or(1, |v| v as u32),
+        };
+        let kinds = o.kinds();
+        let frame = self.viewer.as_ref().map_or(0, |v| v.index.frame_number(v.playhead));
+        match kinds.first().map(|k| resolve_path(&self.loc, &vals, k.0, kinds.len(), frame, k.1)) {
+            Some(Ok(p)) => Ok(display(&p)),
+            Some(Err(e)) => Err(format!("{e:?}")),
+            None => Err("No output enabled".into()),
+        }
+    }
+
+    /// Give each field the user really changed the shot's own marker (value before the edit = its Reset base).
+    fn mark_delivery_edits(&mut self, before: &PipelineExport) {
+        let keys = shot_domains::export_diff(before, &self.current_export());
+        if keys.is_empty() {
+            return;
+        }
+        let preset = self.hint.delivery_src.clone();
+        for k in keys {
+            self.hint.delivery_ov.entry(k.clone()).or_insert_with(|| Field { base: shot_domains::export_get(before, &k), preset: preset.clone() });
+        }
+    }
+
+    /// Edit the Key output draft (enabled/format/compression) with the Key panel's snapshot + `mark_edits` rule.
+    fn deliver_draft_edit(&mut self, clip: &Clip, f: impl FnOnce(&mut crate::workflow::OutputCfg) -> Result<(), String>) -> Result<(), String> {
+        let pr = self.project.as_ref().ok_or("no project open")?;
+        let dr = self.ai.draft(clip, pr, self.settings.saved());
+        let snap = dr.snapshot();
+        let mut out = dr.out.clone();
+        f(&mut out)?;
+        out.validate()?;
+        dr.out = out;
+        dr.mark_edits(&snap);
+        Ok(())
+    }
+
+    /// `deliver_cmd` without the immediate delivery write: the old panel drags sliders through this and lets
+    /// `hint_pending_refresh` write once the pointer settles.
+    pub(crate) fn deliver_run(&mut self, ctx: &egui::Context, c: DeliverCmd) -> Result<(), String> {
+        let Some(clip) = self.open_clip_snapshot() else {
+            return Err("Open a shot first.".into());
+        };
+        if self.hint.folder.as_deref() != Some(clip.folder.as_str()) {
+            return Err("This shot's delivery settings are still loading.".into());
+        }
+        self.hint.cmd_err = None;
+        self.sync_deliveries(&clip);
+        let before = self.current_export();
+        // Only edits of the shot's own delivery fields get override markers (never a preset Apply / Reset / sync).
+        let marks = matches!(c, DeliverCmd::SetKind { .. } | DeliverCmd::SetContainer { .. } | DeliverCmd::SetCodec { .. } | DeliverCmd::SetQuality { .. } | DeliverCmd::SetFps(_) | DeliverCmd::UseSourceFps | DeliverCmd::SetRange { .. } | DeliverCmd::ResetExportDir);
+        let video_mut = |app: &mut App, o: DeliverOutput| -> Result<VideoDelivery, String> {
+            match app.hint.deliveries.get(o.key()) {
+                Some(Delivery::Video(v)) => Ok(v.clone()),
+                Some(Delivery::Sequence) => Err(format!("{} is delivered as an image sequence: choose Video file first.", o.title())),
+                None => Err(format!("{} is not enabled.", o.title())),
+            }
+        };
+        match c {
+            DeliverCmd::SetEnabled { output, on } => {
+                self.deliver_draft_edit(&clip, |o| {
+                    *output.enabled_mut(o) = on;
+                    Ok(())
+                })?;
+                self.sync_deliveries(&clip);
+            }
+            DeliverCmd::SetSeqFormat { output, exr } => self.deliver_draft_edit(&clip, |o| {
+                *output.format_mut(o) = if exr { "exr" } else { "png" }.into();
+                Ok(())
+            })?,
+            DeliverCmd::SetKind { output, video } => {
+                let Some(d) = self.hint.deliveries.get_mut(output.key()) else {
+                    return Err(format!("{} is not enabled.", output.title()));
+                };
+                match (video, matches!(d, Delivery::Video(_))) {
+                    (true, false) => *d = Delivery::Video(VideoDelivery::default_for("mp4")),
+                    (false, true) => *d = Delivery::Sequence,
+                    _ => {}
+                }
+            }
+            DeliverCmd::SetContainer { output, container } => {
+                if !VIDEO_CODECS.iter().any(|c| c.container == container) {
+                    return Err(format!("Unknown video file type {container}"));
+                }
+                let v = video_mut(self, output)?;
+                if v.container != container || crate::presets::codec(&v.container, &v.codec).is_none() {
+                    self.hint.deliveries.insert(output.key().into(), Delivery::Video(VideoDelivery::default_for(&container)));
+                }
+            }
+            DeliverCmd::SetCodec { output, codec } => {
+                let v = video_mut(self, output)?;
+                let Some(c) = crate::presets::codec(&v.container, &codec) else {
+                    return Err(format!("{codec} is not a codec of this file type."));
+                };
+                if c.id != v.codec {
+                    self.hint.deliveries.insert(output.key().into(), Delivery::Video(VideoDelivery { container: v.container, codec: c.id.into(), quality: c.default }));
+                }
+            }
+            DeliverCmd::SetQuality { output, quality } => {
+                let mut v = video_mut(self, output)?;
+                let Some(c) = crate::presets::codec(&v.container, &v.codec) else {
+                    return Err("Choose a file type and codec first.".into());
+                };
+                if !quality.is_finite() {
+                    return Err("Quality must be a number.".into());
+                }
+                v.quality = (quality.round().max(0.0) as u32).clamp(c.min, c.max);
+                self.hint.deliveries.insert(output.key().into(), Delivery::Video(v));
+            }
+            DeliverCmd::SetCompression(c) => {
+                let c = crate::workflow::EXR_COMPRESSIONS.iter().find(|x| **x == c).ok_or_else(|| format!("Unknown EXR compression {c}"))?;
+                self.deliver_draft_edit(&clip, |o| {
+                    o.exr_compression = c.to_string();
+                    Ok(())
+                })?;
+            }
+            DeliverCmd::SetFps(f) => {
+                if !f.is_finite() || !(0.001..=1000.0).contains(&f) {
+                    return Err("Frame rate must be between 0.001 and 1000 fps.".into());
+                }
+                self.hint.export_fps = Some(f);
+            }
+            DeliverCmd::UseSourceFps => self.hint.export_fps = None,
+            DeliverCmd::SetRange { done_frames } => self.hint.export_partial = done_frames,
+            DeliverCmd::ChooseExportDir => {
+                if !self.request_pick(ctx, PickKind::ExportFolder) {
+                    return Err("Another dialog is open.".into());
+                }
+            }
+            DeliverCmd::ResetExportDir => self.hint.export_dir = None,
+            DeliverCmd::EditLocation { root, folder, file } => {
+                self.loc.root = root.into();
+                (self.loc.folder_template, self.loc.file_template) = (folder, file);
+            }
+            DeliverCmd::SaveLocation => {
+                let root = self.project.as_ref().map(|p| p.root.clone()).ok_or("no project open")?;
+                match crate::workflow::save_location(&root, &self.loc) {
+                    Ok(v) => {
+                        if let Some(p) = &mut self.project {
+                            p.output_location = Some(v);
+                        }
+                        self.loc_note = Some("Saved to project.json".into());
+                    }
+                    Err(e) => {
+                        self.loc_note = Some(format!("Not saved: {e}"));
+                        return Err(e);
+                    }
+                }
+            }
+            DeliverCmd::ResetLocation => {
+                let root = self.project.as_ref().map(|p| p.root.clone()).ok_or("no project open")?;
+                match crate::workflow::clear_location(&root) {
+                    Ok(()) => {
+                        if let Some(p) = &mut self.project {
+                            p.output_location = None;
+                        }
+                        if let Some(l) = crate::workflow::default_location(&clip) {
+                            self.loc = l;
+                        }
+                        self.loc_note = Some("Default location restored".into());
+                    }
+                    Err(e) => {
+                        self.loc_note = Some(format!("Not saved: {e}"));
+                        return Err(e);
+                    }
+                }
+            }
+            DeliverCmd::ResetDelivery => {
+                self.reset_delivery(&clip);
+                return self.hint.cmd_err.take().map_or(Ok(()), Err);
+            }
+            DeliverCmd::Export if self.deliver_export_is_existing(&clip) => return self.deliver_export_existing(&clip),
+            DeliverCmd::Export => {
+                let (Some(pr), Some(_)) = (self.project.as_ref(), self.open) else { return Err("Open a shot first.".into()) };
+                let kv = self.ai.key_view(&clip, pr, self.settings.saved());
+                let Some(i) = kv.primary_intent.clone() else {
+                    return Err("A result already exists: choose what to do with it in Key / Render.".into());
+                };
+                if !kv.primary_enabled {
+                    return Err(kv.blocker.map(|b| b.message).or(kv.status_line).unwrap_or_else(|| "Key cannot start now.".into()));
+                }
+                return self.ai.key_cmd(&clip, pr, self.settings.saved(), ctx, crate::ui::ai::KeyCmd::Submit(i));
+            }
+            DeliverCmd::ExportExisting => return self.deliver_export_existing(&clip),
+            DeliverCmd::RunWorkflow => {
+                let g = self.deliver_gates(&clip);
+                if !g.why.is_empty() {
+                    return Err(g.why);
+                }
+                if self.hint.render_confirm.is_some() {
+                    return Err("Answer the open confirmation first.".into());
+                }
+                let (Ok(pl), Some(i), Some(p)) = (&g.pl, self.open, self.project.as_ref()) else { return Err("Open a shot first.".into()) };
+                let existing = existing_stage_results(&clip);
+                if existing.is_empty() {
+                    self.ai.queue_pipeline(ctx, p, self.settings.saved(), i, pl);
+                } else {
+                    self.hint.render_confirm = Some(RenderConfirm { folder: clip.folder.clone(), sig: result_sig(&clip, &g.range), pipeline: pl.clone(), existing });
+                }
+            }
+            DeliverCmd::ConfirmWorkflow => {
+                let g = self.deliver_gates(&clip);
+                if self.hint.render_confirm.is_none() {
+                    return Err("There is nothing to confirm.".into());
+                }
+                if !self.confirm_valid(&clip, &g) {
+                    self.hint.render_confirm = None;
+                    let m = "The confirmation was closed because the shot, its results or the Deliver settings changed. Press the button again.";
+                    self.hint_note(m);
+                    return Err(m.into());
+                }
+                if let (Some(c), Some(i), Some(p)) = (self.hint.render_confirm.take(), self.open, self.project.as_ref()) {
+                    self.ai.queue_pipeline(ctx, p, self.settings.saved(), i, &c.pipeline);
+                }
+            }
+            DeliverCmd::CancelWorkflow => self.hint.render_confirm = None,
+            DeliverCmd::SavePreset(name) => {
+                self.ensure_presets();
+                let n = name.trim().to_string();
+                if n.is_empty() {
+                    return Err("Name the preset first.".into());
+                }
+                let data = match self.capture_pipeline(&clip) {
+                    Ok(p) => p.to_value(),
+                    Err(e) => {
+                        let m = format!("Preset not saved: {e}");
+                        self.hint_note(m.clone());
+                        return Err(m);
+                    }
+                };
+                self.hint.presets.retain(|p| !(p.kind == "workflow" && p.name == n));
+                self.hint.presets.push(crate::presets::Preset { name: n.clone(), kind: "workflow".into(), data });
+                (self.hint.preset_name_for, self.hint.preset_sel) = (n.clone(), n.clone());
+                if !self.store_presets() {
+                    return Err(self.hint.cmd_err.clone().unwrap_or_else(|| "Presets not saved".into()));
+                }
+                self.hint.note = Some(format!("Saved “{n}”."));
+            }
+            DeliverCmd::ApplyPreset(name) => {
+                self.ensure_presets();
+                let pr = self.hint.presets.iter().find(|p| p.kind == "workflow" && p.name == name).cloned().ok_or_else(|| format!("No preset named “{name}”."))?;
+                self.hint.preset_sel = name.clone();
+                let (note, ok) = self.apply_workflow_preset(ctx, &clip, &pr);
+                self.hint.note = Some(note.clone());
+                if !ok {
+                    self.hint.cmd_err = Some(note.clone());
+                    return Err(note);
+                }
+            }
+            DeliverCmd::RequestDeletePreset(name) => {
+                self.ensure_presets();
+                if !self.hint.presets.iter().any(|p| p.kind == "workflow" && p.name == name) {
+                    return Err(format!("No preset named “{name}”."));
+                }
+                self.hint.preset_del = Some(name);
+            }
+            DeliverCmd::CancelDeletePreset => self.hint.preset_del = None,
+            DeliverCmd::ConfirmDeletePreset(name) => {
+                if self.hint.preset_del.as_deref() != Some(name.as_str()) {
+                    return Err("Delete needs your confirmation first.".into());
+                }
+                self.hint.preset_del = None;
+                self.hint.presets.retain(|p| !(p.kind == "workflow" && p.name == name));
+                if !self.store_presets() {
+                    return Err(self.hint.cmd_err.clone().unwrap_or_else(|| "Presets not saved".into()));
+                }
+            }
+        }
+        if marks {
+            self.mark_delivery_edits(&before);
+        }
+        Ok(())
+    }
+
+    /// One Deliver command, through the same paths as the old Deliver panel. A change to the shot's own delivery
+    /// fields is written at once (atomically with its markers); `Err` = refused or failed, nothing is half-applied.
+    pub(crate) fn deliver_cmd(&mut self, ctx: &egui::Context, c: DeliverCmd) -> Result<(), String> {
+        self.deliver_run(ctx, c)?;
+        let Some(clip) = self.open_clip_snapshot() else { return Ok(()) };
+        let json = delivery_json(&self.hint);
+        if !self.hint.delivery_ov.is_empty() && !self.hint.deliveries.is_empty() && json != self.hint.saved_delivery {
+            if let Err(e) = self.persist_delivery(&clip) {
+                let m = format!("Delivery not saved: {e}. It stays here and is retried on your next edit or Save.");
+                self.hint_note(m.clone());
+                return Err(m);
+            }
+            self.refresh_after_save(&clip.folder);
+        }
+        Ok(())
+    }
+
+    /// Export's primary is the existing result whenever any output is a video.
+    fn deliver_export_is_existing(&self, clip: &Clip) -> bool {
+        self.deliver_out_cfg(clip).is_some_and(|o| self.export_now(&o).has_video())
+    }
+
+    fn deliver_export_existing(&mut self, clip: &Clip) -> Result<(), String> {
+        let g = self.deliver_gates(clip);
+        if !self.deliver_export_is_existing(clip) {
+            return Err("No output is delivered as a video file.".into());
+        }
+        let d = self.export_existing_decision(clip, &g).ok_or("This shot has no Key result to export yet.")?;
+        if !d.enabled {
+            return Err(d.reason);
+        }
+        // Choosing it inside the full-workflow confirmation closes that question.
+        self.hint.render_confirm = None;
+        let (r, Some(p)) = (g.range?, self.project.as_ref()) else { return Err("Open a shot first.".into()) };
+        let cfg = self.current_export();
+        match self.ai.submit_existing_deliveries(clip, &p.root, r, &cfg) {
+            Ok(ids) => {
+                self.hint.note = Some(format!("Queued {} video output(s) from the existing Key result.", ids.len()));
+                Ok(())
+            }
+            Err(e) => {
+                let m = format!("Existing result not exported: {e}");
+                self.hint_note(m.clone());
+                Err(m)
+            }
+        }
+    }
+
+    /// Apply a saved workflow preset (full pipeline, or legacy parameters/outputs only). (note, applied)
+    fn apply_workflow_preset(&mut self, ctx: &egui::Context, clip: &Clip, pr: &crate::presets::Preset) -> (String, bool) {
+        let sel = pr.name.clone();
+        if crate::presets::class_of(pr) == crate::presets::PresetClass::Pipeline {
+            return match crate::presets::Pipeline::from_value(&pr.data) {
+                Err(e) => (format!("Preset not applied: {e}"), false),
+                Ok(pl) => match self.apply_pipeline(ctx, clip, &sel, &pl) {
+                    Ok(()) => (format!("Applied “{sel}”: pre-matte, hint, Key, outputs and export settings. {} Range, colour, prompts and marks are untouched.", if pl.location.is_none() { "Project output location reset to default." } else { "Project output location updated." }), true),
+                    Err(e) => (format!("Preset “{sel}” not fully applied: {e}"), false),
+                },
+            };
+        }
+        let Some(p) = self.project.as_ref() else { return ("Preset not applied: no project open".into(), false) };
+        let dr = self.ai.draft(clip, p, self.settings.saved());
+        let res = crate::presets::apply_workflow(&pr.data, &mut dr.params, &mut dr.out);
+        if res.is_ok() {
+            // Only the fields this preset carries lose their override marker.
+            let carried: std::collections::BTreeSet<String> = ["params", "outputs"]
+                .iter()
+                .flat_map(|k| pr.data.get(k).and_then(|v| v.as_object()).into_iter().flat_map(|m| m.keys().cloned()))
+                .collect();
+            dr.applied(&sel, Some(&carried));
+            // A pick of the clip's own hint mode is one of those fields: it now follows the preset.
+            if crate::persist::explicit_hint_mode(clip).is_some() && pr.data["params"].get("hint_mode").is_some() {
+                let _ = crate::persist::save_preset_hint_mode(clip, &dr.params.hint_mode);
+            }
+        }
+        match res {
+            Ok(()) => (format!("Applied legacy preset “{sel}”: parameters and outputs only (partial; pre-matte, hint, locations and export unchanged)."), true),
+            Err(e) => (format!("Preset not applied: {e}"), false),
         }
     }
 }
@@ -2662,23 +3925,8 @@ impl App {
     pub fn capture_pipeline(&mut self, clip: &Clip) -> Result<crate::presets::Pipeline, String> {
         self.sync_deliveries(clip);
         let Some(pr) = self.project.as_ref() else { return Err("no project open".into()) };
-        let d = self.ai.draft(clip, pr, self.settings.saved());
-        let (params, outputs) = (d.params.clone(), d.out.clone());
-        let location = pr.output_location.clone().filter(|l| !l.is_null());
-        let p = crate::presets::Pipeline {
-            hint: self.hint_cfg_for(clip),
-            params,
-            outputs,
-            location,
-            export: PipelineExport {
-                fps: self.hint.export_fps,
-                allow_partial: self.hint.export_partial,
-                root: self.hint.export_dir.clone(),
-                outputs: self.hint.deliveries.clone(),
-            },
-        };
-        p.validate()?;
-        Ok(p)
+        self.ai.draft(clip, pr, self.settings.saved());
+        self.pipeline_now(clip)
     }
 
     /// Persist and adopt a validated pipeline. Each step reports its own failure; a step that did not save is
@@ -2745,9 +3993,10 @@ impl App {
     }
 
     /// Workflow presets: the full pre-matte -> Key -> per-output delivery pipeline (Key and Deliver share the
-    /// list). Source-bound values are never copied (see `presets`).
-    pub(super) fn preset_ui(&mut self, ui: &mut Ui, clip: &Clip) {
+    /// list). Source-bound values are never copied (see `presets`). Every button is a `DeliverCmd`.
+    pub(super) fn preset_ui(&mut self, ui: &mut Ui, _clip: &Clip) {
         self.ensure_presets();
+        let ctx = ui.ctx().clone();
         let kind = "workflow";
         ui.label(
             RichText::new("Workflow presets").strong(),
@@ -2765,6 +4014,7 @@ impl App {
         }
         let sel_label = names.iter().find(|n| n.0 == self.hint.preset_sel).map_or("(none saved)".to_string(), |n| n.1.clone());
         self.hint.preset_rects.clear();
+        let mut cmd: Option<DeliverCmd> = None;
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt(("preset", kind)).selected_text(sel_label).show_ui(ui, |ui| {
                 for (n, l) in &names {
@@ -2775,48 +4025,30 @@ impl App {
             let ap = ui.add_enabled(have, egui::Button::new("Apply"));
             self.hint.preset_rects.push(("apply", ap.rect));
             if ap.clicked() {
-                let found = self.hint.presets.iter().find(|p| p.kind == kind && p.name == self.hint.preset_sel).cloned();
-                if let (Some(pr), true) = (found, self.project.is_some()) {
-                    let sel = pr.name.clone();
-                    if crate::presets::class_of(&pr) == crate::presets::PresetClass::Pipeline {
-                        let note = match crate::presets::Pipeline::from_value(&pr.data) {
-                            Err(e) => format!("Preset not applied: {e}"),
-                            Ok(pl) => match self.apply_pipeline(ui.ctx(), clip, &sel, &pl) {
-                                Ok(()) => format!("Applied “{sel}”: pre-matte, hint, Key, outputs and export settings. {} Range, colour, prompts and marks are untouched.", if pl.location.is_none() { "Project output location reset to default." } else { "Project output location updated." }),
-                                Err(e) => format!("Preset “{sel}” not fully applied: {e}"),
-                            },
-                        };
-                        self.hint.note = Some(note);
-                    } else if let Some(p) = self.project.as_ref() {
-                        let dr = self.ai.draft(clip, p, self.settings.saved());
-                        let res = crate::presets::apply_workflow(&pr.data, &mut dr.params, &mut dr.out);
-                        if res.is_ok() {
-                            // Only the fields this preset carries lose their override marker.
-                            let carried: std::collections::BTreeSet<String> = ["params", "outputs"]
-                                .iter()
-                                .flat_map(|k| pr.data.get(k).and_then(|v| v.as_object()).into_iter().flat_map(|m| m.keys().cloned()))
-                                .collect();
-                            dr.applied(&sel, Some(&carried));
-                            // A pick of the clip's own hint mode is one of those fields: it now follows the preset.
-                            if crate::persist::explicit_hint_mode(clip).is_some() && pr.data["params"].get("hint_mode").is_some() {
-                                let _ = crate::persist::save_preset_hint_mode(clip, &dr.params.hint_mode);
-                            }
-                        }
-                        self.hint.note = Some(match res {
-                            Ok(()) => format!("Applied legacy preset “{sel}”: parameters and outputs only (partial; pre-matte, hint, locations and export unchanged)."),
-                            Err(e) => format!("Preset not applied: {e}"),
-                        });
-                    }
-                }
+                cmd = Some(DeliverCmd::ApplyPreset(self.hint.preset_sel.clone()));
             }
             let del = ui.add_enabled(have, egui::Button::new("Delete"));
             self.hint.preset_rects.push(("delete", del.rect));
             if del.clicked() {
-                let sel = self.hint.preset_sel.clone();
-                self.hint.presets.retain(|p| !(p.kind == kind && p.name == sel));
-                self.store_presets();
+                cmd = Some(DeliverCmd::RequestDeletePreset(self.hint.preset_sel.clone()));
             }
         });
+        // Deleting a preset needs a second, explicit click.
+        if let Some(n) = self.hint.preset_del.clone().filter(|n| names.iter().any(|x| &x.0 == n)) {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(theme::warn(ui), format!("Delete preset “{n}”? This cannot be undone."));
+                let y = ui.button("Delete preset");
+                self.hint.preset_rects.push(("delete_confirm", y.rect));
+                if y.clicked() {
+                    cmd = Some(DeliverCmd::ConfirmDeletePreset(n.clone()));
+                }
+                let k = ui.button("Keep");
+                self.hint.preset_rects.push(("delete_cancel", k.rect));
+                if k.clicked() {
+                    cmd = Some(DeliverCmd::CancelDeletePreset);
+                }
+            });
+        }
         if self.hint.preset_name_for != self.hint.preset_sel {
             self.hint.preset_name_for = self.hint.preset_sel.clone();
             self.hint.preset_name = self.hint.preset_sel.clone();
@@ -2835,21 +4067,12 @@ impl App {
             let sv = ui.add_enabled(!n.is_empty(), egui::Button::new("Save current as preset"));
             self.hint.preset_rects.push(("save", sv.rect));
             if sv.clicked() {
-                let data = self.capture_pipeline(clip).map(|p| p.to_value());
-                match data {
-                    Ok(data) => {
-                        self.hint.presets.retain(|p| !(p.kind == kind && p.name == n));
-                        self.hint.presets.push(crate::presets::Preset { name: n.clone(), kind: kind.into(), data });
-                        self.hint.preset_name_for = n.clone();
-                        self.hint.preset_sel = n.clone();
-                        if self.store_presets() {
-                            self.hint.note = Some(format!("Saved “{n}”."));
-                        }
-                    }
-                    Err(e) => self.hint.note = Some(format!("Preset not saved: {e}")),
-                }
+                cmd = Some(DeliverCmd::SavePreset(n));
             }
         });
+        if let Some(c) = cmd {
+            let _ = self.deliver_run(&ctx, c);
+        }
         if let Some(n) = &self.hint.note {
             ui.label(RichText::new(n).color(theme::text_dim(ui)).size(12.0));
         }

@@ -1,0 +1,10 @@
+{
+  "pane": "Path mapping",
+  "shared_name": "NAS",
+  "shared_folder": "/mnt/nas",
+  "shell": {
+    "project": "Night_exterior_greenscreen",
+    "saved": true,
+    "models_missing": 0
+  }
+}

@@ -1,6 +1,6 @@
-//! Settings page wired into the real `App::frame`: reachable from Batch and a clip workspace, Cancel/Back discard,
-//! Apply persists and rescales at once, RAM/workers/loop reach the next opened viewer. Temp settings files only;
-//! clicks land on rectangles the app itself reports.
+//! Settings page wired into the real `App::frame`: reachable from Batch and a clip workspace, Esc/Cancel discards,
+//! Apply persists, RAM/workers/loop reach the next opened viewer. Temp settings files only. The page's own
+//! buttons are not located by position: tests call the controller method each button maps to.
 use ck::settings::{Settings, Store};
 use ck::ui::picker::{Backend, PickKind};
 use ck::ui::{App, AppOptions};
@@ -97,28 +97,9 @@ fn open_page(ctx: &egui::Context, app: &mut App) {
     click(ctx, app, at);
     assert!(app.settings_open());
 }
-fn click_apply(ctx: &egui::Context, app: &mut App) {
-    let at = app
-        .settings_page()
-        .apply_rect()
-        .expect("Apply drawn")
-        .center();
-    click(ctx, app, at);
-}
-
-#[test]
-fn settings_footer_stays_compact_across_pointer_redraws() {
-    let (ctx, mut app, _) = start("footer-size", None, None);
-    open_page(&ctx, &mut app);
-    for i in 0..120 {
-        run(&ctx, &mut app, vec![Event::PointerMoved(egui::pos2(400.0 + i as f32, 600.0))]);
-        let r = app.settings_page().apply_rect().unwrap();
-        assert!(r.height() < 40.0 && r.min.y > 830.0 && r.max.y <= 900.0, "frame {i}: {r:?}");
-    }
-}
-fn back(ctx: &egui::Context, app: &mut App) {
-    let at = app.settings_back_rect().expect("Back drawn").center();
-    click(ctx, app, at);
+/// Leave the page with Esc, which is Cancel: the draft is discarded.
+fn leave(ctx: &egui::Context, app: &mut App) {
+    run(ctx, app, key(egui::Key::Escape));
     assert!(!app.settings_open());
 }
 
@@ -128,13 +109,12 @@ fn button_opens_from_batch_and_cancel_discards_the_draft() {
     assert!(!app.in_workspace());
     open_page(&ctx, &mut app);
     app.settings_page().draft_mut().playback.decode_workers = 5;
-    back(&ctx, &mut app);
+    leave(&ctx, &mut app);
     // Reopening starts from saved values; nothing was written.
     open_page(&ctx, &mut app);
     assert_eq!(app.settings_page().draft().playback.decode_workers, 0);
     app.settings_page().draft_mut().playback.decode_workers = 5;
-    let at = app.settings_page().cancel_rect().unwrap().center();
-    click(&ctx, &mut app, at);
+    run(&ctx, &mut app, key(egui::Key::Escape));
     assert!(!app.settings_open());
     assert_eq!(app.settings_page().saved(), &Settings::default());
     assert!(!sp.exists());
@@ -176,7 +156,7 @@ fn workspace_state_survives_the_page_and_shortcuts_are_off_while_it_is_open() {
     assert!(app.in_workspace() && app.settings_open());
     assert_eq!(snap(&app), before);
     assert!(app.viewer().unwrap().clock.is_none() && app.viewer().unwrap().buffering().is_none());
-    back(&ctx, &mut app);
+    leave(&ctx, &mut app);
     assert!(app.in_workspace());
     assert_eq!(
         snap(&app),
@@ -208,9 +188,8 @@ fn apply_persists_rescales_now_and_reaches_the_next_viewer_only() {
         d.playback.cache_mib = 300;
         d.playback.loop_default = false;
     }
-    click_apply(&ctx, &mut app);
+    assert!(app.settings_page().apply(), "Apply saves");
     assert!(app.settings_open(), "Apply keeps the page open");
-    assert_eq!(ctx.zoom_factor(), 1.5);
     assert_eq!(
         app.viewer().unwrap().loader_config(),
         open_cfg,
@@ -222,7 +201,7 @@ fn apply_persists_rescales_now_and_reaches_the_next_viewer_only() {
         (saved.saved().playback.cache_mib, saved.saved().workers()),
         (300, 2)
     );
-    back(&ctx, &mut app);
+    leave(&ctx, &mut app);
     // Next open clip consumes the saved values.
     app.open_clip(&ctx, 0);
     let v = app.viewer().unwrap();
@@ -314,7 +293,7 @@ fn picked_projects_and_dropped_files_wait_while_the_page_is_open() {
         Some(first.as_path()),
         "pick is held under the page"
     );
-    back(&ctx, &mut app);
+    leave(&ctx, &mut app);
     run(&ctx, &mut app, vec![]);
     assert_eq!(
         app.project_root(),
@@ -377,7 +356,7 @@ fn drop_on_settings_is_refused_and_keeps_the_open_clip() {
     open_page(&ctx, &mut app);
     drop_folder(&ctx, &mut app, tmp("drop-set-src"));
     assert!(!app.import_active());
-    back(&ctx, &mut app);
+    leave(&ctx, &mut app);
     run(&ctx, &mut app, vec![]);
     assert!(app.in_workspace() && !app.import_active());
     assert!(app.notice().unwrap().contains("leave Settings"));

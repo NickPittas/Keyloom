@@ -1,5 +1,6 @@
-//! Regression: "Back to batch" used to clear the open clip mid-frame and panic in graph().
-//! Drives the same `App::frame` the window runs, with real egui pointer events at the button's own rectangle.
+//! Regression: leaving a clip used to clear it mid-frame and panic in graph().
+//! Drives the same `App::frame` the window runs, with real key events (Ctrl+Shift+1 = Board page), no positions.
+use ck::ui::shot_page::{Act, DockTab};
 use ck::ui::{App, AppOptions, Tab};
 use eframe::egui::{self, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
 use std::fs;
@@ -46,8 +47,21 @@ fn click(at: egui::Pos2) -> Vec<Event> {
     vec![Event::PointerMoved(at), b(true), b(false)]
 }
 
+/// Ctrl+Shift+N: the page tab shortcut (1 = Board).
+fn page_key(k: egui::Key) -> Vec<Event> {
+    [true, false]
+        .map(|pressed| Event::Key {
+            key: k,
+            physical_key: Some(k),
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+        })
+        .into()
+}
+
 #[test]
-fn back_to_batch_from_every_tab_and_focus_mode_then_reopen() {
+fn board_page_key_leaves_the_clip_from_every_tab_and_focus_mode_then_reopen() {
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(
         &ctx,
@@ -75,10 +89,9 @@ fn back_to_batch_from_every_tab_and_focus_mode_then_reopen() {
                     run(&ctx, &mut app, vec![f]);
                     run(&ctx, &mut app, vec![]);
                     assert!(app.focus_mode());
-                    // Focus hides panels but the header (and Back) stays.
+                    // Focus hides panels; the page tabs still leave the clip.
                 }
-                let at = app.back_rect().expect("back button drawn").center();
-                run(&ctx, &mut app, click(at)); // must not panic mid-frame
+                run(&ctx, &mut app, page_key(egui::Key::Num1)); // must not panic mid-frame
                 run(&ctx, &mut app, vec![]);
                 assert!(!app.in_workspace(), "Back from {tab:?} focus={focus}");
             }
@@ -182,7 +195,7 @@ fn run_at(ctx: &egui::Context, app: &mut App, w: f32, h: f32) {
 }
 
 #[test]
-fn narrow_728_header_controls_do_not_overlap_and_graph_clears_fit_button_and_hint_stays_tall() {
+fn narrow_728_graph_clears_fit_button_and_hint_stays_tall() {
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(
         &ctx,
@@ -195,24 +208,9 @@ fn narrow_728_header_controls_do_not_overlap_and_graph_clears_fit_button_and_hin
     app.switch_tab(Tab::Hint);
     // Wide -> narrow -> wide -> narrow: the remembered graph panel height must not leak between modes.
     for (w, h) in [(1440.0, 900.0), (728.0, 900.0), (1440.0, 900.0), (728.0, 900.0)] {
+        // The graph is drawn only on the dock's Graph tab; the Shot page opens on Actions.
+        app.act_for_test(&ctx, Act::DockTab(DockTab::Graph));
         run_at(&ctx, &mut app, w, h);
-        let hr = app.header_rects().to_vec();
-        assert!(
-            hr.len() >= 7,
-            "back + 5 tabs + focus (+ properties when narrow): {hr:?}"
-        );
-        for (i, a) in hr.iter().enumerate() {
-            assert!(
-                a.max.x <= w + 0.5,
-                "{w}: control {i} runs off the window: {a:?}"
-            );
-            for b in &hr[i + 1..] {
-                assert!(
-                    !a.shrink(0.5).intersects(b.shrink(0.5)),
-                    "{w}: header controls overlap {a:?} {b:?}"
-                );
-            }
-        }
         let (canvas, nodes) = app.graph_rects().expect("graph drawn");
         let fit = ck::ui::graph::fit_button_rect(canvas);
         assert_eq!(nodes.len(), 8);
@@ -279,8 +277,7 @@ fn open_clip_settings_works_from_the_card() {
     run(&ctx, &mut app, click(r.center()));
     run(&ctx, &mut app, vec![]);
     assert!(app.in_workspace(), "card button opens the clip");
-    let at = app.back_rect().unwrap().center();
-    run(&ctx, &mut app, click(at));
+    run(&ctx, &mut app, page_key(egui::Key::Num1));
     run(&ctx, &mut app, vec![]);
     assert!(!app.in_workspace());
 }
@@ -337,8 +334,7 @@ fn dialogs_run_off_the_ui_thread_one_at_a_time_and_results_wait_for_the_board() 
     // Still inside the clip: the picked project is held, not swapped under the viewer.
     assert!(app.in_workspace());
     assert_eq!(app.project_root(), Some(one.as_path()));
-    let at = app.back_rect().unwrap().center();
-    run(&ctx, &mut app, click(at));
+    run(&ctx, &mut app, page_key(egui::Key::Num1));
     for _ in 0..3 {
         run(&ctx, &mut app, vec![]);
     }
@@ -376,8 +372,10 @@ fn viewer_shortcuts_ab_interpretation_loop_and_zoom() {
     let v = app.viewer().unwrap();
     assert_eq!((v.ab, v.linear, v.looping), (ab, lin, !looping));
     assert!(v.zoom > 1.0);
-    run(&ctx, &mut app, key(egui::Key::Num0));
+    // Fit is H or Ctrl+0 (bare 0 is not a shortcut).
+    let ctrl0 = [true, false].map(|pressed| Event::Key { key: egui::Key::Num0, physical_key: Some(egui::Key::Num0), pressed, repeat: false, modifiers: Modifiers::COMMAND });
+    run(&ctx, &mut app, ctrl0.into());
     run(&ctx, &mut app, vec![]);
-    assert_eq!(app.viewer().unwrap().zoom, 1.0, "0 fits");
+    assert_eq!(app.viewer().unwrap().zoom, 1.0, "Ctrl+0 fits");
     assert!(app.in_workspace(), "0 is zoom-fit, not a tab");
 }

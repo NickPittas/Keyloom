@@ -1,0 +1,41 @@
+{
+ "notices": 0,
+ "recent": [
+  {
+   "name": "Night_exterior_greenscreen",
+   "path": "/mnt/raid/projects/2026/northlight_films/Night_exterior_greenscreen",
+   "opened": 740,
+   "missing": false
+  },
+  {
+   "name": "V1_interview_finale",
+   "path": "/mnt/raid/projects/2026/acme_docs/interview_series/season_02/V1_interview_finale",
+   "opened": 90000,
+   "missing": false
+  },
+  {
+   "name": "Studio_B_product_spots",
+   "path": "/home/npittas/Projects/Studio_B_product_spots",
+   "opened": 176400,
+   "missing": false
+  },
+  {
+   "name": "Rooftop_short_film",
+   "path": "/media/npittas/T7_Shuttle/archive/2025/Rooftop_short_film",
+   "opened": 349200,
+   "missing": true
+  },
+  {
+   "name": "Music_video_wire_removal",
+   "path": "/mnt/raid/projects/2026/halcyon_records/Music_video_wire_removal",
+   "opened": 1213200,
+   "missing": false
+  },
+  {
+   "name": "Kitchen_set_commercial_v12_client_review_final",
+   "path": "/mnt/raid/projects/2025/brightside_foods/commercials/Kitchen_set_commercial_v12_client_review_final",
+   "opened": 1818000,
+   "missing": false
+  }
+ ]
+}

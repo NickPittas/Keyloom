@@ -125,6 +125,119 @@ impl WorkerActivity {
     }
 }
 
+/// Presence of one model, as the new page shows it (from path + size only; never a Verify result).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelState {
+    Present,
+    Missing,
+    Downloading,
+    Unknown,
+    Error(String),
+}
+
+/// One catalog artifact, plain owned data. Disabled reasons are `Some` exactly when the action is unavailable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub family: String,
+    pub kind: String,
+    pub capability: String,
+    pub required: bool,
+    pub default_variant: bool,
+    pub state: ModelState,
+    /// Expected size ("Expected size unavailable" when the catalog has none).
+    pub size: String,
+    pub size_is_estimate: bool,
+    pub location: Option<String>,
+    pub revision: String,
+    pub gating: String,
+    /// Licence / provenance / access terms exactly as the catalog records them (empty = not reported).
+    pub terms: Vec<(String, String)>,
+    pub probe_imports: Vec<String>,
+    pub notes: Vec<String>,
+    /// (id, label) of each dependency.
+    pub requires: Vec<(String, String)>,
+    pub issues: Vec<String>,
+    /// Local runtime code/packages: never installed or deleted here.
+    pub local_runtime: bool,
+    pub runtime_note: Option<String>,
+    pub can_download: bool,
+    pub download_reason: Option<String>,
+    pub can_delete: bool,
+    pub delete_reason: Option<String>,
+    pub can_reveal: bool,
+    pub reveal_reason: Option<String>,
+}
+
+/// A family heading with its artifacts (the heading itself is not actionable).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupInfo {
+    pub name: String,
+    pub models: Vec<ModelInfo>,
+}
+
+/// The running model operation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OperationInfo {
+    /// Helper operation name ("download", "check", ...).
+    pub kind: String,
+    pub model_id: Option<String>,
+    /// None while the total is unknown.
+    pub progress: Option<f32>,
+    pub bytes_text: String,
+    pub unknown_total: bool,
+    pub expected_size: Option<String>,
+    pub cancellable: bool,
+    /// Protocol problem reported by the helper, if any.
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageData {
+    pub groups: Vec<GroupInfo>,
+    pub catalog_loaded: bool,
+    pub operation: Option<OperationInfo>,
+    /// Terminal text of the last finished operation and whether it succeeded.
+    pub last_result: Option<(String, bool)>,
+    pub cancel_requested: bool,
+    pub cancel_note: Option<String>,
+    pub cancel_failure: bool,
+    pub missing_count: Option<usize>,
+    pub busy: bool,
+    pub startup_error: Option<String>,
+    /// SAM2 package missing: a runtime repair note (not a Key blocker).
+    pub local_runtime_note: Option<String>,
+    /// This computer's worker, in words.
+    pub worker_text: Option<String>,
+    /// Why Install required / Install all / Refresh are unavailable right now.
+    pub install_block: Option<String>,
+    pub refresh_block: Option<String>,
+}
+
+/// What the new page asks the controller to do. Ids are catalog artifact ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Request {
+    Download(String),
+    InstallRequired,
+    DownloadAll,
+    Cancel,
+    Delete(String),
+    Refresh,
+}
+
+const ONE_AT_A_TIME: &str = "One model operation at a time; wait for it to finish before starting another.";
+const JOB_RUNNING: &str = "Install and Delete are disabled while a job is queued or running on this PC's worker.";
+const LOCAL_RUNTIME: &str = "Local runtime code/packages cannot be installed or deleted here; update or repair the app runtime.";
+
+fn is_local_runtime(a: &Artifact) -> bool {
+    matches!(a.kind.as_str(), "local_package" | "local_code")
+}
+
+fn family(id: &str) -> &'static str {
+    if id.starts_with("birefnet") { "BiRefNet" } else if id.starts_with("sam2") { "SAM2" } else if id.starts_with("videomama") { "VideoMaMa" } else if id.starts_with("matanyone") { "MatAnyone2" } else if id == "gvm" { "GVM" } else { "CorridorKey" }
+}
+
 pub struct Page {
     runtime: Result<Runtime, String>,
     artifacts: BTreeMap<String, Artifact>,
@@ -240,6 +353,18 @@ impl Page {
         } else {
             "Waiting for the current offline status or verification operation to finish.".into()
         }
+    }
+
+    /// Toolbar Models button (§7.1): the startup check failed or required files are missing.
+    pub fn startup_error_or_missing(&self) -> bool {
+        self.initialized && (self.startup_error.is_some() || self.required_ready == Some(false))
+    }
+
+    /// Required models not present (toolbar "N models missing"); None when only a startup error is known.
+    pub fn missing_count(&self) -> Option<usize> {
+        if self.startup_error.is_some() { return None }
+        let n = self.required_artifacts()?.iter().filter(|a| a.present != Some(true)).count();
+        (n > 0).then_some(n)
     }
 
     pub fn needs_attention(&self) -> bool {
@@ -884,20 +1009,19 @@ impl Page {
                 let idle = !self.busy();
                 let can_change = idle && !self.assets_in_use;
                 if ui.add_enabled_ui(can_change, |ui| theme::primary_button(ui, "Install required models")).inner.on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
-                    self.start(Action::DownloadProfile(Profile::Required), ui.ctx());
+                    self.request_ui(Request::InstallRequired, ui.ctx());
                 }
                 if ui.add_enabled(can_change, egui::Button::new("Install full profile")).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
-                    self.start(Action::DownloadProfile(Profile::Full), ui.ctx());
+                    self.request_ui(Request::DownloadAll, ui.ctx());
                 }
                 if ui.add_enabled(idle, egui::Button::new("Verify all")).clicked() {
                     self.start(Action::VerifyAll, ui.ctx());
                 }
                 if ui.add_enabled(idle, egui::Button::new("Refresh status")).clicked() {
-                    self.required_ready = None;
-                    self.start(Action::Check, ui.ctx());
+                    self.request_ui(Request::Refresh, ui.ctx());
                 }
                 if ui.add_enabled(self.can_cancel(), egui::Button::new("Cancel operation")).clicked() {
-                    self.cancel(ui.ctx());
+                    self.request_ui(Request::Cancel, ui.ctx());
                 }
             });
             if let Some(w) = &self.worker {
@@ -989,14 +1113,184 @@ impl Page {
         std::mem::take(&mut self.readiness_changed)
     }
 
+    /// Why no install/delete can start now (one operation at a time, or a job on this PC's worker).
+    fn change_block(&self) -> Option<String> {
+        if self.busy() { Some(ONE_AT_A_TIME.into()) } else if self.assets_in_use { Some(JOB_RUNNING.into()) } else { None }
+    }
+
+    fn download_block(&self, a: &Artifact) -> Option<String> {
+        if is_local_runtime(a) { Some(LOCAL_RUNTIME.into()) } else { self.change_block() }
+    }
+
+    fn delete_block(&self, a: &Artifact) -> Option<String> {
+        if let Some(r) = self.download_block(a) { return Some(r) }
+        (!matches!(a.state.as_deref(), Some("installed" | "partial")))
+            .then(|| "Only installed or partial assets can be deleted.".into())
+    }
+
+    /// Where the model's files are, for Reveal (the path the helper last reported).
+    pub fn artifact_path(&self, id: &str) -> Option<std::path::PathBuf> {
+        self.artifacts.get(id)?.path.as_deref().filter(|p| !p.is_empty()).map(Into::into)
+    }
+
+    /// The one entry point for every model operation (old buttons and the new page). Same guards as the old buttons.
+    pub fn request(&mut self, r: Request, ctx: &egui::Context) -> Result<(), String> {
+        let full = r == Request::DownloadAll;
+        match r {
+            Request::Cancel => {
+                if !self.can_cancel() {
+                    return Err("There is no running download to cancel.".into());
+                }
+                self.cancel(ctx);
+            }
+            Request::Refresh => {
+                if self.busy() {
+                    return Err(ONE_AT_A_TIME.into());
+                }
+                self.required_ready = None;
+                self.start(Action::Check, ctx);
+            }
+            Request::InstallRequired | Request::DownloadAll => {
+                if let Some(e) = self.change_block() {
+                    return Err(e);
+                }
+                let profile = if full { Profile::Full } else { Profile::Required };
+                self.start(Action::DownloadProfile(profile), ctx);
+            }
+            Request::Download(id) => {
+                let a = self.artifacts.get(&id).ok_or_else(|| format!("Unknown model: {id}"))?;
+                if let Some(e) = self.download_block(a) {
+                    return Err(e);
+                }
+                self.start(Action::Download(id), ctx);
+            }
+            Request::Delete(id) => {
+                let a = self.artifacts.get(&id).ok_or_else(|| format!("Unknown model: {id}"))?;
+                if let Some(e) = self.delete_block(a) {
+                    return Err(e);
+                }
+                self.confirm_delete = None;
+                self.start(Action::Delete(id), ctx);
+            }
+        }
+        Ok(())
+    }
+
+    /// Old screen: a refused request shows its reason where the last outcome is shown.
+    fn request_ui(&mut self, r: Request, ctx: &egui::Context) {
+        if let Err(e) = self.request(r, ctx) {
+            self.last_outcome = Some((e, false));
+        }
+    }
+
+    /// Read-only snapshot of everything the old screen shows. Cached state only: no IO, no helper, no `take_snapshot`.
+    pub fn page_data(&self) -> PageData {
+        let required: BTreeSet<&str> =
+            self.required_artifacts().unwrap_or_default().iter().map(|a| a.id.as_str()).collect();
+        let running = self.active.as_ref();
+        let mut groups: Vec<GroupInfo> = Vec::new();
+        for a in self.artifacts.values() {
+            let name = family(&a.id);
+            let downloading = running.is_some_and(|r| {
+                r.current_artifact.as_deref() == Some(a.id.as_str())
+                    || matches!(&r.action, Action::Download(id) | Action::Repair(id) if *id == a.id)
+            });
+            let state = if downloading {
+                ModelState::Downloading
+            } else if let Some(e) = &a.last_error {
+                ModelState::Error(e.clone())
+            } else {
+                match a.present { Some(true) => ModelState::Present, Some(false) => ModelState::Missing, None => ModelState::Unknown }
+            };
+            let local = is_local_runtime(a);
+            let download_reason = self.download_block(a);
+            let delete_reason = self.delete_block(a);
+            let has_path = a.path.as_deref().is_some_and(|p| !p.is_empty());
+            let missing_runtime = local && a.state.is_some() && a.state.as_deref() != Some("installed");
+            let info = ModelInfo {
+                id: a.id.clone(),
+                name: a.label.clone(),
+                family: name.into(),
+                kind: a.kind.clone(),
+                capability: a.capability.clone(),
+                required: required.contains(a.id.as_str()),
+                default_variant: a.default_variant,
+                state,
+                size: a.bytes_required.or(a.size_bytes_estimate).map_or_else(|| "Expected size unavailable".into(), format_bytes),
+                size_is_estimate: a.bytes_required.is_none() && a.size_bytes_estimate.is_some(),
+                location: a.path.clone().filter(|p| !p.is_empty()),
+                revision: format!("{} · {}", a.revision_status.as_deref().unwrap_or("status not reported"), a.revision.as_deref().unwrap_or("revision not reported")),
+                gating: catalog_value(a.gated.as_ref()),
+                terms: a.provenance.iter().map(|(k, v)| (k.clone(), catalog_value(Some(v)))).collect(),
+                probe_imports: a.probe_imports.clone(),
+                notes: a.notes.clone(),
+                requires: a.dependencies.iter().map(|id| (id.clone(), self.artifacts.get(id).map_or_else(|| id.clone(), |d| d.label.clone()))).collect(),
+                issues: a.problems.clone(),
+                local_runtime: local,
+                runtime_note: missing_runtime.then(|| {
+                    let base = if a.kind == "local_package" { "Runtime repair required; the model helper cannot install this package." } else { "Runtime repair required: restore vendored engine code with the app runtime." };
+                    match &a.install_hint { Some(h) => format!("{base} {h}"), None => base.into() }
+                }),
+                can_download: download_reason.is_none(),
+                download_reason,
+                can_delete: delete_reason.is_none(),
+                delete_reason,
+                can_reveal: has_path,
+                reveal_reason: (!has_path).then(|| "Location unavailable until the model status is checked.".into()),
+            };
+            match groups.iter_mut().find(|g| g.name == name) {
+                Some(g) => g.models.push(info),
+                None => groups.push(GroupInfo { name: name.into(), models: vec![info] }),
+            }
+        }
+        let operation = running.map(|r| {
+            let (progress, bytes_text, unknown_total) = match r.progress {
+                Some(p) => {
+                    let fmt = |n: u64| if p.unit == "bytes" { format_bytes(n) } else { format!("{n} {}", p.unit) };
+                    match p.total.filter(|n| *n > 0) {
+                        Some(t) => (Some((p.done as f32 / t as f32).clamp(0.0, 1.0)), format!("{} / {}", fmt(p.done), fmt(t)), false),
+                        None => (None, fmt(p.done), true),
+                    }
+                }
+                None => (None, "progress unavailable".into(), true),
+            };
+            OperationInfo {
+                kind: r.action.name().into(),
+                model_id: r.current_artifact.clone().or(match &r.action { Action::Download(id) | Action::Repair(id) | Action::Delete(id) => Some(id.clone()), _ => None }),
+                progress,
+                bytes_text,
+                unknown_total,
+                expected_size: r.bytes_total.map(format_bytes),
+                cancellable: self.can_cancel(),
+                error: r.malformed.clone(),
+            }
+        });
+        let sam2_missing = self.artifacts.values().any(|a| a.id == "sam2-package" && a.state.is_some() && a.state.as_deref() != Some("installed"));
+        PageData {
+            groups,
+            catalog_loaded: !self.artifacts.is_empty(),
+            operation,
+            last_result: self.last_outcome.clone(),
+            cancel_requested: self.cancel_requested,
+            cancel_note: self.cancel_note.clone(),
+            cancel_failure: self.cancel_failure,
+            missing_count: self.missing_count(),
+            busy: self.busy(),
+            startup_error: self.startup_error.clone(),
+            local_runtime_note: sam2_missing.then(|| "Runtime repair required: SAM2 checkpoint downloads do not install its pinned Python package. Repair the runtime to supply this dependency.".into()),
+            worker_text: self.worker.as_ref().map(WorkerActivity::label),
+            install_block: self.change_block(),
+            refresh_block: self.busy().then(|| ONE_AT_A_TIME.into()),
+        }
+    }
+
     fn nav(&mut self, ui: &mut Ui) {
         ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search models").desired_width(f32::INFINITY));
         let q = self.search.trim().to_lowercase();
         let mut groups: BTreeMap<String, Vec<&Artifact>> = BTreeMap::new();
         for a in self.artifacts.values() {
             if q.is_empty() || a.label.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q) || a.capability.to_lowercase().contains(&q) {
-                let family = if a.id.starts_with("birefnet") { "BiRefNet" } else if a.id.starts_with("sam2") { "SAM2" } else if a.id.starts_with("videomama") { "VideoMaMa" } else if a.id.starts_with("matanyone") { "MatAnyone2" } else if a.id == "gvm" { "GVM" } else { "CorridorKey" }.to_string();
-                groups.entry(family).or_default().push(a);
+                groups.entry(family(&a.id).to_string()).or_default().push(a);
             }
         }
         if groups.is_empty() {
@@ -1066,7 +1360,7 @@ impl Page {
                 let can_change = actions_enabled && !self.assets_in_use;
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_enabled(can_change, egui::Button::new(RichText::new("Download").color(ui.visuals().text_color())).fill(if item.present != Some(true) { theme::accent_mark(ui) } else { theme::card_fill(ui) })).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
-                        self.start(Action::Download(item.id.clone()), ui.ctx());
+                        self.request_ui(Request::Download(item.id.clone()), ui.ctx());
                     }
                     if ui.add_enabled(actions_enabled, egui::Button::new("Verify")).on_hover_text("Optional: re-hash the files against the catalog. The app never needs it.").clicked() {
                         self.start(Action::Verify(item.id.clone()), ui.ctx());
@@ -1089,7 +1383,7 @@ impl Page {
                             ui.horizontal_wrapped(|ui| {
                                 if ui.button(RichText::new("Delete files").color(theme::error(ui))).clicked() {
                                     self.confirm_delete = None;
-                                    self.start(Action::Delete(item.id.clone()), ui.ctx());
+                                    self.request_ui(Request::Delete(item.id.clone()), ui.ctx());
                                 }
                                 if ui.button("Keep").clicked() {
                                     self.confirm_delete = None;

@@ -402,6 +402,8 @@ pub struct View {
     /// "Fit" header button and for tests/QA hit-testing.
     pub canvas: Rect,
     pub node_rects: Vec<Rect>,
+    /// false when the parent supplies its own Fit control (the Shot dock): no on-canvas button, no reserved strip.
+    pub draw_fit_button: bool,
 }
 impl Default for View {
     fn default() -> Self {
@@ -412,6 +414,7 @@ impl Default for View {
             fitted: false,
             canvas: Rect::NOTHING,
             node_rects: vec![],
+            draw_fit_button: true,
         }
     }
 }
@@ -432,7 +435,8 @@ impl View {
             return;
         }
         // The overlay Fit button owns a strip at the right edge: fit into the rest so no node sits under it.
-        let usable = Vec2::new((rect.width() - FIT_BTN_STRIP).max(1.0), rect.height());
+        let strip = if self.draw_fit_button { FIT_BTN_STRIP } else { 0.0 };
+        let usable = Vec2::new((rect.width() - strip).max(1.0), rect.height());
         let avail = usable - Vec2::splat(2.0 * FIT_MARGIN);
         self.zoom = (avail.x / b.width())
             .min(avail.y / b.height())
@@ -457,6 +461,23 @@ impl View {
     pub fn fit_last(&mut self, g: &Graph) {
         let c = self.canvas;
         self.fit(g, c);
+    }
+    /// Fit on the next `show` (the parent's button has no graph in hand); same result as the on-canvas Fit.
+    pub fn request_fit(&mut self) {
+        self.fitted = false;
+    }
+    /// Zoom about the canvas centre by `factor`, clamped to MIN_ZOOM..=MAX_ZOOM.
+    pub fn zoom_by(&mut self, factor: f32) {
+        // Before the first `show` the canvas is Rect::NOTHING; there is no centre to zoom about yet.
+        if !self.canvas.is_positive() {
+            return;
+        }
+        let centre = self.canvas.size() * 0.5;
+        self.zoom_at(centre, factor);
+    }
+    /// Current zoom as a percentage (100.0 = 1:1).
+    pub fn zoom_percent(&self) -> f32 {
+        self.zoom * 100.0
     }
     pub fn to_screen(&self, p: Pos2, rect: Rect) -> Pos2 {
         rect.min + self.pan + p.to_vec2() * self.zoom
@@ -921,15 +942,17 @@ pub fn show(
         ));
     }
 
-    // Discoverable Fit (also: double-click empty canvas).
-    let fit_rect = fit_button_rect(canvas);
-    if ui
-        .put(fit_rect, egui::Button::new("Fit"))
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Fit all nodes (or double-click empty canvas)")
-        .clicked()
-    {
-        v.fit(g, canvas);
+    // Discoverable Fit (also: double-click empty canvas). Skipped when the parent draws its own Fit.
+    if v.draw_fit_button {
+        let fit_rect = fit_button_rect(canvas);
+        if ui
+            .put(fit_rect, egui::Button::new("Fit"))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Fit all nodes (or double-click empty canvas)")
+            .clicked()
+        {
+            v.fit(g, canvas);
+        }
     }
     ev
 }

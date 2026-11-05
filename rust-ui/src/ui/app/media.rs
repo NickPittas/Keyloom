@@ -1,6 +1,7 @@
 //! Media-side recovery and import: relink a vanished movie (probe + identity check, then validated frame
 //! extraction through the worker) and import a companion alpha/mask IMAGE SEQUENCE (validated, no overwrite).
 use super::*;
+use crate::actions::Decision;
 use crate::relink::{self, Probed, SeqPlan};
 use crate::tasks::TaskKind;
 use std::sync::atomic::AtomicBool;
@@ -32,6 +33,109 @@ pub struct MediaState {
     pub movie: Option<MovieRelink>,
     pub seq: Option<SeqImport>,
     pub note: Option<String>,
+}
+
+/// Read-only snapshot of the open clip's Media state, built from cached state only (the Shot page reads it;
+/// every change goes through `media_cmd`).
+#[derive(Debug, Clone)]
+pub(crate) struct MediaView {
+    pub source: MediaSource,
+    pub source_path: Option<PathBuf>,
+    pub resolution: Option<String>,
+    pub source_frames: usize,
+    /// Frames on the timeline (the viewer's index); `None` when no viewer is open on this clip.
+    pub timeline_frames: Option<usize>,
+    pub fps: f64,
+    pub fps_assumed: bool,
+    pub input_linear: bool,
+    pub stored_linear: bool,
+    pub colour_save_failed: bool,
+    pub colour_origin: &'static str,
+    pub paths: Vec<PathRow>,
+    pub result_range: Option<String>,
+    /// The source movie is gone and its stored file name is known: a relink can be offered.
+    pub missing: bool,
+    pub relink: Option<RelinkView>,
+    /// Extract readiness and the reason when it is blocked (only while a movie check is for this clip).
+    pub extract: Option<Decision>,
+    pub can_choose_companion: bool,
+    pub companion: Option<CompanionView>,
+    pub note: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaSource {
+    Sequence { external: bool },
+    Movie,
+    Missing,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PathRow {
+    pub label: &'static str,
+    pub path: PathBuf,
+    /// Frames the folder holds, when it is a frame folder.
+    pub frames: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelinkState {
+    Checking,
+    Failed,
+    Partial,
+    Verified,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RelinkView {
+    pub path: PathBuf,
+    pub state: RelinkState,
+    /// The failure text when `state` is `Failed`.
+    pub failure: Option<String>,
+    pub probed: Option<Probed>,
+    /// The same-footage checkbox (only meaningful for `Partial`).
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompanionView {
+    pub folder: PathBuf,
+    /// false = AlphaHint, true = VideoMamaMaskHint.
+    pub mask: bool,
+    pub plan: Result<CompanionPlan, String>,
+    /// A copy is running; a proposed import has `running == false`.
+    pub running: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompanionPlan {
+    pub dest: PathBuf,
+    /// Frames that will be written.
+    pub copy: usize,
+    /// Existing frames that are kept, never replaced.
+    pub kept: usize,
+}
+
+/// Every Media action the old panel and the Shot page can trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaCmd {
+    /// Input colour interpretation (Linear when true); saved through `persist_media`.
+    SetInputLinear(bool),
+    /// Choose a replacement movie (file dialog, `PickKind::RelinkMovie`).
+    Relink,
+    CancelRelink,
+    ConfirmMovieMatch(bool),
+    ExtractRelinked,
+    /// Choose a companion image folder (file dialog, `PickKind::HintSequence`).
+    ChooseCompanion,
+    /// Alpha (false) or mask (true) target; re-plans a proposed import.
+    ImportAs { mask: bool },
+    StartSequenceImport,
+    /// Drop a proposed (not yet running) import.
+    CancelSequenceImport,
+    /// Ask a running import to stop.
+    StopSequenceImport,
 }
 
 impl App {
@@ -306,43 +410,182 @@ impl App {
         self.media.note.as_deref()
     }
 
+    /// Extract readiness for a movie check of this clip: the same decision the Extract button shows.
+    fn extract_decision(&self, clip: &Clip, m: &MovieRelink) -> Decision {
+        let ready = prepare_source_worker_ok(self.ai.models_unknown(), self.ai.local_caps().as_ref().is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false)))
+            && (matches!(m.verdict, Some(Ok(true))) || matches!(m.verdict, Some(Ok(false))) && m.confirm);
+        crate::actions::decide(self.ai.scheduler(), &clip.root, crate::actions::Action::Extract, "Extract frames", if !ready { Some("FFmpeg or a verified movie is required".into()) } else if self.ai.external_writer(&clip.root) { Some("Another computer is importing into this clip. Wait for it to finish.".into()) } else { None })
+    }
+
+    /// Snapshot of the open clip's Media state. Cached state only; the one file read is the stored movie name,
+    /// and only when the source is missing (the same check the old panel makes).
+    pub(crate) fn media_view(&self) -> Option<MediaView> {
+        let clip = self.clip()?;
+        let v = self.viewer.as_ref();
+        let missing = clip.error.is_some() && matches!(clip.source, Source::Missing) && stored_filename(clip).is_some();
+        let (source, source_path) = match &clip.source {
+            Source::Sequence { dir, external } => (MediaSource::Sequence { external: *external }, Some(dir.clone())),
+            Source::Video { path } => (MediaSource::Movie, Some(path.clone())),
+            Source::Missing => (MediaSource::Missing, None),
+        };
+        let (input_linear, stored_linear, colour_save_failed) = match v {
+            Some(v) => (v.linear, v.linear_stored, self.persist_failed == Some((v.range, v.linear))),
+            None => (clip.input_is_linear, clip.input_is_linear, false),
+        };
+        let mut paths = Vec::new();
+        if let Some(p) = &source_path {
+            paths.push(PathRow { label: "Source", path: p.clone(), frames: None });
+        }
+        if let Some(p) = clip.view_dir(View::Guide) {
+            paths.push(PathRow { label: "Pre-matte guide folder", path: p, frames: Some(clip.mask_frames) });
+        }
+        if let Some(p) = clip.view_dir(View::Hint) {
+            paths.push(PathRow { label: "Final hint folder", path: p, frames: Some(clip.alpha_frames) });
+        }
+        if let Some(p) = &clip.output_dir {
+            paths.push(PathRow { label: "Output folder", path: p.clone(), frames: None });
+        }
+        if let Some(p) = &clip.manifest_dir {
+            paths.push(PathRow { label: "Last run wrote to", path: p.clone(), frames: None });
+        }
+        Some(MediaView {
+            source,
+            source_path,
+            resolution: clip.sample_size.map(|(w, h)| crate::contracts::resolution_label(w, h)),
+            source_frames: clip.input_files.len(),
+            timeline_frames: v.map(|v| v.index.stems.len()),
+            fps: clip.fps,
+            fps_assumed: clip.fps_assumed,
+            input_linear,
+            stored_linear,
+            colour_save_failed,
+            colour_origin: color_origin_text(clip),
+            paths,
+            result_range: clip.result_range_text(),
+            missing,
+            relink: self.media.movie.as_ref().map(|m| RelinkView {
+                path: m.path.clone(),
+                state: match &m.verdict {
+                    None => RelinkState::Checking,
+                    Some(Err(_)) => RelinkState::Failed,
+                    Some(Ok(true)) => RelinkState::Verified,
+                    Some(Ok(false)) => RelinkState::Partial,
+                },
+                failure: match &m.verdict {
+                    Some(Err(e)) => Some(e.clone()),
+                    _ => None,
+                },
+                probed: m.probed.clone(),
+                confirmed: m.confirm,
+            }),
+            extract: self.media.movie.as_ref().filter(|m| m.folder == clip.folder).map(|m| self.extract_decision(clip, m)),
+            can_choose_companion: !clip.input_files.is_empty() && self.media.seq.is_none() && !self.ai.external_writer(&clip.root),
+            companion: self.media.seq.as_ref().filter(|s| s.clip_folder == clip.folder).map(|s| CompanionView {
+                folder: s.folder.clone(),
+                mask: s.mask,
+                running: s.run.is_some(),
+                plan: match &s.plan {
+                    Ok(p) => Ok(CompanionPlan { dest: p.dest.clone(), copy: p.copy.len(), kept: p.kept.len() }),
+                    Err(e) => Err(e.clone()),
+                },
+            }),
+            note: self.media.note.clone(),
+            error: clip.error.clone(),
+        })
+    }
+
+    /// Run one Media action. The old panel and the Shot page both call this; `Err` is a refusal or a failed
+    /// extraction, shown as the Media note.
+    pub(crate) fn media_cmd(&mut self, ctx: &egui::Context, c: MediaCmd) -> Result<(), String> {
+        match c {
+            MediaCmd::SetInputLinear(linear) => {
+                self.viewer.as_mut().ok_or("no clip open")?.linear = linear;
+                self.persist_media();
+            }
+            MediaCmd::Relink => {
+                if self.media.movie.is_none() {
+                    self.request_pick(ctx, PickKind::RelinkMovie);
+                }
+            }
+            MediaCmd::CancelRelink => self.media.movie = None,
+            MediaCmd::ConfirmMovieMatch(on) => self.media.movie.as_mut().ok_or("no movie chosen")?.confirm = on,
+            MediaCmd::ExtractRelinked => self.extract_relinked_movie()?,
+            MediaCmd::ChooseCompanion => {
+                let root = self.clip().ok_or("no clip open")?.root.clone();
+                if self.media.seq.is_none() && !self.ai.external_writer(&root) {
+                    self.request_pick(ctx, PickKind::HintSequence);
+                }
+            }
+            MediaCmd::ImportAs { mask } => {
+                let clip = self.open_clip_snapshot().ok_or("no clip open")?;
+                let range = self
+                    .ai_open_range()
+                    .unwrap_or((0, clip.input_files.len().saturating_sub(1)));
+                let s = self.media.seq.as_mut().ok_or("no companion sequence chosen")?;
+                if s.clip_folder != clip.folder {
+                    return Err("the companion sequence was chosen for another clip".into());
+                }
+                s.mask = mask;
+                if s.run.is_none() {
+                    s.plan = relink::plan_sequence(&clip, &s.folder, mask, range);
+                }
+            }
+            MediaCmd::StartSequenceImport => self.start_sequence_import(ctx),
+            MediaCmd::CancelSequenceImport => {
+                let s = self.media.seq.as_ref().ok_or("no companion sequence chosen")?;
+                if s.run.is_some() {
+                    return Err("the import is running; use Stop import".into());
+                }
+                self.media.seq = None;
+            }
+            MediaCmd::StopSequenceImport => {
+                let (_, stop) = self
+                    .media
+                    .seq
+                    .as_ref()
+                    .and_then(|s| s.run.as_ref())
+                    .ok_or("no import is running")?;
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn media_has_actions(&self, clip: &Clip) -> bool {
         self.media.movie.as_ref().is_some_and(|m| m.folder == clip.folder)
             || self.media.seq.as_ref().is_some_and(|s| s.clip_folder == clip.folder)
     }
 
     pub(super) fn media_actions(&mut self, ui: &mut Ui, clip: &Clip) {
-        let mut extract = false;
-        let mut start = false;
-        let mut cancel = false;
+        let mut cmds = Vec::new();
         theme::section(ui, "Media preparation", |ui| {
             if let Some(m) = self.media.movie.as_ref().filter(|m| m.folder == clip.folder) {
-                let ready = prepare_source_worker_ok(self.ai.models_unknown(), self.ai.local_caps().as_ref().is_some_and(|c| c.tasks.get("prepare_source").copied().unwrap_or(false)))
-                    && (matches!(m.verdict, Some(Ok(true))) || matches!(m.verdict, Some(Ok(false))) && m.confirm);
-                let d = crate::actions::decide(self.ai.scheduler(), &clip.root, crate::actions::Action::Extract, "Extract frames", if !ready { Some("FFmpeg or a verified movie is required".into()) } else if self.ai.external_writer(&clip.root) { Some("Another computer is importing into this clip. Wait for it to finish.".into()) } else { None });
+                let d = self.extract_decision(clip, m);
                 let response = ui.add_enabled(d.enabled, egui::Button::new(&d.label));
-                extract = response.on_disabled_hover_text(d.reason).clicked();
+                if response.on_disabled_hover_text(d.reason).clicked() {
+                    cmds.push(MediaCmd::ExtractRelinked);
+                }
             }
             if let Some(s) = self.media.seq.as_ref().filter(|s| s.clip_folder == clip.folder) {
                 ui.horizontal(|ui| {
-                    if let Some((_, stop)) = &s.run {
+                    if s.run.is_some() {
                         ui.label("Importing frames…");
-                        if ui.button("Stop import").clicked() { stop.store(true, std::sync::atomic::Ordering::Relaxed); }
+                        if ui.button("Stop import").clicked() { cmds.push(MediaCmd::StopSequenceImport); }
                     } else {
-                        start = theme::accent(ui, s.plan.is_ok(), |ui| ui.add(egui::Button::new("Import mask frames"))).clicked();
-                        cancel = ui.button("Cancel import").clicked();
+                        if theme::accent(ui, s.plan.is_ok(), |ui| ui.add(egui::Button::new("Import mask frames"))).clicked() { cmds.push(MediaCmd::StartSequenceImport); }
+                        if ui.button("Cancel import").clicked() { cmds.push(MediaCmd::CancelSequenceImport); }
                     }
                 });
             }
         });
-        if extract {
-            if let Err(e) = self.extract_relinked_movie() { self.media.note = Some(e); }
+        let ctx = ui.ctx().clone();
+        for c in cmds {
+            if let Err(e) = self.media_cmd(&ctx, c) { self.media.note = Some(e); }
         }
-        if start { self.start_sequence_import(ui.ctx()); }
-        if cancel { self.media.seq = None; }
     }
 
     pub(super) fn media_props(&mut self, ui: &mut Ui, clip: &Clip) {
+        let mut cmds = Vec::new();
         let movie_gone = clip.error.is_some()
             && matches!(clip.source, Source::Missing)
             && stored_filename(clip).is_some();
@@ -353,11 +596,9 @@ impl App {
                 ui.colored_label(theme::error(ui), e);
             }
             if self.media.movie.is_none() && ui.button("Relink movie…").on_hover_text("Choose the movie again: its size, frame rate and frame count are checked against what this clip recorded before anything is extracted").clicked() {
-                let ctx = ui.ctx().clone();
-                self.request_pick(&ctx, PickKind::RelinkMovie);
+                cmds.push(MediaCmd::Relink);
             }
-            let mut cancel_relink = false;
-            if let Some(m) = &mut self.media.movie {
+            if let Some(m) = &self.media.movie {
                 ui.label(
                     RichText::new(m.path.display().to_string())
                         .monospace()
@@ -393,19 +634,22 @@ impl App {
                             );
                         } else {
                             ui.colored_label(theme::warn(ui), "The clip kept no frame count to compare, so this match is partial (size and rate only).");
+                            let mut confirm = m.confirm;
                             theme::checkbox(
                                 ui,
-                                &mut m.confirm,
+                                &mut confirm,
                                 "I confirm this is the same footage",
                             );
+                            if confirm != m.confirm {
+                                cmds.push(MediaCmd::ConfirmMovieMatch(confirm));
+                            }
                         }
 
                     }
                 }
-                cancel_relink = ui.button("Cancel relink").clicked();
-            }
-            if cancel_relink {
-                self.media.movie = None;
+                if ui.button("Cancel relink").clicked() {
+                    cmds.push(MediaCmd::CancelRelink);
+                }
             }
             if let Some(r) = self.ai.latest_task(&clip.folder, TaskKind::PrepareSource) {
                 self.ai.task_status_row(ui, &r);
@@ -416,16 +660,12 @@ impl App {
             ui.separator();
             ui.label(RichText::new("Companion alpha / mask frames").strong());
             if self.media.seq.is_none() && !self.ai.external_writer(&clip.root) && ui.button("Import alpha or mask image sequence…").on_hover_text("PNG/EXR frames named like the source frames; checked for size and coverage of In/Out, existing hint frames are never replaced").clicked() {
-                let ctx = ui.ctx().clone();
-                self.request_pick(&ctx, PickKind::HintSequence);
+                cmds.push(MediaCmd::ChooseCompanion);
             }
-            let range = self
-                .ai_open_range()
-                .unwrap_or((0, clip.input_files.len() - 1));
             if let Some(s) = self
                 .media
                 .seq
-                .as_mut()
+                .as_ref()
                 .filter(|s| s.clip_folder == clip.folder)
             {
                 ui.label(
@@ -433,11 +673,11 @@ impl App {
                         .monospace()
                         .size(11.0),
                 );
-                let before = s.mask;
-                ui.radio_value(&mut s.mask, false, "Alpha hint (AlphaHint)");
-                ui.radio_value(&mut s.mask, true, "Mask (VideoMamaMaskHint)");
-                if s.mask != before && s.run.is_none() {
-                    s.plan = relink::plan_sequence(clip, &s.folder, s.mask, range);
+                let mut mask = s.mask;
+                ui.radio_value(&mut mask, false, "Alpha hint (AlphaHint)");
+                ui.radio_value(&mut mask, true, "Mask (VideoMamaMaskHint)");
+                if mask != s.mask {
+                    cmds.push(MediaCmd::ImportAs { mask });
                 }
                 match &s.plan {
                     Err(e) => {
@@ -462,6 +702,10 @@ impl App {
                 ui.label(RichText::new("Use the import action above the node graph.").color(theme::text_dim(ui)).size(12.0));
             }
 
+        }
+        let ctx = ui.ctx().clone();
+        for c in cmds {
+            if let Err(e) = self.media_cmd(&ctx, c) { self.media.note = Some(e); }
         }
         // The note (relink/extraction/import result) is shown in the activity strip.
     }

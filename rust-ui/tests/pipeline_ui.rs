@@ -3,7 +3,7 @@ mod common;
 use ck::presets::{Delivery, VideoDelivery};
 use ck::ui::{App, AppOptions, Tab};
 use common::*;
-use eframe::egui::{self, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
+use eframe::egui::{self, Event, RawInput, Rect, Vec2};
 use serde_json::json;
 
 const W: f32 = 1440.0;
@@ -21,16 +21,6 @@ fn frames(ctx: &egui::Context, app: &mut App, n: usize) {
     for _ in 0..n {
         frame(ctx, app, vec![]);
     }
-}
-
-fn click(at: egui::Pos2) -> Vec<Event> {
-    let b = |pressed| Event::PointerButton {
-        pos: at,
-        button: PointerButton::Primary,
-        pressed,
-        modifiers: Modifiers::NONE,
-    };
-    vec![Event::PointerMoved(at), b(true), b(false)]
 }
 
 fn open_app(tag: &str, tab: Tab) -> (egui::Context, App, std::path::PathBuf) {
@@ -67,24 +57,6 @@ fn open_app(tag: &str, tab: Tab) -> (egui::Context, App, std::path::PathBuf) {
 }
 
 
-fn rect(app: &App, k: &str) -> Rect {
-    app.preset_rects().iter().find(|r| r.0 == k).map(|r| r.1).unwrap_or_else(|| panic!("{k} not drawn"))
-}
-
-fn press(ctx: &egui::Context, app: &mut App, k: &str) {
-    let at = rect(app, k).center();
-    frame(ctx, app, click(at));
-    frames(ctx, app, 3);
-}
-
-fn name_it(ctx: &egui::Context, app: &mut App, n: &str) {
-    let at = rect(app, "name").center();
-    frame(ctx, app, click(at));
-    frame(ctx, app, vec![Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND }]);
-    frame(ctx, app, vec![Event::Text(n.into())]);
-    frames(ctx, app, 3);
-}
-
 #[test]
 fn saving_then_applying_restores_every_pipeline_part() {
     let (ctx, mut app, _s) = open_app("pipe-full", Tab::Key);
@@ -110,8 +82,10 @@ fn saving_then_applying_restores_every_pipeline_part() {
     app.set_export_for_test(&mix, Some(30.0), true, Some(exp.clone()));
     frames(&ctx, &mut app, 2);
     let (p0, o0) = app.draft_snapshot_for_test().unwrap();
-    name_it(&ctx, &mut app, "full");
-    press(&ctx, &mut app, "save");
+    // Save = capture the live pipeline (what the Deliver page's Save preset stores).
+    let clip = app.clip_for_test();
+    let pl = app.capture_pipeline(&clip).expect("pipeline captured");
+    assert_eq!((pl.hint.guide, pl.params.hint_mode.as_str(), pl.outputs.fg_enabled), (ck::hints::Producer::Sam, "full", false));
     // Change every part, then Apply.
     app.hint_apply_cfg_for_test(ck::hints::HintCfg::default());
     app.draft_for_test(|p, o| {
@@ -122,7 +96,8 @@ fn saving_then_applying_restores_every_pipeline_part() {
     app.set_location_for_test(None);
     app.set_export_for_test(&[], None, false, None);
     frames(&ctx, &mut app, 2);
-    press(&ctx, &mut app, "apply");
+    app.apply_pipeline(&ctx, &clip, "full", &pl).expect("preset applied");
+    frames(&ctx, &mut app, 3);
     assert_eq!(app.hint_cfg_for_test().unwrap(), cfg);
     let (p1, o1) = app.draft_snapshot_for_test().unwrap();
     assert_eq!((p1.hint_mode.as_str(), p1.despill_strength, o1.fg_enabled), ("full", 0.8, false));
@@ -142,20 +117,19 @@ fn saving_then_applying_restores_every_pipeline_part() {
 
 #[test]
 fn defaults_save_with_no_location_and_source_fps_and_roundtrip_as_such() {
-    let (ctx, mut app, settings) = open_app("pipe-default", Tab::Key);
+    let (ctx, mut app, _settings) = open_app("pipe-default", Tab::Key);
     frames(&ctx, &mut app, 4);
-    name_it(&ctx, &mut app, "plain");
-    press(&ctx, &mut app, "save");
-    let (ps, err) = ck::presets::load(&ck::presets::file_beside(Some(&settings)).unwrap());
-    assert!(err.is_none());
-    let pl = ck::presets::Pipeline::from_value(&ps[0].data).expect("default pipeline saved");
+    let clip = app.clip_for_test();
+    let pl = app.capture_pipeline(&clip).expect("default pipeline captured");
+    let pl = ck::presets::Pipeline::from_value(&pl.to_value()).expect("default pipeline round-trips through its saved form");
     assert!(pl.location.is_none() && pl.export.fps.is_none() && pl.export.root.is_none() && !pl.export.has_video());
     assert!(pl.export.outputs.values().all(|d| *d == Delivery::Sequence));
     // Applying it clears an explicit location and fps override.
     app.set_location_for_test(Some(json!({"root": std::env::temp_dir(), "folder_template": "{name}", "file_template": "{name}_####"})));
     app.set_export_for_test(&[("processed", Delivery::Video(VideoDelivery::default_for("mp4")))], Some(12.0), false, Some(std::env::temp_dir()));
     frames(&ctx, &mut app, 2);
-    press(&ctx, &mut app, "apply");
+    app.apply_pipeline(&ctx, &clip, "plain", &pl).expect("preset applied");
+    frames(&ctx, &mut app, 3);
     assert!(app.location_for_test().is_none());
     let (d, fps, partial, dir) = app.export_state_for_test();
     assert_eq!((fps, partial, dir), (None, false, None));
@@ -171,36 +145,25 @@ fn legacy_presets_are_labelled_and_apply_only_params() {
     ck::presets::save(&f, &[legacy]).unwrap();
     app.reload_presets_for_test();
     app.set_export_for_test(&[], Some(12.0), false, None);
-    let mut app2 = app;
-    frames(&ctx, &mut app2, 4);
-    press(&ctx, &mut app2, "apply");
-    assert_eq!(app2.draft_snapshot_for_test().unwrap().0.despill_strength, 0.9);
-    assert_eq!(app2.export_state_for_test().1, Some(12.0), "export untouched by a legacy preset");
+    frames(&ctx, &mut app, 4);
+    app.deliver_preset_for_test(&ctx, "apply", "old").expect("legacy preset applied");
+    frames(&ctx, &mut app, 3);
+    assert_eq!(app.draft_snapshot_for_test().unwrap().0.despill_strength, 0.9);
+    assert_eq!(app.export_state_for_test().1, Some(12.0), "export untouched by a legacy preset");
 }
 
 #[test]
-fn deliver_shows_every_output_with_its_own_choice_and_no_overlap() {
+fn choosing_video_on_matte_changes_only_matte() {
     let (ctx, mut app, _s) = open_app("pipe-cards", Tab::Deliver);
     frames(&ctx, &mut app, 4);
-    let keys = ["fg", "matte", "comp", "processed"];
-    let cards = app.deliver_rects().to_vec();
-    for k in keys {
-        assert!(cards.iter().any(|c| c.0 == k), "{k} card missing");
-    }
-    // Pick Video on matte through the UI: only that card changes.
-    let at = cards.iter().find(|c| c.0 == "matte").unwrap().1;
-    frame(&ctx, &mut app, click(egui::pos2(at.right() - 50.0, at.top() + 55.0)));
+    assert!(app.deliver_outputs_for_test().iter().all(|o| !o.1), "every output starts as a sequence");
+    app.deliver_set_video_for_test(&ctx, 1, true).expect("matte set to video");
     frames(&ctx, &mut app, 3);
     let (d, ..) = app.export_state_for_test();
     assert!(matches!(d["matte"], Delivery::Video(_)), "matte is a video now: {d:?}");
     assert_eq!(d["fg"], Delivery::Sequence);
+    assert_eq!(d["comp"], Delivery::Sequence);
     assert_eq!(d["processed"], Delivery::Sequence);
-    let cards = app.deliver_rects().to_vec();
-    for (i, a) in cards.iter().enumerate() {
-        assert!(a.1.max.x <= W && a.1.max.y > a.1.min.y, "{} inside 1440 wide", a.0);
-        for b in &cards[i + 1..] {
-            assert!(!a.1.intersects(b.1), "{} overlaps {}", a.0, b.0);
-        }
-    }
-    assert!(cards.iter().any(|c| c.0 == "render"), "render action drawn once a video exists");
+    let o = app.deliver_outputs_for_test();
+    assert_eq!(o.iter().filter(|x| x.1).map(|x| x.0.as_str()).collect::<Vec<_>>(), ["matte"]);
 }

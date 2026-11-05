@@ -1,0 +1,328 @@
+{
+ "project": "V1_interview_finale",
+ "saved": 1,
+ "cards": [
+  {
+   "n": "V1-0062_A002C010_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0065_A003C011_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Keying 34% · frame 33 / 96",
+   "pc": "kamino3",
+   "dot": "ok",
+   "job": "r",
+   "prog": 34,
+   "r": 1
+  },
+  {
+   "n": "V1-0068_A004C012_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Can't key: no machine",
+   "pc": "",
+   "dot": "",
+   "err": 1
+  },
+  {
+   "n": "V1-0071_A002C013_261012_R4LF",
+   "st": "mask",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Pre-matte done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0074_A003C014_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "Automatic",
+   "dot": ""
+  },
+  {
+   "n": "V1-0077_A004C015_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Can't key: no machine",
+   "pc": "",
+   "dot": "",
+   "err": 1
+  },
+  {
+   "n": "V1-0080_A002C016_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0083_A003C017_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Waiting for kamino3",
+   "pc": "kamino3",
+   "dot": "ok",
+   "job": "q",
+   "dash": 1,
+   "q": 1
+  },
+  {
+   "n": "V1-0086_A004C018_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0089_A002C019_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Can't key: no machine",
+   "pc": "",
+   "dot": "",
+   "err": 1
+  },
+  {
+   "n": "V1-0092_A003C020_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0095_A004C021_261012_R4LF",
+   "st": "mask",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Pre-matte done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0098_A002C022_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0101_A003C023_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Can't key: no machine",
+   "pc": "",
+   "dot": "",
+   "err": 1
+  },
+  {
+   "n": "V1-0104_A004C024_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "Automatic",
+   "dot": ""
+  },
+  {
+   "n": "V1-0107_A002C025_261012_R4LF",
+   "st": "mask",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Pre-matte done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0110_A003C026_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0113_A004C027_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0116_A002C028_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0119_A003C029_261012_R4LF",
+   "st": "mask",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Pre-matte done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0122_A004C030_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0125_A002C031_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0128_A003C032_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "Automatic",
+   "dot": ""
+  },
+  {
+   "n": "V1-0131_A004C033_261012_R4LF",
+   "st": "mask",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Pre-matte done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0134_A002C034_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0137_A003C035_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0140_A004C036_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0143_A002C037_261012_R4LF",
+   "st": "mask",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Pre-matte done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0146_A003C038_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  },
+  {
+   "n": "V1-0149_A004C039_261012_R4LF",
+   "st": "ready",
+   "meta": "3200×1800 · 24 fps · 96 fr",
+   "s": "Hint done",
+   "pc": "kamino3",
+   "dot": "ok"
+  }
+ ],
+ "machines": [
+  {
+   "name": "This machine",
+   "local": 1,
+   "state": "idle",
+   "job": "Preparing V1-0086",
+   "gpu": 21,
+   "vram": 15,
+   "cpu": 7,
+   "ram": 28,
+   "vramt": "3.6 / 24.0 GB",
+   "ramt": "34.7 / 123.5 GB"
+  },
+  {
+   "name": "kamino3",
+   "state": "busy",
+   "job": "Keying V1-0065 · 34%",
+   "gpu": 96,
+   "vram": 71,
+   "cpu": 18,
+   "ram": 41,
+   "vramt": "17.0 / 24.0 GB",
+   "ramt": "26.2 / 63.9 GB"
+  },
+  {
+   "name": "render-node-07-with-a-long-name",
+   "state": "offline"
+  }
+ ],
+ "waiting": [
+  7
+ ],
+ "running": 1,
+ "activity": "Keying V1-0065",
+ "notices": 0,
+ "sel": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29
+ ],
+ "hov": null,
+ "qtab": "machines",
+ "menu": null,
+ "dialog": 1,
+ "drawer": 0
+}

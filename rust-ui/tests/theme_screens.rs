@@ -94,9 +94,30 @@ fn cursor_at(ctx: &egui::Context, app: &mut App, at: egui::Pos2) -> egui::Cursor
     last
 }
 
-/// Tabs, chips and the A/B toggle show the hand; a disabled chip and empty space do not.
+/// Every text painted in the frame as (rect on screen, clip rect, text), found by walking the painted shapes.
+fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(Rect, Rect, String)> {
+    fn walk(s: &egui::epaint::Shape, clip: Rect, out: &mut Vec<(Rect, Rect, String)>) {
+        match s {
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|x| walk(x, clip, out)),
+            egui::epaint::Shape::Text(t) => out.push((t.galley.rect.translate(t.pos.to_vec2()), clip, t.galley.text().to_string())),
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    for cs in shapes {
+        walk(&cs.shape, cs.clip_rect, &mut out);
+    }
+    out
+}
+
+/// Centre of the first painted text equal to `label` (what the user reads, not a stored rectangle).
+fn label_at(shapes: &[egui::epaint::ClippedShape], label: &str) -> Option<egui::Pos2> {
+    painted_texts(shapes).into_iter().find(|(_, _, s)| s == label).map(|(r, _, _)| r.center())
+}
+
+/// Tabs and chips show the hand; a disabled chip does not. Found by their painted labels.
 #[test]
-fn tabs_and_chips_show_the_hand_and_disabled_or_empty_do_not() {
+fn tabs_and_chips_show_the_hand_and_disabled_chips_do_not() {
     for pref in ["Dark", "Light"] {
         let ctx = egui::Context::default();
         let dialogs: ck::ui::picker::Backend = Arc::new(|k, _| panic!("a real dialog ({k:?}) must never open in tests"));
@@ -107,34 +128,20 @@ fn tabs_and_chips_show_the_hand_and_disabled_or_empty_do_not() {
         app.open_clip(&ctx, 0);
         app.switch_tab(Tab::Hint);
         let size = Vec2::new(1440.0, 900.0);
-        for _ in 0..4 { frame(&ctx, &mut app, size); }
-        let rects = app.header_rects().to_vec();
-        assert_eq!(cursor_at(&ctx, &mut app, rects[0].center()), egui::CursorIcon::PointingHand, "{pref} back");
-        assert_eq!(cursor_at(&ctx, &mut app, rects[1].center()), egui::CursorIcon::PointingHand, "{pref} tab");
-        let rects = app.viewer().unwrap().ui_rects.clone();
-        let find = |n: &str| rects.iter().find(|(k, _)| *k == n).unwrap_or_else(|| panic!("{n} chip not drawn")).1.center();
-        assert_eq!(cursor_at(&ctx, &mut app, find("ab")), egui::CursorIcon::PointingHand, "{pref} A/B chip");
-        // The default pre-matte producer is GVM, so the SAM chip is disabled; the rightmost view chip (Processed) has no output yet, so it is disabled too.
-        assert_eq!(cursor_at(&ctx, &mut app, find("sam")), egui::CursorIcon::Default, "{pref} disabled SAM chip");
-        let chips = find("chips");
-        let last = egui::Pos2::new(rects.iter().find(|(k, _)| *k == "chips").unwrap().1.right() - 20.0, chips.y);
-        assert_eq!(cursor_at(&ctx, &mut app, last), egui::CursorIcon::Default, "{pref} disabled Processed chip");
-        assert_eq!(cursor_at(&ctx, &mut app, egui::Pos2::new(700.0, 20.0)), egui::CursorIcon::Default, "{pref} empty header");
+        let mut shapes = vec![];
+        for _ in 0..4 { shapes = frame(&ctx, &mut app, size); }
+        let at = |label: &str| label_at(&shapes, label).unwrap_or_else(|| panic!("{pref}: {label:?} not painted"));
+        assert_eq!(cursor_at(&ctx, &mut app, at("Key")), egui::CursorIcon::PointingHand, "{pref} tab");
+        // The default pre-matte producer is GVM, so the SAM chip is disabled.
+        assert_eq!(cursor_at(&ctx, &mut app, at("SAM")), egui::CursorIcon::Default, "{pref} disabled SAM chip");
     }
 }
 
-/// Every text painted in the bottom action panel (cards, buttons) must lie fully inside its clip: nothing is cut
-/// off at 900x640, 1440x900 or 2400x1400, in Dark and Light, on every tab that has actions.
+/// Short labels, cards and buttons painted inside a clipped area (the bottom action panel) must lie fully inside their
+/// clip: nothing is cut off at 900x640, 1440x900 or 2400x1400, in Dark and Light, on every tab that has actions.
+/// Long status prose scrolls in its own column, so only labels of up to 40 characters are checked.
 #[test]
 fn action_cards_and_buttons_are_not_cut_off_at_three_window_sizes() {
-    use egui::Shape;
-    fn texts(s: &Shape, clip: Rect, out: &mut Vec<(Rect, Rect, String)>) {
-        match s {
-            Shape::Vec(v) => v.iter().for_each(|x| texts(x, clip, out)),
-            Shape::Text(t) => out.push((t.galley.rect.translate(t.pos.to_vec2()), clip, t.galley.job.text.clone())),
-            _ => {}
-        }
-    }
     for pref in ["Dark", "Light"] {
         for size in [Vec2::new(900.0, 640.0), Vec2::new(1440.0, 900.0), Vec2::new(2400.0, 1400.0)] {
             let ctx = egui::Context::default();
@@ -149,25 +156,28 @@ fn action_cards_and_buttons_are_not_cut_off_at_three_window_sizes() {
                 app.switch_tab(tab);
                 for _ in 0..4 { frame(&ctx, &mut app, size); }
                 let shapes = frame(&ctx, &mut app, size);
-                let panel = app.tools_rects().expect("tools panel drawn")[0];
-                let mut t = vec![];
-                for cs in &shapes { texts(&cs.shape, cs.clip_rect, &mut t); }
-                let inside: Vec<_> = t.iter().filter(|(r, c, s)| r.is_positive() && panel.contains(r.center()) && c.center().y > panel.top() && s.len() <= 40 && !s.contains("marked frames")).collect();
-                assert!(inside.len() > 2, "{pref} {tab:?} {size:?}: no text in the action panel");
-                let cut: Vec<_> = inside.iter().filter(|(r, c, _)| r.top() < c.top() - 1.0 || r.bottom() > c.bottom() + 1.0 || r.bottom() > panel.bottom() + 1.0).map(|(r, _, s)| format!("{s:?} {r:?} panel {panel:?}")).collect();
-                // (The marked-frames row under the cards is reached with the always-visible scrollbar. Long status prose scrolls in its own column; cards and buttons must show.)
-                // The viewer's own bottom rows (marks line) must stay above the action panel.
-                let marks = app.viewer().unwrap().ui_rects.iter().find(|(k, _)| *k == "marks_text").map(|(_, r)| r.bottom());
-                if let Some(b) = marks { assert!(b <= panel.top() + 1.0, "{pref} {tab:?} {size:?}: viewer marks row {b} runs under the action panel {panel:?}"); }
+                // Clipped areas are the panels and columns; a label inside one must show in full.
+                let labels: Vec<_> = painted_texts(&shapes)
+                    .into_iter()
+                    .filter(|(r, c, s)| r.is_positive() && (c.width() < size.x - 1.0 || c.height() < size.y - 1.0) && s.len() <= 40 && !s.contains("marked frames"))
+                    .collect();
+                assert!(labels.len() > 2, "{pref} {tab:?} {size:?}: no action label painted");
+                let cut: Vec<String> = labels
+                    .iter()
+                    // Text fields clip long values by design; a folder template ("{name}_{version}/{output}") is such a value.
+                    .filter(|(_, _, s)| !(s.contains('{') && s.contains('}')))
+                    .filter(|(r, c, _)| r.left() < c.left() - 1.0 || r.top() < c.top() - 1.0 || r.right() > c.right() + 1.0 || r.bottom() > c.bottom() + 1.0)
+                    .map(|(r, c, s)| format!("{s:?} {r:?} clip {c:?}"))
+                    .collect();
                 assert!(cut.is_empty(), "{pref} {tab:?} {size:?}: cut off:\n{}", cut.join("\n"));
             }
         }
     }
 }
 
-/// The viewer's chip rows (A/B wipe, overlay chips, SAM, the view chips) never overlap at any width.
+/// The viewer's chip labels (A/B wipe, overlay chips, SAM, the view chips) never paint over each other at any width.
 #[test]
-fn viewer_chip_rows_never_overlap_at_three_window_sizes() {
+fn viewer_chip_labels_never_overlap_at_three_window_sizes() {
     for pref in ["Dark", "Light"] {
         for size in [Vec2::new(900.0, 640.0), Vec2::new(1440.0, 900.0), Vec2::new(2400.0, 1400.0)] {
             let ctx = egui::Context::default();
@@ -180,11 +190,14 @@ fn viewer_chip_rows_never_overlap_at_three_window_sizes() {
             for tab in [Tab::Hint, Tab::Key] {
                 app.switch_tab(tab);
                 for _ in 0..5 { frame(&ctx, &mut app, size); }
-                let rects: Vec<_> = app.viewer().unwrap().ui_rects.iter().filter(|(k, _)| matches!(*k, "chips" | "ab" | "overlay_off" | "overlay_guide" | "overlay_hint" | "sam")).cloned().collect();
-                assert!(rects.len() >= 5, "{pref} {tab:?} {size:?}: chips not drawn: {rects:?}");
-                for (i, (a, ra)) in rects.iter().enumerate() {
-                    for (b, rb) in &rects[i + 1..] {
-                        assert!(!ra.intersects(*rb), "{pref} {tab:?} {size:?}: {a} {ra:?} overlaps {b} {rb:?}");
+                let shapes = frame(&ctx, &mut app, size);
+                let labels: Vec<_> = painted_texts(&shapes).into_iter().filter(|(r, _, s)| r.is_positive() && s.len() <= 20).collect();
+                assert!(labels.len() >= 5, "{pref} {tab:?} {size:?}: chips not drawn: {labels:?}");
+                for (i, (ra, _, a)) in labels.iter().enumerate() {
+                    for (rb, _, b) in &labels[i + 1..] {
+                        // The dock repaints its tab labels on the strip's own labels: same text, same spot is not a collision.
+                        let repaint = a == b && (ra.left() - rb.left()).abs() <= 2.0 && (ra.top() - rb.top()).abs() <= 2.0;
+                        assert!(repaint || !ra.shrink(1.0).intersects(rb.shrink(1.0)), "{pref} {tab:?} {size:?}: {a:?} {ra:?} overlaps {b:?} {rb:?}");
                     }
                 }
             }
@@ -248,7 +261,7 @@ fn stage_colours(ctx: &egui::Context) -> Vec<(ClipState, theme::StageColors, Col
     out
 }
 
-/// The Board draws every stage's chip fill and 2 px card edge in its own colour, and names it.
+/// The Board draws every stage's chip fill and a card edge in its own colour, and names it.
 fn stage_chips_are_painted(pref: &str, ctx: &egui::Context, shapes: &[egui::epaint::ClippedShape]) {
     use egui::Shape;
     fn rects(s: &Shape, out: &mut Vec<egui::epaint::RectShape>) {
@@ -262,7 +275,8 @@ fn stage_chips_are_painted(pref: &str, ctx: &egui::Context, shapes: &[egui::epai
     shapes.iter().for_each(|c| rects(&c.shape, &mut all));
     for (st, c, _, _) in stage_colours(ctx).into_iter().take(4) {
         assert!(all.iter().any(|r| r.fill == c.chip), "{pref}: no {st:?} chip painted");
-        assert!(all.iter().any(|r| r.stroke.color == c.edge && r.stroke.width >= 2.0), "{pref}: no {st:?} card edge painted");
+        // The Board card's edge is a 3 px filled bar in the stage colour (controls/card.rs), or a stroke.
+        assert!(all.iter().any(|r| r.fill == c.edge) || all.iter().any(|r| r.stroke.color == c.edge && r.stroke.width > 0.0), "{pref}: no {st:?} card edge painted");
     }
 }
 

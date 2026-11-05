@@ -1,0 +1,11 @@
+{
+  "pane": "Playback",
+  "cache_auto": true,
+  "decode_auto": true,
+  "loop_default": true,
+  "shell": {
+    "project": "Night_exterior_greenscreen",
+    "saved": true,
+    "models_missing": 0
+  }
+}

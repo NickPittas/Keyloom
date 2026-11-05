@@ -41,6 +41,8 @@ pub struct DisplayFrame {
     pub rgba: Vec<u8>,
     pub has_alpha: bool,
     pub clipped_hdr: bool,
+    /// (pixels with any colour channel < 0, pixels with any colour channel > 1). None = unknown or 8-bit source.
+    pub out_of_range: Option<(usize, usize)>,
     pub info: String,
 }
 
@@ -168,6 +170,7 @@ fn decode_exr_display(path: &Path, interp: Interp) -> std::result::Result<Displa
     let alpha = find(&img, "A");
     let mut out = vec![255u8; n * 4];
     let mut clipped = false;
+    let (mut below, mut above) = (0usize, 0usize);
     let mut track = |v: f32| {
         if !(0.0..=1.0).contains(&v) && v.is_finite() {
             clipped = true;
@@ -179,17 +182,22 @@ fn decode_exr_display(path: &Path, interp: Interp) -> std::result::Result<Displa
         has_alpha = alpha.is_some();
         for i in 0..n {
             let a = alpha.map_or(1.0, |a| sample(a, i));
+            let (mut lo, mut hi) = (false, false);
             for (k, s) in [r, g, b].into_iter().enumerate() {
                 let mut v = sample(s, i);
                 if interp == Interp::LinearToSrgbPremul && alpha.is_some() {
                     v = if a > 0.0 { v / a } else { 0.0 };
                 }
                 track(v);
+                lo |= v < 0.0;
+                hi |= v > 1.0;
                 out[i * 4 + k] = match interp {
                     Interp::LinearToSrgb | Interp::LinearToSrgbPremul => linear_to_srgb8(v),
                     _ => (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
                 };
             }
+            below += lo as usize;
+            above += hi as usize;
             if let Some(a) = alpha {
                 out[i * 4 + 3] = (sample(a, i).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
@@ -204,6 +212,8 @@ fn decode_exr_display(path: &Path, interp: Interp) -> std::result::Result<Displa
         for i in 0..n {
             let v = sample(y, i);
             track(v);
+            below += (v < 0.0) as usize;
+            above += (v > 1.0) as usize;
             let g = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             out[i * 4..i * 4 + 3].fill(g);
         }
@@ -220,6 +230,7 @@ fn decode_exr_display(path: &Path, interp: Interp) -> std::result::Result<Displa
         rgba: out,
         has_alpha,
         clipped_hdr: clipped,
+        out_of_range: Some((below, above)),
         info: format!("EXR {desc} {ty} {comp}"),
     })
 }
@@ -267,6 +278,7 @@ fn decode_png(path: &Path, interp: Interp) -> std::result::Result<DisplayFrame, 
         rgba: out,
         has_alpha: has_alpha && interp != Interp::Matte,
         clipped_hdr: false,
+        out_of_range: None,
         info: format!(
             "PNG {:?} {:?}-bit(8 shown)",
             info.color_type, info.bit_depth

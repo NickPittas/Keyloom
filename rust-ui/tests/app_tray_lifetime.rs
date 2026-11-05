@@ -137,8 +137,8 @@ fn confirm_batch(ctx: &egui::Context, app: &mut App) {
     app.key_selected(ctx);
     pump(ctx, app, "batch review", |a| a.ai().batch_ready());
     settle(ctx, app);
-    let r = app.ai().batch_confirm_rect.expect("Queue button drawn");
-    click_on(ctx, app, r.center());
+    app.ai_mut().confirm_batch();
+    run(ctx, app, vec![]);
     app.ai_mut().placement = session;
 }
 

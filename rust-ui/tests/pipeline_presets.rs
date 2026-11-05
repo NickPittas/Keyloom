@@ -6,9 +6,10 @@ use ck::presets::{class_of, Delivery, Pipeline, PipelineExport, PresetClass, Vid
 use ck::project::{load_project, LoadOptions};
 use ck::settings::Settings;
 use ck::tasks::TaskKind;
+use ck::ui::shot_page::{Act, BarAct, PropAct};
 use ck::ui::{App, AppOptions};
 use ck::workflow::{OutputCfg, Params};
-use eframe::egui::{self, Event, Modifiers, PointerButton, RawInput, Rect, Vec2};
+use eframe::egui::{self, Event, RawInput, Rect, Vec2};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,13 +74,6 @@ fn pump(ctx: &egui::Context, app: &mut App, what: &str, mut done: impl FnMut(&Ap
         std::thread::sleep(Duration::from_millis(15));
     }
 }
-fn click_on(ctx: &egui::Context, app: &mut App, at: egui::Pos2) {
-    let b = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    run(ctx, app, vec![Event::PointerMoved(at)]);
-    run(ctx, app, vec![b(true)]);
-    run(ctx, app, vec![b(false)]);
-}
-
 fn start(e: &Env, folders: &[&str], p: &Pipeline) -> (egui::Context, App) {
     let ctx = egui::Context::default();
     let mut app = App::with_ctx(
@@ -107,8 +101,8 @@ fn start(e: &Env, folders: &[&str], p: &Pipeline) -> (egui::Context, App) {
     (ctx, app)
 }
 fn confirm(ctx: &egui::Context, app: &mut App) {
-    let r = app.ai().batch_confirm_rect.expect("Queue button drawn");
-    click_on(ctx, app, r.center());
+    app.ai_mut().confirm_batch();
+    run(ctx, app, vec![]);
 }
 
 /// Only the matte is enabled, as PNG.
@@ -422,27 +416,19 @@ fn choosing_a_saved_preset_in_the_batch_dropdown_recomputes_the_rows_and_chain()
     }
     let plain = app.ai().batch_summary().join("\n");
     assert!(plain.contains("a: new") && !plain.contains("export"), "{plain}");
-    // The review has no preset choice: the Board's selector picks it, and a clean Key queues at once.
+    // The Board's preset choice (same saved file) drives the next Key; choosing queues nothing.
     app.ai_mut().cancel_batch();
-    for _ in 0..4 {
-        run(&ctx, &mut app, vec![]);
-    }
-    let at = app.ai().board_preset_rect.expect("Board preset selector drawn").center();
-    click_on(&ctx, &mut app, at);
-    for _ in 0..4 {
-        run(&ctx, &mut app, vec![]);
-    }
-    let items = app.ai().board_preset_items.clone();
-    let names: Vec<&str> = items.iter().map(|i| i.0.as_str()).collect();
-    assert_eq!(names, ["", "full", "old"], "disk presets listed, legacy included");
-    let full_at = items.iter().find(|i| i.0 == "full").unwrap().1.center();
-    click_on(&ctx, &mut app, full_at);
+    let names: Vec<String> = ck::presets::load(&e.base.join("presets.json")).0.into_iter().map(|p| p.name).collect();
+    assert_eq!(names, ["full", "old"], "disk presets listed, legacy included");
+    app.ai_mut().batch_dialog_set_preset(&ctx, Some("full".into()));
     for _ in 0..4 {
         run(&ctx, &mut app, vec![]);
     }
     assert!(app.ai().scheduler().task_snapshot().is_empty(), "choosing queues nothing");
-    let key = app.ai().board_key_rect.expect("Key button drawn").center();
-    click_on(&ctx, &mut app, key);
+    app.select_folders(&["a"]);
+    app.key_selected(&ctx);
+    pump(&ctx, &mut app, "review", |a| a.ai().batch_ready());
+    confirm(&ctx, &mut app);
     pump(&ctx, &mut app, "queued", |a| a.ai().scheduler().task_snapshot().len() == 3);
     let kinds: Vec<TaskKind> = app.ai().scheduler().task_snapshot().iter().map(|t| t.job.kind).collect();
     assert_eq!(kinds, [TaskKind::Birefnet, TaskKind::Matanyone2, TaskKind::ExportVideo]);
@@ -581,27 +567,18 @@ fn open_app(e: &Env) -> (egui::Context, App) {
 }
 
 #[test]
-fn board_preset_selector_is_visible_before_review_and_drives_the_plan() {
+fn board_preset_chosen_before_review_drives_the_plan() {
     let e = env("board", &[("a", 4, 24.0, Some((1, 3)))], json!({"version": 2}));
     let full = pipeline(birefnet_matanyone(), "full", export_on());
     ck::presets::save(&e.base.join("presets.json"), &[ck::presets::pipeline_preset("full", &full)]).unwrap();
     let (ctx, mut app) = open_app(&e);
     app.select_folders(&["a"]);
     run(&ctx, &mut app, vec![]);
-    // The selector is on the Board before any review exists, listing the same saved file.
-    let at = app.ai().board_preset_rect.expect("Board preset selector drawn").center();
-    click_on(&ctx, &mut app, at);
-    for _ in 0..4 {
-        run(&ctx, &mut app, vec![]);
-    }
-    let items = app.ai().board_preset_items.clone();
-    assert_eq!(items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), ["", "full"]);
-    click_on(&ctx, &mut app, items[1].1.center());
-    for _ in 0..4 {
-        run(&ctx, &mut app, vec![]);
-    }
-    let key = app.ai().board_key_rect.expect("Key button drawn").center();
-    click_on(&ctx, &mut app, key);
+    // The preset is chosen before any review exists, from the same saved file.
+    app.ai_mut().batch_dialog_set_preset(&ctx, Some("full".into()));
+    app.key_selected(&ctx);
+    pump(&ctx, &mut app, "review", |a| a.ai().batch_ready());
+    confirm(&ctx, &mut app);
     pump(&ctx, &mut app, "queued", |a| !a.ai().scheduler().task_snapshot().is_empty());
     let kinds: Vec<TaskKind> = app.ai().scheduler().task_snapshot().iter().map(|t| t.job.kind).collect();
     assert!(kinds.contains(&TaskKind::ExportVideo), "the chosen preset's pipeline is planned: {kinds:?}");
@@ -680,13 +657,13 @@ fn existing_key_result_is_delivered_without_a_new_key_in_sequence_and_never_over
     app.ai_mut().placement = ck::scheduler::Placement::Target("l0".into()); // Automatic waits for a live GPU sample
 
     // Opening a clip no longer starts the worker, so there is no capability reply to wait for: let the clip load.
-    pump(&ctx, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some() && !a.deliver_rects().is_empty());
+    pump(&ctx, &mut app, "clip loaded", |a| a.in_workspace() && a.open_frame_count().is_some());
+    pump(&ctx, &mut app, "hint state loaded", |a| a.hint_loaded_for_test());
     app.set_export_for_test(&[("matte", video("mp4", "h264", 18))], None, false, None);
-    pump(&ctx, &mut app, "export button drawn", |a| a.deliver_rects().iter().any(|r| r.0 == "export_existing"));
-    let r = app.deliver_rects().iter().find(|r| r.0 == "export_existing").unwrap().1;
-    let right = app.tools_rects().unwrap()[2];
-    assert!((r.center().x - right.center().x).abs() < 1.0, "export button centred in the action region");
-    click_on(&ctx, &mut app, r.center());
+    app.act_for_test(&ctx, Act::Props(PropAct::Bar(BarAct::Menu("Export existing".into()))));
+    for _ in 0..4 {
+        run(&ctx, &mut app, vec![]);
+    }
     assert_eq!(app.ai().scheduler().task_snapshot().len(), 1);
     assert!(app.ai().scheduler().snapshot().is_empty(), "clicking Export existing queues no Key");
     drop(app);

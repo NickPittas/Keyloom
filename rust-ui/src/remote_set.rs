@@ -3,7 +3,7 @@
 use crate::netlink::Source;
 use crate::network_setup::ConnectionInfo;
 use crate::queue::Entry;
-use crate::remote::{Action, Conn, Env, Remote};
+use crate::remote::{Action, Conn, ConnRow, Env, Remote};
 use crate::ui::ai::NetSubmit;
 use crate::settings::Settings;
 use eframe::egui::{self, RichText, Ui};
@@ -230,6 +230,17 @@ impl RemoteSet {
         acts
     }
 
+    /// Read-only submitted-job snapshot for Board cards and the running count.
+    pub fn jobs_snapshot(&self) -> Vec<crate::remote::JobSnapshot> {
+        self.remotes.iter().flat_map(Remote::jobs_snapshot).collect()
+    }
+
+    pub fn machines_snapshot(&self) -> Vec<crate::remote::MachineSnapshot> {
+        self.remotes.iter().flat_map(Remote::machines_snapshot).collect()
+    }
+
+    pub fn running_count(&self) -> usize { self.remotes.iter().map(Remote::running_count).sum() }
+
     /// Jobs of PCs that were removed: one collapsed History section, grouped by PC. Kept until the user clears them.
     fn history_ui(&mut self, ui: &mut Ui) {
         if self.history.as_ref().is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(1)) {
@@ -287,21 +298,43 @@ impl RemoteSet {
         if !self.available() {
             return vec![];
         }
-        let own: Vec<String> = self.remotes.iter().filter_map(Remote::me).map(str::to_owned).chain(own_iid.map(str::to_owned)).collect();
+        let own = self.own_ids(own_iid);
         let mut acts = vec![];
-        for (c, default) in conn_of(s, sp) {
-            let Some(r) = self.remotes.iter().find(|r| r.key == key_of(&c)) else { continue };
+        for (c, default, r, blocker) in self.visible(s, sp, own_net) {
+            acts.extend(r.row(ui, &c, default, blocker, &own));
+            ui.end_row();
+        }
+        acts
+    }
+
+    /// The saved connections as read-only rows for the Machines page: the same connections, order and own-id filter as `rows`.
+    /// Nothing when networking is off.
+    pub fn conn_rows(&self, s: &Settings, own_net: Option<&str>, own_iid: Option<&str>) -> Vec<ConnRow> {
+        if !self.available() {
+            return vec![];
+        }
+        let own = self.own_ids(own_iid);
+        self.visible(s, None, own_net).into_iter().map(|(c, default, r, _)| r.conn_row_for(&c, default, &own)).collect()
+    }
+
+    /// Every installation id that is this computer's own (each network's own id, and `own_iid`).
+    fn own_ids(&self, own_iid: Option<&str>) -> Vec<String> {
+        self.remotes.iter().filter_map(Remote::me).map(str::to_owned).chain(own_iid.map(str::to_owned)).collect()
+    }
+
+    /// The connections the Clients table draws, in order, with the Batch-default flag and the remove blocker. `rows` and `conn_rows` share it.
+    fn visible(&self, s: &Settings, sp: Option<&Path>, own_net: Option<&str>) -> Vec<(Conn, bool, &Remote, Option<String>)> {
+        conn_of(s, sp).into_iter().filter_map(|(c, default)| {
+            let r = self.remotes.iter().find(|r| r.key == key_of(&c))?;
             let blocker = r.remove_blocker(c.creds.as_deref());
             // `own_net` unknown (None) must not match a connection whose network is unknown too. A leftover
             // self-connection is skipped only when idle and removable; otherwise its controls must stay reachable.
             let own_net_conn = own_net.is_some_and(|n| r.ns().as_deref() == Some(n));
             if own_net_conn && !c.enabled && blocker.is_none() {
-                continue;
+                return None;
             }
-            acts.extend(r.row(ui, &c, default, blocker, &own));
-            ui.end_row();
-        }
-        acts
+            Some((c, default, r, blocker))
+        }).collect()
     }
 
 }
