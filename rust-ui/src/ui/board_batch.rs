@@ -47,12 +47,16 @@ fn counts(cards: &[FxShot]) -> Counts {
 fn six_cells(ui: &mut Ui, id: Id, height: f32, width: f32, add: impl FnOnce(&mut [Ui; 6])) {
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let mut row = ui.new_child(UiBuilder::new().id_salt(id).max_rect(rect));
+    let completed_width = (line(ui.painter(), "Completed", ty::chip(), 14.0, f32::INFINITY).size().x + 28.0).round();
+    let mut col_widths = COLS;
+    col_widths[1] -= (completed_width - col_widths[2]).max(0.0);
+    col_widths[2] = completed_width;
     let mut x = rect.left();
     let mut cells = std::array::from_fn(|i| {
         let width = if i == 5 {
-            width - COLS[..5].iter().sum::<f32>()
+            width - col_widths[..5].iter().sum::<f32>()
         } else {
-            COLS[i]
+            col_widths[i]
         };
         let cell_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(width, height));
         x += width;
@@ -328,7 +332,7 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
         let galley = line(cells[1].painter(), &row.name, ty::mono(), 16.0, cells[1].max_rect().width() - 8.0);
         paint_line(cells[1].painter(), cells[1].max_rect(), galley, 16.0, Align::Min, t.text_primary, 1.0);
         let stage = match row.stage.as_str() { "mask" => Stage::Mask, "ready" => Stage::Ready, "done" => Stage::Completed, _ => Stage::Raw };
-        let stage_rect = cells[2].max_rect().translate(vec2(0.0, if index > 0 { 1.0 } else { 0.0 }));
+        let stage_rect = cells[2].max_rect();
         let mut stage_cell = cells[2].new_child(UiBuilder::new().max_rect(stage_rect).layout(Layout::left_to_right(Align::Center)));
         chips::stage_chip(&mut stage_cell, stage);
 
@@ -347,8 +351,9 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
             chips::job_badge_motion(&mut badge, job, true);
         } else {
             let rect = cells[3].max_rect();
-            let galley = line(cells[3].painter(), "—", ty::label(), 16.0, rect.width());
-            paint_line(cells[3].painter(), rect, galley, 16.0, Align::Min, t.text_tertiary, 0.0);
+            let painter = cells[3].painter().with_clip_rect(rect);
+            let galley = line(&painter, "—", ty::label(), 16.0, rect.width());
+            paint_line(&painter, rect, galley, 16.0, Align::Min, t.text_tertiary, 0.0);
         }
 
         let mut pick = batch.machines.iter().position(|machine| machine.id.as_ref() == row.machine.as_ref()).unwrap_or(items.len());
