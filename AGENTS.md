@@ -17,6 +17,8 @@ Build installers ONLY with the canonical command, on the target OS:
 - The staged self-check at build time uses `bundle.BUILD_SELFCHECK_TIMEOUT` (finite, 300 s); installers have no install-time budget, only the 300 s no-progress stall guard (`STALL_SECONDS`).
 
 ## Tests
+**Hard rule: live first.** No test of any kind is run, created, fixed, read or written until the feature itself has been verified live: the real app with the real worker, GPU and models (Endor; Kamino3 for Windows), with the result seen as a screenshot, process exit or real files. Test results never count as proof that a feature works. This applies to every delegated agent.
+
 Follow `rust-ui/AGENTS.md`: run tests only through `rust-ui/tools/isolated-test.sh` (use absolute paths for the interpreter and test files), never on the live desktop.
 
 ## Command monitoring and timing gates (persistent user requirements)
