@@ -1372,7 +1372,10 @@ impl Remote {
 
     // ---- UI --------------------------------------------------------------------------------------------------------
 
-    pub fn status_line(&self, _cfg: &Conn) -> (String, bool) {
+    pub fn status_line(&self, cfg: &Conn) -> (String, bool) {
+        if !cfg.enabled {
+            return ("Not connected".into(), false);
+        }
         match &self.phase {
             Phase::Online if self.contacted => ("Connected".into(), true),
             Phase::Online => ("Connecting…".into(), false),
@@ -1565,7 +1568,10 @@ impl Remote {
     /// The shared source of a connection's values: the Clients row draws these, `conn_row` and `RemoteSet::conn_rows` return them.
     pub(crate) fn conn_row_for(&self, cfg: &Conn, is_default: bool, own: &[String]) -> ConnRow {
         let (status_text, connected) = self.status_line(cfg);
-        let notes = self.notes();
+        let mut notes = if cfg.enabled { self.notes() } else { Vec::new() };
+        if cfg.enabled && matches!(self.phase, Phase::Failed(_)) && !notes.contains(&status_text) {
+            notes.insert(0, status_text.clone());
+        }
         let installs = self.other_installations(own);
         let host_name = installs.iter().find(|i| i.id == self.public_host()).map(|i| i.name.trim()).filter(|n| !n.is_empty())
             .or_else(|| { let n = cfg.host_name.trim(); (!n.is_empty()).then_some(n) })
@@ -1641,6 +1647,25 @@ impl Remote {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn machines_diagnostics_follow_connect_without_losing_the_failure() {
+        let mut r = Remote::blank(Source::Off, "connection.json".into());
+        let reason = "This connection was revoked by the other machine. Remove it and join again.";
+        r.phase = Phase::Failed(reason.into());
+        r.status = Some("no such endpoint".into());
+        let mut cfg = Conn { enabled: true, ..Conn::default() };
+        let row = r.conn_row(&cfg);
+        assert!(row.notes.iter().any(|n| n.contains(reason)));
+        assert!(row.status_detail.contains(reason));
+        cfg.enabled = false;
+        let row = r.conn_row(&cfg);
+        assert_eq!(row.status_text, "Not connected");
+        assert!(!row.connected && row.notes.is_empty() && row.status_detail.is_empty());
+        assert_eq!(r.status.as_deref(), Some("no such endpoint"));
+        cfg.enabled = true;
+        assert!(r.conn_row(&cfg).status_detail.contains(reason));
+    }
 
     #[test]
     fn own_queue_does_not_offer_submitters_as_render_targets() {
@@ -1954,10 +1979,11 @@ mod discovery_tests {
         let mut r = free_remote(1.0, true);
         r.contacted = false; // credentials loaded and the link is up, but the PC has not answered yet
         assert!(!r.online() && !r.is_free("X") && !r.accepts_work(&Conn { enabled: true, receive: true, ..Conn::default() }));
-        assert_eq!(r.status_line(&Conn::default()).0, "Connecting…");
+        let cfg = Conn { enabled: true, ..Conn::default() };
+        assert_eq!(r.status_line(&cfg).0, "Connecting…");
         r.contacted = true; // a successful status or push contact
         assert!(r.online() && r.is_free("X"));
-        assert_eq!(r.status_line(&Conn::default()), ("Connected".to_owned(), true));
+        assert_eq!(r.status_line(&cfg), ("Connected".to_owned(), true));
         r.stop(); // the link dropped: the connection is kept, the PC is simply offline until it answers again
         assert!(!r.online());
     }

@@ -308,7 +308,8 @@ impl Page {
         let t = *tokens(ui);
         ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg_panel);
         let bounds = ui.available_rect_before_wrap();
-        let overflow = self.scrolls_at(bounds.width(), bounds.height());
+        let fixed_notes_h = (self.live.notes.len() + usize::from(self.notice.is_some())) as f32 * 24.0;
+        let overflow = self.scrolls_at(bounds.width(), bounds.height() + fixed_notes_h - self.notes_height(ui, bounds.width()));
         let gutter = if overflow { 8.0 } else { 0.0 };
         let scroll_rect = Rect::from_min_max(bounds.min - egui::vec2(0.0, gutter), bounds.max + egui::vec2(gutter, gutter));
         let mut page = ui.new_child(UiBuilder::new().max_rect(scroll_rect).layout(Layout::top_down(Align::Min)));
@@ -367,7 +368,7 @@ impl Page {
         let local_table_h = table_height(1, local_table_w < 1256.0);
         let other_table_h = table_height(self.live.others.len(), local_table_w < 1256.0);
         let joined_body_h = self.joined_body_height(local_table_w < 808.0);
-        let notes_h = (self.live.notes.len() + usize::from(self.notice.is_some())) as f32 * 24.0;
+        let notes_h = self.notes_height(ui, w);
         let local_h = if self.fx.local_open {
             24.0 + 2.0 + 72.0
                 + self.live.local.service_error.iter().count() as f32 * 24.0
@@ -389,19 +390,30 @@ impl Page {
         draw_text(&page, Rect::from_min_size(origin + egui::vec2(8.0, 4.0), egui::vec2(w - 16.0, 20.0)), "Machines", ty::title(), 20.0, t.text_primary, Align::Min);
         let mut y = origin.y + 28.0;
         for (note, is_error) in &self.live.notes {
-            draw_text(&page, Rect::from_min_size(egui::pos2(origin.x + 16.0, y), egui::vec2(w - 32.0, 24.0)), note, ty::small(), 14.0, if *is_error { t.error } else { t.text_secondary }, Align::Min);
-            y += 24.0;
+            let galley = page.painter().layout(note.clone(), ty::small(), if *is_error { t.error } else { t.text_secondary }, (w - 32.0).max(1.0));
+            let height = galley.size().y.max(20.0) + 4.0;
+            page.painter().galley(egui::pos2(origin.x + 16.0, y), galley, t.text_secondary);
+            y += height;
         }
         if let Some(notice) = self.notice.as_deref() {
-            draw_text(&page, Rect::from_min_size(egui::pos2(origin.x + 16.0, y), egui::vec2(w - 120.0, 24.0)), notice, ty::small(), 14.0, t.error, Align::Min);
+            let galley = page.painter().layout(notice.to_owned(), ty::small(), t.error, (w - 120.0).max(1.0));
+            let height = galley.size().y.max(20.0) + 4.0;
+            page.painter().galley(egui::pos2(origin.x + 16.0, y), galley, t.error);
             if ui.add(buttons::ghost_button("Dismiss").at(egui::pos2(origin.x + w - 92.0, y))).clicked() { acts.push(Act::DismissNotice); }
-            y += 24.0;
+            y += height;
         }
         self.local_section(&mut page, t, origin.x, y, w, local_table_h, acts);
         y += local_h;
         self.other_section(&mut page, t, origin.x, y, w, other_table_h, acts);
         y += other_h;
         self.joined_section(&mut page, t, origin.x, y, w, local_table_w < 808.0, joined_body_h, acts);
+    }
+
+    fn notes_height(&self, ui: &Ui, width: f32) -> f32 {
+        self.live.notes.iter().map(|(note, _)| (note, width - 32.0))
+            .chain(self.notice.iter().map(|notice| (notice, width - 120.0)))
+            .map(|(text, width)| ui.painter().layout(text.clone(), ty::small(), Color32::WHITE, width.max(1.0)).size().y.max(20.0) + 4.0)
+            .sum()
     }
 
     fn scrolls_at(&self, width: f32, height: f32) -> bool {
@@ -1178,6 +1190,29 @@ fn disclosure(ui: &mut Ui, rect: Rect, id: &str, title: &str, expanded: bool, ba
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machines_diagnostics_wrap_complete_messages_in_narrow_windows() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+        let reason = "The connection to this workstation was revoked. Remove the old connection and join this machine again before sending more shots.";
+        let mut page = Page::new();
+        page.update(Live { notes: vec![(reason.into(), true)], ..Live::default() });
+        page.set_notice(Some(format!("Could not remove connection: {reason}")));
+        let mut output = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 1600.0))),
+            ..Default::default()
+        }, |ui| { page.ui(ui); });
+        output.textures_delta.clear();
+        for message in [reason.to_owned(), format!("Could not remove connection: {reason}")] {
+            let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == message => Some(text),
+                _ => None,
+            }).expect("the whole diagnostic must be drawn");
+            assert!(text.galley.rows.len() > 1, "the diagnostic must wrap");
+            assert!(text.pos.x + text.galley.size().x <= 360.0);
+        }
+    }
 
     #[test]
     fn machines_fixtures_select_the_approved_page_states() {

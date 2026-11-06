@@ -67,7 +67,7 @@ fn key_cmd_of(a: KeyAct) -> KeyCmd {
 }
 
 #[cfg(test)]
-mod tests {
+mod hint_command_tests {
     use super::*;
 
     #[test]
