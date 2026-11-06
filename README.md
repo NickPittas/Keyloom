@@ -41,10 +41,10 @@ These credits do not resolve discrepancies between upstream licence labels and r
 - **Key** with temporal awareness, VRAM and despill controls. Results are never overwritten unless you confirm.
 - **Review** Input, Hint, FG, Matte, Comp and Processed in one viewer with an A/B wipe.
 - **Deliver** FG, Matte, Comp and Processed as EXR/PNG sequences and/or MP4, MOV or WebM videos.
-- **Network setup** from the Clients page: discover and connect to other PCs, choose their addresses, and control which PCs accept work.
+- **Network setup** from the Machines page: discover and connect to other PCs, choose their addresses, and control which PCs accept work.
 - **Batch** many shots at once with a saved workflow preset, and spread them over several PCs on your network.
 
-Published installer assets (see [distribution permissions](#licence-and-sharing)): [Windows 2.5.0](https://github.com/NickPittas/Keyloom/releases/tag/v2.5.0-windows) · [Linux 2.5.0](https://github.com/NickPittas/Keyloom/releases/tag/v2.5.0-linux). Only online installers are distributed; they download required dependencies during installation. Follow the [installation guide](docs/install.md).
+Published installer assets (see [distribution permissions](#licence-and-sharing)): [Windows 3.0.0](https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-windows) · [Linux 3.0.0](https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-linux). Only online installers are distributed; they download required dependencies during installation. Follow the [installation guide](docs/install.md). Latest release notes: [Keyloom 3.0.0](docs/release-3.0.0.md).
 
 ## Quick start
 

@@ -1,14 +1,14 @@
 # Keyloom network rendering
 
-Keyloom — powered by CorridorKey can send work to other Windows and Linux PCs on your LAN or Tailscale network. Network setup is in **Clients**; no terminal commands are needed.
+Keyloom — powered by CorridorKey can send work to other Windows and Linux PCs on your LAN or Tailscale network. Network setup is in **Machines**; no terminal commands are needed.
 
 Every installation hosts its own network service, can submit work, and can receive work. There is nothing to type: no host address, port or "Add network" form.
 
 **Keyloom must be running on every PC that renders shots**, not just the submitting PC. Keep the app window open, or enable background mode and leave the app running after its window closes. **File → Quit** or terminating the app stops receiving work. The daemon/service can stay running and keep a PC discoverable even after Keyloom quits, but **that daemon-only PC will not get work or render shots**. Discovery/reachability is not proof that a renderer is available.
 
-**This PC** (top of **Clients**) shows the PC name, the addresses the service answers on (every LAN, Tailscale and ZeroTier interface at once), whether it is running, and four buttons: **Start**, **Stop**, **Remove** (click twice) and **Refresh**. **Save** next to the name is the only thing that changes the global PC name; it is sent to every connected PC.
+**This PC** (top of **Machines**) shows the PC name, the addresses the service answers on (every LAN, Tailscale and ZeroTier interface at once), whether it is running, and four buttons: **Start**, **Stop**, **Remove** (click twice) and **Refresh**. **Save** next to the name is the only thing that changes the global PC name; it is sent to every connected PC.
 
-**Other PCs** lists discovered PCs you have not joined yet. Keyloom scans once when Clients is first opened and again only when you press **ReScan** (there is an elapsed timer and **Cancel**; a scan is cut off after 35 s). Each row shows the name, addresses, network type (LAN, Tailscale, ZeroTier), reachability and join status. Tick an available PC to join it. Once joined, it moves to the **Clients** table below; it is not duplicated in the discovery list. PCs are identified by certificate, never by name, so two PCs may have the same name.
+**Other PCs** lists discovered PCs you have not joined yet. Keyloom scans once when Machines is first opened and again only when you press **ReScan** (there is an elapsed timer and **Cancel**; a scan is cut off after 35 s). Each row shows the name, addresses, network type (LAN, Tailscale, ZeroTier), reachability and join status. Tick an available PC to join it. Once joined, it moves to the **Machines** table below; it is not duplicated in the discovery list. PCs are identified by certificate, never by name, so two PCs may have the same name.
 
 ## 1. Hosting happens automatically
 
@@ -20,7 +20,7 @@ The first time Keyloom starts it installs this PC's per-user service (a `systemd
 
 The installer offers network firewall configuration: Windows may request administrator approval; Linux can configure an active UFW firewall with your approval. The app itself does not silently open ports. If configuration was skipped or failed, see [firewall setup](install.md#windows-firewall). Allow access only on trusted/private networks.
 
-![Clients page with service controls, discovery and the unified client table](screenshots/native/12-clients.png)
+![Machines page](screenshots/native/12-machines.png)
 
 *Current UI, captured in an isolated session with simulated PCs, addresses and hardware. This is a documentation example, not a live network or performance measurement.*
 
@@ -28,7 +28,7 @@ The installer offers network firewall configuration: Windows may request adminis
 
 Tick an available PC in **Other PCs**. Its owner must enable **Let other PCs join this PC**. Keyloom connects using the certificate fingerprint the scan showed; a changed certificate is refused. Addresses are refreshed on each scan, so moving between LAN and Tailscale does not require re-joining. New connections offer the PC you selected; older connections may still offer every member of their network.
 
-The **Clients** table puts **This computer** and joined network PCs together. It shows the client name, connection kind, address selection, status, reported GPU and network ID. Drag a column header's right edge to resize it; scroll horizontally if necessary.
+The **Machines** table puts **This computer** and joined network PCs together. It shows the client name, connection kind, address selection, status, reported GPU and network ID. Drag a column header's right edge to resize it; scroll horizontally if necessary.
 
 | Control | What it does |
 |---|---|
@@ -43,7 +43,7 @@ Expand **Default assignment** to choose the session's default placement: **Autom
 
 ## 3. Control who can join this PC
 
-Under **This PC**, **Let other PCs join this PC** controls new address-based joins. Turn it off to refuse new joins; it does not disconnect PCs that already joined or interrupt their jobs. Turn it on only on a trusted network. The current Clients page has no invitation-file creation or import controls.
+Under **This PC**, **Let other PCs join this PC** controls new address-based joins. Turn it off to refuse new joins; it does not disconnect PCs that already joined or interrupt their jobs. Turn it on only on a trusted network. The current Machines page has no invitation-file creation or import controls.
 
 Expand **PCs registered on this PC** to inspect existing logins, when they joined, when they were last seen and whether they are online or in use. **Refresh** reloads the list. **Retire** asks for confirmation and revokes a selected login; that PC must join again before using this PC. This PC's own login and logins in use cannot be retired. **Retire all unused** selects only offline, unused logins other than this PC's own.
 
@@ -78,11 +78,11 @@ The destination checks models, shared paths, free output paths and the frame con
 
 ## 6. Watch the Batch queue
 
-The Batch board's **Queue** has two tabs: **Machines** for work assigned to PCs, and **Waiting (N)** for Automatic shots that have not been assigned yet. **Clients** remains the place for availability and setup.
+The Batch board's **Queue** has two tabs: **Machines** for work assigned to PCs, and **Waiting (N)** for Automatic shots that have not been assigned yet. **Machines** remains the place for availability and setup.
 
 ### Machines
 
-![Machines tab with computer meters and ordered pipeline stages](screenshots/native/15-batch-progress.png)
+![Board Queue panel with this computer and Kamino-3 working on two shots](screenshots/native/04-board.png)
 
 *Isolated documentation example: one simulated pipeline is running while three shots wait for a free PC. Hardware readings are fixture values, not measured performance.*
 
@@ -93,10 +93,6 @@ Collapse a PC to see its current shot and overall status on the header. Finished
 Cancelling running work is cooperative and keeps frames already written. A job already running remains owned by its receiver and is not reassigned while it may still be writing. When **Send again** is available for a submission that has never been attempted, it returns the shot to the end of Automatic's waiting list; an uncertain submission instead stays under reconciliation.
 
 ### Waiting list
-
-![Waiting tab with three Automatic shots and Pause, Resume and Cancel controls](screenshots/native/16-batch-waiting.png)
-
-*Isolated example: Studio_03 is paused; the other shots can be assigned when a suitable PC becomes free.*
 
 **Automatic** keeps confirmed shots in one ordered waiting list rather than splitting the batch between PCs in advance. Each free PC takes one eligible shot; when it finishes, it can take the next. Network candidates must be online with both **Connect** and **Accept work** enabled. Automatic requires fresh, known GPU readings with both GPU utilization and VRAM use **below 50%**; a busy PC or unknown/stale readings are not treated as free.
 
@@ -114,8 +110,8 @@ A shot assigned explicitly to a PC is not load-balanced in advance by Automatic.
 |---|---|
 | Service will not start | Read the UI error: address/port in use, unavailable user service manager, or permissions. Do not start a second host on the same port. |
 | Cannot join / *Join not allowed* | The other PC's service must be running, reachable through its firewall, and have **Let other PCs join this PC** enabled. ReScan if its addresses changed. |
-| Different or incomplete machine list | Check the joined connections in **Clients**. Each PC hosts its own service; new connections offer the PC you selected, not necessarily every member of its network. |
-| PC visible but Automatic does not use it | Check **Connect** and **Accept work** on its Clients row, keep its app running, and check the Queue's **Waiting** tab for the reason. GPU and VRAM readings must be known, fresh and below 50%. |
+| Different or incomplete machine list | Check the joined connections in **Machines**. Each PC hosts its own service; new connections offer the PC you selected, not necessarily every member of its network. |
+| PC visible but Automatic does not use it | Check **Connect** and **Accept work** on its Machines row, keep its app running, and check the Queue's **Waiting** tab for the reason. GPU and VRAM readings must be known, fresh and below 50%. |
 | Shared files unavailable | Open the share as the desktop user and test the mapping in Keyloom. |
 | PC missing from the list | ReScan. Check that Keyloom is running there and the PCs share a network (LAN, Tailscale or ZeroTier). Do not delete a service folder: that would create a different network and orphan every joined PC. |
 
@@ -123,7 +119,7 @@ Pairing credentials and the service database stay on local disk, outside project
 
 ## Limits
 
-- Every PC must run Keyloom 2.4 or newer to be found; earlier versions have no discovery and must be updated.
+- Run the same Keyloom version (3.0.0) on every PC. A PC on an older version can still be listed, but it cannot receive this PC's address ("no such endpoint") and may not accept sent shots; update it.
 - The OS firewall must allow the Keyloom service (TCP 8443-8452 and UDP 44554). The installer can configure supported firewalls with approval; otherwise configure them manually.
 - Discovery uses LAN broadcast plus Tailscale's peer list and known addresses. Networks that block broadcast or Tailscale ACLs that block the ports can hide PCs from the list; correct reachability and ReScan. The current UI has no manual-address or invitation-file fallback.
 - The background service is separate from the Keyloom window: **Stop** keeps it stopped until **Start** or the next sign-in.

@@ -1,6 +1,6 @@
 # Keyloom user guide
 
-Screenshots show the native app. Clients and queue captures use clearly labelled, isolated example data. Some other workflow captures predate the Keyloom rename; use the accompanying text for current control names. Example hardware readings are not performance measurements.
+Screenshots show the native app. Machines and queue captures use clearly labelled, isolated example data. Some other workflow captures predate the Keyloom rename; use the accompanying text for current control names. Example hardware readings are not performance measurements.
 
 This guide follows one shot from import to delivery, then covers batches, settings and models. For rendering on several computers see [Network rendering](network-rendering.md).
 
@@ -21,8 +21,6 @@ The same commands are in the **File** menu (**New project…**, **Open project�
 
 ### New project
 
-![New project](screenshots/native/02-new-project.png)
-
 Choose a parent folder, then give the project a name in the **New project** window and press **Create project**. An empty project folder is created inside the folder you picked.
 
 ### Project output folder
@@ -32,8 +30,6 @@ The bar under the menu shows **Project output folder…**. New renders go under 
 ## 2. Import clips
 
 Use **Import clips…** (movies, several at once), **Import folder…** (movies plus image sequences found in the folder and its sub-folders), or drag files and folders onto the window. On Linux, drag and drop needs X11 (the app starts through XWayland when it can).
-
-![Import plan](screenshots/native/03-import.png)
 
 Nothing is written until you press **Import N clips** in the plan. The plan lists each clip, what happens to it, and any file that is skipped and why. The **Destination** section shows exactly where the files will go:
 
@@ -51,7 +47,7 @@ What import does:
 
 Opening a project shows the batch board; import may open the new clip directly. Use **Back to batch** to return.
 
-![Current batch board and Machines queue](screenshots/native/15-batch-progress.png)
+![Board with two shots and the Queue panel](screenshots/native/04-board.png)
 
 This isolated example uses simulated media, a running pipeline and three waiting shots.
 
@@ -62,7 +58,7 @@ This isolated example uses simulated media, a running pipeline and three waiting
 - **Preset** and **Key selected N clips…** start a batch (see [section 9](#9-key-many-shots-at-once)).
 - The **Queue** panel on the right has **Machines** and **Waiting (N)** tabs. Each PC keeps completed runs under **Earlier (N)**; see [queue controls](#queue-machines).
 - **Import clips…** and **Import folder…** add media. Use **File → Open project…** to switch projects; missing source media has relink/recovery actions.
-- **Clients** and **Settings** are in the top bar.
+- **Machines** and **Settings** are in the top bar.
 
 ## 4. Media
 
@@ -184,19 +180,19 @@ If a decision is needed, **Review batch** lists the affected clips. Existing res
 
 Each shot keeps its own In/Out, input colour and hint prompts. SAM and Chroma pre-mattes must already cover the clip's frames; otherwise the shot is blocked. GVM and BiRefNet generate theirs automatically.
 
-### Clients and assignment
+### Machines and assignment
 
-Open **Clients** in the top bar to manage PCs, not to monitor renders.
+Open **Machines** in the top bar to manage PCs, not to monitor renders.
 
 **Keep Keyloom running on every rendering PC**, with its window open or in configured background mode. A PC whose app has quit can still be found because its daemon/service is running, but it will not receive work or render shots. **File → Quit** stops the app; closing its window is different when background mode is enabled. See [background running](#background-running).
 
-![Clients page with discovery and the unified client table](screenshots/native/12-clients.png)
+![Machines page](screenshots/native/12-machines.png)
 
 *Isolated documentation example with simulated PCs, addresses and hardware.*
 
 - **This PC** shows service controls, **Let other PCs join this PC**, and the name other PCs see.
-- **Other PCs** shows newly discovered PCs. Tick one to join it; it then moves into the **Clients** table.
-- The **Clients** table combines this computer and joined PCs, with their addresses, status and reported GPUs. **Connect** enables a connection. **Accept work** allows Automatic to send to a network PC; on this computer's own connection it enables receiving from other PCs.
+- **Other PCs** shows newly discovered PCs. Tick one to join it; it then moves into the **Machines** table.
+- The **Machines** table combines this computer and joined PCs, with their addresses, status and reported GPUs. **Connect** enables a connection. **Accept work** allows Automatic to send to a network PC; on this computer's own connection it enables receiving from other PCs.
 - **Check workers** probes local workers. **Default assignment** sets the session's placement; individual clips can override it.
 - **Default for Batch job** selects a preferred network for submissions without a specific PC, not a fixed destination for every Automatic shot.
 
@@ -215,10 +211,6 @@ Each pipeline shows its applicable stages in order: **Pre-matte**, **Hint**, **K
 Finished, failed and cancelled runs go into **Earlier (N)** under the PC. **Clear finished** removes finished entries and logs, not running work or rendered files. History for removed PCs remains under **History** until cleared. Cancelling running work is cooperative: the worker stops at a safe point and keeps frames already written.
 
 ### Queue: Waiting list
-
-![Queue Waiting tab showing ordered shots, including a paused shot](screenshots/native/16-batch-waiting.png)
-
-*Isolated example: Studio_03 is paused; Studio_02 and Studio_04 remain eligible.*
 
 **Waiting (N)** lists confirmed **Automatic** shots that do not have a PC yet. Each free PC takes one eligible shot, then takes another when it finishes; the batch is not divided between PCs in advance. The **Why:** line explains why work is still waiting. Network PCs need their **Keyloom app running**, plus **Connect** and **Accept work** enabled; daemon-only discoverability is not enough. Automatic requires fresh GPU readings with both GPU utilization and VRAM usage below 50%.
 
@@ -239,7 +231,7 @@ An explicitly assigned shot keeps its chosen destination. Running network jobs a
 - **Path mapping:** how shared storage is named on this computer, for network rendering ([details](network-rendering.md#4-map-shared-storage-on-each-pc)).
 
   ![Path mapping](screenshots/native/10-path-mapping.png)
-- **AI worker targets:** a local checkout. Normal installs need nothing here; other PCs are used through **Clients** (top bar).
+- **AI worker targets:** a local checkout. Normal installs need nothing here; other PCs are used through **Machines** (top bar).
 - **Masks and hints:** default SAM2 tracker model.
 - **Paths and info:** read-only locations of preferences, runtime and Python.
 - **Models & runtime…** button: see below.

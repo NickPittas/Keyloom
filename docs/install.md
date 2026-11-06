@@ -1,6 +1,6 @@
 # Installing Keyloom — powered by CorridorKey
 
-Keyloom installs for your own user account. The networking rework configures the per-user host automatically across detected interfaces; an explicit **Remove** choice is preserved. In **Clients**, use **ReScan** and check the PCs you want to send work to. The host coordinates discovery and queues; rendering needs Keyloom open or running in background mode. See [Network rendering](network-rendering.md).
+Keyloom installs for your own user account. The networking rework configures the per-user host automatically across detected interfaces; an explicit **Remove** choice is preserved. In **Machines**, use **ReScan** and check the PCs you want to send work to. The host coordinates discovery and queues; rendering needs Keyloom open or running in background mode. See [Network rendering](network-rendering.md).
 
 ## What you need
 
@@ -21,18 +21,18 @@ The source repository and linked installer assets are public. Availability is no
 
 Only **online installers** are distributed, and only the latest release is retained on GitHub. There is no offline-installer download. Quit Keyloom with **File → Quit** before updating; install over the existing folder without uninstalling.
 
-### Windows 2.5.0
+### Windows 3.0.0
 
-Download **all three files** from the [Windows release](https://github.com/NickPittas/Keyloom/releases/tag/v2.5.0-windows) into the **same folder**:
+Download **all three files** from the [Windows release](https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-windows) into the **same folder**:
 
-- `Keyloom-online-2.5.0-8f35288d65-windows-x86_64.exe`
-- `Keyloom-online-2.5.0-8f35288d65-windows-x86_64-1.bin`
-- `Keyloom-online-2.5.0-8f35288d65-windows-x86_64.exe.sha256`
+- `Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64.exe`
+- `Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64-1.bin`
+- `Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64.exe.sha256`
 
 Check both installer files in PowerShell:
 
 ```powershell
-Get-Content .\Keyloom-online-2.5.0-8f35288d65-windows-x86_64.exe.sha256 | ForEach-Object {
+Get-Content .\Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64.exe.sha256 | ForEach-Object {
   $hash, $name = $_ -split '\s+', 2
   $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $name).Hash
   if ($got -ine $hash) { throw "SHA256 mismatch: $name" }
@@ -42,14 +42,14 @@ Get-Content .\Keyloom-online-2.5.0-8f35288d65-windows-x86_64.exe.sha256 | ForEac
 
 Every line must say `OK`. Then double-click the `.exe`; keep the `.bin` beside it. The default install folder is `%LOCALAPPDATA%\Programs\Keyloom`. Download models from the app after installation.
 
-### Linux 2.5.0
+### Linux 3.0.0
 
-Download the `.run` and its `.sha256` file from the [Linux release](https://github.com/NickPittas/Keyloom/releases/tag/v2.5.0-linux). In the download folder:
+Download the `.run` and its `.sha256` file from the [Linux release](https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-linux). In the download folder:
 
 ```sh
-sha256sum -c Keyloom-online-2.5.0-7560ea9aff-linux-x86_64.run.sha256
-chmod +x Keyloom-online-2.5.0-7560ea9aff-linux-x86_64.run
-./Keyloom-online-2.5.0-7560ea9aff-linux-x86_64.run
+sha256sum -c Keyloom-online-3.0.0-9fd666602f-linux-x86_64.run.sha256
+chmod +x Keyloom-online-3.0.0-9fd666602f-linux-x86_64.run
+./Keyloom-online-3.0.0-9fd666602f-linux-x86_64.run
 ```
 
 The default install folder is `~/.local/opt/Keyloom`. Use `--prefix DIR` to choose another folder or `--repair` to repair an existing install. See [Linux firewall](#linux-firewall-ufw) for `--firewall yes|skip` and `--no-firewall`. Do not run two installers on the same folder at once.
@@ -65,7 +65,7 @@ It **contains Keyloom itself** (the application, its own Python runtime and FFmp
 - **Update:** finds the existing install from its `receipt.json`. Files identical to the current or previous version are copied from the installed copy, the rest comes from the installer, and a wheel is downloaded only if a file it provides is still missing. If this exact build is already installed and every file verifies, it says so and exits without any network access.
 - **Fast update (unchanged runtime):** when the new build's `runtime_id` (a SHA-256 over its `runtime/` manifest entries) equals that of the runtime in an install Keyloom itself activated (this folder, or the one being taken over), the update links that runtime directory by reference. No runtime file is read, hashed, copied or downloaded; only the changed application files are staged and checked. "Already installed" is one local check (application files hashed once, the runtime is trusted from the install record, not re-read) and needs no network. If an existing runtime cannot be reused safely, the installer assembles a fresh runtime from its payload and required downloads; an invalid manifest stops installation. The trust is a same-user install record, not protection against the account owner.
 - **Runtime changed or first install:** only the new runtime is extracted and, if files are missing, downloaded. While a wheel downloads, verifies or extracts, a line is printed every second with the phase, bytes done/total, speed and elapsed time; `WAITING` means no new bytes arrived in that second (liveness, not progress). A silent server fails after 20 s (`stalled: no data for 20s`, or `connect timed out`), the download resumes on retry, and a failing local step is never repeated unchanged.
-- **Logs:** every install appends to `<prefix>/install.log` (header per step; all installer output and failure reasons). The app writes service errors to `<settings>/network/service.log` and shows them as selectable text in Clients. While a declared wait (UAC, sudo, download) is active the console prints its reason once and then every 20 s, plus `wait finished`.
+- **Logs:** every install appends to `<prefix>/install.log` (header per step; all installer output and failure reasons). The app writes service errors to `<settings>/network/service.log` and shows them as selectable text in Machines. While a declared wait (UAC, sudo, download) is active the console prints its reason once and then every 20 s, plus `wait finished`.
 - **No install-time limit:** there is no time budget for an install. A step is stopped, rolled back and reported (exit `124`, nothing activated) only when it shows no output at all for 5 minutes. Only an actual wheel download and your sudo password (Linux) or UAC prompt (Windows) for the firewall step are declared waits through `KEYLOOM_WAIT_FILE`, which the wrapper must export. Independent work runs on one bounded pool of 8 workers (never more than 16): wheel downloads and file copies. Existing-install discovery checks candidates in a fixed order. Each wheel is handled by exactly one worker, symlinks are created only after all file workers finish, and results never depend on completion order. The console shows, every second, bytes, MiB/s, active and finished workers, phase and elapsed time. Fewer wheels are fetched at once when free disk space is tight, and any error cancels the remaining work before anything is activated. Each wheel transfer runs in its own short-lived helper process, so a stop (an error elsewhere or Ctrl-C) kills a stuck connection immediately instead of waiting for a network timeout; partial downloads are kept and resume on the next run.
 - **Repair:** `--repair` rebuilds the current version the same way and fully re-verifies every file, including the runtime.
 - **Resume:** an interrupted download resumes from `.staging.dl` in the install folder (kept up to 6 hours, removed after a successful install).
@@ -125,7 +125,7 @@ The Windows installers are unchanged by this step.
 
 After installation, launch Keyloom on **every PC that will render shots**, not just the submitting PC. Leave the app open, or enable background mode and keep it running after closing its window. **File → Quit** or terminating the app stops that PC from receiving work.
 
-The daemon/service can remain running when the app has quit, so other PCs may still discover it. **Daemon-only visibility does not mean the PC can accept or render shots.** Check its receiver status and Clients controls before submitting work; see [network rendering](network-rendering.md).
+The daemon/service can remain running when the app has quit, so other PCs may still discover it. **Daemon-only visibility does not mean the PC can accept or render shots.** Check its receiver status and Machines controls before submitting work; see [network rendering](network-rendering.md).
 
 ## Models
 
