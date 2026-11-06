@@ -791,6 +791,7 @@ pub struct AiUi {
     /// two projects that both have a `shot-01` clip never share an assignment.
     clients: BTreeMap<PathBuf, Option<String>>,
     pub notice: Option<String>,
+    notice_roots: Vec<PathBuf>,
     /// Recompute cues for the Key / delivery cards: `Some(pulse 0..1)` = stale (set each frame by the Hint feedback tick).
     pub stale_key: Option<f32>,
     pub stale_deliver: Option<f32>,
@@ -971,6 +972,7 @@ impl AiUi {
             assignment: Placement::Auto,
             clients: BTreeMap::new(),
             notice,
+            notice_roots: vec![],
             stale_key: None,
             stale_deliver: None,
             disk_gen: 0,
@@ -1185,6 +1187,18 @@ impl AiUi {
                     if self.sched.state_of(&id).is_some_and(|s| s.is_terminal()) =>
                 {
                     self.on_task_end(&id);
+                    if self.notice.as_deref().is_some_and(|m| m.starts_with("Queued ")) && self.notice_roots.iter().all(|root| {
+                        !self.tracked.iter().any(|t| &t.clip_root == root && self.sched.state_of(&t.job_id).is_some_and(|s| !s.is_terminal()))
+                    }) {
+                        self.notice_roots.clear();
+                        if let Some(notice) = &mut self.notice {
+                            let keep: Vec<_> = notice.split(". ")
+                                .filter(|part| part.contains("Not queued:") || part.contains("waiting for a free PC"))
+                                .collect();
+                            *notice = keep.join(". ");
+                            if notice.is_empty() { self.notice = None; }
+                        }
+                    }
                     (id, false)
                 }
                 SchedEvent::Preview {
@@ -3632,6 +3646,7 @@ impl AiUi {
         }
         let Some(b) = self.batch.take() else { return };
         let rows = b.rows;
+        let notice_roots: Vec<_> = rows.iter().filter(|r| r.plan().is_some()).map(|r| r.clip.root.clone()).collect();
         let reused: Vec<String> = rows.iter().filter(|r| r.plan().is_some()).filter_map(|r| r.reuse_note()).collect();
         let (mut queued, mut waiting, mut errs) = (0, 0, vec![]);
         let mut per_client: BTreeMap<String, usize> = BTreeMap::new();
@@ -3666,6 +3681,7 @@ impl AiUi {
         if !errs.is_empty() {
             m += &format!(" Not queued: {}", errs.join(" "));
         }
+        self.notice_roots = notice_roots;
         self.notice = Some(m);
     }
 
