@@ -3232,8 +3232,8 @@ impl App {
                 self.key_selected(&ctx);
             }
         }
-        self.models
-            .set_asset_safety(!self.ai.model_asset_mutation_safe(), self.ai.unresolved_model_fences());
+        let (active_models, usage_unknown) = self.ai.active_model_usage();
+        self.models.set_asset_safety(active_models, usage_unknown, self.ai.unresolved_model_fences());
         self.models.set_worker_activity(Some(self.ai.worker_activity()));
         self.models.tick(&ctx);
         self.models.take_readiness_changed();

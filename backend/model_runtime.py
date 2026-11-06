@@ -55,19 +55,10 @@ def model_artifact_dir(artifact_id: str, *, roots: Roots | None = None, catalog=
     """Resolve a catalog model directory without checking or loading its files."""
     catalog, artifact = _catalog_artifact(artifact_id, catalog)
     roots = roots or Roots.defaults()
-    if artifact.kind == "hf_cache_file":
-        path = hf_cache_snapshot_path(
-            roots.hf_cache, artifact.repo_id, artifact.revision, artifact.hf_filename
-        ).parent
-    else:
-        base = {
-            "v2_models_dir": roots.v2_models_dir,
-            "data_dir": roots.data_dir,
-            "v2_package_root": roots.v2_package_root,
-        }.get(artifact.layout_root)
-        path = base / artifact.layout_rel if base is not None and artifact.layout_rel else base
+    checker = StatusChecker(catalog, roots)
+    path = checker.artifact_dir(artifact)
     remap_roots = {destination.split("/", 1)[0] for destination in artifact.path_remap.values()}
-    if path is not None and len(remap_roots) == 1:
+    if path is not None and not checker.is_hf_snapshot_dir(artifact, path) and len(remap_roots) == 1:
         path /= remap_roots.pop()
     if path is None:
         raise ModelAssetsUnavailableError(
@@ -102,6 +93,11 @@ def validate_local_model_path(
             continue
         selected.append(file)
         local_path = root.joinpath(*parts)
+        if (not local_path.is_file() and artifact_id == "videomama"
+                and parts[:1] == ["unet"] and len(parts) == 2):
+            flat_path = root / parts[1]
+            if file.size is not None and flat_path.is_file() and flat_path.stat().st_size == file.size:
+                local_path = flat_path
         if not local_path.is_file():
             problems.append(f"missing: {'/'.join(parts)}")
         elif local_path.stat().st_size == 0:
@@ -152,7 +148,10 @@ def dependency_path(checker: StatusChecker, dependency) -> Path | None:
         required = dependency.required_files()
         path = checker.file_path(dependency, required[0]) if required else None
     else:
-        path = model_artifact_dir(dependency.id, roots=checker.roots, catalog=checker.catalog)
+        path = checker.artifact_dir(dependency)
+        remap_roots = {destination.split("/", 1)[0] for destination in dependency.path_remap.values()}
+        if path is not None and not checker.is_hf_snapshot_dir(dependency, path) and len(remap_roots) == 1:
+            path /= remap_roots.pop()
     return Path(path) if path is not None else None
 
 
