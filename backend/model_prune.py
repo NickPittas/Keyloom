@@ -39,6 +39,7 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
     checker = StatusChecker(catalog, roots)
     result: list[dict] = []
     planned_removed: set[Path] = set()
+    processed_cache_roots: set[Path] = set()
     def remove(path: Path, reason: str, *, directory: bool = False) -> None:
         if not _parent_is_real(path):
             if not any(item["path"] == str(path) for item in result):
@@ -144,6 +145,7 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
             if resolved_cache in processed_caches:
                 continue
             processed_caches.add(resolved_cache)
+            processed_cache_roots.add(resolved_cache)
             cache = resolved_cache
             repo = cache / repo_name
             try:
@@ -205,4 +207,32 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
                 erase_tree(repo / ".no_exist", f"HF .no_exist cache for {art.repo_id}")
             except OSError as exc:
                 result.append({"path": str(repo), "bytes": 0, "reason": reason, "error": str(exc)})
+
+    for cache in processed_cache_roots:
+        shared = cache / "blobs"
+        marker = shared / ".huggingface-shared-blobs"
+        if _is_link(shared) or not shared.is_dir() or not marker.is_file():
+            continue
+        try:
+            for shard in shared.iterdir():
+                if _is_link(shard) or not shard.is_dir():
+                    continue
+                for refs in shard.glob("*.refs"):
+                    if _is_link(refs) or not refs.is_file():
+                        continue
+                    sha = refs.name[:-5]
+                    try:
+                        lines = refs.read_text(encoding="utf-8").splitlines()
+                    except OSError:
+                        continue
+                    if not lines or any(not line.strip().startswith("models--") for line in lines):
+                        continue
+                    if any(os.path.lexists(cache / line.strip()) and (cache / line.strip()) not in planned_removed for line in lines):
+                        continue
+                    blob = shard / sha
+                    remove(blob, f"orphaned shared HF blob {sha[:12]}")
+                    remove(refs, f"orphaned shared HF blob refs {sha[:12]}")
+                    remove(shard / f"{sha}.lock", f"orphaned shared HF blob lock {sha[:12]}")
+        except OSError:
+            continue
     return result
