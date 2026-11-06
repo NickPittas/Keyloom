@@ -191,9 +191,24 @@ fn with_job(tag: &str, clip: &str, frames: u32) -> (Env, egui::Context, App) {
     (e, ctx, app)
 }
 
+fn with_job_bg(tag: &str, clip: &str, frames: u32) -> (Env, egui::Context, App) {
+    let e = env(tag, &[(clip, frames, matte_png())], json!({"version": 2}));
+    enable_background(&e);
+    let ctx = egui::Context::default();
+    let mut app = app_for(&e, &ctx);
+    app.select_folders(&[clip]);
+    (e, ctx, app)
+}
+
+fn enable_background(e: &Env) {
+    let mut settings: Value = serde_json::from_slice(&fs::read(&e.settings).unwrap()).unwrap();
+    settings["interface"]["background"] = json!(true);
+    fs::write(&e.settings, settings.to_string()).unwrap();
+}
+
 #[test]
 fn close_hides_to_the_tray_while_the_driver_finishes_the_job_and_show_restores() {
-    let (e, ctx, mut app) = with_job("hide", "ok1", 2);
+    let (e, ctx, mut app) = with_job_bg("hide", "ok1", 2);
     let (tray, tx) = Tray::channel();
     app.set_tray(Some(tray));
     fs::write(e.base.join("tray-note-shown"), "").unwrap(); // the first-time note was already seen
@@ -229,7 +244,7 @@ fn close_hides_to_the_tray_while_the_driver_finishes_the_job_and_show_restores()
 
 #[test]
 fn first_close_shows_the_tray_note_before_hiding() {
-    let (e, ctx, mut app) = with_job("note", "ok1", 1);
+    let (e, ctx, mut app) = with_job_bg("note", "ok1", 1);
     let (tray, _tx) = Tray::channel();
     app.set_tray(Some(tray));
     let cmds = frame(&ctx, &mut app, true, vec![]);
