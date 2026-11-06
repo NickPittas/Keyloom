@@ -328,7 +328,9 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
         let galley = line(cells[1].painter(), &row.name, ty::mono(), 16.0, cells[1].max_rect().width() - 8.0);
         paint_line(cells[1].painter(), cells[1].max_rect(), galley, 16.0, Align::Min, t.text_primary, 1.0);
         let stage = match row.stage.as_str() { "mask" => Stage::Mask, "ready" => Stage::Ready, "done" => Stage::Completed, _ => Stage::Raw };
-        chips::stage_chip(&mut cells[2], stage);
+        let stage_rect = cells[2].max_rect().translate(vec2(0.0, if index > 0 { 1.0 } else { 0.0 }));
+        let mut stage_cell = cells[2].new_child(UiBuilder::new().max_rect(stage_rect).layout(Layout::left_to_right(Align::Center)));
+        chips::stage_chip(&mut stage_cell, stage);
 
         let job = match row.job {
             Some(BatchDialogJob::Queued) => Some(Job::Queued),
