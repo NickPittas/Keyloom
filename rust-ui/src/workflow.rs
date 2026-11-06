@@ -1022,6 +1022,9 @@ fn build(
 /// Persist what a submitted job used: `clip_id` (once), `workflow`, `output_values` and the result folder.
 /// Atomic, other keys preserved. Call before `Scheduler::submit`; on `Err` nothing was queued.
 pub fn commit(clip: &Clip, plan: &Plan, params: &Params, out: &OutputCfg) -> Result<(), String> {
+    if plan.job.clip_root != abs(&clip.root) {
+        return Err("the plan belongs to another clip".into());
+    }
     update_json(&clip.meta_path, |m: &mut Map<String, Value>| {
         if plan.clip_id_is_new || !m.contains_key("clip_id") {
             m.insert("clip_id".into(), json!(plan.clip_id));

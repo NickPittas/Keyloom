@@ -29,6 +29,8 @@ pub struct Fixture {
     pub project: String,
     pub shot: String,
     pub stage: String,
+    /// Processing stage for the status chip; `stage` is the selected workspace tab.
+    pub clip_stage: String,
     pub view: String,
     pub viewer_state: String,
     pub overlay: String,
@@ -86,6 +88,7 @@ impl Default for Fixture {
             project: "Night_exterior_greenscreen".into(),
             shot: "V1-0062_A003C001_261012_R4LF".into(),
             stage: "Key".into(),
+            clip_stage: "done".into(),
             view: "Comp".into(),
             viewer_state: "comp".into(),
             overlay: "Off".into(),

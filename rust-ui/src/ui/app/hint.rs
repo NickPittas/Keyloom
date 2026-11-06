@@ -589,7 +589,6 @@ fn stems_of(c: &Clip) -> Vec<String> {
 }
 
 impl State {
-    pub(super) fn board_export_root(&self) -> Option<&Path> { self.export_dir.as_deref() }
     pub(super) fn deliveries_has_video(&self) -> bool {
         self.deliveries.values().any(|d| matches!(d, Delivery::Video(_)))
     }
@@ -905,7 +904,7 @@ impl App {
         v.ann.preview = stem.as_ref().filter(|_| sam_on).and_then(|s| {
             let sig = psig(&self.hint, s, v.linear);
             self.ai
-                .current_preview(&clip.folder, s, sig)
+                .current_preview(&clip.root, s, sig)
                 .filter(|r| preview_is_live(&r.job_id, &self.hint.dead_previews))
                 .map(|r| r.mask_png.clone())
         });
@@ -1239,7 +1238,7 @@ impl App {
         }
         let completed: Vec<_> = self
             .ai
-            .completed_tasks(&clip.folder)
+            .completed_tasks(&clip.root)
             .into_iter()
             .map(|(id, kind, dir)| {
                 let job = self.ai.task_job(&id);
@@ -1717,7 +1716,7 @@ impl App {
             Run::Guide => pre_marks,
             Run::Hint => hint_marks,
         };
-        let before = self.ai.task_ids(&clip.folder);
+        let before = self.ai.task_ids(&clip.root);
         // Settings and prompts are frozen in `steps` now; the run waits for the earlier same-clip steps.
         let action = match what {
             Run::Guide if self.hint.cfg.guide == Producer::Sam => Action::Track,
@@ -1730,7 +1729,7 @@ impl App {
                 // Frozen settings of a whole-range run: they become the baseline only if the job completes.
                 if !marks_only {
                     let snap = Snap { cfg: self.hint.cfg.clone(), ann: ann_sig(&self.hint.ann) };
-                    for id in self.ai.task_ids(&clip.folder).into_iter().filter(|i| !before.contains(i)) {
+                    for id in self.ai.task_ids(&clip.root).into_iter().filter(|i| !before.contains(i)) {
                         self.hint.rc.inflight.insert(id, snap.clone());
                     }
                 }
@@ -1928,7 +1927,7 @@ impl App {
         let installed_sam = |id: &str| g.lazy || g.local.as_ref().is_some_and(|c| c.sam_models.iter().any(|x| x.as_str() == id));
         let tools = tools_for(guide);
         let stage = |frames: usize, node: Node, preview: Option<&crate::actions::Decision>, gen: &crate::actions::Decision| {
-            let refusal = delete_refusal(self.ai.clip_active(&clip.root) || self.ai.task_busy(&clip.folder), self.ai.external_writer(&clip.root));
+            let refusal = delete_refusal(self.ai.clip_active(&clip.root) || self.ai.task_busy(&clip.root), self.ai.external_writer(&clip.root));
             HintStage {
                 frames_on_disk: frames,
                 stale: self.stage_pending(node),
@@ -2365,7 +2364,7 @@ impl App {
         if d.folder != clip.folder {
             return;
         }
-        let refusal = delete_refusal(self.ai.clip_active(&clip.root) || self.ai.task_busy(&clip.folder), self.ai.external_writer(&clip.root));
+        let refusal = delete_refusal(self.ai.clip_active(&clip.root) || self.ai.task_busy(&clip.root), self.ai.external_writer(&clip.root));
         let (current, marked): (Option<String>, Vec<String>) = match &self.viewer {
             Some(v) => (v.index.stems.get(v.playhead).cloned(), clip.keyframes.iter().filter_map(|k| v.index.stems.get(*k).cloned()).collect()),
             None => (None, vec![]),
@@ -2476,7 +2475,7 @@ impl App {
         if let Some(v) = &mut self.viewer {
             v.forget_paths(&paths);
         }
-        let ids = self.ai.forget_masks(&clip.folder);
+        let ids = self.ai.forget_masks(&clip.root);
         self.hint.dead_previews.extend(ids);
         self.refresh_clip(ctx, &clip.folder);
         let mut msg = format!("Deleted {} file(s).", deleted.len());
@@ -3281,7 +3280,7 @@ impl App {
 
     fn deliver_gates(&self, clip: &Clip) -> DeliverGates {
         let ffmpeg = self.ai.models_unknown() || self.ai.local_caps().is_some_and(|c| c.tasks.get("export_video").copied().unwrap_or(false));
-        let busy = self.ai.task_busy(&clip.folder);
+        let busy = self.ai.task_busy(&clip.root);
         let range = self.ai_open_range();
         let pl = self.pipeline_now(clip);
         let why = match (&pl, &range) {

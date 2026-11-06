@@ -368,6 +368,7 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
                 .selected_text(status_label(&row.status))
                 .show_ui(status_cell, |menu| {
                     if let Some(reason) = &row.reason { menu.label(reason); }
+                    if let Some(note) = &row.reuse_note { menu.label(note); }
                     if let Some(accept) = &row.accept {
                         if menu.selectable_label(row.included, accept).clicked() { edits.push(BatchEdit::Include(index, true)); }
                     }
@@ -386,6 +387,9 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
             let color = if row.blocked { t.error } else if row.status == "—" { t.text_tertiary } else { t.text_primary };
             let galley = line(status_cell.painter(), &row.status, ty::label(), 16.0, rect.width());
             paint_line(status_cell.painter(), rect, galley, 16.0, Align::Min, color, 0.0);
+            if let Some(note) = &row.reuse_note {
+                status_cell.interact(rect, egui::Id::unique(("board-batch-reuse-note", index)), Sense::hover()).on_hover_text(note);
+            }
         }
     });
 }
@@ -690,5 +694,30 @@ mod tests {
                 skipped: 0
             }
         );
+    }
+
+    #[test]
+    fn compatible_hint_reuse_note_is_visible_in_the_row() {
+        let note = "Reusing the existing compatible hint";
+        let row = BatchDialogRow {
+            folder: "shot".into(), name: "Shot".into(), stage: "done".into(), machine: None,
+            job: None, status: note.into(), reason: None, included: true, can_include: true,
+            accept: None, offer: None, reuse_note: Some(note.into()), reuse: true, mismatch: false,
+            reset_to_preset: false, queueable: true, blocked: false,
+        };
+        let batch = BatchDialog { planning: false, preset: None, presets: vec![], machines: vec![], rows: vec![row.clone()] };
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 80.0))), ..Default::default() },
+            |ui| live_row(ui, 0, &row, &batch, &[], 1100.0, &mut vec![]),
+        );
+        fn has_text(shape: &egui::epaint::Shape, wanted: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(text) => text.galley.job.text == wanted,
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, wanted)),
+                _ => false,
+            }
+        }
+        assert!(out.shapes.iter().any(|shape| has_text(&shape.shape, note)), "the automatic reuse note is drawn in the row");
     }
 }

@@ -171,8 +171,9 @@ struct CardView {
     busy: bool,
     /// Shown as the disabled reason when `busy`.
     busy_reason: &'static str,
-    /// Adds a "Cancel job" menu item (disabled unless `busy`).
+    /// Adds a "Cancel job" menu item.
     cancel: bool,
+    can_cancel: bool,
 }
 
 fn action_cards(fx: &Fixture) -> [CardSpec; 3] {
@@ -198,6 +199,7 @@ fn fixture_cards(fx: &Fixture) -> Vec<CardView> {
         busy: fx.busy_percent.is_some(),
         busy_reason: "Keying in progress",
         cancel: false,
+        can_cancel: false,
     }).collect()
 }
 
@@ -215,6 +217,7 @@ fn live_cards(fx: &Fixture) -> Vec<CardView> {
         busy: c.percent.is_some(),
         busy_reason: "Job in progress",
         cancel: true,
+        can_cancel: c.can_cancel,
     }).collect()
 }
 
@@ -239,16 +242,14 @@ fn draw_actions(ui: &mut Ui, body: Rect, cards: &[CardView], out: &mut DockOut) 
 
         let busy = card.busy;
         let reason = card.busy_reason;
-        let mut more_button = icon_button(Icon::More, IconButtonSize::Normal22, "More actions").in_rect(more);
-        if busy { more_button = more_button.disabled(reason); }
-        let response = ui.add(more_button);
+        let response = ui.add(icon_button(Icon::More, IconButtonSize::Normal22, "More actions").in_rect(more));
         let menu_id = Id::unique(("shot-dock-card-menu", i));
         let was_open = ui.ctx().data(|d| d.get_temp::<bool>(menu_id)).unwrap_or(false);
-        let just_opened = response.clicked() && !busy && !was_open;
-        let mut open = if response.clicked() && !busy { !was_open } else { was_open };
+        let just_opened = response.clicked() && !was_open;
+        let mut open = if response.clicked() { !was_open } else { was_open };
         if open {
             let mut items = vec![MenuItem::new("Reveal folder")];
-            if card.cancel { items.push(if busy { MenuItem::new("Cancel job") } else { MenuItem::new("Cancel job").disabled("") }); }
+            if card.cancel { items.push(if card.can_cancel { MenuItem::new("Cancel job") } else { MenuItem::new("Cancel job").disabled("") }); }
             items.push(MenuItem::sep());
             let delete = MenuItem::new("Delete frames…").destructive();
             items.push(if busy { delete.disabled(reason) } else { delete });
@@ -317,5 +318,63 @@ mod tests {
         assert_eq!(deliver.ports_out.len(), 2);
         assert!(deliver.ports_out.iter().all(|(_, _, enabled)| *enabled));
         assert_eq!(deliver.ports_out.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(), ["Matte", "Processed"]);
+    }
+
+    #[test]
+    fn active_job_more_menu_still_dispatches_cancel() {
+        use egui::{Event, PointerButton, Pos2, RawInput, Vec2};
+
+        let active = Fixture { live: true, cards: vec![crate::ui::shot_page::Card { percent: Some(42), can_cancel: false, ..Default::default() }], ..Default::default() };
+        let guarded = live_cards(&active);
+        assert!(guarded[0].busy && !guarded[0].can_cancel, "uncancellable progress still blocks Delete frames");
+
+        let ctx = egui::Context::default();
+        let cards = [CardView {
+            id: "key-job".into(), icon: Icon::Key, title: "Key result".into(), meta: "Key · 42%".into(),
+            actions: true, busy: true, busy_reason: "Job in progress", cancel: true, can_cancel: true,
+        }];
+        fn frame(ctx: &egui::Context, cards: &[CardView], events: Vec<Event>) -> (Vec<egui::epaint::ClippedShape>, Option<(String, CardAction)>, Rect) {
+            let mut action = None;
+            let mut body = None;
+            let out = ctx.run_ui(RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 300.0))), events, ..Default::default() }, |ui| {
+                let rect = Rect::from_min_size(ui.max_rect().min, vec2(320.0, 112.0));
+                body = Some(rect);
+                let mut dock = DockOut::default();
+                draw_actions(ui, rect, cards, &mut dock);
+                action = dock.card_action;
+            });
+            (out.shapes, action, body.unwrap())
+        }
+        let (_, _, body) = frame(&ctx, &cards, vec![]);
+        let at = body.min + vec2(269.0, 83.0);
+        let pointer = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&ctx, &cards, vec![Event::PointerMoved(at)]);
+        frame(&ctx, &cards, vec![pointer(true)]);
+        frame(&ctx, &cards, vec![pointer(false)]);
+        let (menu, _, _) = frame(&ctx, &cards, vec![]);
+
+        fn find(shape: &egui::epaint::Shape, label: &str) -> Option<Rect> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label => Some(text.galley.rect.translate(text.pos.to_vec2())),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
+                _ => None,
+            }
+        }
+        fn labels(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => out.push(text.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|shape| labels(shape, out)),
+                _ => {}
+            }
+        }
+        let cancel = menu.iter().find_map(|shape| find(&shape.shape, "Cancel job")).unwrap_or_else(|| {
+            let mut visible = vec![];
+            menu.iter().for_each(|shape| labels(&shape.shape, &mut visible));
+            panic!("active job menu is reachable; visible text: {visible:?}")
+        }).center();
+        frame(&ctx, &cards, vec![Event::PointerMoved(cancel)]);
+        frame(&ctx, &cards, vec![Event::PointerButton { pos: cancel, button: PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+        let (_, action, _) = frame(&ctx, &cards, vec![Event::PointerButton { pos: cancel, button: PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        assert_eq!(action, Some(("key-job".into(), CardAction::Cancel)));
     }
 }

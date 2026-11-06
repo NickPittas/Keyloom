@@ -41,6 +41,38 @@ const HINT_TOOLS_H: f32 = 160.0;
 const GRAPH_HEADER: f32 = 32.0;
 const MIN_VIEWER: f32 = 300.0;
 
+fn saved_export_root(clip: &Clip) -> Option<PathBuf> {
+    clip.native.get("delivery")
+        .and_then(|v| serde_json::from_value::<crate::presets::PipelineExport>(v.clone()).ok())
+        .and_then(|e| e.root)
+}
+
+#[cfg(test)]
+mod board_export_tests {
+    use super::*;
+
+    #[test]
+    fn board_exports_use_the_clips_saved_delivery_root() {
+        let base = std::env::temp_dir().join(format!("ck-board-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join("project");
+        let clip = project.join("clips/shot");
+        std::fs::create_dir_all(clip.join("Frames")).unwrap();
+        let mut png = png::Encoder::new(std::fs::File::create(clip.join("Frames/f_1101.png")).unwrap(), 4, 4);
+        png.set_color(png::ColorType::Rgb);
+        png.set_depth(png::BitDepth::Eight);
+        png.write_header().unwrap().write_image_data(&[0; 48]).unwrap();
+        std::fs::write(clip.join(".video_metadata.json"), r#"{"fps":24.0,"width":4,"height":4}"#).unwrap();
+        let export = base.join("shot_delivery");
+        std::fs::write(clip.join("clip.json"), serde_json::json!({"ck_native":{"delivery":{"root":export}}}).to_string()).unwrap();
+        std::fs::write(project.join("project.json"), r#"{"version":2,"clips":["shot"]}"#).unwrap();
+
+        let loaded = crate::project::load_project(&project, &crate::project::LoadOptions::default()).unwrap();
+        assert_eq!(saved_export_root(&loaded.clips[0]), Some(export));
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Media,
@@ -903,7 +935,7 @@ impl App {
                 else if let Some(error) = self.thumbs.as_ref().and_then(|t| t.failed(clip)) { ("Unreadable frame".into(), error.to_owned()) }
                 else { ("Loading preview…".into(), "The first source frame is still being decoded.".into()) };
             let source_available = match &clip.source { Source::Video { path } => Some(path.exists()), Source::Sequence { dir, .. } => Some(dir.exists()), Source::Missing => Some(false) };
-            let exports_available = crate::pipeline::export_dir(clip, &project.root, self.hint.board_export_root()).is_dir();
+            let exports_available = crate::pipeline::export_dir(clip, &project.root, saved_export_root(clip).as_deref()).is_dir();
             if activity.is_empty() { activity = import_activity.unwrap_or_default(); }
             let q = u8::from(job == "q");
             let r = u8::from(job == "r");
@@ -990,7 +1022,7 @@ impl App {
                     if let Some((path,select_file)) = source.filter(|(path,_)| path.exists()) { reveal(path,select_file,&mut self.ai); }
                 },
                 super::board::Act::RevealExports(i) => if let Some((clip,root)) = self.project.as_ref().and_then(|p|p.clips.get(i).map(|c|(c,p.root.as_path()))) {
-                    let path = crate::pipeline::export_dir(clip,root,self.hint.board_export_root());
+                    let path = crate::pipeline::export_dir(clip,root,saved_export_root(clip).as_deref());
                     if path.is_dir() { reveal(&path,false,&mut self.ai); }
                 },
                 super::board::Act::Remove(i) => self.ask_remove_shot(i),
@@ -1030,6 +1062,14 @@ impl App {
     fn shot_block(&self, c: &Clip) -> Option<String> {
         if matches!(self.imp.card_state(c), CardState::Busy(..) | CardState::Waiting) {
             return Some(format!("{} is being extracted. Wait for it to finish, then remove it.", c.display_name));
+        }
+        if self.ai.external_writer(&c.root) {
+            return Some(format!("{} is being written by a companion import. Wait for it to finish, then remove it.", c.display_name));
+        }
+        if self.project.as_ref().is_some_and(|p| self.remote.jobs_snapshot().iter().any(|j| {
+            j.active && j.project_root.as_deref() == Some(&p.root) && j.clip_root.as_deref() == Some(&c.root)
+        })) {
+            return Some(format!("{} is being written by another computer. Wait for it to finish, then remove it.", c.display_name));
         }
         self.ai
             .clip_busy(&c.root)

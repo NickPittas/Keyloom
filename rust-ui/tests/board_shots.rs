@@ -357,6 +357,27 @@ fn remove_shot_is_refused_with_the_reason_while_the_shot_is_queued() {
 }
 
 #[test]
+fn remove_shot_rechecks_a_companion_writer_before_confirmation() {
+    let e = env("bs-remove-import-race", &["a", "b"], json!({}));
+    let (ctx, mut app) = open(&e, "Dark");
+    app.ask_remove_shot(1);
+    let initial = frames(&ctx, &mut app, 2);
+    assert!(texts(&initial).iter().any(|(_, text)| text == "Remove"), "idle shot can be removed");
+
+    let clip = load_project(&e.project, &LoadOptions::default()).unwrap().clips[1].clone();
+    app.ai_mut().set_external_writer(&clip.root, true);
+    let blocked = frames(&ctx, &mut app, 2);
+    let remove = text_rect(&blocked, "Remove");
+    click(&ctx, &mut app, remove.center());
+    assert!(app.ai().notice.as_deref().is_some_and(|text| text.contains("companion import")), "the confirmation handler rechecks the live writer");
+    assert_eq!(order(&app), strs(&["a", "b"]));
+    assert!(project_json(&e).get("removed_clips").is_none());
+
+    drop(app);
+    let _ = fs::remove_dir_all(e.base);
+}
+
+#[test]
 fn shot_context_menu_shows_remove_and_disabled_reveal_entries() {
     let e = env("bs-context", &["a"], json!({}));
     let (ctx, mut app) = open(&e, "Dark");

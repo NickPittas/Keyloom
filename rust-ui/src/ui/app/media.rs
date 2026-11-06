@@ -651,7 +651,7 @@ impl App {
                     cmds.push(MediaCmd::CancelRelink);
                 }
             }
-            if let Some(r) = self.ai.latest_task(&clip.folder, TaskKind::PrepareSource) {
+            if let Some(r) = self.ai.latest_task(&clip.root, TaskKind::PrepareSource) {
                 self.ai.task_status_row(ui, &r);
             }
         }

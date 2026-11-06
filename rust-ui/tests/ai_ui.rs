@@ -611,6 +611,30 @@ fn reasons(r: Result<Plan, Blocked>) -> String {
 }
 
 #[test]
+fn a_frozen_key_plan_cannot_write_into_a_copied_project() {
+    let e = env("copy-plan", &[("c", 3, json!({}))], json!({"version": 2}));
+    let original = load(&e);
+    let params = Params::default();
+    let out = matte_only();
+    let plan = plan(&inputs(&original, &params, &out, (0, 2)), Intent::New).unwrap();
+
+    let copied_root = e.base.join("copy/clips/c");
+    fs::create_dir_all(copied_root.join("Frames")).unwrap();
+    for n in 1101..=1103 {
+        fs::copy(e.project.join(format!("clips/c/Frames/f_{n}.png")), copied_root.join(format!("Frames/f_{n}.png"))).unwrap();
+    }
+    fs::write(copied_root.join("clip.json"), "{}").unwrap();
+    let copied = load_project(&e.base.join("copy"), &LoadOptions::default()).unwrap();
+    let clip = &copied.clips[0];
+    let before = fs::read(&clip.meta_path).unwrap();
+
+    let err = ck::workflow::commit(clip, &plan, &params, &out).unwrap_err();
+    assert!(err.contains("another clip"), "{err}");
+    assert_eq!(fs::read(&clip.meta_path).unwrap(), before, "copied metadata was not changed");
+    fs::remove_dir_all(e.base).unwrap();
+}
+
+#[test]
 fn gate_refuses_bad_range_outputs_and_hints_naming_the_problem() {
     let e = env("gate", &[("c", 6, json!({}))], json!({"version": 2}));
     let p = load(&e);
