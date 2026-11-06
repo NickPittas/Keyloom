@@ -1193,7 +1193,11 @@ mod tests {
 
     fn click(ctx: &egui::Context, app: &mut App, label: &str) {
         let out = frame(ctx, app, vec![]);
-        let b = node(&out, label).unwrap_or_else(|| panic!("no {label}")).bounds().unwrap();
+        let nodes = &out.platform_output.accesskit_update.as_ref().unwrap().nodes;
+        let n = nodes.iter().find(|(_, n)| n.role() == egui::accesskit::Role::MenuItem && n.label() == Some(label))
+            .or_else(|| nodes.iter().find(|(_, n)| n.label() == Some(label)))
+            .unwrap_or_else(|| panic!("no {label}"));
+        let b = n.1.bounds().unwrap();
         let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
         let btn = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
         frame(ctx, app, vec![egui::Event::PointerMoved(at)]);
@@ -1335,6 +1339,7 @@ mod tests {
     #[test]
     fn g2_global_status_opens_project_activity_and_notices_with_failure_count() {
         let (ctx, mut app, d, _) = start_app("g2-global-activity", None);
+        app.recent.fixture_notices = None;
         app.opts.startup_notice = Some("Startup warning".into());
         app.activity_inject_for_test(vec![
             crate::ui::activity::Step::new("g2-job", "Keying shot", crate::ui::activity::Level::Error),
@@ -1342,9 +1347,9 @@ mod tests {
         assert_eq!(app.notice_count(), 1);
         assert_eq!(app.failure_count(), 1);
         let out = frame(&ctx, &mut app, vec![]);
-        assert!(node(&out, "Activity, 1 unacknowledged failures").is_some());
+        assert!(node(&out, "No jobs running, 1 unacknowledged failures").is_some());
         assert!(node(&out, "1 notices").is_some());
-        click(&ctx, &mut app, "Activity, 1 unacknowledged failures");
+        click(&ctx, &mut app, "No jobs running, 1 unacknowledged failures");
         assert!(app.activity_is_open());
         assert_eq!(app.strip.activity.tab, 0);
         let activity = frame(&ctx, &mut app, vec![]);
@@ -1402,10 +1407,12 @@ mod tests {
         click(&ctx, &mut app, "Window");
         let window = frame(&ctx, &mut app, vec![]);
         let labels: Vec<_> = window.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().filter_map(|(_, n)| n.label()).collect();
+        assert!(window.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::MenuItem && n.label() == Some("Properties")));
         for approved in ["Properties", "Bottom panel", "Queue", "Activity", "Reset panel sizes"] {
             assert!(labels.contains(&approved), "missing approved Window item: {approved}");
         }
         assert!(!labels.contains(&"Keyboard shortcuts"));
+        assert!(!app.shot_page.drawer_open());
         click(&ctx, &mut app, "Properties");
         assert!(app.shot_page.drawer_open());
         assert!(app.props_sheet);

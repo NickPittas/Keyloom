@@ -345,9 +345,9 @@ mod tests {
             TabStrip::new(TabKind::Page, &mut active, &tabs).compact(true).whole_px(true).rects_out(&mut rects).show(ui);
         });
         out.textures_delta.clear();
-        assert_eq!(rects[0].width(), 28.0);
+        assert!(rects[0].width() > 28.0, "the active compact tab keeps its label");
         assert!(rects[1].width() > 28.0, "the cached count needs room beside the Models icon");
-        let models = &out.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().find(|(_, n)| n.label() == Some("Models")).unwrap().1;
+        let models = &out.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().find(|(_, n)| n.role() == Role::Tab && n.label() == Some("Models, blocked")).unwrap().1;
         assert_eq!(models.description(), Some("Models\n12 required models missing\nCtrl+Shift+4"));
     }
 }
