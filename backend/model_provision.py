@@ -833,6 +833,7 @@ class ProvisionManager:
             for publication in publications:
                 self._commit_publication(publication, root, allow_leaf_link=allow_leaf_link)
             publications.clear()
+            self._remove_old_model_copies(art, dest)
             with contextlib.suppress(OSError, ArtifactError):
                 self._remove_path(cleanup_root, root)
         except Exception:
@@ -856,6 +857,43 @@ class ProvisionManager:
                    "note": "" if verified else
                    f"installed; {len(files_unhashed)} file(s) lack trusted digests"})
         return True
+
+    def _remove_old_model_copies(self, art: Artifact, dest: Path) -> None:
+        destination_complete = all(self.checker._is_size_match(self.checker._file_at(art, dest, f), f)
+                                   for f in art.required_files())
+        protected = (self.roots.v2_package_root.parent / "pretrained_models").resolve()
+        for legacy in ((*self.roots.legacy_data_dirs, *self.roots.legacy_models_dirs)
+                       if destination_complete else ()):
+            old = legacy / art.layout_rel if art.layout_rel else legacy
+            try:
+                legacy_root = legacy.resolve()
+                old_resolved = old.resolve()
+                if (old == dest or old_resolved == dest.resolve()
+                        or old_resolved == protected or old_resolved.is_relative_to(protected)
+                        or not old_resolved.is_relative_to(legacy_root)
+                        or self.checker.is_hf_snapshot_dir(art, old)):
+                    continue
+                removed = 0
+                for f in art.required_files():
+                    path = self.checker._file_at(art, old, f)
+                    resolved = path.resolve()
+                    if (not resolved.is_relative_to(legacy_root)
+                            or not self.checker._is_size_match(path, f)):
+                        continue
+                    size = path.stat().st_size
+                    path.unlink()
+                    removed += size
+                parent = old
+                while parent != legacy and parent.is_relative_to(legacy):
+                    parent.rmdir()
+                    parent = parent.parent
+                if removed:
+                    self.emit({"event": "old-copy-removed", "artifact": art.id,
+                               "path": str(old), "bytes": removed})
+            except OSError as e:
+                self.emit({"event": "old-copy-removal-failed", "artifact": art.id,
+                           "path": str(old), "error": str(e)})
+        self.checker.refresh_paths(art)
 
     def _missing_bytes(self, art: Artifact) -> int:
         """Preflight only the bytes absent from this artifact's pinned staging area."""
