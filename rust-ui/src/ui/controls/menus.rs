@@ -68,6 +68,7 @@ pub struct MenuBarOut {
     pub response: Response,
     /// The activated row as a path: menu index, then item index per submenu level.
     pub clicked: Option<Vec<usize>>,
+    pub open: bool,
 }
 
 pub struct ListOut {
@@ -626,8 +627,9 @@ impl<'a> MenuBar<'a> {
             }
             if clicked.is_some() { nav = Nav::default() }
         }
+        let open = nav.open;
         if !forced { ctx.data_mut(|d| { d.insert_temp(id, nav); }); }
-        MenuBarOut { response: group, clicked }
+        MenuBarOut { response: group, clicked, open }
     }
 }
 

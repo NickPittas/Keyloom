@@ -228,6 +228,9 @@ pub struct App {
     node: Node,
     focus_mode: bool,
     props_sheet: bool,
+    /// Board/Shot page selection while a shot viewer is retained across navigation.
+    board_selected: bool,
+    menu_open: bool,
     /// Status-bar item that opened the Activity popover (its rect anchors it).
     activity_anchor: Option<egui::Rect>,
     /// Per-clip (by folder) graph layout and view; kept across Back/open, not persisted.
@@ -501,6 +504,8 @@ impl App {
             node: Node::Media,
             focus_mode: false,
             props_sheet: false,
+            board_selected: false,
+            menu_open: false,
             activity_anchor: None,
             graphs: Default::default(),
             graph_collapsed: false,
@@ -648,16 +653,23 @@ impl App {
         app
     }
 
-    fn load(&mut self, ctx: &egui::Context) {
-        self.viewer = None;
-        self.open = None;
-        self.selected.clear();
+    fn load(&mut self, ctx: &egui::Context) -> bool {
         let lo = LoadOptions {
             global_output_dir: self.opts.global_output_dir.clone(),
         };
         let prev = self.project.as_ref().map(|p| p.root.clone());
-        match load_project(&PathBuf::from(self.path_input.trim()), &lo) {
-            Ok(p) => {
+        let p = match load_project(&PathBuf::from(self.path_input.trim()), &lo) {
+            Ok(p) => p,
+            Err(e) => {
+                self.load_error = Some(e);
+                ctx.request_repaint();
+                return false;
+            }
+        };
+        self.viewer = None;
+        self.open = None;
+        self.selected.clear();
+        {
                 // Same-root reloads (import progress) keep unsaved drafts, their baselines and the location.
                 let switched = prev.as_ref() != Some(&p.root);
                 self.summaries = p.clips.iter().map(card_summary).collect();
@@ -670,19 +682,13 @@ impl App {
                     self.init_location();
                 }
                 self.record_recent();
-            }
-            Err(e) => {
-                self.summaries.clear();
-                self.project = None;
-                self.load_error = Some(e);
-                self.forget_project_state();
-            }
         }
         // A reload of the same project keeps a waiting plan; switching projects forgets it (its "open
         // project" destination would otherwise still point at the old one).
         self.imp
             .project_changed(self.project.as_ref().map(|p| p.root.as_path()));
         ctx.request_repaint();
+        true
     }
 
     /// A different project is loading: nothing keyed by clip folder may carry over (same names, other project).
@@ -759,6 +765,7 @@ impl App {
         v.looping = st.playback.loop_default;
         self.viewer = Some(v);
         self.open = Some(i);
+        self.board_selected = false;
         let saved = self
             .project
             .as_ref()
@@ -815,6 +822,9 @@ impl App {
         if self.hint_delete_open() {
             return;
         }
+        if self.menu_open || self.activity_is_open() {
+            return;
+        }
         self.shortcuts(ctx);
         self.new_project_window(ctx);
         // A focused graph node is a button, not text entry: shortcuts (F, B, 1-5, Esc…) must keep working there.
@@ -841,6 +851,14 @@ impl App {
             }
             return;
         }
+        if self.page_now() == 0 {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::A)) {
+                self.key_selected(ctx);
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::A)) {
+                self.selected = (0..self.project.as_ref().map_or(0, |p| p.clips.len())).collect();
+            }
+            return;
+        }
         if self.viewer.is_none() {
             return;
         }
@@ -854,7 +872,7 @@ impl App {
     // ------------------------------------------------------------------ board
 
     fn refresh_board_status(&mut self) {
-        let Some(project) = self.project.as_ref() else { return };
+        if self.project.is_none() { return; }
         let now = Instant::now();
         let meters = self.local_meters(now);
         let targets = self.ai.scheduler().targets();
@@ -866,7 +884,7 @@ impl App {
                 super::models::WorkerActivity::Idle | super::models::WorkerActivity::Stopped => String::new(),
             }
         };
-        let notices = project.notes.len() as u32 + u32::from(self.ai.notice.is_some()) + u32::from(self.ai.pending_note().is_some()) + u32::from(self.load_error.is_some()) + u32::from(self.opts.startup_notice.is_some()) + u32::from(self.save_error.is_some());
+        let notices = self.notice_count();
         let activity = match self.activity_summary() {
             Some((t, _)) if self.open.is_some() => t,
             _ => activity,
@@ -951,12 +969,7 @@ impl App {
             cards.push(super::board::FxShot { n: clip.display_name.clone(), st: match clip.state { ClipState::Masked => "mask", ClipState::Ready => "ready", ClipState::Complete => "done", _ => "raw" }.into(), meta, s: status, pc, dot: String::new(), job, prog, err, q, r, thumb, thumb_aspect, thumb_label, thumb_tooltip, source_available, exports_available, resume });
         }
         let meters = self.local_meters(now);
-        let mut notice_text = project.notes.clone();
-        notice_text.extend(self.ai.notice.iter().cloned());
-        notice_text.extend(self.ai.pending_note().map(str::to_owned));
-        notice_text.extend(self.load_error.iter().cloned());
-        notice_text.extend(self.opts.startup_notice.iter().cloned());
-        notice_text.extend(self.save_error.iter().cloned());
+        let notice_text = self.active_notice_text();
         let notices = notice_text.len() as u32;
         if activity.is_empty() && self.imp.busy() { activity = self.imp.busy_what().to_owned(); }
         if activity.is_empty() { activity = queue.iter().filter(|s| s.root == project.root).flat_map(|s| s.runs.iter().flat_map(|r| r.rows.iter().filter(|x| x.executing).map(|x| format!("{} - {} {}", s.title, x.heading, x.cell.text)))).next().unwrap_or_default(); }
@@ -1219,13 +1232,6 @@ impl App {
                 });
             });
         }
-        // The one activity strip: fixed height on every tab, in Focus and with the graph collapsed. Declared
-        // first among the bottom panels, so it sits directly above the system metrics.
-        let strip = Panel::bottom("activity")
-            .exact_size(super::activity::STRIP_H)
-            .frame(egui::Frame::new().fill(theme::card_fill(ui)).inner_margin(egui::Margin::symmetric(10, 4)).stroke(egui::Stroke::new(1.0, theme::panel_edge(ui))))
-            .show(ui, |ui| self.activity_strip(ui));
-        self.strip.rect = Some(strip.response.rect);
         if !focus {
             if !narrow || self.props_sheet {
                 Panel::right("props")
@@ -1249,7 +1255,7 @@ impl App {
             let short = ui.available_height() < 560.0;
             self.graph_short = short;
             let min_viewer = if narrow || short { 290.0 } else { MIN_VIEWER }; // 900x640: the action cards must keep their buttons visible
-            let max_h = (ui.available_height() - 34.0 - super::activity::STRIP_H - tools_h - min_viewer).max(graph_min);
+            let max_h = (ui.available_height() - 34.0 - tools_h - min_viewer).max(graph_min);
             if if short { !self.graph_short_open } else { self.graph_collapsed } {
                 Panel::bottom("graph_collapsed")
                     .frame(egui::Frame::new().fill(theme::canvas_fill(ui)).inner_margin(8))
@@ -2596,7 +2602,9 @@ impl App {
             dropped
         };
         // Clip-level dialogs (relink, hint movie/sequence, export folder) answer inside the open clip.
-        if self.in_workspace()
+        if self.held_pick.as_ref().is_some_and(|(kind, _)| *kind == PickKind::Project) {
+            self.apply_pick(ctx);
+        } else if self.in_workspace()
             && !self.settings_open
             && matches!(
                 self.held_pick.as_ref().map(|h| h.0),
@@ -3178,9 +3186,9 @@ impl App {
                 },
             ),
             PickKind::Project => {
-                self.open_project_path(ctx, paths[0].clone());
-                if let Some(from) = locate {
-                    self.located(from);
+                let opened = self.open_project_path(ctx, paths[0].clone());
+                if opened {
+                    if let Some(from) = locate { self.located(from); }
                 }
             }
             PickKind::Location => {
@@ -3210,7 +3218,7 @@ impl App {
         self.imp.notice_text()
     }
     pub fn in_workspace(&self) -> bool {
-        self.viewer.is_some() && self.open.is_some()
+        self.viewer.is_some() && self.open.is_some() && !self.board_selected
     }
     /// Source-frame count of the open clip (tests).
     pub fn open_frame_count(&self) -> Option<usize> {
@@ -3365,24 +3373,23 @@ impl App {
         }
         // Outermost bottom panel: on every page (Board, clip, Settings, Clients, Models), fixed height.
         if self.board_fx.is_some() {
-            Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| if let Some(b) = &self.board_fx { b.status(ui); });
+            let failures = self.failure_count();
+            let status = Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.board_fx.as_ref().map(|b| b.status(ui, failures))).inner;
+            if let Some(status) = status { self.route_status(status); }
             self.metrics_rect = None;
         } else if self.project.is_none() {
             // §7.4: no hardware meters before a project is open; the status bar shows activity and notices only.
-            Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.start_status(ui));
+            let status = Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.start_status(ui)).inner;
+            self.route_status(status);
             self.metrics_rect = None;
         } else {
             // One 22 px status bar carries the CPU/RAM/GPU/VRAM meters (§8.8); no separate metrics footer.
             self.metrics_rect = None;
-            let status = Panel::bottom("board_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.board_page.status(ui)).inner;
-            if let Some(seg) = status.clicked {
-                if matches!(seg, super::controls::statusbar::Segment::Activity | super::controls::statusbar::Segment::Notices) {
-                    self.activity_anchor = status.segments.iter().find(|(s, _)| *s == seg).map(|(_, r)| *r);
-                    self.activity_toggle();
-                }
-            }
+            let failures = self.failure_count();
+            let status = Panel::bottom("board_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.board_page.status(ui, failures)).inner;
+            self.route_status(status);
         }
-        // §7.1: menu bar 24 + toolbar 36 (page tabs, Models button).
+        // §7.1: menu bar 24 + toolbar 36 (page tabs with cached Models attention).
         Panel::top("banner").exact_size(60.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.chrome(ui));
         if std::mem::take(&mut self.settings_requested) {
             self.open_settings();
@@ -3467,11 +3474,10 @@ impl App {
             }
         } else if let Some(p) = self.shot_fx.as_mut() {
             egui::CentralPanel::default().show(ui, |ui| p.ui(ui));
-        } else if self.viewer.is_some() && self.open.is_some() {
+        } else if self.viewer.is_some() && self.open.is_some() && !self.board_selected {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.shot_workspace(ui));
             if std::mem::take(&mut self.back_requested) {
-                self.viewer = None;
-                self.open = None;
+                self.board_selected = true;
                 ctx.request_repaint();
             }
         } else {
