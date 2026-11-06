@@ -143,6 +143,7 @@ pub enum Act {
     DownloadAll,
     Cancel,
     Delete(String),
+    Repair(String),
     Refresh,
     Reveal(String),
 }
@@ -448,6 +449,19 @@ impl Page {
 
         // Only a missing model offers an install; present, downloading and other states show no download button (bible §5.12).
         let mut name_right = delete_x - 8.0;
+        if model.state == ModelState::Present {
+            let repair_block = self.fx.startup_error.as_deref()
+                .or_else(|| (!self.fx.catalog_loaded).then_some("Model catalog is unavailable."))
+                .or_else(|| self.fx.busy.then_some("Wait for the current model operation to finish."))
+                .or_else(|| (!model.can_delete()).then_some("This model cannot be repaired here."));
+            let repair = if repair_block.is_none() { buttons::secondary_button("Repair") } else { buttons::secondary_button("Repair").disabled(repair_block.unwrap()) };
+            let repair_w = repair.natural_width(ui);
+            let repair_x = delete_x - 8.0 - repair_w;
+            if ui.add(repair.at(Pos2::new(repair_x, rect.min.y + 5.0))).clicked() {
+                acts.push(Act::Repair(model.id.clone()));
+            }
+            name_right = repair_x - 8.0;
+        }
         if model.state == ModelState::Missing {
             let download_block = self.fx.startup_error.as_deref()
                 .or_else(|| (!self.fx.catalog_loaded).then_some("Model catalog is unavailable."))

@@ -227,6 +227,7 @@ pub enum Request {
     DownloadAll,
     Cancel,
     Delete(String),
+    Repair(String),
     Refresh,
 }
 
@@ -1229,6 +1230,13 @@ impl Page {
                 }
                 self.confirm_delete = None;
                 self.start(Action::Delete(id), ctx);
+            }
+            Request::Repair(id) => {
+                let a = self.artifacts.get(&id).ok_or_else(|| format!("Unknown model: {id}"))?;
+                if let Some(e) = self.delete_block(a) {
+                    return Err(e);
+                }
+                self.start(Action::Repair(id), ctx);
             }
         }
         Ok(())
