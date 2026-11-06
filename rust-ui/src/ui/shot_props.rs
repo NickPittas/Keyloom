@@ -1261,9 +1261,11 @@ fn output_row(
 ) {
     rows.row_full(selected, false, |ui, cols| {
         let mut checked = checked;
-        let check = ui.add(Check::new(&mut checked, Some(name)).at(cols.label.min));
+        let check = ui.add(Check::new(&mut checked, None).at(cols.label.min));
         let t = tokens(ui);
         let p = ui.painter().clone();
+        let name_rect = Rect::from_min_max(egui::pos2(check.rect.max.x + 6.0, check.rect.top()), cols.label.max);
+        paint_line(&p, name_rect, line(&p, name, ty::label(), 16.0, name_rect.width()), 16.0, Align::Min, t.text_primary, 0.0);
         let value_rect = Rect::from_min_max(
             egui::pos2(cols.control.min.x.max(check.rect.max.x + 8.0), cols.control.min.y),
             cols.control.max,
@@ -1808,9 +1810,11 @@ fn output_row_live(rows: &mut PropRows, name: &str, enabled: bool, selected: boo
             .interact(cols.row, ui.scope_id().with(("deliver-out-row", name)), Sense::click())
             .on_hover_text("Select to edit its format below");
         let mut on = enabled;
-        let check = ui.add(Check::new(&mut on, Some(name)).at(cols.label.min));
+        let check = ui.add(Check::new(&mut on, None).at(cols.label.min));
         let t = tokens(ui);
         let p = ui.painter().clone();
+        let name_rect = Rect::from_min_max(egui::pos2(check.rect.max.x + 6.0, check.rect.top()), cols.label.max);
+        paint_line(&p, name_rect, line(&p, name, ty::label(), 16.0, name_rect.width()), 16.0, Align::Min, t.text_primary, 0.0);
         let value_rect = Rect::from_min_max(
             egui::pos2(cols.control.min.x.max(check.rect.max.x + 8.0), cols.control.min.y),
             cols.control.max,

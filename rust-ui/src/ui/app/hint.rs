@@ -20,7 +20,7 @@ use std::path::Path;
 #[derive(Default)]
 pub struct State {
     folder: Option<String>,
-    cfg: HintCfg,
+    pub(super) cfg: HintCfg,
     ann: Annotations,
     undo: Vec<Annotations>,
     note: Option<String>,
@@ -501,7 +501,7 @@ fn prov_base(clip: &Clip, cur: &Snap) -> (Snap, Snap) {
 }
 
 /// Tools the guide producer can use: SAM takes prompts, Chroma a screen colour, the others are automatic.
-fn tools_for(p: Producer) -> &'static [(Tool, &'static str, &'static str)] {
+pub(super) fn tools_for(p: Producer) -> &'static [(Tool, &'static str, &'static str)] {
     match p {
         Producer::Sam => &[
             (Tool::FgPoint, "Point +", "Foreground point (click)"),
@@ -1300,6 +1300,7 @@ impl App {
         let live_key = key_id.as_ref().and_then(|id| {
             self.ai.scheduler().snapshot().into_iter().find(|e| &e.job.job_id == id).map(|e| (e.dispatched_at, e.last_activity))
         });
+        let busy = self.ai.task_busy(&clip.root);
         let rc = &mut self.hint.rc;
         // Evidence is remembered per job id: a rebuilt scheduler forgets the job, the result is still that job's.
         if let (Some(id), Some((d, f))) = (&key_id, live_key) {
@@ -1344,6 +1345,11 @@ impl App {
             // The scheduler's own Done stamp, not the time this frame noticed it (a chained Key may already have
             // been dispatched by then).
             rc.hint_done_at = rc.hint_done_at.max(at);
+        }
+        let scheduler = self.ai.scheduler();
+        rc.inflight.retain(|id, _| scheduler.state_of(id).is_some_and(|state| !state.is_terminal()));
+        if rc.inflight.is_empty() && !busy && self.hint.note.as_deref().is_some_and(|note| note.ends_with(" queued.")) {
+            self.hint.note = None;
         }
         rc.key_manifest = Some(manifest);
         // A hint is newer than the Key result unless that result's job was dispatched at or after the hint
@@ -4157,7 +4163,7 @@ impl App {
 
 /// Width of the vertical tool strip beside the viewer.
 /// One 28 px button plus the frame margin: the column is exactly as wide as its content.
-const STRIP_W: f32 = 36.0;
+pub(super) const STRIP_W: f32 = 36.0;
 
 #[derive(Clone, Copy)]
 enum Icon {

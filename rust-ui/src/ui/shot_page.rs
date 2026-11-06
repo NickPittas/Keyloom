@@ -17,7 +17,7 @@ pub use props::{
     ReviewProps, RouteProps, StageProps,
 };
 
-use eframe::egui::{self, Align, ColorImage, Rect, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2};
+use eframe::egui::{self, Align, ColorImage, Rect, Sense, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2};
 use serde::Deserialize;
 use std::{io::Cursor, path::Path};
 
@@ -188,13 +188,18 @@ pub struct Regions {
 
 /// Fixed Shot page geometry for the Wide, Medium and Compact rules in bible §7.2/§7.5.
 pub fn regions(viewport: Rect, focus: bool, drawer_open: bool) -> Regions {
+    regions_sized(viewport, focus, drawer_open, None, None)
+}
+
+fn regions_sized(viewport: Rect, focus: bool, drawer_open: bool, props_w: Option<f32>, dock_body_h: Option<f32>) -> Regions {
     let wide = viewport.width() >= 1600.0;
     let compact = viewport.width() < 1200.0;
     let show_properties = !focus && drawer_open;
     let header = (!focus).then(|| Rect::from_min_size(viewport.min, Vec2::new(viewport.width(), 32.0)));
     let work_top = viewport.top() + if focus { 0.0 } else { 32.0 };
     let work = Rect::from_min_max(egui::pos2(viewport.left(), work_top), viewport.max);
-    let props_width = if wide { 320.0 } else { 280.0 };
+    let max_w = 640.0_f32.min(viewport.width() * 0.5).max(240.0);
+    let props_width = props_w.unwrap_or(if wide { 320.0 } else { 280.0 }).clamp(240.0, max_w);
     let viewer_width = (viewport.width() - if show_properties { props_width + 1.0 } else { 0.0 }).max(0.0);
     let viewer_column = Rect::from_min_size(work.min, Vec2::new(viewer_width, work.height()));
     let splitter = show_properties.then(|| Rect::from_min_size(
@@ -203,7 +208,9 @@ pub fn regions(viewport: Rect, focus: bool, drawer_open: bool) -> Regions {
     let properties = show_properties.then(|| Rect::from_min_size(
         egui::pos2(viewport.right() - props_width, work.top()), Vec2::new(props_width, work.height()),
     ));
-    let dock_body_h = if focus || compact { 0.0 } else if wide { 176.0 } else { 116.0 };
+    let dock_body_h = if focus || compact { 0.0 } else {
+        dock_body_h.unwrap_or(if wide { 176.0 } else { 116.0 }).clamp(0.0, (work.height() - 28.0*3.0 - 24.0 - 160.0).max(0.0))
+    };
     let dock_h = if focus { 0.0 } else { 24.0 + dock_body_h };
     let viewer_h = (work.height() - 28.0 - 28.0 - 28.0 - dock_h).max(0.0);
     let toolbar = Rect::from_min_size(work.min, Vec2::new(viewer_width, 28.0));
@@ -273,6 +280,8 @@ pub struct Page {
     dock_expanded: bool,
     graph_body: Option<Rect>,
     plate: Option<TextureHandle>,
+    props_w: Option<f32>,
+    dock_h: Option<f32>,
 }
 
 fn dock_tab(s: &str) -> DockTab {
@@ -301,7 +310,7 @@ impl Page {
         if !zoom_fit { viewer_state.zoom = fx.zoom.trim_end_matches('%').trim().parse().unwrap_or(38.0); }
         Ok(Self {
             drawer_open: fx.drawer, dock_tab: dock_tab(&fx.dock_tab), dock_expanded: fx.dock_expanded, graph_body: None,
-            fx, viewer_state, zoom_fit, plate: None, layout: None,
+            fx, viewer_state, zoom_fit, plate: None, layout: None, props_w: None, dock_h: None,
         })
     }
 
@@ -309,7 +318,7 @@ impl Page {
         Self {
             fx: Fixture { live: true, ..Fixture::default() },
             layout: None, viewer_state: ViewerState::default(), zoom_fit: true, drawer_open: true,
-            dock_tab: DockTab::Actions, dock_expanded: false, graph_body: None, plate: None,
+            dock_tab: DockTab::Actions, dock_expanded: false, graph_body: None, plate: None, props_w: None, dock_h: None,
         }
     }
 
@@ -354,7 +363,7 @@ impl Page {
         )
         // Never lay out below/above what the caller's panel really gives (live chrome heights differ from the 60/22 assumed here).
         .intersect(ui.clip_rect());
-        let mut layout = regions(full,self.viewer_state.focus, self.drawer_open);
+        let mut layout = regions_sized(full, self.viewer_state.focus, self.drawer_open, self.props_w, self.dock_h);
         let t = tokens(ui);
         ui.painter().with_clip_rect(full).rect_filled(full, 0.0, t.bg_panel);
         if let Some(header_rect) = layout.header {
@@ -363,6 +372,30 @@ impl Page {
             if let Some(stage) = out.stage { acts.push(Act::Stage(stage)); }
         }
         if let Some(splitter) = layout.splitter { ui.painter().rect_filled(splitter, 0.0, t.border_divider); }
+        if let Some(splitter) = layout.splitter {
+            let hit = splitter.expand2(Vec2::new(3.0, 0.0));
+            let response = egui::Area::new(egui::Id::new("shot-props-splitter"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(hit.min)
+                .show(ui.ctx(), |ui| {
+                    let (_, response) = ui.allocate_exact_size(hit.size(), Sense::click_and_drag());
+                    response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                }).inner;
+            if response.double_clicked() { self.props_w = None; }
+            if response.dragged() { self.props_w = Some(full.right() - response.interact_pointer_pos().unwrap_or(hit.center()).x); }
+        }
+        if let Some(tabs) = layout.dock_tabs {
+            let hit = Rect::from_min_size(tabs.min, Vec2::new(tabs.width(), 6.0));
+            let response = egui::Area::new(egui::Id::new("shot-dock-splitter"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(hit.min)
+                .show(ui.ctx(), |ui| {
+                    let (_, response) = ui.allocate_exact_size(hit.size(), Sense::click_and_drag());
+                    response.on_hover_cursor(egui::CursorIcon::ResizeVertical)
+                }).inner;
+            if response.double_clicked() { self.dock_h = None; }
+            if response.dragged() { self.dock_h = Some((full.bottom() - response.interact_pointer_pos().unwrap_or(hit.center()).y - 24.0).max(0.0)); }
+        }
         // The page's own dock state is the source of truth; the dock reads it from the fixture fields.
         self.fx.dock_tab = (if self.dock_tab == DockTab::Graph { "Node graph" } else { "Actions" }).into();
         self.fx.dock_expanded = self.dock_expanded;

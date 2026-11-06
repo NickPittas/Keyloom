@@ -2,7 +2,7 @@
 //! real picture and timeline in the page's regions, and turns the page's acts into viewer/App calls.
 //! Not routed yet: `workspace` stays the production path until the cutover.
 use super::*;
-use super::hint::{DeliverCmd, DeliverOutput, DeliverView, HintCmd, HintEdit, HintStage, HintView};
+use super::hint::{self, DeliverCmd, DeliverOutput, DeliverView, HintCmd, HintEdit, HintStage, HintView};
 use super::media::{MediaCmd, MediaSource, MediaView};
 use crate::hints::{Final, Producer};
 use crate::project::View as PV;
@@ -728,9 +728,20 @@ impl App {
         }
         self.refresh_shot_page();
         let acts = self.shot_page.ui(ui);
-        if let (Some(l), Some(v)) = (self.shot_page.layout(), self.viewer.as_mut()) {
-            v.image_ui(ui, l.viewer);
-            v.timeline_ui(ui, l.timeline);
+        if let Some(l) = self.shot_page.layout() {
+            let mut viewer_rect = l.viewer;
+            if self.tab == crate::ui::Tab::Hint && !hint::tools_for(self.hint.cfg.guide).is_empty() {
+                let strip = egui::Rect::from_min_max(viewer_rect.min, egui::pos2(viewer_rect.left() + hint::STRIP_W, viewer_rect.bottom()));
+                let rest = egui::Rect::from_min_max(egui::pos2(strip.right(), viewer_rect.top()), viewer_rect.max);
+                viewer_rect = rest;
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(strip).layout(egui::Layout::top_down(egui::Align::Center)).id_salt("hint_tool_strip"));
+                child.set_clip_rect(strip);
+                self.hint_tool_strip(&mut child);
+            }
+            if let Some(v) = self.viewer.as_mut() {
+                v.image_ui(ui, viewer_rect);
+                v.timeline_ui(ui, l.timeline);
+            }
         }
         if let Some(r) = self.shot_page.graph_rect() {
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)).id_salt("shot_graph"));

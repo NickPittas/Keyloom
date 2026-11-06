@@ -43,7 +43,7 @@ impl App {
         note("hint", self.hint_note_text().map(str::to_owned));
         note("media", self.media.note.clone());
         if self.ai.lock_attention(clip) {
-            note("lock", Some("A hint lock on this clip needs a decision: open Details.".into()));
+            note("lock", Some("A hint lock on this clip needs a decision: open Activity to release it.".into()));
         }
         let (sched, others) = self.ai.activity_steps(&clip.root);
         steps.extend(sched);
@@ -242,9 +242,16 @@ impl App {
         if !self.strip.open {
             return;
         }
+        let clip = self.clip().cloned();
         let rows = self.global_activity_items();
         let items: Vec<_> = rows.iter().filter(|row| !matches!(row.kind, ItemKind::Notice(_)) || !self.strip.activity.is_acknowledged(row.id)).map(GlobalActivityItem::as_item).collect();
         let out = control::activity_popover(ui.ctx(), anchor, &mut self.strip.activity, &items);
+        if let Some(clip) = clip.filter(|clip| self.ai.lock_attention(clip)) {
+            egui::Area::new(ui.scope_id().with("hint-lock-recovery"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(anchor.left_bottom() + egui::vec2(0.0, -control::MAX_HEIGHT - 8.0))
+                .show(ui.ctx(), |ui| self.ai.hint_lock_ui(ui, &clip));
+        }
         if out.closed { self.strip.open = false; }
         if let Some((id, Action::Cancel)) = out.action {
             if let Some(job) = rows.iter().find(|row| row.id == id).and_then(|row| row.job.as_deref()) { self.ai.cancel(job); }

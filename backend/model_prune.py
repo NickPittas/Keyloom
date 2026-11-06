@@ -9,13 +9,27 @@ from backend.model_catalog import load_catalog
 from backend.model_status import Roots, StatusChecker
 
 
+def _is_link(p: Path) -> bool:
+    try:
+        info = p.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            return True
+        isjunction = getattr(os.path, "isjunction", None)
+        if isjunction is not None:
+            return isjunction(p)
+        return os.name == "nt" and bool(
+            info.st_file_attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        )
+    except OSError:
+        return True
+
+
 def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
     catalog = load_catalog()
     roots = Roots.defaults()
     checker = StatusChecker(catalog, roots)
     result: list[dict] = []
     planned_removed: set[Path] = set()
-
     def remove(path: Path, reason: str, *, directory: bool = False) -> None:
         try:
             info = path.lstat()
@@ -42,6 +56,16 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
 
     def erase_tree(path: Path, reason: str) -> None:
         try:
+            if _is_link(path):
+                info = path.lstat()
+                if not dry_run:
+                    if os.name == "nt" and not stat.S_ISLNK(info.st_mode):
+                        os.rmdir(path)
+                    else:
+                        path.unlink()
+                planned_removed.add(path)
+                result.append({"path": str(path), "bytes": 0, "reason": reason})
+                return
             info = path.lstat()
             if stat.S_ISDIR(info.st_mode):
                 for child in path.iterdir():
@@ -75,7 +99,7 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
                 for part in relative.parts:
                     current /= part
                     try:
-                        if stat.S_ISLNK(current.lstat().st_mode):
+                        if _is_link(current):
                             safe = False
                             break
                     except FileNotFoundError:
@@ -93,8 +117,16 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
         if not art.repo_id:
             continue
         repo_name = f"models--{art.repo_id.replace('/', '--')}"
+        processed_caches: set[Path] = set()
         for cache in roots.hf_caches:
             cache = Path(cache)
+            try:
+                resolved_cache = cache.resolve(strict=False)
+            except OSError:
+                continue
+            if resolved_cache in processed_caches:
+                continue
+            processed_caches.add(resolved_cache)
             repo = cache / repo_name
             try:
                 repo.relative_to(cache)
@@ -108,9 +140,11 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
                 continue
             reason = f"unused HF cache copy of {art.repo_id}"
             try:
-                in_repo = in_use is not None and in_use.is_relative_to(repo)
+                in_repo = in_use is not None and in_use.resolve(strict=False).is_relative_to(
+                    repo.resolve(strict=False)
+                )
             except (OSError, ValueError):
-                in_repo = False
+                in_repo = True
             if not in_repo:
                 erase_tree(repo, reason)
                 continue
@@ -119,12 +153,21 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
             keep = checker.artifact_dir(art)
             kept_blob_targets: set[Path] = set()
             try:
+                resolved_keep = keep.resolve(strict=False)
                 for snap in snapshots.iterdir():
-                    if snap == keep or not snap.is_dir():
+                    try:
+                        is_keep = snap.resolve(strict=False) == resolved_keep
+                    except OSError:
+                        continue
+                    if is_keep or not snap.is_dir():
                         continue
                     erase_tree(snap, f"unused HF revision of {art.repo_id}")
                 for snap in snapshots.iterdir():
-                    if snap != keep:
+                    try:
+                        is_keep = snap.resolve(strict=False) == resolved_keep
+                    except OSError:
+                        continue
+                    if not is_keep:
                         continue
                     for base, dirs, files in os.walk(snap, followlinks=False):
                         for name in files:

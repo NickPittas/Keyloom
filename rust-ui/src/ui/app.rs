@@ -215,6 +215,7 @@ struct ShotRemove {
 }
 
 pub struct App {
+    board_disk: std::collections::HashMap<PathBuf, (Instant, Option<bool>, bool)>,
     opts: AppOptions,
     project: Option<Project>,
     path_input: String,
@@ -488,6 +489,7 @@ impl App {
             None => project_shell::Recent::load(settings.store_path()),
         };
         let mut app = App {
+            board_disk: Default::default(),
             path_input: opts
                 .project
                 .as_ref()
@@ -906,6 +908,8 @@ impl App {
         let running = queue.iter().flat_map(|s| &s.runs).filter(|r| r.rows.iter().any(|x| x.executing)).count() as u32 + remote_jobs.iter().filter(|j| j.running).count() as u32;
         let finished = self.ai.finished_count(&queue) as u32 + remote_jobs.iter().filter(|j| !j.active).count() as u32;
         let mut cards = Vec::with_capacity(project.clips.len());
+        let live_roots: std::collections::HashSet<_> = project.clips.iter().map(|c| c.root.clone()).collect();
+        self.board_disk.retain(|root, _| live_roots.contains(root));
         let mut activity = String::new();
         for clip in &project.clips {
             let import_state = self.imp.card_state(clip);
@@ -959,8 +963,15 @@ impl App {
                 else if clip.input_files.is_empty() { ("No frames".into(), "No source frames are available for this shot.".into()) }
                 else if let Some(error) = self.thumbs.as_ref().and_then(|t| t.failed(clip)) { ("Unreadable frame".into(), error.to_owned()) }
                 else { ("Loading preview…".into(), "The first source frame is still being decoded.".into()) };
-            let source_available = match &clip.source { Source::Video { path } => Some(path.exists()), Source::Sequence { dir, .. } => Some(dir.exists()), Source::Missing => Some(false) };
-            let exports_available = crate::pipeline::export_dir(clip, &project.root, saved_export_root(clip).as_deref()).is_dir();
+            let (source_available, exports_available) = match self.board_disk.get(&clip.root) {
+                Some((at, source, exports)) if now.duration_since(*at) < std::time::Duration::from_secs(2) => (*source, *exports),
+                _ => {
+                    let source = match &clip.source { Source::Video { path } => Some(path.exists()), Source::Sequence { dir, .. } => Some(dir.exists()), Source::Missing => Some(false) };
+                    let exports = crate::pipeline::export_dir(clip, &project.root, saved_export_root(clip).as_deref()).is_dir();
+                    self.board_disk.insert(clip.root.clone(), (now, source, exports));
+                    (source, exports)
+                }
+            };
             if activity.is_empty() { activity = import_activity.unwrap_or_default(); }
             let q = u8::from(job == "q");
             let r = u8::from(job == "r");

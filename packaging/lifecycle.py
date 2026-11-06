@@ -1097,7 +1097,8 @@ def prune_model_copies(version_dir: Path) -> dict:
     env = clean_env(PYTHONPATH=str(app))
     try:
         r = run_logged([str(descriptor_python(version_dir)), "-I", "-B", "-c",
-                        "import json,sys; from backend.model_prune import prune_unused_model_copies as p; print(json.dumps(p()))"],
+                        "import json,sys; sys.path.insert(0,sys.argv[1]); from backend.model_prune import prune_unused_model_copies as p; print(json.dumps(p()))",
+                        str(app)],
                        "models-prune", cwd=str(app), env=env, timeout=INNER_TIMEOUT)
         if r.returncode:
             raise InstallError(f"model prune exited with code {r.returncode}")

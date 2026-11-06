@@ -378,7 +378,8 @@ class StatusChecker:
                                 root / "VideoMaMa" / "weights.safetensors")
             else:
                 alternatives = ()
-            path = next((candidate for candidate in alternatives if self._is_size_match(candidate, f)), path)
+            if not self._is_size_match(path, f):
+                path = next((candidate for candidate in alternatives if self._is_size_match(candidate, f)), path)
         return path
 
     def _is_size_match(self, path: Path, f: FileSpec) -> bool:

@@ -1168,7 +1168,15 @@ impl AiUi {
                 self.batch = None;
                 self.block_reason = Some(w);
             }
-            None => self.confirm_batch(),
+            None => { self.confirm_batch(); self.clear_auto_wait_notice_if_empty(); }
+        }
+    }
+
+    fn clear_auto_wait_notice_if_empty(&mut self) {
+        if !self.auto_pending.is_empty() { return; }
+        if let Some(notice) = &mut self.notice {
+            *notice = notice.split(". ").filter(|part| !part.contains("waiting for a free PC")).collect::<Vec<_>>().join(". ");
+            if notice.is_empty() { self.notice = None; }
         }
     }
 
@@ -1193,7 +1201,7 @@ impl AiUi {
                         self.notice_roots.clear();
                         if let Some(notice) = &mut self.notice {
                             let keep: Vec<_> = notice.split(". ")
-                                .filter(|part| part.contains("Not queued:") || part.contains("waiting for a free PC"))
+                                .filter(|part| part.contains("Not queued:") || (part.contains("waiting for a free PC") && !self.auto_pending.is_empty()))
                                 .collect();
                             *notice = keep.join(". ");
                             if notice.is_empty() { self.notice = None; }
@@ -3792,6 +3800,7 @@ impl AiUi {
                 self.push_waiting(a);
             }
         }
+        self.clear_auto_wait_notice_if_empty();
         self.auto_wait = self.auto_pending.iter().any(|a| !a.paused).then(|| {
             let clients = if self.auto_clients > 0 { "every client is busy or over 50%" } else { "no client with Connect + Accept work is online" };
             [self.local_wait(local), Some(clients.to_owned())].into_iter().flatten().collect::<Vec<_>>().join("; ")
@@ -3995,6 +4004,7 @@ impl AiUi {
     /// Drop the Automatic shots still waiting for a free PC.
     pub fn cancel_auto(&mut self) {
         self.auto_pending.clear();
+        self.clear_auto_wait_notice_if_empty();
     }
 
     fn network_row(&mut self, project: &Project, st: &Settings, preset_name: Option<&str>, r: &BatchRow, plan: &Plan, target: Option<String>) -> Result<NetSubmit, String> {
