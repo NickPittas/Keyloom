@@ -1,8 +1,70 @@
-# Keyloom — powered by CorridorKey
+<p align="center">
+  <img src="ui/theme/keyloom-256.png" alt="Keyloom" width="128">
+</p>
 
-Keyloom is a desktop app for pulling clean keys (green or blue screen) from video footage. You bring in clips, build a rough matte (the **hint**), run the keyer, check the result and deliver image sequences or video files. Several computers can share the rendering.
+<h1 align="center">Keyloom</h1>
 
-This is the current native app (Windows 10/11 x64 and Linux x64, NVIDIA GPU). The text of the earlier upstream README is kept in [docs/upstream-readme.md](docs/upstream-readme.md).
+<p align="center">
+  <b>Clean green- and blue-screen keys from video — build a hint, key it, review it, deliver it, and spread the work over every GPU on your network.</b><br>
+  <sub>powered by CorridorKey · Windows 10/11 and Linux x64 · NVIDIA GPU</sub>
+</p>
+
+<p align="center">
+  <a href="https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-windows"><b>Download for Windows</b></a> ·
+  <a href="https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-linux"><b>Download for Linux</b></a> ·
+  <a href="docs/install.md">Install guide</a> ·
+  <a href="docs/user-guide.md">User guide</a> ·
+  <a href="docs/release-3.0.0.md">What's new in 3.0.0</a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/native/04-board.png" alt="The Board: shot cards on the left, the Queue panel on the right showing each machine and the progress of every stage" width="100%">
+  <br><sub>The Board — every shot of the project, and a Queue panel showing what each machine is doing, stage by stage.</sub>
+</p>
+
+## See it in action
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/native/detail-queue.png" alt="Queue panel during a two-machine batch"><br><b>One batch, two machines.</b> This PC is keying one shot while Kamino-3 runs another; each shows its stage and progress, with Cancel.</td>
+    <td width="50%"><img src="docs/screenshots/native/detail-hint.png" alt="Hint tab with the drawing tool column"><br><b>Draw the hint.</b> SAM points, paint, erase and box tools beside the frame, or let GVM, BiRefNet or a chroma key do it.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/native/detail-batch.png" alt="Key selected shots dialog"><br><b>Key many shots at once.</b> Pick a machine per shot (or Automatic) and send the whole batch.</td>
+    <td><img src="docs/screenshots/native/detail-deliver.png" alt="Deliver outputs"><br><b>Deliver what you need.</b> FG, Matte, Comp and Processed as EXR/PNG sequences or MP4/MOV/WebM.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/native/detail-machines.png" alt="Machines page"><br><b>Render on several PCs.</b> Join machines, choose which accept work and which are the default.</td>
+    <td><img src="docs/screenshots/native/detail-models.png" alt="Models page"><br><b>Models in one place.</b> See what is present, Repair a damaged model, or Delete it.</td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/native/07-key.png" alt="Key tab"><br><b>Key</b> with temporal awareness, VRAM and despill controls.</td>
+    <td><img src="docs/screenshots/native/08-review.png" alt="Review tab"><br><b>Review</b> Input, Hint, FG, Matte, Comp and Processed in one viewer with an A/B wipe.</td>
+  </tr>
+</table>
+
+Keyloom is a desktop app for pulling clean keys from video footage. You bring in clips, build a rough matte (the **hint**), run the keyer, check the result and deliver image sequences or video files. The text of the earlier upstream README is kept in [docs/upstream-readme.md](docs/upstream-readme.md).
+
+## What you can do
+
+- **Import** movies or PNG/EXR image sequences into a project, one clip or a whole folder.
+- **Build a hint** with SAM (points, boxes, paint), GVM, BiRefNet or a chroma key, then optionally refine it with MatAnyone2 or VideoMaMa, or import an alpha/mask you made elsewhere.
+- **Key** with temporal awareness, VRAM and despill controls. Results are never overwritten unless you confirm.
+- **Review** Input, Hint, FG, Matte, Comp and Processed in one viewer with an A/B wipe.
+- **Deliver** FG, Matte, Comp and Processed as EXR/PNG sequences and/or MP4, MOV or WebM videos.
+- **Network setup** from the Machines page: discover and connect to other PCs, choose their addresses, and control which PCs accept work.
+- **Batch** many shots at once with a saved workflow preset, and spread them over several PCs on your network.
+
+
+## Quick start
+
+1. [Install](docs/install.md) the app, then download models from **Models & runtime…**.
+2. Start Keyloom, choose **New project…**, then **Import clips…**.
+3. Work through each clip: **Media → Hint → Key → Review → Deliver**.
+
+**For network rendering, Keyloom must be running on every rendering PC.** Keep its window open, or enable background mode and leave the app running after closing the window. **File → Quit** or terminating the app stops it from receiving work. The separate daemon/service may remain running and keep the PC discoverable, but it cannot render shots or accept them without the app. A visible PC is not necessarily an available renderer.
+
+Full walkthrough: [User guide](docs/user-guide.md). Rendering on several computers: [Network rendering](docs/network-rendering.md). [Documentation index](docs/README.md) distinguishes current guides from historical records and legacy translations.
 
 ## Credits and attributions
 
@@ -32,29 +94,6 @@ The current application has its own native Rust interface, project workflow, net
 
 These credits do not resolve discrepancies between upstream licence labels and retained licence texts (notably MatAnyone2); consult both the linked source and retained notices rather than assuming a permissive or commercial-use grant.
 
-![Welcome screen](docs/screenshots/native/01-welcome.png)
-
-## What you can do
-
-- **Import** movies or PNG/EXR image sequences into a project, one clip or a whole folder.
-- **Build a hint** with SAM (points, boxes, paint), GVM, BiRefNet or a chroma key, then optionally refine it with MatAnyone2 or VideoMaMa, or import an alpha/mask you made elsewhere.
-- **Key** with temporal awareness, VRAM and despill controls. Results are never overwritten unless you confirm.
-- **Review** Input, Hint, FG, Matte, Comp and Processed in one viewer with an A/B wipe.
-- **Deliver** FG, Matte, Comp and Processed as EXR/PNG sequences and/or MP4, MOV or WebM videos.
-- **Network setup** from the Machines page: discover and connect to other PCs, choose their addresses, and control which PCs accept work.
-- **Batch** many shots at once with a saved workflow preset, and spread them over several PCs on your network.
-
-Published installer assets (see [distribution permissions](#licence-and-sharing)): [Windows 3.0.0](https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-windows) · [Linux 3.0.0](https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-linux). Only online installers are distributed; they download required dependencies during installation. Follow the [installation guide](docs/install.md). Latest release notes: [Keyloom 3.0.0](docs/release-3.0.0.md).
-
-## Quick start
-
-1. [Install](docs/install.md) the app, then download models from **Models & runtime…**.
-2. Start Keyloom, choose **New project…**, then **Import clips…**.
-3. Work through each clip: **Media → Hint → Key → Review → Deliver**.
-
-**For network rendering, Keyloom must be running on every rendering PC.** Keep its window open, or enable background mode and leave the app running after closing the window. **File → Quit** or terminating the app stops it from receiving work. The separate daemon/service may remain running and keep the PC discoverable, but it cannot render shots or accept them without the app. A visible PC is not necessarily an available renderer.
-
-Full walkthrough: [User guide](docs/user-guide.md). Rendering on several computers: [Network rendering](docs/network-rendering.md). [Documentation index](docs/README.md) distinguishes current guides from historical records and legacy translations.
 
 ## Requirements
 
