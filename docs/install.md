@@ -25,14 +25,14 @@ Only **online installers** are distributed, and only the latest release is retai
 
 Download **all three files** from the [Windows release](https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-windows) into the **same folder**:
 
-- `Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64.exe`
-- `Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64-1.bin`
-- `Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64.exe.sha256`
+- `Keyloom-online-3.0.0-df30931ce4-windows-x86_64.exe`
+- `Keyloom-online-3.0.0-df30931ce4-windows-x86_64-1.bin`
+- `Keyloom-online-3.0.0-df30931ce4-windows-x86_64.exe.sha256`
 
 Check both installer files in PowerShell:
 
 ```powershell
-Get-Content .\Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64.exe.sha256 | ForEach-Object {
+Get-Content .\Keyloom-online-3.0.0-df30931ce4-windows-x86_64.exe.sha256 | ForEach-Object {
   $hash, $name = $_ -split '\s+', 2
   $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $name).Hash
   if ($got -ine $hash) { throw "SHA256 mismatch: $name" }
@@ -47,9 +47,9 @@ Every line must say `OK`. Then double-click the `.exe`; keep the `.bin` beside i
 Download the `.run` and its `.sha256` file from the [Linux release](https://github.com/NickPittas/Keyloom/releases/tag/v3.0.0-linux). In the download folder:
 
 ```sh
-sha256sum -c Keyloom-online-3.0.0-9fd666602f-linux-x86_64.run.sha256
-chmod +x Keyloom-online-3.0.0-9fd666602f-linux-x86_64.run
-./Keyloom-online-3.0.0-9fd666602f-linux-x86_64.run
+sha256sum -c Keyloom-online-3.0.0-e3ee5c3f76-linux-x86_64.run.sha256
+chmod +x Keyloom-online-3.0.0-e3ee5c3f76-linux-x86_64.run
+./Keyloom-online-3.0.0-e3ee5c3f76-linux-x86_64.run
 ```
 
 The default install folder is `~/.local/opt/Keyloom`. Use `--prefix DIR` to choose another folder or `--repair` to repair an existing install. See [Linux firewall](#linux-firewall-ufw) for `--firewall yes|skip` and `--no-firewall`. Do not run two installers on the same folder at once.

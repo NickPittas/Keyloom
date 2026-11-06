@@ -1,6 +1,6 @@
 # Keyloom 3.0.0 release
 
-Keyloom — powered by CorridorKey. Source commit `3ec5df0bd5fcd902118f3c4165e7b8f102c199d5`; later documentation updates do not change the payloads. Only the online installers are distributed. Source and release assets are public; redistribution permissions are described in the [README](../README.md#licence-and-sharing).
+Keyloom — powered by CorridorKey. Source commit `2e542b02d199446250d0cc6b1b030100ce3f6601`; later documentation updates do not change the payloads. Only the online installers are distributed. Source and release assets are public; redistribution permissions are described in the [README](../README.md#licence-and-sharing).
 
 ## Before updating
 
@@ -21,16 +21,16 @@ Quit Keyloom first, **including the copy in the tray** (tray icon > **Quit**). T
 
 | Platform | Payload identity | Installer |
 |---|---|---|
-| Linux x86-64 | `3.0.0-9fd666602f` | Online `.run` |
-| Windows x86-64 | `3.0.0-f6b35b1a00` | Online `.exe` + `-1.bin` |
+| Linux x86-64 | `3.0.0-e3ee5c3f76` | Online `.run` |
+| Windows x86-64 | `3.0.0-df30931ce4` | Online `.exe` + `-1.bin` |
 
 Sizes and SHA256 values are in [the asset manifest](release-3.0.0-assets.json). Keep the Windows `.bin` beside the `.exe`.
 
 | File | SHA256 |
 |---|---|
-| `Keyloom-online-3.0.0-9fd666602f-linux-x86_64.run` | `382996808578c69dcd153548ac4557c687902e3595c7876a24fe1047ecda7c0f` |
-| `Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64.exe` | `455454494da584c19716bf0168fa8e53eb03d4544478b80b09e0eff31af18a17` |
-| `Keyloom-online-3.0.0-f6b35b1a00-windows-x86_64-1.bin` | `40d0058a24a13b0bd05bfce1170f47a5bff2d07a74a196e394ac7be63759d5e2` |
+| `Keyloom-online-3.0.0-e3ee5c3f76-linux-x86_64.run` | `c6ee95b31a6813ec286f6ada4ecc5dd2cb1c7711b5b3234631c6ad5095832623` |
+| `Keyloom-online-3.0.0-df30931ce4-windows-x86_64.exe` | `0276525f55051d21ca0ccb67f1e55c0928e6a987955c61fa549951917fd3087e` |
+| `Keyloom-online-3.0.0-df30931ce4-windows-x86_64-1.bin` | `06bfab0f4c8be06912a3e1d97c50b59fe39a8b68dc36a62724453269f7472f84` |
 
 Releases: tags `v3.0.0-windows` and `v3.0.0-linux` on [GitHub](https://github.com/NickPittas/Keyloom/releases).
 
