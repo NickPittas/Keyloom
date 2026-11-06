@@ -169,6 +169,10 @@ struct Item {
     not_before: Option<Instant>,
 }
 
+fn clear_matching_note(note: &mut Option<String>, prefix: &str) {
+    if note.as_deref().is_some_and(|s| s.starts_with(prefix)) { *note = None; }
+}
+
 /// A shot running on this PC.
 struct Run {
     job_id: String,
@@ -394,7 +398,7 @@ impl Inbound {
                     self.reload = true;
                 }
                 "cancelled" => {
-                    self.cancels.insert(job_id.clone());
+                    self.committed_cancel(&job_id);
                     if let Rx::Running(r) = &mut self.rx {
                         if r.job_id == job_id && !r.cancel_sent {
                             Self::cancel_all(r, env);
@@ -411,11 +415,19 @@ impl Inbound {
         self.advance(now, env);
     }
 
+    fn committed_cancel(&mut self, job_id: &str) {
+        self.cancels.insert(job_id.to_owned());
+        self.queue.retain(|item| item.id != job_id);
+    }
+
     /// Receive jobs / join policy / PC name to the endpoint, whenever they differ from what it was last told.
     fn configure(&mut self, env: &Env) {
         if let Some(rx) = &self.configuring {
             match rx.try_recv() {
                 Err(TryRecvError::Empty) => return,
+                Ok(Ok(_)) => {
+                    clear_matching_note(&mut self.note, "The network settings could not be applied");
+                }
                 Ok(Err(e)) => {
                     self.sent_cfg = None;
                     self.note = Some(format!("The network settings could not be applied ({}).", e.message));
@@ -441,6 +453,9 @@ impl Inbound {
         if let Some(rx) = &self.publishing {
             match rx.try_recv() {
                 Err(TryRecvError::Empty) => return,
+                Ok(Ok(_)) => {
+                    clear_matching_note(&mut self.note, "This PC's entry for the other PCs could not be updated");
+                }
                 Ok(Err(e)) => self.note = Some(format!("This PC's entry for the other PCs could not be updated ({}).", e.message)),
                 _ => {}
             }
@@ -455,6 +470,7 @@ impl Inbound {
         self.last_avail = Some(avail);
         let sample = if let View::Live(s) = env.metrics { Some(s) } else { None };
         let gpu = env.ai.scheduler().targets().into_iter().find(|t| t.local && t.enabled).and_then(|t| t.ready).and_then(|r| r.gpu);
+        if gpu.is_none() || sample.is_none() { clear_matching_note(&mut self.note, "This PC is not offered to other PCs:"); }
         let name = truncate(env.settings.network.name.trim(), 64);
         let mut args = json!({"avail": {"receiving": avail.0, "busy": avail.1, "held": avail.2}});
         if !name.is_empty() {
@@ -463,6 +479,7 @@ impl Inbound {
         if let (Some(g), Some(s)) = (&gpu, sample) {
             match (g.verified_uuid(), s.ram_total.map(|b| b / (1 << 20)).filter(|r| *r > 0)) {
                 (Ok(uuid), Some(ram)) => {
+                    clear_matching_note(&mut self.note, "This PC is not offered to other PCs:");
                     args["gpu"] = json!({"uuid": uuid, "name": truncate(&g.name, 120), "vram_total_mb": ((g.vram_gb * 1024.0) as u64).max(1), "ram_total_mb": ram});
                     self.stats_seq += 1;
                     args["stats"] = stats_args(s, self.stats_seq);
@@ -483,6 +500,7 @@ impl Inbound {
                     match done {
                         Ok(Ok(rows)) => {
                             self.loaded = true;
+                            clear_matching_note(&mut self.note, "The inbox could not be read");
                             for r in rows.as_array().into_iter().flatten() {
                                 let Some(id) = r.get("job_id").and_then(Value::as_str) else { continue };
                                 if self.seen.insert(id.to_owned()) {
@@ -1155,5 +1173,24 @@ mod tests {
         Inbound::push_terminal(&mut r, "succeeded", "b");
         assert_eq!(r.outbox.len(), 1);
         assert_eq!(r.outbox[0]["data"]["state"], "failed");
+    }
+
+    #[test]
+    fn c9_committed_cancel_removes_waiting_job_before_dispatch() {
+        let mut inbound = Inbound::new();
+        inbound.queue.push_back(Item { id: "job-1".into(), spec: Err("test".into()), not_before: None });
+        inbound.committed_cancel("job-1");
+        assert!(inbound.queue.is_empty());
+        assert!(inbound.cancels.contains("job-1"));
+    }
+
+    #[test]
+    fn c2_success_clears_only_the_matching_inbox_error() {
+        let mut note = Some("The inbox could not be read (offline); trying again.".to_owned());
+        clear_matching_note(&mut note, "The inbox could not be read");
+        assert!(note.is_none());
+        note = Some("The network settings could not be applied (offline).".into());
+        clear_matching_note(&mut note, "The inbox could not be read");
+        assert!(note.is_some());
     }
 }

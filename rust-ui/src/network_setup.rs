@@ -40,6 +40,7 @@ pub struct Svc {
     /// `(url, kind)` of every address the service answers on.
     pub endpoints: Vec<(String, String)>,
     pub discovery: bool,
+    pub discovery_error: Option<String>,
     pub host_installation_id: Option<String>,
     pub receiver_online: bool,
     pub name: String,
@@ -323,6 +324,7 @@ pub struct PageSnapshot {
     /// `(short address, kind)` of every address the service answers on (running only).
     pub addresses: Vec<(String, String)>,
     pub discovery: bool,
+    pub discovery_error: Option<String>,
     pub receiver_online: bool,
     pub certificate: Option<String>,
     pub host_installation_id: Option<String>,
@@ -337,6 +339,7 @@ pub struct PageSnapshot {
     pub joining_key: Option<String>,
     pub retiring: bool,
     pub note: Option<String>,
+    pub note_is_error: bool,
     pub scanning: bool,
     pub scan_started: Option<Instant>,
     pub scan_summary: Option<String>,
@@ -383,6 +386,7 @@ pub struct Setup {
     svc: Option<Svc>,
     svc_unknown: bool,
     note: Option<String>,
+    note_is_error: bool,
     joined: Option<Joined>,
     name: String,
     name_loaded: bool,
@@ -417,6 +421,7 @@ pub struct Setup {
     retire_ask: Option<Vec<String>>,
     /// Confirmed logins not yet sent: one at a time, so the first error stops the rest.
     retire_todo: VecDeque<String>,
+    retire_unused_only: bool,
 }
 
 fn state_dir(sp: Option<&Path>) -> Option<PathBuf> {
@@ -474,6 +479,7 @@ fn parse_svc(v: &Value) -> Svc {
         endpoints: v.get("endpoints").and_then(Value::as_array).into_iter().flatten()
             .filter_map(|e| Some((e.get("url")?.as_str()?.to_owned(), e.get("kind").and_then(Value::as_str).unwrap_or("").to_owned()))).take(MAX_ENDPOINTS).collect(),
         discovery: b("discovery"),
+        discovery_error: text(v, "discovery_error"),
         host_installation_id: text(v, "host_installation_id"),
         receiver_online: b("receiver_online"),
         name: v.get("name").and_then(Value::as_str).unwrap_or("").to_owned(),
@@ -573,6 +579,7 @@ impl Setup {
             svc: None,
             svc_unknown: false,
             note: None,
+            note_is_error: false,
             joined: None,
             name: crate::remote::default_name(),
             name_loaded: false,
@@ -602,6 +609,7 @@ impl Setup {
             installs_open: false,
             retire_ask: None,
             retire_todo: VecDeque::new(),
+            retire_unused_only: false,
         }
     }
 
@@ -620,6 +628,7 @@ impl Setup {
                 v["running"] = json!(true);
                 v["allow_address_join"] = info.get("join").cloned().unwrap_or(json!(false));
                 v["discovery"] = json!(info.get("discovery_error").is_none_or(Value::is_null));
+                v["discovery_error"] = info.get("discovery_error").cloned().unwrap_or(Value::Null);
                 (true, Some(parse_svc(&v)))
             }
         };
@@ -634,6 +643,17 @@ impl Setup {
     }
     pub fn set_note(&mut self, s: String) {
         self.note = Some(s);
+        self.note_is_error = true;
+    }
+    fn set_note_kind(&mut self, s: impl Into<String>, is_error: bool) {
+        self.note = Some(s.into());
+        self.note_is_error = is_error;
+    }
+    fn clear_note_error(&mut self, prefix: &str) {
+        if self.note_is_error && self.note.as_deref().is_some_and(|s| s.starts_with(prefix)) {
+            self.note = None;
+            self.note_is_error = false;
+        }
     }
     fn busy(&self) -> bool {
         !self.pend.is_empty() || !self.queue.is_empty() || !self.app_pend.is_empty()
@@ -649,7 +669,7 @@ impl Setup {
     }
     fn retire_next(&mut self) {
         if let Some(id) = self.retire_todo.pop_front() {
-            self.push(Op::ServiceRetire, json!({"installation_id": id}), Pend::Retire);
+            self.push(Op::ServiceRetire, json!({"installation_id": id, "unused_only": self.retire_unused_only}), Pend::Retire);
         }
     }
 
@@ -716,7 +736,7 @@ impl Setup {
         if !svc.installed {
             if self.installed_once {
                 self.ensure = Ensure::Done;
-                self.note = Some("This PC's host service could not be installed; press Start to try again.".into());
+                self.set_note_kind("This PC's host service could not be installed; press Start to try again.", true);
                 nlog("host service could not be installed");
                 return;
             }
@@ -840,7 +860,7 @@ impl Setup {
         self.scan_item = None;
         self.scan_id = None;
         self.scan_started = None;
-        self.note = Some(why.to_owned());
+        self.set_note_kind(why, true);
     }
 
     fn scan_done(&mut self, out: Result<Value, crate::netlink::LinkError>) {
@@ -852,10 +872,12 @@ impl Setup {
                 let scan = parse_scan(&v);
                 self.updates = scan.pcs.iter().filter(|p| !p.is_self).map(|p| ScanUpdate { network_id: p.network_id.clone(), host_iid: p.host_iid.clone(), name: p.name.clone(), endpoints: p.urls() }).collect();
                 self.scan = Some(scan);
+                self.clear_note_error("Scan failed");
+                self.clear_note_error("Network link failed");
             }
             Err(e) => {
                 nlog(&format!("scan failed: {} ({})", e.code, err_text(&e)));
-                self.note = Some(format!("Scan failed ({})", err_text(&e)));
+                self.set_note_kind(format!("Scan failed ({})", err_text(&e)), true);
             }
         }
     }
@@ -899,7 +921,7 @@ impl Setup {
             self.ensure = Ensure::Done;
         }
         self.svc_unknown |= unknown;
-        self.note = Some(why.to_owned());
+        self.set_note_kind(why, true);
     }
 
     fn cancel_scan(&mut self) {
@@ -915,6 +937,7 @@ impl Setup {
         self.scan_started = Some(Instant::now());
         self.scan_item = Some(json!({"timeout_s": 20, "known": known}));
         self.note = None;
+        self.note_is_error = false;
     }
 
     fn on_reply(&mut self, p: Pend, out: Result<Value, crate::netlink::LinkError>) {
@@ -927,20 +950,22 @@ impl Setup {
                 }
                 self.svc = Some(svc);
                 self.svc_unknown = false;
+                self.clear_note_error("Could not read the service status");
                 if ensure {
                     self.ensure_step();
                 }
             }
             (Pend::Status { ensure }, Err(e)) => {
                 nlog(&format!("status failed: {} ({})", e.code, err_text(&e)));
-                self.note = Some(format!("Could not read the service status ({})", err_text(&e)));
+                self.set_note_kind(format!("Could not read the service status ({})", err_text(&e)), true);
                 if ensure {
                     self.ensure = Ensure::Done;
                 }
             }
             (Pend::Service(what), Ok(_)) => {
                 nlog(&format!("setup {what} ok"));
-                self.note = Some(format!("{what}: done."));
+                if self.note_is_error && self.note.as_deref().is_some_and(|s| s.starts_with(what)) { self.note = None; self.note_is_error = false; }
+                self.set_note_kind(format!("{what}: done."), false);
                 match what {
                     "Install" => self.push(Op::ServiceStatus, json!({}), Pend::Status { ensure: true }),
                     _ => {
@@ -954,7 +979,7 @@ impl Setup {
             }
             (Pend::Service(what), Err(e)) => {
                 nlog(&format!("{what} failed: {} ({})", e.code, err_text(&e)));
-                self.note = Some(format!("{what} failed ({})", err_text(&e)));
+                self.set_note_kind(format!("{what} failed ({})", err_text(&e)), true);
                 if what == "Install" {
                     self.ensure = Ensure::Done;
                 }
@@ -964,7 +989,8 @@ impl Setup {
                 nlog("setup join ok");
                 let reused = v.get("reused").and_then(Value::as_bool).unwrap_or(false);
                 let path = v.get("credentials_path").and_then(Value::as_str).map_or_else(|| m.creds.display().to_string(), str::to_owned);
-                self.note = Some(if reused { "This computer was already on that network; keeping its connection.".into() } else if m.local { "This PC now uses its own network.".into() } else { "Joined. Your other connections stay connected.".into() });
+                self.clear_note_error("Join failed");
+                self.set_note_kind(if reused { "This computer was already on that network; keeping its connection." } else if m.local { "This PC now uses its own network." } else { "Joined. Your other connections stay connected." }, false);
                 let mut endpoints = endpoint_urls(v.get("endpoints"));
                 if endpoints.is_empty() {
                     endpoints = m.eps.clone();
@@ -983,27 +1009,27 @@ impl Setup {
             (Pend::Join(_), Err(e)) => {
                 let why = if e.code == "paired_not_saved" || e.code == "pair_uncertain" { "the result is uncertain; check Other PCs before trying again" } else { "existing connections are unchanged" };
                 nlog(&format!("join failed: {} ({})", e.code, err_text(&e)));
-                self.note = Some(format!("Join failed; {why} ({})", err_text(&e)));
+                self.set_note_kind(format!("Join failed; {why} ({})", err_text(&e)), true);
             }
             (Pend::Installs, Ok(v)) => {
                 self.installs = Some(parse_installs(&v));
                 self.installs_err = None;
+                self.clear_note_error("Could not read the PCs registered");
             }
             (Pend::Installs, Err(e)) => {
                 nlog(&format!("registered PCs failed: {} ({})", e.code, err_text(&e)));
-                let why = format!("Could not read the PCs registered on this PC ({})", err_text(&e));
-                self.installs_err = Some(why.clone());
-                self.note = Some(why);
+                self.installs_err = Some(format!("Could not read the PCs registered on this PC ({})", err_text(&e)));
             }
             (Pend::Retire, out) => {
                 match out {
                     Ok(_) => {
-                        self.note = Some("Login retired.".into());
+                        self.clear_note_error("Retire failed");
+                        self.set_note_kind("Login retired.", false);
                         self.retire_next();
                     }
                     Err(e) => {
                         nlog(&format!("retire failed: {} ({})", e.code, err_text(&e)));
-                        self.note = Some(format!("Retire failed ({})", err_text(&e)));
+                        self.set_note_kind(format!("Retire failed ({})", err_text(&e)), true);
                         self.retire_todo.clear();
                     }
                 }
@@ -1019,11 +1045,11 @@ impl Setup {
     /// left in the folder) lets the bridge reuse the one of the same network instead of registering this PC again.
     fn begin_join(&mut self, op: Op, mut args: Value, mut meta: JoinMeta) {
         let Some(dir) = self.net_dir.clone() else {
-            self.note = Some("Settings location is unknown; cannot save a connection.".into());
+            self.set_note_kind("Settings location is unknown; cannot save a connection.", true);
             return;
         };
         if let Err(e) = crate::remote::private_dir(&dir) {
-            self.note = Some(format!("Join not started: the folder for credentials could not be made private ({e})"));
+            self.set_note_kind(format!("Join not started: the folder for credentials could not be made private ({e})"), true);
             return;
         }
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
@@ -1040,21 +1066,21 @@ impl Setup {
                 cands.extend(found);
             }
             Err(e) => {
-                self.note = Some(format!("Join not started: the credentials folder could not be listed ({e}), so a saved identity for this network could not be looked for."));
+                self.set_note_kind(format!("Join not started: the credentials folder could not be listed ({e}), so a saved identity for this network could not be looked for."), true);
                 return;
             }
         }
         let mut seen = HashSet::new();
         cands.retain(|c| !c.trim().is_empty() && seen.insert(c.clone()));
         if cands.len() > MAX_KNOWN {
-            self.note = Some(format!("Join not started: {} saved identities exceed the supported limit of {MAX_KNOWN}. Existing connections and identity files have been kept.", cands.len()));
+            self.set_note_kind(format!("Join not started: {} saved identities exceed the supported limit of {MAX_KNOWN}. Existing connections and identity files have been kept.", cands.len()), true);
             return;
         }
         if !cands.is_empty() {
             args["existing_credentials_paths"] = json!(cands);
         }
         meta.creds = creds;
-        self.note = Some("Joining…".into());
+        self.set_note_kind("Joining…", false);
         self.push(op, args, Pend::Join(meta));
     }
 
@@ -1062,7 +1088,7 @@ impl Setup {
     fn join_pc(&mut self, pc: &Pc) {
         let urls = pc.urls();
         let Some(url) = pc.endpoints.iter().find(|e| e.reachable && e.url.starts_with("https://")).map(|e| e.url.clone()).or_else(|| urls.first().cloned()) else {
-            self.note = Some("That PC has no usable address in the last scan; press ReScan.".into());
+            self.set_note_kind("That PC has no usable address in the last scan; press ReScan.", true);
             return;
         };
         let args = pc.join_args(&url, &self.reg_name);
@@ -1111,6 +1137,7 @@ impl Setup {
         if ok.is_empty() {
             return;
         }
+        self.retire_unused_only = unused_only;
         self.retire_todo = ok.into();
         self.retire_next();
     }
@@ -1187,6 +1214,7 @@ impl Setup {
             allow_join: self.allow_join,
             addresses: if svc.running { svc.endpoints.iter().map(|(u, k)| (short(u), k.clone())).collect() } else { vec![] },
             discovery: svc.discovery,
+            discovery_error: svc.discovery_error.clone(),
             receiver_online: svc.receiver_online,
             certificate: svc.network_id.clone(),
             host_installation_id: svc.host_installation_id.clone(),
@@ -1200,15 +1228,16 @@ impl Setup {
             joining_key,
             retiring: self.retiring(),
             note: self.note.clone(),
+            note_is_error: self.note_is_error,
             scanning: self.scanning(),
             scan_started: self.scan_started,
             scan_summary,
             scan_warnings,
             pcs,
-            installs_state: match (&self.installs, &self.installs_err) {
-                (None, Some(e)) => InstallsState::Failed(e.clone()),
+            installs_state: match (&self.installs_err, &self.installs) {
+                (Some(e), _) => InstallsState::Failed(e.clone()),
                 (None, None) => InstallsState::Loading,
-                _ => InstallsState::Loaded,
+                (None, Some(_)) => InstallsState::Loaded,
             },
             installs,
         }
@@ -1573,5 +1602,49 @@ mod discovery_contract_tests {
         assert_eq!(ep_kind("https://[fd7a:115c:a1e0::1]:8443"), "Tailscale");
         assert_eq!(ep_kind("https://127.0.0.1:8443"), "Local");
         assert_eq!(ep_kind("https://pc.example.net:8443"), "Network");
+    }
+
+    fn snapshot(s: &Setup) -> PageSnapshot {
+        let settings = Settings::default();
+        s.page_snapshot(&Ctx { settings: &settings, settings_path: None, connected: false, connections: &[] })
+    }
+
+    #[test]
+    fn c1_installation_read_error_has_one_owner_and_reload_clears_it() {
+        let mut s = Setup::new(Source::Off);
+        s.installs = Some(vec![]);
+        s.on_reply(Pend::Installs, Err(crate::netlink::LinkError { code: "offline".into(), message: "offline".into() }));
+        let failed = snapshot(&s);
+        assert!(matches!(failed.installs_state, InstallsState::Failed(_)));
+        assert!(failed.note.is_none());
+        s.on_reply(Pend::Installs, Ok(json!({"installations": []})));
+        let loaded = snapshot(&s);
+        assert_eq!(loaded.installs_state, InstallsState::Loaded);
+        assert!(loaded.note.is_none());
+    }
+
+    #[test]
+    fn c10_c11_hosted_info_keeps_discovery_error_and_hides_service_actions() {
+        let mut s = Setup::new(Source::Off);
+        s.set_hosted(Hosted::Running(json!({"discovery_error": "adapter unavailable"})));
+        let hosted = snapshot(&s);
+        assert_eq!(hosted.discovery_error.as_deref(), Some("adapter unavailable"));
+        assert!(!hosted.discovery);
+        assert!(!hosted.can_start && !hosted.can_stop && !hosted.can_remove && !hosted.can_refresh);
+
+        s.set_hosted(Hosted::Off);
+        s.svc = Some(Svc::default());
+        assert!(snapshot(&s).can_start, "an uninstalled service still offers Start");
+    }
+
+    #[test]
+    fn c12_service_success_notice_is_informational_and_replaces_error() {
+        let mut s = Setup::new(Source::Off);
+        s.on_reply(Pend::Service("Stop"), Err(crate::netlink::LinkError { code: "failed".into(), message: "failed".into() }));
+        assert!(snapshot(&s).note_is_error);
+        s.on_reply(Pend::Service("Stop"), Ok(json!({})));
+        let success = snapshot(&s);
+        assert_eq!(success.note.as_deref(), Some("Stop: done."));
+        assert!(!success.note_is_error);
     }
 }

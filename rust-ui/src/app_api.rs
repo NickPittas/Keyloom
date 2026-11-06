@@ -197,7 +197,7 @@ _OPS = {
     "endpoint_start": _start, "endpoint_stop": _stop, "retire_legacy": _retire_legacy, "endpoint_info": lambda a: _info(),
     "endpoint_refresh": lambda a: (_need().refresh(), {})[1],
     "registered": lambda a: _need().registered(),
-    "retire": lambda a: _need().retire(a["installation_id"]),
+    "retire": lambda a: _need().retire(a["installation_id"], a.get("unused_only", False)),
     "inbox": _inbox,
     "publish": lambda a: (_need().publish(a.get("name"), a.get("gpu"), a.get("stats"), a.get("avail")), {})[1],
     "destinations": lambda a: _need().destinations(),
