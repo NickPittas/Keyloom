@@ -14,12 +14,15 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
     roots = Roots.defaults()
     checker = StatusChecker(catalog, roots)
     result: list[dict] = []
+    planned_removed: set[Path] = set()
 
     def remove(path: Path, reason: str, *, directory: bool = False) -> None:
         try:
             info = path.lstat()
             if directory:
                 if not stat.S_ISDIR(info.st_mode):
+                    return
+                if any(child not in planned_removed for child in path.iterdir()):
                     return
                 size = 0
                 if not dry_run:
@@ -30,6 +33,7 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
                 size = info.st_size if stat.S_ISREG(info.st_mode) else 0
                 if not dry_run:
                     path.unlink()
+            planned_removed.add(path)
             result.append({"path": str(path), "bytes": size, "reason": reason})
         except FileNotFoundError:
             pass
@@ -45,6 +49,8 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
                 remove(path, reason, directory=True)
             else:
                 remove(path, reason)
+        except FileNotFoundError:
+            pass
         except OSError as exc:
             result.append({"path": str(path), "bytes": 0, "reason": reason, "error": str(exc)})
 
