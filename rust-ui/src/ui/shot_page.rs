@@ -190,7 +190,7 @@ pub struct Regions {
 pub fn regions(viewport: Rect, focus: bool, drawer_open: bool) -> Regions {
     let wide = viewport.width() >= 1600.0;
     let compact = viewport.width() < 1200.0;
-    let show_properties = !focus && (!compact || drawer_open);
+    let show_properties = !focus && drawer_open;
     let header = (!focus).then(|| Rect::from_min_size(viewport.min, Vec2::new(viewport.width(), 32.0)));
     let work_top = viewport.top() + if focus { 0.0 } else { 32.0 };
     let work = Rect::from_min_max(egui::pos2(viewport.left(), work_top), viewport.max);
@@ -308,7 +308,7 @@ impl Page {
     pub fn new() -> Self {
         Self {
             fx: Fixture { live: true, ..Fixture::default() },
-            layout: None, viewer_state: ViewerState::default(), zoom_fit: true, drawer_open: false,
+            layout: None, viewer_state: ViewerState::default(), zoom_fit: true, drawer_open: true,
             dock_tab: DockTab::Actions, dock_expanded: false, graph_body: None, plate: None,
         }
     }
@@ -319,7 +319,7 @@ impl Page {
         if fx.shot_id != self.fx.shot_id {
             self.viewer_state = ViewerState::default();
             self.zoom_fit = true;
-            self.drawer_open = false;
+            self.drawer_open = true;
             self.dock_expanded = false;
         }
         self.fx = fx;
@@ -328,7 +328,7 @@ impl Page {
     /// Regions computed by the last `ui` call.
     pub fn layout(&self) -> Option<Regions> { self.layout }
 
-    /// Properties column shown (Wide/Medium) or drawer open (Compact), as the header toggle sets it.
+    /// Properties column or drawer visibility, as the header toggle sets it.
     pub fn drawer_open(&self) -> bool { self.drawer_open }
     pub fn toggle_drawer(&mut self) { self.drawer_open = !self.drawer_open; }
     /// Toolbar snapshot from the live viewer; Focus and the zoom readout stay page-owned.
@@ -359,7 +359,7 @@ impl Page {
         ui.painter().with_clip_rect(full).rect_filled(full, 0.0, t.bg_panel);
         if let Some(header_rect) = layout.header {
             let out = header::draw(ui, header_rect, &self.fx, self.drawer_open);
-            if out.toggle_drawer { self.drawer_open = !self.drawer_open; acts.push(Act::ToggleDrawer); }
+            if out.toggle_drawer { self.toggle_drawer(); acts.push(Act::ToggleDrawer); }
             if let Some(stage) = out.stage { acts.push(Act::Stage(stage)); }
         }
         if let Some(splitter) = layout.splitter { ui.painter().rect_filled(splitter, 0.0, t.border_divider); }
@@ -471,10 +471,12 @@ mod tests {
         assert_eq!(wide.properties_body.unwrap().height(), 866.0);
         assert_eq!(wide.properties_action.unwrap().height(), 72.0);
 
-        let medium = regions(Rect::from_min_size(pos2(0.0, 0.0), vec2(1440.0, 818.0)), false, false);
+        let medium = regions(Rect::from_min_size(pos2(0.0, 0.0), vec2(1440.0, 818.0)), false, true);
         assert_eq!(medium.viewer.size(), vec2(1159.0, 562.0));
         assert_eq!(medium.picture.size(), vec2(999.0, 562.0));
         assert_eq!(medium.dock_body.unwrap().height(), 116.0);
+        let medium_hidden = regions(Rect::from_min_size(pos2(0.0, 0.0), vec2(1440.0, 818.0)), false, false);
+        assert!(medium_hidden.properties.is_none());
 
         let compact = regions(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 558.0)), false, true);
         assert_eq!(compact.viewer.size(), vec2(619.0, 418.0));
@@ -486,5 +488,31 @@ mod tests {
         assert_eq!(focus.viewer.size(), vec2(1920.0, 914.0));
         assert_eq!(focus.picture.size(), vec2(1625.0, 914.0));
         assert!(focus.header.is_none() && focus.properties.is_none() && focus.dock_tabs.is_none());
+    }
+
+    #[test]
+    fn properties_toggle_changes_wide_and_medium_layout() {
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(1440.0, 818.0));
+        let ctx = egui::Context::default();
+        let mut page = Page::new();
+        assert!(regions(viewport, false, page.drawer_open()).properties.is_some());
+        let click = pos2(1421.0, 76.0);
+        let frame = |page: &mut Page, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1440.0, 900.0))), events, ..Default::default() };
+            let mut acts = vec![];
+            let mut output = ctx.run_ui(raw, |ui| acts = page.ui(ui));
+            output.textures_delta.clear();
+            acts
+        };
+        frame(&mut page, vec![egui::Event::PointerMoved(click)]);
+        frame(&mut page, vec![egui::Event::PointerButton { pos: click, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+        let acts = frame(&mut page, vec![egui::Event::PointerButton { pos: click, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        assert!(acts.iter().any(|a| matches!(a, Act::ToggleDrawer)));
+        assert!(regions(viewport, false, page.drawer_open()).properties.is_none());
+        frame(&mut page, vec![egui::Event::PointerMoved(click)]);
+        frame(&mut page, vec![egui::Event::PointerButton { pos: click, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+        let acts = frame(&mut page, vec![egui::Event::PointerButton { pos: click, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        assert!(acts.iter().any(|a| matches!(a, Act::ToggleDrawer)));
+        assert!(regions(viewport, false, page.drawer_open()).properties.is_some());
     }
 }

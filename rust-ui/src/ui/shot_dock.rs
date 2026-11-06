@@ -101,7 +101,10 @@ fn panel(ui: &mut Ui, tabs_rect: Rect, body_rect: Option<Rect>, fx: &Fixture, co
     let before = active;
     let mut strip = part(ui, tabs_rect, "dock-tabs");
     TabStrip::new(TabKind::Panel, &mut active, &tabs).name("Shot dock").show(&mut strip);
-    if active != before { out.tab = Some(if active == 0 { DockTab::Actions } else { DockTab::Graph }); }
+    if active != before {
+        out.tab = Some(if active == 0 { DockTab::Actions } else { DockTab::Graph });
+        if collapsed_compact { out.expand = Some(true); }
+    }
     panel_labels(ui, tabs_rect, active);
     if active == 1 { graph_tools(&mut strip, tabs_rect, fx.dock_expanded, out); }
 
@@ -312,6 +315,29 @@ fn graph_wires() -> [Wire; 10] {
 mod tests {
     use super::*;
 
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> (Vec<egui::epaint::ClippedShape>, DockOut) {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(500.0, 40.0))),
+            events,
+            ..Default::default()
+        };
+        let mut out = DockOut::default();
+        let mut full = ctx.run_ui(raw, |ui| panel(ui, Rect::from_min_size(pos2(0.0, 0.0), vec2(500.0, 24.0)), None, &Fixture::default(), true, &mut out));
+        full.textures_delta.clear();
+        (full.shapes, out)
+    }
+
+    fn text_pos(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<egui::Pos2> {
+        fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => Some(t.pos + t.galley.size() * 0.5),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, text)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|s| find(&s.shape, text))
+    }
+
     #[test]
     fn shot_dock_deliver_ports_match_enabled_outputs() {
         let deliver = graph_nodes(&Fixture::default()).into_iter().find(|node| node.title == "Deliver").unwrap();
@@ -376,5 +402,17 @@ mod tests {
         frame(&ctx, &cards, vec![Event::PointerButton { pos: cancel, button: PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
         let (_, action, _) = frame(&ctx, &cards, vec![Event::PointerButton { pos: cancel, button: PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
         assert_eq!(action, Some(("key-job".into(), CardAction::Cancel)));
+    }
+
+    #[test]
+    fn selecting_a_compact_dock_tab_expands_the_dock() {
+        let ctx = egui::Context::default();
+        let (shapes, _) = frame(&ctx, vec![]);
+        let p = text_pos(&shapes, "Node graph").expect("graph tab label");
+        frame(&ctx, vec![egui::Event::PointerMoved(p)]);
+        frame(&ctx, vec![egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+        let (_, out) = frame(&ctx, vec![egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        assert_eq!(out.tab, Some(DockTab::Graph));
+        assert_eq!(out.expand, Some(true));
     }
 }

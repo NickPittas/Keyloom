@@ -128,6 +128,10 @@ fn scope_stems(scope: DelScope, current: Option<&str>, marked: &[String]) -> Opt
     }
 }
 
+fn marked_keyframe_stems(source: &[String], keyframes: &[usize]) -> Vec<String> {
+    keyframes.iter().filter_map(|index| source.get(*index).cloned()).collect()
+}
+
 fn delete_request(cmd: &str, rid: &str, root: &Path, prematte: bool, stems: &Option<Vec<String>>, movies: bool) -> String {
     serde_json::json!({"cmd": cmd, "request_id": rid, "clip_root": root, "asset": if prematte { "prematte" } else { "hint" },
         "scope": if stems.is_some() { "frames" } else { "all" }, "stems": stems.clone().unwrap_or_default(), "movies": movies})
@@ -285,6 +289,7 @@ mod cue_tests {
 pub struct Unsaved {
     route: Option<HintCfg>,
     delivery: Option<(crate::shot_domains::Fields, Option<String>, PipelineExport)>,
+    annotations: Option<Annotations>,
 }
 
 /// One video output's encode settings: container, codec, quality, fps in thousandths, partial-result flag and
@@ -808,6 +813,10 @@ impl App {
                 Err(e) => self.hint.note = Some(e),
             }
             self.hint.ann_saved = ann_sig(&self.hint.ann);
+            if let Some(a) = self.hint_unsaved.get(&clip.folder).and_then(|u| u.annotations.clone()) {
+                self.hint.ann = a;
+                self.hint.note = Some("SAM prompts could not be saved earlier; the unsaved prompts were restored.".into());
+            }
             let left = hints::interrupted_publish(&clip.root);
             if !left.is_empty() {
                 self.hint.note = Some(format!("An interrupted hint publication left {} aside; running any hint job on this clip (or clearing its lock) restores it.", left.join(", ")));
@@ -872,7 +881,19 @@ impl App {
                 self.hint.undo.push(before);
                 self.hint.undo.truncate(50);
                 match self.hint.ann.save(clip) {
-                    Ok(()) => self.hint.note = None,
+                    Ok(()) => {
+                        self.hint.ann_saved = ann_sig(&self.hint.ann);
+                        let clear = if let Some(u) = self.hint_unsaved.get_mut(&clip.folder) {
+                            u.annotations = None;
+                            u.route.is_none() && u.delivery.is_none()
+                        } else {
+                            false
+                        };
+                        if clear {
+                            self.hint_unsaved.remove(&clip.folder);
+                        }
+                        self.hint.note = None;
+                    }
                     Err(e) => self.hint.note = Some(format!("Annotations not saved: {e}")),
                 }
             }
@@ -947,6 +968,7 @@ impl App {
         if ann_sig(&self.hint.ann) != self.hint.ann_saved {
             self.hint.ann.save(&clip)?;
             self.hint.ann_saved = ann_sig(&self.hint.ann);
+            self.unsaved_annotations_done(&clip.folder);
         }
         other
     }
@@ -995,6 +1017,15 @@ impl App {
             } else {
                 u.delivery = None;
             }
+            if u.route.is_none() && u.delivery.is_none() && u.annotations.is_none() {
+                self.hint_unsaved.remove(folder);
+            }
+        }
+    }
+
+    fn unsaved_annotations_done(&mut self, folder: &str) {
+        if let Some(u) = self.hint_unsaved.get_mut(folder) {
+            u.annotations = None;
             if u.route.is_none() && u.delivery.is_none() {
                 self.hint_unsaved.remove(folder);
             }
@@ -1060,7 +1091,7 @@ impl App {
         }
     }
 
-    /// The shown shot is being left: write its pending route/delivery now; whatever cannot be written is kept (by
+    /// The shown shot is being left: write its pending route/delivery/prompts now; whatever cannot be written is kept (by
     /// shot) and comes back, still unsaved, when the shot is opened again. Never dropped.
     fn flush_on_leave(&mut self) {
         let Some(old) = self.hint.folder.clone().and_then(|f| p_clip_by_folder(self.project.as_ref(), &f)) else { return };
@@ -1074,8 +1105,14 @@ impl App {
                 Err(_) => Some((self.hint.delivery_ov.clone(), self.hint.delivery_src.clone(), self.current_export())),
             };
         }
-        if un.route.is_some() || un.delivery.is_some() {
-            self.ai.notice = Some(format!("{}: hint route / delivery edits could not be saved. They are kept and shown as unsaved; Save retries them.", old.display_name));
+        if ann_sig(&self.hint.ann) != self.hint.ann_saved {
+            un.annotations = self.hint.ann.save(&old).err().map(|_| self.hint.ann.clone());
+            if un.annotations.is_none() {
+                self.hint.ann_saved = ann_sig(&self.hint.ann);
+            }
+        }
+        if un.route.is_some() || un.delivery.is_some() || un.annotations.is_some() {
+            self.ai.notice = Some(format!("{}: hint route, delivery or prompt edits could not be saved. They are kept and shown as unsaved; Save retries them.", old.display_name));
             self.hint_unsaved.insert(old.folder.clone(), un);
         }
     }
@@ -1098,6 +1135,17 @@ impl App {
                 match write_delivery(&clip.meta_path, f, src.as_deref(), e) {
                     Ok(()) => self.unsaved_done(&folder, false),
                     Err(e) => errs.push(format!("{}: delivery: {e}", clip.display_name)),
+                }
+            }
+            if let Some(a) = &u.annotations {
+                match a.save(&clip) {
+                    Ok(()) => {
+                        self.unsaved_annotations_done(&folder);
+                        if self.hint.folder.as_deref() == Some(folder.as_str()) && ann_sig(&self.hint.ann) == ann_sig(a) {
+                            self.hint.ann_saved = ann_sig(a);
+                        }
+                    }
+                    Err(e) => errs.push(format!("{}: prompts: {e}", clip.display_name)),
                 }
             }
             let ctx = self.ctx_handle();
@@ -1542,6 +1590,7 @@ pub(crate) enum HintEdit {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum HintCmd {
+    ChooseMovie,
     Edit(HintEdit),
     MarkedMode { pre: bool, hint: bool },
     ResetRoute,
@@ -1835,8 +1884,12 @@ impl App {
     fn undo_annotation(&mut self) {
         if let (Some(prev), Some(c)) = (self.hint.undo.pop(), self.open_clip_snapshot()) {
             self.hint.ann = prev;
-            if let Err(e) = self.hint.ann.save(&c) {
-                self.hint_note(format!("Annotations not saved: {e}"));
+            match self.hint.ann.save(&c) {
+                Ok(()) => {
+                    self.hint.ann_saved = ann_sig(&self.hint.ann);
+                    self.unsaved_annotations_done(&c.folder);
+                }
+                Err(e) => self.hint_note(format!("Annotations not saved: {e}")),
             }
         }
     }
@@ -1994,7 +2047,7 @@ impl App {
 
     /// Run one Hint command through the same paths the old panel used. `Err` = refused or failed (the reason is
     /// also in the Hint note, as before); nothing is changed on refusal.
-    pub(crate) fn hint_cmd(&mut self, _ctx: &egui::Context, c: HintCmd) -> Result<(), String> {
+    pub(crate) fn hint_cmd(&mut self, ctx: &egui::Context, c: HintCmd) -> Result<(), String> {
         let Some(clip) = self.open_clip_snapshot() else {
             return Err("Open a shot first.".into());
         };
@@ -2059,8 +2112,12 @@ impl App {
                     }
                     _ => {}
                 }
-                if let Err(e) = self.hint.ann.save(&clip) {
-                    self.hint_note(format!("Annotations not saved: {e}"));
+                match self.hint.ann.save(&clip) {
+                    Ok(()) => {
+                        self.hint.ann_saved = ann_sig(&self.hint.ann);
+                        self.unsaved_annotations_done(&clip.folder);
+                    }
+                    Err(e) => self.hint_note(format!("Annotations not saved: {e}")),
                 }
             }
             HintCmd::PreviewSam => {
@@ -2101,6 +2158,7 @@ impl App {
                 self.submit_task_job(&clip, Ok(job), 0, "Hint movie import", Action::Hint);
                 self.hint.movie = None;
             }
+            HintCmd::ChooseMovie => { self.request_pick(ctx, crate::ui::picker::PickKind::HintMovie); }
             HintCmd::CancelMovie => self.hint.movie = None,
             // Opens the existing dialog (scope, exact file plan, refusals); never deletes by itself.
             HintCmd::RequestDelete { prematte } => {
@@ -2365,10 +2423,8 @@ impl App {
             return;
         }
         let refusal = delete_refusal(self.ai.clip_active(&clip.root) || self.ai.task_busy(&clip.root), self.ai.external_writer(&clip.root));
-        let (current, marked): (Option<String>, Vec<String>) = match &self.viewer {
-            Some(v) => (v.index.stems.get(v.playhead).cloned(), clip.keyframes.iter().filter_map(|k| v.index.stems.get(*k).cloned()).collect()),
-            None => (None, vec![]),
-        };
+        let current = self.viewer.as_ref().and_then(|v| v.index.stems.get(v.playhead).cloned());
+        let marked = marked_keyframe_stems(&stems_of(clip), &clip.keyframes);
         let stems = scope_stems(d.scope, current.as_deref(), &marked);
         let key = format!("{}|{:?}|{}|{:?}", d.prematte, d.scope, d.movies, stems);
         if let Some((is_delete, rx)) = &d.rx {
@@ -4262,5 +4318,121 @@ mod delete_masks_tests {
         dead.insert("job-1".to_string());
         assert!(!preview_is_live("job-1", &dead));
         assert!(preview_is_live("job-2", &dead));
+    }
+}
+
+#[cfg(test)]
+mod annotation_leave_tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, app: &mut crate::ui::App) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| app.frame(ui));
+        output.textures_delta.clear();
+    }
+
+    fn png(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(file, 4, 4);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&[0; 48]).unwrap();
+    }
+
+    #[test]
+    fn marked_delete_dialog_resolves_marks_against_source_frames() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("hint-marked-delete-{}-{nonce}", std::process::id()));
+        let root = base.join("project");
+        let frames = root.join("clips/c1/Frames");
+        std::fs::create_dir_all(&frames).unwrap();
+        png(&frames.join("f_1001.png"));
+        std::fs::write(root.join("clips/c1/clip.json"), "{}").unwrap();
+        std::fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = crate::ui::App::with_ctx(&ctx, crate::ui::AppOptions {
+            project: Some(root.clone()),
+            open_clip: Some("c1".into()),
+            tab: Some(crate::ui::Tab::Hint),
+            ..Default::default()
+        });
+        for _ in 0..3 { frame(&ctx, &mut app); }
+        app.hint_sync();
+        let clip_index = app.project.as_ref().unwrap().clips.iter().position(|c| c.folder == "c1").unwrap();
+        app.project.as_mut().unwrap().clips[clip_index].keyframes = vec![0];
+        let clip = app.project.as_ref().unwrap().clips[clip_index].clone();
+        assert_eq!(stems_of(&clip), ["f_1001"]);
+        app.viewer.as_mut().unwrap().index.stems = vec!["generated-frame".into()];
+
+        let marked = Some(vec!["f_1001".to_owned()]);
+        let plan_key = format!("{}|{:?}|{}|{:?}", false, DelScope::Marked, false, marked);
+        app.hint.dele = Some(Del {
+            folder: clip.folder.clone(), prematte: false, scope: DelScope::Marked, movies: false,
+            plan_key: plan_key.clone(), plan: Some(Ok(DelPlan { files: vec!["f_1001".into()], ..Default::default() })),
+            rx: None, done: None,
+        });
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 500.0))), ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| app.hint_delete_ui(ui, &clip));
+        output.textures_delta.clear();
+        let dialog = app.hint.dele.as_ref().unwrap();
+        assert_eq!(dialog.plan_key, plan_key);
+        assert!(matches!(&dialog.plan, Some(Ok(plan)) if plan.files == ["f_1001"]));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn failed_prompt_clear_survives_leaving_and_reopening_the_shot() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("hint-ann-leave-{}-{nonce}", std::process::id()));
+        let root = base.join("project");
+        for name in ["c1", "c2"] {
+            let frames = root.join("clips").join(name).join("Frames");
+            std::fs::create_dir_all(&frames).unwrap();
+            png(&frames.join("f_1.png"));
+            let mut saved = Annotations::default();
+            saved.frame_mut("f_1").points.push(crate::hints::Pt { x: 0.5, y: 0.5, label: 1 });
+            let metadata = if name == "c1" {
+                serde_json::json!({"ck_native":{"annotations":saved}}).to_string()
+            } else {
+                "{}".into()
+            };
+            std::fs::write(root.join("clips").join(name).join("clip.json"), metadata).unwrap();
+        }
+        std::fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = crate::ui::App::with_ctx(&ctx, crate::ui::AppOptions {
+            project: Some(root.clone()),
+            open_clip: Some("c1".into()),
+            tab: Some(crate::ui::Tab::Hint),
+            ..Default::default()
+        });
+        for _ in 0..3 { frame(&ctx, &mut app); }
+        app.hint_sync();
+        app.hint.cfg.guide = Producer::Sam;
+
+        let c2 = app.project.as_ref().unwrap().clips.iter().position(|c| c.folder == "c2").unwrap();
+        let metadata = root.join("clips/c1/clip.json");
+        let blocked_metadata = root.join("clips/c1/blocked-meta");
+        std::fs::create_dir(&blocked_metadata).unwrap();
+        app.project.as_mut().unwrap().clips.iter_mut().find(|c| c.folder == "c1").unwrap().meta_path = blocked_metadata;
+        assert!(app.hint_cmd(&ctx, HintCmd::ClearPrompts { all: true }).is_err());
+        app.open_clip(&ctx, c2);
+        for _ in 0..3 { frame(&ctx, &mut app); }
+
+        app.project.as_mut().unwrap().clips.iter_mut().find(|c| c.folder == "c1").unwrap().meta_path = metadata.clone();
+        let c1 = app.project.as_ref().unwrap().clips.iter().position(|c| c.folder == "c1").unwrap();
+        app.open_clip(&ctx, c1);
+        for _ in 0..3 { frame(&ctx, &mut app); }
+        assert!(app.hint.ann.frames.is_empty(), "the failed clear must be restored instead of persisted prompts");
+        app.hint_flush_project().unwrap();
+
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+        assert!(raw["ck_native"]["annotations"]["frames"].as_object().is_some_and(|o| o.is_empty()));
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
