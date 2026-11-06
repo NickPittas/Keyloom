@@ -4277,6 +4277,9 @@ impl AiUi {
             && self.sched.task_attention().is_empty()
             && !self.sched.running()
     }
+    pub fn active_model_usage(&self) -> (Vec<String>, bool) {
+        self.sched.active_model_usage()
+    }
     /// The app's model snapshot changed (a check ended: startup, Check/Verify, root change, finished Install/Repair/
     /// Delete). Buttons and the scheduler read this one record; no worker is asked anything.
     pub fn set_models(&mut self, snapshot: crate::models::Snapshot) {

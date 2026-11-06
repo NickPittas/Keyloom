@@ -112,6 +112,7 @@ class ProvisionManager:
         # the JSON event stream to stderr.
         self._emit_stream = sys.stdout
         self._emit_fn = emit or self._default_emit
+        self._seeded_files: dict[str, set[str]] = {}
 
     def _default_emit(self, event: dict) -> None:
         self._emit_stream.write(json.dumps(event, sort_keys=True) + "\n")
@@ -226,6 +227,15 @@ class ProvisionManager:
         if art.kind in ("local_package", "local_code"):
             return
         target, _directory = self._publication_target(art, dest)
+        targets = [target]
+        if art.kind in ("hf_files", "hf_snapshot"):
+            targets.extend(self._published_paths(art, dest, Path()).values())
+        elif len(art.download_files()) == 1:
+            targets.append(dest / art.download_files()[0].layout_path)
+        for target in dict.fromkeys(targets):
+            self._recover_publication_target(art, dest, root, target)
+
+    def _recover_publication_target(self, art: Artifact, dest: Path, root: Path, target: Path) -> None:
         journal_path = self._journal_path(target)
         self._assert_safe_path(journal_path, root)
         if not journal_path.exists():
@@ -298,8 +308,8 @@ class ProvisionManager:
     def _rollback_publication(self, journal: dict, root: Path, *, allow_leaf_link: bool) -> None:
         journal["phase"] = "new-moved" if journal.get("phase") in {"new-moved", "committed"} else journal.get("phase")
         self._write_journal(journal, root, allow_leaf_link=allow_leaf_link)
-        self._recover_artifact_publication(
-            self.catalog.get(journal["artifact"]), Path(journal["dest"]), root
+        self._recover_publication_target(
+            self.catalog.get(journal["artifact"]), Path(journal["dest"]), root, Path(journal["target"])
         )
 
     @contextlib.contextmanager
@@ -636,14 +646,14 @@ class ProvisionManager:
         try:
             for art in artifacts:
                 try:
-                    dest = self.checker.artifact_dir(art)
+                    dest = self.checker.destination_dir(art)
                     if dest is None:
                         raise ArtifactError("not-deletable", f"{art.label} has no managed model destination")
                     root = self._asset_root(art)
                     with self._artifact_lock(art, dest):
                         files = set()
                         for spec in art.download_files():
-                            path = self.checker.file_path(art, spec)
+                            path = dest / spec.layout_path
                             if path is None or path == root:
                                 raise ArtifactError("unsafe-path", "refusing to remove an unmanaged model path")
                             self._assert_safe_path(path, root, allow_leaf_link=art.kind == "hf_cache_file")
@@ -679,7 +689,7 @@ class ProvisionManager:
         if art.kind in ("local_package", "local_code"):
             with self._artifact_lock(art, self.roots.v2_package_root):
                 return self._install_artifact_locked(art, repair)
-        dest = self.checker.artifact_dir(art)
+        dest = self.checker.destination_dir(art)
         if dest is None:
             raise ArtifactError("not-installable", f"{art.id} has no writable asset root")
         root = self._asset_root(art)
@@ -717,16 +727,12 @@ class ProvisionManager:
             raise ArtifactError("gated", f"{art.repo_id} requires license acceptance/token "
                                          "(gated={art.gated}); credentials stay out of logs")
 
-        dest = self.checker.artifact_dir(art)
+        dest = self.checker.destination_dir(art)
         if dest is None:
             raise ArtifactError("not-installable", f"{art.id} has no writable asset root")
         root = self._asset_root(art)
         allow_leaf_link = art.kind == "hf_cache_file"
         self._assert_safe_path(dest, root, allow_leaf_link=allow_leaf_link)
-        for f in art.required_files():
-            path = self.checker.file_path(art, f)
-            if path is not None:
-                self._assert_safe_path(path, root, allow_leaf_link=allow_leaf_link)
         if art.kind in ("hf_files", "hf_snapshot"):
             self._assert_safe_tree(self._hf_staging_dir(art, dest), root)
         elif art.kind == "hf_cache_file":
@@ -745,6 +751,7 @@ class ProvisionManager:
                        "verified": before["verified"], "ready": before["ready"], "path": before["path"],
                        "note": "already installed; not re-hashed (use verify or repair to re-check)"})
             return True
+        self._seed_existing_files(art, dest)
         needed_bytes = self._missing_bytes(art)
         self.emit({"event": "artifact-start", "artifact": art.id,
                    "bytes_total": needed_bytes,
@@ -753,7 +760,7 @@ class ProvisionManager:
         self._preflight_disk(art, dest, needed_bytes)
         stage_root: Path | None = None
         cleanup_root: Path | None = None
-        publication = None
+        publications: list[dict] = []
         try:
             with contextlib.redirect_stdout(sys.stderr):
                 if art.kind == "hf_cache_file":
@@ -783,26 +790,20 @@ class ProvisionManager:
                                "files_total": len(art.download_files()),
                                "path": f.path})
                     self.emit({"event": "file-done", "artifact": art.id, "path": f.path})
-            source = stage_root
-            target = dest
-            directory = art.kind in ("hf_files", "hf_snapshot")
-            if directory:
-                top = self._artifact_top_dir(art)
-                if top:
-                    self._move_upstream_notices(art, stage_root, top)
-                    source, target = stage_root / top, dest / top
-                else:
-                    source, target = stage_root, dest
-            else:
-                if len(art.download_files()) != 1:
-                    raise ArtifactError("download-failed", f"{art.id} transport must select one file")
-                f = art.download_files()[0]
-                source, target = stage_root / f.layout_path, dest / f.layout_path
+            top = self._artifact_top_dir(art) if art.kind in ("hf_files", "hf_snapshot") else ""
+            if top:
+                self._move_upstream_notices(art, stage_root, top)
             self._check_cancel(art.id)  # final cancellation point before publication
-            publication = self._publish(source, target, root,
-                                        allow_leaf_link=allow_leaf_link,
-                                        directory=directory, art=art, dest=dest)
-            self._check_cancel(art.id)
+            for f in art.download_files():
+                source = stage_root / f.layout_path
+                if top and not f.required and Path(f.layout_path).parts[0] != top:
+                    source = stage_root / top / ".upstream" / f.layout_path
+                target = published_paths[f.layout_path]
+                if source.is_file():
+                    publications.append(self._publish(source, target, root,
+                                                      allow_leaf_link=allow_leaf_link,
+                                                      directory=False, art=art, dest=dest))
+                self._check_cancel(art.id)
 
             for f in art.download_files():
                 published = published_paths.get(f.layout_path)
@@ -814,6 +815,7 @@ class ProvisionManager:
                                             _stat_identity(published)):
                     raise ArtifactError("file-changed", f"{f.layout_path} changed during publication")
 
+            self.checker.refresh_paths(art)
             if not self._record_digests(art, hashes):
                 self.checker.hash_cache.reload()
                 raise ArtifactError("verification-cache", "could not persist verification cache")
@@ -821,19 +823,21 @@ class ProvisionManager:
             if not after["present"]:
                 raise ArtifactError("missing-files",
                                     f"closure incomplete after publication: {after['problems'][:5]}")
-            if art.has_trusted_hashes() and not after["ready"]:
+            if art.has_trusted_hashes() and len(hashes) == len(art.required_files()) and not after["ready"]:
                 raise ArtifactError("verification-failed",
                                     "downloaded files did not reach verified Ready state")
             self._check_cancel(art.id)
-            self._commit_publication(publication, root, allow_leaf_link=allow_leaf_link)
-            publication = None
+            for publication in publications:
+                self._commit_publication(publication, root, allow_leaf_link=allow_leaf_link)
+            publications.clear()
             with contextlib.suppress(OSError, ArtifactError):
                 self._remove_path(cleanup_root, root)
         except Exception:
-            if publication is not None:
+            if publications:
                 self.checker.hash_cache.reload()
-                self._rollback_publication(publication, root,
-                                           allow_leaf_link=allow_leaf_link)
+                for publication in reversed(publications):
+                    self._rollback_publication(publication, root,
+                                               allow_leaf_link=allow_leaf_link)
             raise
 
         after = self.checker.check_artifact(art)
@@ -853,7 +857,7 @@ class ProvisionManager:
     def _missing_bytes(self, art: Artifact) -> int:
         """Preflight only the bytes absent from this artifact's pinned staging area."""
         if art.kind in ("hf_files", "hf_snapshot"):
-            dest = self.checker.artifact_dir(art)
+            dest = self.checker.destination_dir(art)
             root = self._hf_staging_dir(art, dest) / "payload"
             return self._remaining_bytes(art, root)
         if art.kind == "hf_cache_file":
@@ -866,12 +870,13 @@ class ProvisionManager:
                 dg = file_digest(art, f)
                 if staged.is_file() and dg is not None:
                     before = _stat_identity(staged)
-                    valid = digest_file(staged, dg) == dg.expected
+                    seeded = f.layout_path in self._seeded_files.get(art.id, set())
+                    valid = seeded or digest_file(staged, dg) == dg.expected
                     if before is not None and before == _stat_identity(staged) and valid:
                         return 0
                 return art.trusted_bytes() or art.size_bytes_estimate or 0
             else:
-                dest = self.checker.artifact_dir(art)
+                dest = self.checker.destination_dir(art)
                 root = self._http_staging_dir(art, dest)
                 return self._remaining_bytes(art, root, parts=True)
         size = art.trusted_bytes()
@@ -889,6 +894,10 @@ class ProvisionManager:
         estimate = art.size_bytes_estimate
         total = 0
         for f in selected:
+            if f.layout_path in self._seeded_files.get(art.id, set()):
+                staged = root / f.layout_path
+                if staged.is_file() and (f.size is None or staged.stat().st_size == f.size):
+                    continue
             if f.size is None:
                 if estimate is None:
                     raise ArtifactError("size-unknown",
@@ -908,8 +917,9 @@ class ProvisionManager:
                 if size != f.size:
                     continue
                 before = _stat_identity(path)
+                seeded = f.layout_path in self._seeded_files.get(art.id, set())
                 dg = file_digest(art, f)
-                valid = dg is None or digest_file(path, dg) == dg.expected
+                valid = seeded or dg is None or digest_file(path, dg) == dg.expected
                 if before is not None and before == _stat_identity(path) and valid:
                     current = size
                     break
@@ -918,6 +928,8 @@ class ProvisionManager:
 
     def _record_digests(self, art: Artifact, staged_digests: dict[str, str]) -> bool:
         for f in art.required_files():
+            if f.layout_path in self._seeded_files.get(art.id, set()):
+                continue
             path = self.checker.file_path(art, f)
             dg = file_digest(art, f)
             if path is not None and dg is not None:
@@ -953,12 +965,13 @@ class ProvisionManager:
                                     f"{f.layout_path}: expected {f.size}, got {actual_size}")
             dg = file_digest(art, f)
             actual = None
-            if dg is not None:
+            reused = f.layout_path in self._seeded_files.get(art.id, set())
+            if dg is not None and not reused:
                 actual = digest_file(path, dg)
             after = _stat_identity(path)
             if before is None or before != after:
                 raise ArtifactError("file-changed", f"{f.layout_path} changed during validation")
-            if dg is not None:
+            if dg is not None and not reused:
                 if actual != dg.expected:
                     self._remove_path(path, self._asset_root(art))
                     raise ArtifactError("hash-mismatch",
@@ -994,6 +1007,38 @@ class ProvisionManager:
             target.parent.mkdir(parents=True, exist_ok=True)
             src.replace(target)
 
+    def _seed_existing_files(self, art: Artifact, dest: Path) -> None:
+        if art.kind in ("hf_files", "hf_snapshot"):
+            payload = self._hf_staging_dir(art, dest) / "payload"
+        elif art.kind == "hf_cache_file":
+            payload = self._hf_cache_staging_dir(art) / "payload"
+        elif art.md5_b64:
+            payload = self._rvm_staging_dir(art) / (art.layout_rel or "")
+        else:
+            payload = self._http_staging_dir(art, dest)
+        root = self._asset_root(art)
+        self._assert_safe_tree(payload, root)
+        payload.mkdir(parents=True, exist_ok=True)
+        seeded = self._seeded_files.setdefault(art.id, set())
+        for f in art.download_files():
+            target = payload / f.layout_path
+            if self.checker._is_size_match(target, f):
+                continue
+            for source in self.checker.candidate_file_paths(art, f):
+                try:
+                    valid = self.checker._is_size_match(source, f)
+                except OSError:
+                    valid = False
+                if not valid or source == target:
+                    continue
+                self._assert_safe_path(target.parent, root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+                if self.checker._is_size_match(target, f):
+                    seeded.add(f.layout_path)
+                    break
+                target.unlink(missing_ok=True)
+
     def _publish(self, source: Path, target: Path, root: Path, *,
                  allow_leaf_link: bool, directory: bool, art: Artifact,
                  dest: Path) -> dict:
@@ -1008,6 +1053,8 @@ class ProvisionManager:
         backup = None
         if had_target:
             if target.is_dir() and not self._is_link_or_reparse(target):
+                if not directory:
+                    raise ArtifactError("unsafe-path", f"refusing to replace a directory at a model file path: {target}")
                 self._assert_safe_tree(target, root)
             else:
                 self._assert_safe_path(target, root, allow_leaf_link=allow_leaf_link)
@@ -1041,7 +1088,7 @@ class ProvisionManager:
                 if not target.is_file():
                     raise ArtifactError("missing-files", f"published file is not regular: {target}")
         except Exception:
-            self._recover_artifact_publication(art, dest, root)
+            self._rollback_publication(journal, root, allow_leaf_link=allow_leaf_link)
             raise
         return journal
 
@@ -1195,13 +1242,14 @@ class ProvisionManager:
             before = _stat_identity(path)
             valid = path.is_file() and (f.size is None or path.stat().st_size == f.size)
             dg = file_digest(art, f)
-            if valid and dg is not None:
+            seeded = f.layout_path in self._seeded_files.get(art.id, set())
+            if valid and dg is not None and not seeded:
                 valid = digest_file(path, dg) == dg.expected
             if before is None or before != _stat_identity(path):
                 raise ArtifactError("file-changed", f"{f.layout_path} changed while staging")
             if not valid:
                 self._remove_path(path, self._asset_root(art))
-            elif dg is not None:
+            else:
                 verified.add(f.path)
         return verified
 
@@ -1233,6 +1281,17 @@ class ProvisionManager:
                 self._assert_safe_path(dst_dir.parent, self._asset_root(art))
                 dst_dir.parent.mkdir(parents=True, exist_ok=True)
                 src_dir.rename(dst_dir)
+            else:
+                self._assert_safe_tree(dst_dir, self._asset_root(art))
+                for source in sorted(src_dir.rglob("*")):
+                    if not source.is_file():
+                        continue
+                    target = dst_dir / source.relative_to(src_dir)
+                    if target.exists():
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    source.replace(target)
+                self._remove_path(src_dir, self._asset_root(art))
                 continue
             self._assert_safe_tree(dst_dir, self._asset_root(art))
             for p in sorted(src_dir.rglob("*")):
@@ -1252,12 +1311,16 @@ class ProvisionManager:
             self._assert_safe_tree(stage_root, root)
             stage_root.mkdir(parents=True, exist_ok=True)
             self._assert_safe_path(stage_root, root)
+            staged_dir = stage_root / (art.layout_rel or "")
+            if all((staged_dir / f.layout_path).is_file()
+                   and f.layout_path in self._seeded_files.get(art.id, set())
+                   for f in art.required_files()):
+                return staged_dir, stage_root
             self._run_download_worker({
                 "action": "rvm", "package_root": str(self.roots.v2_package_root),
                 "staging_root": str(stage_root), "url": art.url,
                 "filename": f.path, "md5_b64": art.md5_b64,
             }, art.id)
-            staged_dir = stage_root / (art.layout_rel or "")
             return staged_dir, stage_root
 
         stage_root = self._http_staging_dir(art, dest)

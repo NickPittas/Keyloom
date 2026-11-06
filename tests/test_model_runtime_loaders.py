@@ -208,6 +208,29 @@ def test_explicit_local_model_root_requires_selected_component_files(monkeypatch
     ) == local
 
 
+def test_explicit_local_model_root_accepts_legacy_flat_videomama_unet(monkeypatch, tmp_path):
+    config = b"legacy config"
+    weights = b"legacy weights"
+    artifact = _artifact(
+        "videomama", "checkpoints",
+        ("VideoMaMa/unet/config.json", "VideoMaMa/unet/weights.safetensors"),
+        path_remap={"unet/": "VideoMaMa/unet/"},
+    )
+    artifact = replace(artifact, files=(
+        replace(artifact.files[0], size=len(config)),
+        replace(artifact.files[1], size=len(weights)),
+    ))
+    monkeypatch.setattr(model_runtime, "load_catalog", lambda: Catalog(1, "", {}, {artifact.id: artifact}))
+    local = tmp_path / "flat-videomama"
+    local.mkdir()
+    (local / "config.json").write_bytes(config)
+    (local / "weights.safetensors").write_bytes(weights)
+
+    assert model_runtime.validate_local_model_path(
+        "videomama", local, components=("unet",)
+    ) == local
+
+
 def test_runtime_needs_presence_only_never_a_hash_record(monkeypatch, tmp_path):
     artifact = _artifact("model", "models/model", ("weights.bin",), sha256="a" * 64)
     catalog = Catalog(1, "", {}, {artifact.id: artifact})
