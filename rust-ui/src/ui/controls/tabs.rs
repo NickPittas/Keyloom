@@ -90,8 +90,8 @@ impl<'a> TabStrip<'a> {
             let tw = line(&painter, tab.label, ty::button(), 16.0, f32::INFINITY).size().x + 1.0 / 64.0;
             match self.kind {
                 // Compact page tabs (§7.5): icon only, 28 × 28; the active tab keeps its label.
-                TabKind::Page if self.compact && tab.icon.is_some() && i != active_now => 28.0,
-                TabKind::Page => 12.0 + if tab.icon.is_some() { 22.0 } else { 0.0 } + tw + 12.0,
+                TabKind::Page if self.compact && tab.icon.is_some() && i != active_now => 28.0 + badge_w(tab).map_or(0.0, |b| 6.0 + b),
+                TabKind::Page => 12.0 + if tab.icon.is_some() { 22.0 } else { 0.0 } + tw + tab.status.map_or(0.0, |_| 15.0) + badge_w(tab).map_or(0.0, |b| 6.0 + b) + 12.0,
                 TabKind::Stage => {
                     // Shot mockup: 12 px pads, or 6 px at Compact, where inactive tabs are circle-only.
                     let pad = if self.compact { 6.0 } else { 12.0 };
@@ -151,6 +151,7 @@ impl<'a> TabStrip<'a> {
                 ui.ctx().accesskit_node_builder(resp.id, |nd| {
                     nd.set_selected(is_sel);
                     if let Some(r) = tab.disabled { nd.set_description(r); }
+                    else if let Some(t) = tab.tip { nd.set_description(t); }
                 });
                 if let Some(r) = tab.disabled { let _ = resp.on_hover_text(r).on_disabled_hover_text(r); }
                 else if let Some(t) = tab.tip { let _ = resp.on_hover_text(t); }
@@ -222,11 +223,22 @@ impl TabPaint<'_> {
         let c = self.label_color();
         if self.compact && self.tab.icon.is_some() && !self.active {
             self.icon(ui, r.min.x + 6.0, c);
+            if let (Some(b), Some(bw)) = (self.tab.badge, self.badge_w) {
+                self.count_badge(p, egui::pos2(r.max.x - bw - 3.0, r.center().y), b, bw);
+            }
         } else {
             let mut x = self.unsnapped_x + 12.0;
             self.icon(ui, x, c);
             if self.tab.icon.is_some() { x += 22.0 }
-            self.label(ui, x, c);
+            x += self.label(ui, x, c);
+            if let Some(status) = self.tab.status {
+                let color = if status == StageStatus::Blocked { t.error } else { t.warning };
+                p.circle_filled(egui::pos2((x + 9.0).round(), r.center().y.round()), 3.0, color);
+                x += 15.0;
+            }
+            if let (Some(b), Some(bw)) = (self.tab.badge, self.badge_w) {
+                self.count_badge(p, egui::pos2((x + 6.0 + bw / 2.0).round(), r.center().y.round()), b, bw);
+            }
         }
         if self.focus { self.ring(ui, top) }
     }
@@ -275,13 +287,16 @@ impl TabPaint<'_> {
         if self.tab.icon.is_some() { x += 22.0 }
         let w = self.label(ui, x, c);
         if let (Some(b), Some(bw)) = (self.tab.badge, self.badge_w) {
-            let bx = (x + w + 6.0).round();
-            let br = Rect::from_min_size(egui::pos2(bx, (r.center().y - 8.0).round()), egui::vec2(bw.round(), 16.0));
-            p.rect_filled(br, CornerRadius::same(8), t.bg_pressed);
-            let g = line(p, &b.to_string(), ty::chip(), 14.0, f32::INFINITY);
-            paint_line(p, br, g, 14.0, Align::Center, t.text_primary, 0.0);
+            self.count_badge(p, egui::pos2((x + w + 6.0 + bw / 2.0).round(), r.center().y.round()), b, bw);
         }
         if self.focus { self.ring(ui, CornerRadius::ZERO) }
+    }
+
+    fn count_badge(&self, p: &egui::Painter, center: egui::Pos2, count: u32, width: f32) {
+        let rect = Rect::from_center_size(center, egui::vec2(width.round(), 16.0));
+        p.rect_filled(rect, CornerRadius::same(8), self.t.bg_pressed);
+        let g = line(p, &count.to_string(), ty::chip(), 14.0, f32::INFINITY);
+        paint_line(p, rect, g, 14.0, Align::Center, self.t.text_primary, 0.0);
     }
 }
 
@@ -313,5 +328,26 @@ mod tests {
         let c = rects(true, true);
         assert!(c.iter().all(|r| r.size() == egui::vec2(28.0, 28.0)), "{c:?}");
         assert_eq!(c.iter().map(|r| r.min.x).collect::<Vec<_>>(), vec![8.0, 38.0, 68.0]);
+    }
+
+    #[test]
+    fn g2_compact_models_badge_reserves_space_on_the_existing_tab() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::fonts::install(&ctx);
+        let tabs = [
+            Tab::new("Board").icon(Icon::Board),
+            Tab::new("Models").icon(Icon::Models).badge(12).status(StageStatus::Blocked).tip("Models\n12 required models missing\nCtrl+Shift+4"),
+        ];
+        let mut active = 0;
+        let mut rects = Vec::new();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            TabStrip::new(TabKind::Page, &mut active, &tabs).compact(true).whole_px(true).rects_out(&mut rects).show(ui);
+        });
+        out.textures_delta.clear();
+        assert_eq!(rects[0].width(), 28.0);
+        assert!(rects[1].width() > 28.0, "the cached count needs room beside the Models icon");
+        let models = &out.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().find(|(_, n)| n.label() == Some("Models")).unwrap().1;
+        assert_eq!(models.description(), Some("Models\n12 required models missing\nCtrl+Shift+4"));
     }
 }

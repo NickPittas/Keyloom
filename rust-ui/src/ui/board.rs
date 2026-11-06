@@ -217,7 +217,7 @@ impl Page {
         self.fx.meters = meters;
     }
 
-    pub fn status(&self, ui: &mut Ui) -> super::controls::statusbar::StatusOut {
+    pub fn status(&self, ui: &mut Ui, failures: u32) -> super::controls::statusbar::StatusOut {
         let w = ui.ctx().content_rect().width();
         let width = if w >= 1600.0 { super::controls::statusbar::Width::Wide } else if w >= 1200.0 { super::controls::statusbar::Width::Medium } else { super::controls::statusbar::Width::Compact };
         let activity = if self.fx.activity.is_empty() { None } else { Some((ActivityIcon::Spinner, self.fx.activity.as_str())) };
@@ -229,6 +229,7 @@ impl Page {
         let data = StatusData {
             activity,
             notices: self.fx.notices,
+            failures,
             queue_waiting: Some(if self.fx.live { self.fx.waiting_total } else { self.fx.waiting.len() as u32 }),
             meters,
             start: !self.fx.live || self.fx.project.is_empty(),
