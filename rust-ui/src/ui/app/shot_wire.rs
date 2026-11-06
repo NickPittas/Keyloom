@@ -96,6 +96,7 @@ fn key_again(kv: &KeyView) -> Go {
     let pick = |w: Intent| kv.intents.iter().find(|i| i.enabled && i.intent == w);
     match pick(Intent::NewVersion).or_else(|| pick(Intent::Resume)) {
         Some(i) => Go::Key(KeyCmd::Submit(i.intent)),
+        None if pick(Intent::Replace).is_some() => Go::Key(KeyCmd::RequestReplace),
         None => Go::Notice(kv.intents.iter().find_map(|i| i.reason.clone()).unwrap_or_else(|| "Choose how to key again from the ⋯ menu".into())),
     }
 }
@@ -591,11 +592,12 @@ impl App {
             fx.shot_id = clip.folder.clone();
             fx.shot = clip.display_name.clone();
             fx.stage = self.tab.label().to_string();
+            fx.clip_stage = match clip.state { ClipState::Masked => "mask", ClipState::Ready => "ready", ClipState::Complete => "done", _ => "raw" }.into();
             if let Some(p) = &self.project {
                 fx.project = p.display_name.clone();
             }
             // Running job of this clip: the active head step of the activity model (same source as the old strip).
-            let (steps, _) = self.ai.activity_steps(&clip.folder);
+            let (steps, _) = self.ai.activity_steps(&clip.root);
             if let Some(h) = activity::build(steps).head.filter(|h| h.level == Level::Active) {
                 fx.job_label = Some(h.stage);
                 fx.busy_percent = (h.total > 0).then(|| (h.done * 100 / h.total).min(100) as u8);
@@ -803,7 +805,7 @@ impl App {
             },
             Tab::Media => self.media_view().map(|m| media_bar(&m)).unwrap_or_default(),
             Tab::Hint => {
-                let head = activity::build(self.ai.activity_steps(&clip.folder).0).head.filter(|h| h.level == Level::Active);
+                let head = activity::build(self.ai.activity_steps(&clip.root).0).head.filter(|h| h.level == Level::Active);
                 match self.hint_view() {
                     Some(hv) => hint_bar(&hv, head.as_ref()),
                     None => {
@@ -823,7 +825,7 @@ impl App {
                 b
             }
             Tab::Deliver => {
-                let head = activity::build(self.ai.activity_steps(&clip.folder).0).head.filter(|h| h.level == Level::Active);
+                let head = activity::build(self.ai.activity_steps(&clip.root).0).head.filter(|h| h.level == Level::Active);
                 match self.deliver_view() {
                     Some(dv) => deliver_bar(&dv, head.as_ref()),
                     None => {
@@ -916,11 +918,23 @@ impl App {
     /// `None` = "No result yet": no manifest and no output frames on disk.
     fn shot_review_props(&self, clip: &Clip) -> Option<ReviewProps> {
         let v = self.viewer.as_ref()?;
-        let outs: Vec<(&str, usize)> = VIEW_NAMES.iter().filter(|(_, w)| matches!(w, PV::Fg | PV::Matte | PV::Comp | PV::Processed)).map(|(n, w)| (*n, v.index.view_frames(*w))).filter(|(_, n)| *n > 0).collect();
+        let expected: Vec<&str> = clip.manifest.as_ref().and_then(|m| m.source_stems.as_ref())
+            .map(|stems| stems.iter().map(String::as_str).collect())
+            .or_else(|| {
+                let range = clip.manifest.as_ref()?.range.as_ref()?;
+                let start = clip.input_files.iter().position(|f| f.0 == range.in_stem)?;
+                let end = clip.input_files.iter().position(|f| f.0 == range.out_stem)?;
+                (start <= end).then(|| clip.input_files[start..=end].iter().map(|f| f.0.as_str()).collect())
+            })
+            .unwrap_or_else(|| clip.input_files.iter().map(|f| f.0.as_str()).collect());
+        let outs: Vec<(&str, usize)> = VIEW_NAMES.iter()
+            .filter(|(_, w)| matches!(w, PV::Fg | PV::Matte | PV::Comp | PV::Processed))
+            .map(|(n, w)| (*n, expected.iter().filter(|stem| v.index.view_has(*w, stem)).count()))
+            .filter(|(_, n)| *n > 0).collect();
         if outs.is_empty() && clip.manifest.is_none() {
             return None;
         }
-        let total = clip.input_files.len();
+        let total = expected.len();
         let name = |w: PV| VIEW_NAMES.iter().find(|(_, x)| *x == w).map_or("Input", |(n, _)| *n).to_string();
         Some(ReviewProps {
             frames: outs.iter().map(|(n, c)| (n.to_string(), format!("{c} of {}", total.max(*c)))).collect(),
@@ -1183,5 +1197,83 @@ impl App {
         let o = DisplayOpts { channel: s.channel, gain: s.gain as f32, gamma: s.gamma as f32, background: s.background, wipe_horizontal: horizontal };
         v.set_display(o);
         self.shot_display(Some(o));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::Intent;
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn png(path: &std::path::Path) {
+        let mut encoder = png::Encoder::new(fs::File::create(path).unwrap(), 4, 4);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&[0; 48]).unwrap();
+    }
+
+    fn app_with_clip(tag: &str, with_result: bool) -> (egui::Context, App, PathBuf) {
+        let base = std::env::temp_dir().join(format!("ck-shot-wire-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let project = base.join("project");
+        let clip = project.join("clips/shot");
+        fs::create_dir_all(clip.join("Frames")).unwrap();
+        for n in 1101..=1105 { png(&clip.join(format!("Frames/f_{n}.png"))); }
+        fs::write(clip.join(".video_metadata.json"), r#"{"fps":24.0,"width":4,"height":4}"#).unwrap();
+        let native = if with_result {
+            let result = base.join("result");
+            fs::create_dir_all(&result).unwrap();
+            png(&result.join("shot_1102.png"));
+            fs::write(result.join(crate::project::MANIFEST_NAME), json!({
+                "version": 3, "engine": "corridorkey-v2", "clip_id": "clip-id", "enabled_outputs": ["matte"],
+                "formats": {"matte": "png"}, "range": {"in_point": 1, "out_point": 2, "in_stem": "f_1102", "out_stem": "f_1103"},
+                "source_stems": ["f_1102", "f_1103"], "files": {"matte": ["shot_1102.png", "shot_1103.png"]}, "complete": false
+            }).to_string()).unwrap();
+            json!({"clip_id": "clip-id", "key_result": {"manifest_dir": result}})
+        } else { json!({}) };
+        fs::write(clip.join("clip.json"), native.to_string()).unwrap();
+        fs::write(project.join("project.json"), r#"{"version":2,"clips":["shot"]}"#).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { project: Some(project), open_clip: Some("shot".into()), tab: Some(Tab::Review), ..Default::default() });
+        if app.clip().is_none() { app.open_clip(&ctx, 0); }
+        (ctx, app, base)
+    }
+
+    #[test]
+    fn review_counts_only_the_manifest_range() {
+        let (_ctx, app, base) = app_with_clip("review-range", true);
+        let clip = app.clip().unwrap().clone();
+        let review = app.shot_review_props(&clip).expect("the manifest provides a review");
+        assert_eq!(review.frames, [("Matte".into(), "1 of 2".into())]);
+        assert_eq!(review.missing_frames, 1);
+        drop(app);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn live_header_stage_comes_from_the_clip_state() {
+        let (_ctx, mut app, base) = app_with_clip("header-stage", false);
+        app.refresh_shot_page();
+        assert_eq!(app.shot_page.fx.clip_stage, "raw");
+        drop(app);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn replace_only_key_again_requests_the_replace_confirmation() {
+        let (ctx, mut app, base) = app_with_clip("replace-only", false);
+        let project = app.project.as_ref().unwrap().clone();
+        let clip = app.clip().unwrap().clone();
+        let settings = app.settings_page().saved().clone();
+        let mut view = app.ai.key_view(&clip, &project, &settings);
+        view.intents = vec![crate::ui::ai::IntentView { intent: Intent::Replace, label: "Replace".into(), enabled: true, reason: None }];
+        assert!(matches!(key_again(&view), Go::Key(KeyCmd::RequestReplace)));
+        drop(app);
+        drop(ctx);
+        let _ = fs::remove_dir_all(base);
     }
 }

@@ -9,6 +9,7 @@ use crate::worker::{LockCmd, Outcome};
 pub struct PreviewResult {
     pub job_id: String,
     pub folder: String,
+    pub clip_root: PathBuf,
     pub frame_stem: String,
     pub mask_png: PathBuf,
     pub width: u32,
@@ -112,6 +113,7 @@ impl AiUi {
             warnings: vec![],
             job_id: id.clone(),
             folder: clip.folder.clone(),
+            clip_root: clip.root.clone(),
             name: clip.display_name.clone(),
             label: kind.label().into(),
         });
@@ -211,11 +213,11 @@ impl AiUi {
 
     /// Every step of this clip in submit order (Key jobs and tasks, one per job id), and how many OTHER clips
     /// still have unfinished work.
-    pub fn activity_steps(&self, folder: &str) -> (Vec<crate::ui::activity::Step>, usize) {
+    pub fn activity_steps(&self, clip_root: &Path) -> (Vec<crate::ui::activity::Step>, usize) {
         use crate::ui::activity::{Cancel, Level, Step};
         let local = || "This computer".to_string();
         let mut out: Vec<Step> = vec![];
-        let mut others: Vec<&str> = vec![];
+        let mut others: Vec<PathBuf> = vec![];
         for t in &self.tracked {
             let (state, cancel_req, task, hold, queued_pc) = if let Some(e) = self.sched.job(&t.job_id) {
                 let pc = match &e.placement {
@@ -229,9 +231,9 @@ impl AiUi {
             } else {
                 continue;
             };
-            if t.folder != folder {
-                if !state.is_terminal() && !others.contains(&t.folder.as_str()) {
-                    others.push(&t.folder);
+            if t.clip_root != clip_root {
+                if !state.is_terminal() && !others.contains(&t.clip_root) {
+                    others.push(t.clip_root.clone());
                 }
                 continue;
             }
@@ -333,9 +335,9 @@ impl AiUi {
             || self.sched.task_snapshot().iter().any(|t| t.job.clip_root == clip_root && t.state.fences())
     }
 
-    pub fn task_busy(&self, folder: &str) -> bool {
+    pub fn task_busy(&self, clip_root: &Path) -> bool {
         self.tracked.iter().any(|t| {
-            t.folder == folder
+            t.clip_root == clip_root
                 && !t.label.is_empty()
                 && self
                     .sched
@@ -347,12 +349,12 @@ impl AiUi {
     /// The newest finished/ongoing task of `kind` for this clip that publishes into `dir` (`AlphaHint` or
     /// `VideoMamaMaskHint`). One kind (SAM tracking, a producer) can publish into either, so the column a job
     /// belongs to is its actual `publish_dir`, not just its kind.
-    pub fn latest_task_in(&self, folder: &str, kind: TaskKind, dir: &str) -> Option<String> {
+    pub fn latest_task_in(&self, clip_root: &Path, kind: TaskKind, dir: &str) -> Option<String> {
         self.tracked
             .iter()
             .rev()
             .find(|t| {
-                t.folder == folder
+                t.clip_root == clip_root
                     && self.sched.task(&t.job_id).is_some_and(|e| {
                         e.job.kind == kind
                             && e.job
@@ -365,12 +367,12 @@ impl AiUi {
     }
 
     /// The newest finished/ongoing task of `kind` for this clip.
-    pub fn latest_task(&self, folder: &str, kind: TaskKind) -> Option<String> {
+    pub fn latest_task(&self, clip_root: &Path, kind: TaskKind) -> Option<String> {
         self.tracked
             .iter()
             .rev()
             .find(|t| {
-                t.folder == folder
+                t.clip_root == clip_root
                     && self
                         .sched
                         .task(&t.job_id)
@@ -383,14 +385,14 @@ impl AiUi {
     /// discarded, never shown as the current selection).
     pub fn current_preview(
         &self,
-        folder: &str,
+        clip_root: &Path,
         frame_stem: &str,
         sig: u64,
     ) -> Option<&PreviewResult> {
         self.tk
             .previews
             .values()
-            .filter(|p| p.folder == folder && p.frame_stem == frame_stem && p.sig == sig)
+            .filter(|p| p.clip_root == clip_root && p.frame_stem == frame_stem && p.sig == sig)
             .last()
     }
 
@@ -407,12 +409,12 @@ impl AiUi {
         };
         let sig = self.tk.sigs.get(&id).copied().unwrap_or(0);
         // A newer preview for this clip supersedes (and deletes the files of) the older ones.
-        let folder = t.folder.clone();
+        let clip_root = t.clip_root.clone();
         let old: Vec<String> = self
             .tk
             .previews
             .values()
-            .filter(|p| p.folder == folder)
+            .filter(|p| p.clip_root == clip_root)
             .map(|p| p.job_id.clone())
             .collect();
         for o in old {
@@ -425,6 +427,7 @@ impl AiUi {
             PreviewResult {
                 job_id: id,
                 folder: t.folder.clone(),
+                clip_root: t.clip_root.clone(),
                 frame_stem: stem,
                 mask_png: PathBuf::from(png),
                 width: w,

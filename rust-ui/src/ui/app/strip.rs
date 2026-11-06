@@ -37,7 +37,7 @@ impl App {
         if self.ai.lock_attention(clip) {
             note("lock", Some("A hint lock on this clip needs a decision: open Details.".into()));
         }
-        let (sched, others) = self.ai.activity_steps(&clip.folder);
+        let (sched, others) = self.ai.activity_steps(&clip.root);
         steps.extend(sched);
         if let Some((phase, done, total)) = self.imp.progress_of(clip) {
             let mut s = Step::new("import", if phase == "compress" { "Compress frames" } else { "Extract frames" }, Level::Active);

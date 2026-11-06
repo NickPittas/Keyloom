@@ -41,7 +41,12 @@ pub(super) fn draw(ui: &mut Ui, rect: Rect, fx: &Fixture, drawer_open: bool) -> 
         pos2(name_rect.left(), name_rect.center().y - galley.size().y / 2.0), galley, t.text_primary,
     );
     // Chip takes its natural width: text + 6 px pads + 16 px icon lead, minimum 56 (chips::badge).
-    let (chip_stage, label) = if fx.empty { (Stage::Ready, "Ready") } else { (Stage::Completed, "Completed") };
+    let (chip_stage, label) = match fx.clip_stage.as_str() {
+        "raw" => (Stage::Raw, "Raw"),
+        "mask" => (Stage::Mask, "Mask"),
+        "ready" => (Stage::Ready, "Ready"),
+        _ => (Stage::Completed, "Completed"),
+    };
     // Compact (mockup 58 @900): icon-only 22 px chip with a coloured left bar; the label is its tooltip.
     let chip_w = if compact { 22.0 } else { (ui.painter().layout_no_wrap(label.to_owned(), ty::chip(), t.text_primary).size().x + 28.0).max(56.0).round() };
     // Compact: a truncated name fills its full 160 px cap (mockup flex box), not the last glyph-trimmed width.
