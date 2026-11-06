@@ -247,10 +247,19 @@ impl App {
         let items: Vec<_> = rows.iter().filter(|row| !matches!(row.kind, ItemKind::Notice(_)) || !self.strip.activity.is_acknowledged(row.id)).map(GlobalActivityItem::as_item).collect();
         let out = control::activity_popover(ui.ctx(), anchor, &mut self.strip.activity, &items);
         if let Some(clip) = clip.filter(|clip| self.ai.lock_attention(clip)) {
-            egui::Area::new(ui.scope_id().with("hint-lock-recovery"))
+            let screen = ui.ctx().content_rect();
+            let popover_x = anchor.left().min(screen.right() - 480.0).max(screen.left());
+            let response = egui::Area::new(ui.scope_id().with("hint-lock-recovery"))
                 .order(egui::Order::Foreground)
-                .fixed_pos(anchor.left_bottom() + egui::vec2(0.0, -control::MAX_HEIGHT - 8.0))
-                .show(ui.ctx(), |ui| self.ai.hint_lock_ui(ui, &clip));
+                .pivot(egui::Align2::LEFT_BOTTOM)
+                .fixed_pos(egui::pos2(popover_x + 480.0 + 8.0, anchor.top()))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(360.0);
+                        self.ai.hint_lock_ui(ui, &clip)
+                    })
+                });
+            ui.ctx().move_to_top(response.response.layer_id);
         }
         if out.closed { self.strip.open = false; }
         if let Some((id, Action::Cancel)) = out.action {

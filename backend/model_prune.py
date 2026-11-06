@@ -24,6 +24,15 @@ def _is_link(p: Path) -> bool:
         return True
 
 
+def _parent_is_real(p: Path) -> bool:
+    try:
+        return os.path.normcase(str(p.parent.resolve(strict=False))) == os.path.normcase(
+            str(p.parent.absolute())
+        )
+    except OSError:
+        return False
+
+
 def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
     catalog = load_catalog()
     roots = Roots.defaults()
@@ -31,6 +40,10 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
     result: list[dict] = []
     planned_removed: set[Path] = set()
     def remove(path: Path, reason: str, *, directory: bool = False) -> None:
+        if not _parent_is_real(path):
+            if not any(item["path"] == str(path) for item in result):
+                result.append({"path": str(path), "bytes": 0, "reason": reason, "error": "skipped: reached through a link"})
+            return
         try:
             info = path.lstat()
             if directory:
@@ -55,6 +68,10 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
             result.append({"path": str(path), "bytes": 0, "reason": reason, "error": str(exc)})
 
     def erase_tree(path: Path, reason: str) -> None:
+        if not _parent_is_real(path):
+            if not any(item["path"] == str(path) for item in result):
+                result.append({"path": str(path), "bytes": 0, "reason": reason, "error": "skipped: reached through a link"})
+            return
         try:
             if _is_link(path):
                 info = path.lstat()
@@ -91,7 +108,7 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
                     relative = candidate.relative_to(legacy)
                 except ValueError:
                     continue
-                if not relative.parts or candidate == in_use or candidate == destination:
+                if not relative.parts or (in_use is not None and candidate.resolve(strict=False) == in_use.resolve(strict=False)) or (destination is not None and candidate.resolve(strict=False) == destination.resolve(strict=False)):
                     continue
                 # Reject symlinked path components so catalog paths cannot escape a legacy root.
                 current = legacy
@@ -127,6 +144,7 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
             if resolved_cache in processed_caches:
                 continue
             processed_caches.add(resolved_cache)
+            cache = resolved_cache
             repo = cache / repo_name
             try:
                 repo.relative_to(cache)
@@ -150,6 +168,9 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
                 continue
 
             snapshots = repo / "snapshots"
+            blobs = repo / "blobs"
+            if _is_link(blobs) or _is_link(snapshots):
+                continue
             keep = checker.artifact_dir(art)
             kept_blob_targets: set[Path] = set()
             try:
@@ -177,7 +198,6 @@ def prune_unused_model_copies(dry_run: bool = False) -> list[dict]:
                                     kept_blob_targets.add(item.resolve(strict=True))
                                 except OSError:
                                     pass
-                blobs = repo / "blobs"
                 if blobs.is_dir():
                     for blob in blobs.iterdir():
                         if blob.resolve(strict=False) not in kept_blob_targets:
