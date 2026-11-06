@@ -346,7 +346,8 @@ impl Page {
         // ---- grid
         let notice_h = if fx.notice_text.is_empty() { 0.0 } else { 24.0 };
         if !fx.notice_text.is_empty() {
-            let note = fx.notice_text.join(" · ");
+            let mut seen = std::collections::HashSet::new();
+            let note = fx.notice_text.iter().filter(|s| seen.insert(s.as_str())).cloned().collect::<Vec<_>>().join(" · ");
             let rect = Rect::from_min_size(pos2(gcol.min.x + 16.0, gcol.min.y + 34.0), vec2((gcol.width() - 32.0).max(0.0), 20.0));
             ui.put(rect, egui::Label::new(egui::RichText::new(&note).color(t.warning)).truncate()).on_hover_text(note);
         }
@@ -383,7 +384,7 @@ impl Page {
                         thumb_label: &c.thumb_label,
                         thumb_tooltip: &c.thumb_tooltip,
                         specimen: !fx.live,
-                        stage: match c.st.as_str() { "mask" => Stage::Mask, "ready" => Stage::Ready, "done" => Stage::Completed, _ => Stage::Raw },
+                        stage: if matches!(c.job.as_str(), "q" | "r" | "p") { Stage::Ready } else { match c.st.as_str() { "mask" => Stage::Mask, "ready" => Stage::Ready, "done" => Stage::Completed, _ => Stage::Raw } },
                         job: match c.job.as_str() { "q" => Some(Job::Queued), "r" => Some(Job::Rendering(c.prog / 100.0)), "p" => Some(Job::Preparing), "f" => Some(Job::Failed), _ => None },
                         meta: &c.meta,
                         status_line: &c.s,
