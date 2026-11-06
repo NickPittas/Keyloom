@@ -516,6 +516,21 @@ impl App {
 
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::Modifiers;
+        fn take(ctx: &egui::Context, mods: Modifiers, k: Key) -> bool {
+            ctx.input_mut(|i| {
+                let Some(index) = i.events.iter().position(|event| matches!(event,
+                    egui::Event::Key { key, physical_key, pressed: true, modifiers, .. }
+                        if modifiers.matches_logically(mods)
+                            && (*key == k || (*physical_key == Some(k) && !matches!(key,
+                                Key::A | Key::B | Key::C | Key::D | Key::E | Key::F | Key::G
+                                | Key::H | Key::I | Key::J | Key::K | Key::L | Key::M | Key::N
+                                | Key::O | Key::P | Key::Q | Key::R | Key::S | Key::T | Key::U
+                                | Key::V | Key::W | Key::X | Key::Y | Key::Z)))
+                )) else { return false; };
+                i.events.remove(index);
+                true
+            })
+        }
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         for (i, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].into_iter().enumerate() {
             if !ctx.text_edit_focused() {
@@ -535,21 +550,21 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Comma)) {
             self.goto_page(4);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) && self.project.is_some() {
+        if take(ctx, Modifiers::COMMAND, Key::S) && self.project.is_some() {
             self.report_save();
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::N)) {
+        if take(ctx, Modifiers::COMMAND, Key::N) {
             self.new_project_pick(ctx);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
+        if take(ctx, Modifiers::COMMAND, Key::O) {
             self.request_pick(ctx, PickKind::Project);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::I)) {
+        if take(ctx, Modifiers::COMMAND | Modifiers::SHIFT, Key::I) {
             self.request_pick(ctx, PickKind::Folder);
-        } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::I)) {
+        } else if take(ctx, Modifiers::COMMAND, Key::I) {
             self.request_pick(ctx, PickKind::Clips);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
+        if take(ctx, Modifiers::COMMAND, Key::Q) {
             self.quit_request(ctx);
         }
     }
