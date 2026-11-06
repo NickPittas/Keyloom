@@ -32,6 +32,35 @@ def test_submit_replay_same_and_different(store, clock):
     assert e.value.status == 409
 
 
+def test_submit_replay_is_allowed_after_receiving_turns_off(store, clock):
+    sub, _ = setup_pair(store, clock)
+    body = {"submission_id": sid(1), "spec": SPEC, "target": None}
+    accepted = store.submit(sub, body, accepting=lambda: True)
+    assert store.submit(sub, body, accepting=lambda: False) == accepted
+    with pytest.raises(ApiError) as e:
+        store.submit(sub, {**body, "spec": spec(clip_id="changed")}, accepting=lambda: False)
+    assert code(e) == "submission_conflict"
+    with pytest.raises(ApiError) as e:
+        store.submit(sub, {**body, "submission_id": sid(2)}, accepting=lambda: False)
+    assert code(e) == "not_receiving"
+    with pytest.raises(ApiError) as e:
+        store.submit(sub, {**body, "submission_id": sid(3)}, only_if_free=True, accepting=lambda: False)
+    assert code(e) == "not_free"
+
+
+def test_retire_unused_rechecks_online_state_inside_store(store, clock):
+    rec, _ = make_inst(store, "receiver")
+    with pytest.raises(ApiError) as e:
+        store.revoke(rec["id"], only_if_unused=True, only_if_offline=True)
+    assert code(e) == "online"
+    clock.t += SESSION_TTL
+    store.revoke(rec["id"], only_if_unused=True, only_if_offline=True)
+    assert not store.installation_active(rec["id"])
+    active, _ = make_inst(store, "retire-one")
+    store.revoke(active["id"], only_if_unused=True)
+    assert not store.installation_active(active["id"])
+
+
 def test_frozen_spec_roundtrip(store, clock):
     sub, rec = setup_pair(store, clock)
     store.submit(sub, {"submission_id": sid(1), "spec": SPEC, "target": None})

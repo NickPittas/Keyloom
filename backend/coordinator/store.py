@@ -215,7 +215,7 @@ class Store:
             row = self.db.execute("SELECT last_seen FROM sessions WHERE installation_id=?", (installation_id,)).fetchone()
         return self._online(installation_id, row["last_seen"] if row else None)
 
-    def revoke(self, installation_id, only_if_unused=False):
+    def revoke(self, installation_id, only_if_unused=False, only_if_offline=False):
         """Returns the STARTED attempts that stay fenced: revoking credentials proves nothing about a running writer.
         only_if_unused: refuse with 409 in_use, in the same transaction, while the login still has unfinished work."""
         now = self.clock()
@@ -224,6 +224,10 @@ class Store:
                 raise ApiError(404, "unknown_installation", "no such installation")
             if only_if_unused and db.execute("SELECT " + _IN_USE.format(i="?"), (installation_id,) * 3).fetchone()[0]:
                 raise ApiError(409, "in_use", "this login has unfinished jobs")
+            if only_if_offline:
+                session = db.execute("SELECT last_seen FROM sessions WHERE installation_id=?", (installation_id,)).fetchone()
+                if self._online(installation_id, session["last_seen"] if session else None):
+                    raise ApiError(409, "online", "this login is online")
             db.execute("UPDATE installations SET revoked_at=? WHERE id=? AND revoked_at IS NULL", (now, installation_id))
             db.execute("UPDATE gpu_slots SET enabled=0 WHERE installation_id=?", (installation_id,))
             db.execute("DELETE FROM sessions WHERE installation_id=?", (installation_id,))
@@ -311,7 +315,7 @@ class Store:
 
     # ---- submission -------------------------------------------------------------------------------
 
-    def submit(self, inst, body, only_if_free=False):
+    def submit(self, inst, body, only_if_free=False, accepting=None):
         obj(body, "submission", ("submission_id", "spec", "target"))
         sid = ident(body["submission_id"], "submission_id")
         target = validate_target(body["target"])
@@ -323,6 +327,8 @@ class Store:
                 if prior["submitter"] != inst["id"] or prior["payload_hash"] != phash:
                     raise ApiError(409, "submission_conflict", "submission_id was already used with different content")
                 return json.loads(prior["response_json"])
+            if accepting is not None and not accepting():
+                raise ApiError(409, "not_free" if only_if_free else "not_receiving", "this PC is not taking jobs from other PCs (Receive jobs is off)")
             if target and not db.execute("SELECT 1 FROM installations WHERE id=? AND revoked_at IS NULL", (target,)).fetchone():
                 bad("target installation does not exist")
             if only_if_free and (why := self._not_free(db)):  # an Automatic shot is only taken by a PC that is still free

@@ -577,6 +577,9 @@ impl App {
             last_ctx: None,
             thumbs: None,
         };
+        if let Some(target) = crate::remote_set::RemoteSet::saved_default_target(app.settings.saved(), app.settings.store_path().map(Path::new)) {
+            app.ai.placement = crate::scheduler::Placement::Target(target);
+        }
         app.ai.set_presets_file(crate::presets::file_beside(app.settings.store_path()));
         if opts.project.is_some() {
             app.load(ctx);
@@ -2843,13 +2846,17 @@ impl App {
     }
 
     /// Save the edited network settings and hand them to the driver.
-    fn net_save(&mut self, what: &str) {
+    fn net_save(&mut self, what: &str) -> bool {
+        let save_error = format!("{what}, but the connection settings could not be saved.");
         if self.settings.apply() {
+            if self.machines_page.notice_text() == Some(save_error.as_str()) { self.machines_page.set_notice(None); }
             if let Some(d) = &self.driver {
                 d.publish(self.settings.saved(), self.settings.store_path());
             }
+            true
         } else {
-            self.ai.notice = Some(format!("{what}, but the connection settings could not be saved."));
+            self.machines_page.set_notice(Some(save_error));
+            false
         }
     }
 
@@ -2991,17 +2998,24 @@ impl App {
     fn finish_remove(&mut self, creds: &str, notice: Option<String>) {
         let n = self.net_draft();
         let own = n.connections.iter().any(|c| c.credentials == creds && c.local_host);
+        let was_default = n.default_submit == creds;
         let destination = n.connections.iter().find(|c| c.credentials == creds).map(|c| c.legacy_id.clone()).filter(|l| !l.is_empty());
         n.connections.retain(|c| c.credentials != creds);
+        if was_default {
+            n.default_submit.clear();
+        }
+        if !self.net_save("Removed") {
+            self.settings.open();
+            return;
+        }
+        if was_default {
+            self.ai.placement = crate::scheduler::Placement::Auto;
+        }
         if let Some(pc_id) = destination {
             // The user removed a registered PC's destination: it is not offered again (its registration is Retired from the Clients page).
             let _ = crate::app_api::spawn_call("destination_remove", serde_json::json!({"pc_id": pc_id}));
         }
-        if n.default_submit == creds {
-            n.default_submit.clear();
-        }
         self.remote.remove(creds);
-        self.net_save("Removed");
         if !own {
             for ext in ["", ".session", ".lock", ".network.json"] {
                 let _ = std::fs::remove_file(format!("{creds}{ext}"));
@@ -4449,15 +4463,89 @@ mod finish_remove_tests {
 
         let ctx = egui::Context::default();
         let mut app = App::with_ctx(&ctx, AppOptions { settings_path: Some(sp.clone()), ..Default::default() });
+        app.ai.placement = crate::scheduler::Placement::Target("network:test/target".into());
         app.finish_remove(&gone, Some("still listed".into()));
 
         let saved = crate::settings::Store::load(Some(sp));
         let left: Vec<&str> = saved.saved().network.connections.iter().map(|c| c.credentials.as_str()).collect();
         assert_eq!(left, [kept.as_str()]);
         assert!(saved.saved().network.default_submit.is_empty(), "the removed default is cleared");
+        assert_eq!(app.ai.placement, crate::scheduler::Placement::Auto, "the paired shot default is cleared too");
         assert!(files.iter().all(|f| !std::path::Path::new(f).exists()), "login and side files are deleted");
         assert!(std::path::Path::new(&kept).exists() && hist.exists() && std::path::Path::new(&attempt).exists());
         assert_eq!(app.ai.notice.as_deref(), Some("still listed"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn c6_machine_notice_is_dismissed_by_the_page_action() {
+        let d = std::env::temp_dir().join(format!("ck-machines-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { settings_path: Some(d.join("settings.json")), ..Default::default() });
+        app.machines_page.set_notice(Some("Connection not removed: busy.".into()));
+        assert!(app.machines_page.notice_text().is_some());
+        app.handle_machines_act(&ctx, crate::ui::machines_page::Act::DismissNotice);
+        assert!(app.machines_page.notice_text().is_none());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn c6_saving_settings_preserves_an_unrelated_machine_notice() {
+        let d = std::env::temp_dir().join(format!("ck-machines-notice-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { settings_path: Some(d.join("settings.json")), ..Default::default() });
+        app.machines_page.set_notice(Some("Connection not removed: still in use.".into()));
+        app.net_action(crate::remote::Action::ReceiveJobs(true));
+        assert_eq!(app.machines_page.notice_text(), Some("Connection not removed: still in use."));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn c4_saved_network_default_restores_placement_at_app_start() {
+        let d = std::env::temp_dir().join(format!("ck-default-placement-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let creds = d.join("login.json").display().to_string();
+        let sp = d.join("settings.json");
+        std::fs::write(&sp, serde_json::json!({"version": 1, "network": {
+            "connections_migrated": true,
+            "default_submit": creds,
+            "connections": [{"credentials": creds, "enabled": true, "network_id": "network-a", "host_installation_id": "host-id"}]
+        }}).to_string()).unwrap();
+
+        let ctx = egui::Context::default();
+        let app = App::with_ctx(&ctx, AppOptions { settings_path: Some(sp), ..Default::default() });
+        assert_eq!(app.ai.placement, crate::scheduler::Placement::Target("network:network-a/host-id".into()));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn c7_failed_settings_save_keeps_connection_and_credentials() {
+        let d = std::env::temp_dir().join(format!("ck-remove-save-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let cfg = d.join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let creds = d.join("login.json").display().to_string();
+        let sp = cfg.join("settings.json");
+        std::fs::write(&sp, serde_json::json!({"version": 1, "network": {"connections_migrated": true, "default_submit": creds, "connections": [{"credentials": creds, "enabled": true}]}}).to_string()).unwrap();
+        for ext in ["", ".session", ".lock", ".network.json"] { std::fs::write(format!("{creds}{ext}"), "keep").unwrap(); }
+
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { settings_path: Some(sp), ..Default::default() });
+        app.ai.placement = crate::scheduler::Placement::Target("network:test/target".into());
+        std::fs::rename(&cfg, d.join("config-saved")).unwrap();
+        std::fs::write(&cfg, "block directory creation").unwrap();
+        app.finish_remove(&creds, None);
+
+        assert!(app.settings.saved().network.connections.iter().any(|c| c.credentials == creds));
+        assert_eq!(app.settings.saved().network.default_submit, creds);
+        assert_eq!(app.ai.placement, crate::scheduler::Placement::Target("network:test/target".into()));
+        assert!(["", ".session", ".lock", ".network.json"].iter().all(|ext| std::path::Path::new(&format!("{creds}{ext}")).exists()));
+        assert!(app.machines_page.notice_text().is_some_and(|n| n.contains("could not be saved")));
         let _ = std::fs::remove_dir_all(d);
     }
 }

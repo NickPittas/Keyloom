@@ -35,7 +35,7 @@ fn conn_of(s: &Settings, _sp: Option<&Path>) -> Vec<(Conn, bool)> {
             endpoints.retain(|u| u.as_str() != p);
             endpoints.insert(0, p.to_owned());
         }
-        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), endpoints, preferred: p.to_owned(), target_host: c.host_installation_id.trim().to_owned(), legacy_ns: c.legacy_ns.trim().to_owned(), legacy_id: c.legacy_id.trim().to_owned(), alias_ns: c.alias_ns.trim().to_owned(), alias_id: c.alias_id.trim().to_owned() }, default)
+        (Conn { creds: Some(PathBuf::from(&key)), enabled: c.enabled, receive: c.receive, name: name.clone(), host_name: c.host_name.clone(), network_id: c.network_id.trim().to_owned(), endpoints, preferred: p.to_owned(), target_host: c.host_installation_id.trim().to_owned(), legacy_ns: c.legacy_ns.trim().to_owned(), legacy_id: c.legacy_id.trim().to_owned(), alias_ns: c.alias_ns.trim().to_owned(), alias_id: c.alias_id.trim().to_owned() }, default)
     }).collect()
 }
 
@@ -46,6 +46,13 @@ fn key_of(c: &Conn) -> String {
 impl RemoteSet {
     pub fn new(source: Source) -> Self {
         Self { source, remotes: vec![], history: None, history_err: None }
+    }
+    pub fn saved_default_target(s: &Settings, sp: Option<&Path>) -> Option<String> {
+        let default = s.network.default_submit.trim();
+        let (cfg, is_default) = conn_of(s, sp).into_iter().find(|(c, _)| key_of(c) == default)?;
+        let mut remote = Remote::new(Source::Off, key_of(&cfg));
+        remote.seed(&cfg);
+        remote.conn_row_for(&cfg, is_default, &[]).default_target
     }
     pub fn available(&self) -> bool {
         self.source != Source::Off

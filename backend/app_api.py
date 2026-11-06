@@ -330,11 +330,11 @@ class AppEndpoint:
         self._set_iid(iid)
         return iid
 
-    def retire(self, installation_id):
+    def retire(self, installation_id, unused_only=False):
         """Retire a PC that registered here (Retire): refused for this PC itself and while the login has unfinished work."""
         if installation_id == self.live["iid"]:
             raise EndpointError("cannot_retire_self", "this PC's own installation cannot be retired")
-        return {"retired": installation_id, "started_attempts": self.store.revoke(installation_id, only_if_unused=True)}
+        return {"retired": installation_id, "started_attempts": self.store.revoke(installation_id, only_if_unused=True, only_if_offline=bool(unused_only))}
 
     # ---- what the app asks of its own inbox -----------------------------------------------------
 
