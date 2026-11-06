@@ -148,8 +148,8 @@ fn cluster(layout: Layout, badges: &[f32]) -> Vec<Slot> {
         v.extend([Slot::Channel, Slot::Div, Slot::Bg, Slot::Div, Slot::GainIcon, Slot::Gain, Slot::Gap, Slot::GammaIcon, Slot::Gamma, Slot::Gap, Slot::Reset, Slot::Div]);
         v.extend([Slot::Zoom, Slot::Gap, Slot::Fit, Slot::One, Slot::Div, Slot::Wipe, Slot::Gap, Slot::Focus]);
     } else {
-        v.extend([Slot::Info, Slot::Div, Slot::Channel, Slot::Div, Slot::Bg, Slot::Div, Slot::Sliders, Slot::Div, Slot::Zoom, Slot::Gap, Slot::Fit]);
-        if layout == Layout::Medium { v.push(Slot::One) }
+        v.extend([Slot::Info, Slot::Div, Slot::Channel, Slot::Div, Slot::Bg, Slot::Div, Slot::Sliders, Slot::Div, Slot::Zoom]);
+        if layout == Layout::Medium { v.extend([Slot::Gap, Slot::Fit, Slot::One]) }
         v.extend([Slot::Div, Slot::Wipe, Slot::Gap, Slot::Focus]);
     }
     v
