@@ -1261,13 +1261,19 @@ fn output_row(
 ) {
     rows.row_full(selected, false, |ui, cols| {
         let mut checked = checked;
-        let _ = ui.add(Check::new(&mut checked, Some(name)).at(cols.label.min));
+        let check = ui.add(Check::new(&mut checked, Some(name)).at(cols.label.min));
         let t = tokens(ui);
         let p = ui.painter().clone();
+        let value_rect = Rect::from_min_max(
+            egui::pos2(cols.control.min.x.max(check.rect.max.x + 8.0), cols.control.min.y),
+            cols.control.max,
+        );
+        ui.interact(value_rect, ui.scope_id().with(("deliver-out-summary", name)), Sense::hover())
+            .on_hover_text(summary);
         paint_line(
             &p,
-            cols.control,
-            line(&p, summary, ty::mono(), 14.0, cols.control.width()),
+            value_rect,
+            line(&p, summary, ty::mono(), 14.0, value_rect.width()),
             14.0,
             Align::Min,
             if selected {
@@ -1805,10 +1811,16 @@ fn output_row_live(rows: &mut PropRows, name: &str, enabled: bool, selected: boo
         let check = ui.add(Check::new(&mut on, Some(name)).at(cols.label.min));
         let t = tokens(ui);
         let p = ui.painter().clone();
+        let value_rect = Rect::from_min_max(
+            egui::pos2(cols.control.min.x.max(check.rect.max.x + 8.0), cols.control.min.y),
+            cols.control.max,
+        );
+        ui.interact(value_rect, ui.scope_id().with(("deliver-out-summary", name)), Sense::hover())
+            .on_hover_text(summary);
         paint_line(
             &p,
-            cols.control,
-            line(&p, summary, ty::mono(), 14.0, cols.control.width()),
+            value_rect,
+            line(&p, summary, ty::mono(), 14.0, value_rect.width()),
             14.0,
             Align::Min,
             if selected { t.text_primary } else { t.text_secondary },
