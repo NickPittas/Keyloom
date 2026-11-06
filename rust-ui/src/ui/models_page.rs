@@ -110,6 +110,7 @@ pub struct Fixture {
     pub missing_count: Option<usize>,
     pub busy: bool,
     pub install_block: Option<String>,
+    pub required_block: Option<String>,
     pub refresh_block: Option<String>,
     pub operation: Option<OperationInfo>,
     pub last_result: Option<(String, bool)>,
@@ -142,6 +143,7 @@ pub enum Act {
     DownloadAll,
     Cancel,
     Delete(String),
+    Repair(String),
     Refresh,
     Reveal(String),
 }
@@ -339,12 +341,15 @@ impl Page {
             self.confirm_download_all = true;
         }
 
-        let required_enabled = self.fx.catalog_loaded && self.fx.startup_error.is_none() && self.fx.required_missing() && block.is_none();
+        let required_block = self.fx.required_block.as_deref()
+            .or(self.fx.startup_error.as_deref())
+            .or_else(|| self.fx.busy.then_some("Wait for the current model operation to finish."));
+        let required_enabled = self.fx.catalog_loaded && self.fx.startup_error.is_none() && self.fx.required_missing() && required_block.is_none();
         let required = if required_enabled {
             buttons::secondary_button("Install required")
         } else {
             buttons::secondary_button("Install required").disabled(
-                block.unwrap_or(match self.fx.required_status() {
+                required_block.unwrap_or(match self.fx.required_status() {
                     Some(true) => "All required models are present",
                     Some(false) => "No required models can be installed right now",
                     None if self.fx.catalog_loaded => "Required model status is unknown",
@@ -356,6 +361,19 @@ impl Page {
         let required_x = all_x - 8.0 - required_w;
         if ui.add(required.at(Pos2::new(required_x, title.min.y + 11.0))).clicked() {
             acts.push(Act::InstallRequired);
+        }
+
+        let refresh_block = self.fx.refresh_block.as_deref()
+            .or_else(|| self.fx.busy.then_some("Wait for the current model operation to finish."));
+        let refresh = if refresh_block.is_none() {
+            buttons::secondary_button("Refresh status")
+        } else {
+            buttons::secondary_button("Refresh status").disabled(refresh_block.unwrap())
+        };
+        let refresh_w = refresh.natural_width(ui);
+        let refresh_x = required_x - 8.0 - refresh_w;
+        if ui.add(refresh.at(Pos2::new(refresh_x, title.min.y + 11.0))).clicked() {
+            acts.push(Act::Refresh);
         }
 
     }
@@ -431,6 +449,19 @@ impl Page {
 
         // Only a missing model offers an install; present, downloading and other states show no download button (bible §5.12).
         let mut name_right = delete_x - 8.0;
+        if model.state == ModelState::Present {
+            let repair_block = self.fx.startup_error.as_deref()
+                .or_else(|| (!self.fx.catalog_loaded).then_some("Model catalog is unavailable."))
+                .or_else(|| self.fx.busy.then_some("Wait for the current model operation to finish."))
+                .or_else(|| (!model.can_delete()).then_some("This model cannot be repaired here."));
+            let repair = if repair_block.is_none() { buttons::secondary_button("Repair") } else { buttons::secondary_button("Repair").disabled(repair_block.unwrap()) };
+            let repair_w = repair.natural_width(ui);
+            let repair_x = delete_x - 8.0 - repair_w;
+            if ui.add(repair.at(Pos2::new(repair_x, rect.min.y + 5.0))).clicked() {
+                acts.push(Act::Repair(model.id.clone()));
+            }
+            name_right = repair_x - 8.0;
+        }
         if model.state == ModelState::Missing {
             let download_block = self.fx.startup_error.as_deref()
                 .or_else(|| (!self.fx.catalog_loaded).then_some("Model catalog is unavailable."))

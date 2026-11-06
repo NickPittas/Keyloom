@@ -41,6 +41,7 @@ from backend.model_catalog import (
     FileSpec,
     hf_cache_snapshot_path,
     hf_hub_cache_dir,
+    hf_hub_cache_dirs,
 )
 
 HASH_CACHE_NAME = "model_verify.json"
@@ -67,6 +68,9 @@ class Roots:
     v2_package_root: Path
     hf_cache: Path
     cache_dir: Path
+    legacy_data_dirs: tuple[Path, ...] = ()
+    legacy_models_dirs: tuple[Path, ...] = ()
+    hf_caches: tuple[Path, ...] = ()
 
     @classmethod
     def defaults(
@@ -78,6 +82,7 @@ class Roots:
     ) -> "Roots":
         from backend import install_paths, v2_paths
 
+        explicit_hf = hf_cache is not None
         if v2_models_dir is None:
             v2_models_dir = v2_paths.get_v2_models_dir()  # env → descriptor → platform
         install = install_paths.discover()
@@ -85,12 +90,33 @@ class Roots:
             data_dir = _default_data_dir(install)
         if cache_dir is None:
             cache_dir = _default_cache_dir(install, Path(data_dir))
+        package_root = v2_paths.get_v2_package_root()
+        from backend.install_paths import platform_user_data
+        fallback_data = platform_user_data()
+        legacy_data = tuple(p for p in (fallback_data, package_root, package_root.parent)
+                            if p is not None and Path(p) != Path(data_dir))
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            fallback_models = Path(local) / "Keyloom" / "EngineV2"
+        elif sys.platform == "win32":
+            fallback_models = Path.home() / "AppData" / "Local" / "Keyloom" / "EngineV2"
+        elif sys.platform == "darwin":
+            fallback_models = Path.home() / "Library" / "Application Support" / "Keyloom" / "EngineV2"
+        else:
+            xdg = os.environ.get("XDG_DATA_HOME")
+            fallback_models = (Path(xdg) if xdg else Path.home() / ".local" / "share") / "Keyloom" / "EngineV2"
+        legacy_models = (fallback_models,) if fallback_models != Path(v2_models_dir) else ()
+        caches = tuple(dict.fromkeys(
+            ([Path(hf_cache)] if explicit_hf else []) + list(hf_hub_cache_dirs())))
         return cls(
             data_dir=Path(data_dir),
             v2_models_dir=Path(v2_models_dir),
-            v2_package_root=v2_paths.get_v2_package_root(),
+            v2_package_root=package_root,
             hf_cache=Path(hf_cache) if hf_cache else hf_hub_cache_dir(),
             cache_dir=Path(cache_dir),
+            legacy_data_dirs=legacy_data,
+            legacy_models_dirs=legacy_models,
+            hf_caches=caches,
         )
 
 
@@ -286,9 +312,11 @@ class StatusChecker:
         self.catalog = catalog
         self.roots = roots
         self.hash_cache = HashCache(roots.cache_dir / HASH_CACHE_NAME)
+        self._selected_dirs: dict[str, Path] = {}
 
     # -- path resolution -------------------------------------------------
-    def artifact_dir(self, art: Artifact) -> Path | None:
+    def destination_dir(self, art: Artifact) -> Path | None:
+        """Canonical writable destination; discovery never redirects downloads."""
         if art.kind == "local_package":
             return None
         if art.kind == "hf_cache_file":
@@ -300,11 +328,101 @@ class StatusChecker:
             return None
         return base / art.layout_rel if art.layout_rel else base
 
-    def file_path(self, art: Artifact, f: FileSpec) -> Path | None:
+    def _candidate_dirs(self, art: Artifact) -> tuple[Path, ...]:
+        if art.kind == "local_package":
+            return ()
+        if art.kind == "hf_cache_file" and art.repo_id:
+            layout_candidates = [self.destination_dir(art)]
+        else:
+            root_map = {
+                "v2_models_dir": (self.roots.v2_models_dir, *self.roots.legacy_models_dirs),
+                "data_dir": (self.roots.data_dir, *self.roots.legacy_data_dirs),
+                "v2_package_root": (self.roots.v2_package_root,),
+            }
+            bases = root_map.get(art.layout_root or "", ())
+            suffix = Path(art.layout_rel) if art.layout_rel else Path()
+            layout_candidates = [Path(base) / suffix for base in bases]
+        if art.kind.startswith("hf_") and art.repo_id:
+            roots = self.roots.hf_caches or (self.roots.hf_cache,)
+            repo = f"models--{art.repo_id.replace('/', '--')}"
+            for cache in roots:
+                snapshots = Path(cache) / repo / "snapshots"
+                pinned = snapshots / art.revision if art.revision else None
+                if pinned is not None:
+                    layout_candidates.append(pinned)
+                if snapshots.is_dir():
+                    layout_candidates.extend(sorted((p for p in snapshots.iterdir() if p.is_dir() and p != pinned),
+                                                    key=lambda p: p.name))
+        if art.id == "matanyone2":
+            layout_candidates.append(self.roots.v2_package_root.parent / "pretrained_models")
+        return tuple(dict.fromkeys(p for p in layout_candidates if p is not None))
+
+    def is_hf_snapshot_dir(self, art: Artifact, root: Path) -> bool:
+        if not art.kind.startswith("hf_") or not art.repo_id:
+            return False
+        repo = f"models--{art.repo_id.replace('/', '--')}"
+        return any(Path(root).parent == Path(cache) / repo / "snapshots"
+                   for cache in (self.roots.hf_caches or (self.roots.hf_cache,)))
+
+    def _file_at(self, art: Artifact, root: Path, f: FileSpec) -> Path:
         if art.kind == "hf_cache_file":
-            return hf_cache_snapshot_path(self.roots.hf_cache, art.repo_id, art.revision, art.hf_filename)
+            return root / str(art.hf_filename)
+        if art.kind.startswith("hf_") and art.repo_id and self.is_hf_snapshot_dir(art, root):
+            return root / f.path
+        path = root / f.layout_path
+        if art.id == "videomama":
+            if f.layout_path.endswith("/unet/config.json"):
+                alternatives = (root / "VideoMaMa" / "config.json",)
+            elif f.layout_path.endswith("/unet/diffusion_pytorch_model.safetensors"):
+                alternatives = (root / "VideoMaMa" / "diffusion_pytorch_model.safetensors",
+                                root / "VideoMaMa" / "weights.safetensors")
+            else:
+                alternatives = ()
+            if not self._is_size_match(path, f):
+                path = next((candidate for candidate in alternatives if self._is_size_match(candidate, f)), path)
+        return path
+
+    def _is_size_match(self, path: Path, f: FileSpec) -> bool:
+        try:
+            return f.size is not None and path.is_file() and path.stat().st_size == f.size
+        except OSError:
+            return False
+
+    def artifact_dir(self, art: Artifact) -> Path | None:
+        if art.kind == "local_package":
+            return None
+        if art.id in self._selected_dirs:
+            return self._selected_dirs[art.id]
+        dest = self.destination_dir(art)
+        candidates = self._candidate_dirs(art)
+        if dest is None:
+            return None
+        if not candidates:
+            self._selected_dirs[art.id] = dest
+            return dest
+        files = art.required_files()
+        if art.kind == "hf_cache_file":
+            files = art.required_files()[:1]
+        best, best_score = dest, -1
+        for root in candidates:
+            score = sum(self._is_size_match(self._file_at(art, root, f), f) for f in files)
+            if score > best_score:
+                best, best_score = root, score
+            if score == len(files) and files:
+                best = root
+                break
+        self._selected_dirs[art.id] = best
+        return best
+
+    def refresh_paths(self, art: Artifact) -> None:
+        self._selected_dirs.pop(art.id, None)
+
+    def candidate_file_paths(self, art: Artifact, f: FileSpec) -> tuple[Path, ...]:
+        return tuple(dict.fromkeys(self._file_at(art, root, f) for root in self._candidate_dirs(art)))
+
+    def file_path(self, art: Artifact, f: FileSpec) -> Path | None:
         d = self.artifact_dir(art)
-        return (d / f.layout_path) if d else None
+        return self._file_at(art, d, f) if d else None
 
     # -- status (offline, no hashing) ------------------------------------
     def check_artifact(self, art: Artifact) -> dict:
@@ -370,6 +488,7 @@ class StatusChecker:
             "revision_status": art.revision_status,
             "gated": art.gated,
             "path": str(self.artifact_dir(art)) if self.artifact_dir(art) else None,
+            "can_delete": self.artifact_dir(art) == self.destination_dir(art),
             "problems": problems,
             "verified": verified,
             "verify_state": ("verified" if verified else

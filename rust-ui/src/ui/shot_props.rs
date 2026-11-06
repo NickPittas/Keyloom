@@ -177,7 +177,7 @@ pub struct BarProps {
     pub primary_enabled: bool,
     pub primary_reason: Option<String>,
     pub secondary: Option<(String, bool)>,
-    pub menu: Vec<(String, bool)>,
+    pub menu: Vec<(String, bool, Option<String>)>,
     /// (message, fix button label).
     pub blocker: Option<(String, Option<String>)>,
     pub status: Option<String>,
@@ -358,6 +358,7 @@ pub struct DeliverPresetProps {
 #[derive(Clone, Debug)]
 pub struct DeliverProps {
     pub outputs: Vec<DeliverOutputProps>,
+    pub confirm_existing: Option<Vec<String>>,
     /// Shared EXR compression: current value, the values on offer, and its notes.
     pub compression: String,
     pub compression_choices: Vec<String>,
@@ -411,6 +412,7 @@ pub struct LiveProps {
 /// Values are the app's own strings (producer/finish ids, "green"/"blue", tool ids).
 #[derive(Clone, Debug, PartialEq)]
 pub enum HintAct {
+    ChooseMovie,
     Bypass(bool),
     Producer(String),
     BirefnetVariant(String),
@@ -1259,13 +1261,21 @@ fn output_row(
 ) {
     rows.row_full(selected, false, |ui, cols| {
         let mut checked = checked;
-        let _ = ui.add(Check::new(&mut checked, Some(name)).at(cols.label.min));
+        let check = ui.add(Check::new(&mut checked, None).at(cols.label.min));
         let t = tokens(ui);
         let p = ui.painter().clone();
+        let name_rect = Rect::from_min_max(egui::pos2(check.rect.max.x + 6.0, check.rect.top()), cols.label.max);
+        paint_line(&p, name_rect, line(&p, name, ty::label(), 16.0, name_rect.width()), 16.0, Align::Min, t.text_primary, 0.0);
+        let value_rect = Rect::from_min_max(
+            egui::pos2(cols.control.min.x.max(check.rect.max.x + 8.0), cols.control.min.y),
+            cols.control.max,
+        );
+        ui.interact(value_rect, ui.scope_id().with(("deliver-out-summary", name)), Sense::hover())
+            .on_hover_text(summary);
         paint_line(
             &p,
-            cols.control,
-            line(&p, summary, ty::mono(), 14.0, cols.control.width()),
+            value_rect,
+            line(&p, summary, ty::mono(), 14.0, value_rect.width()),
             14.0,
             Align::Min,
             if selected {
@@ -1302,8 +1312,17 @@ fn draw_live(ui: &mut Ui, rect: Rect, fx: &Fixture, lp: &LiveProps) -> Vec<PropA
         None
     } else {
         Some(Box::new(|ui: &mut Ui| {
-            for (label, on) in &b.menu {
-                if ui.add_enabled(*on, egui::Button::new(label)).clicked() {
+            for (label, on, reason) in &b.menu {
+                let response = ui.add_enabled(*on, egui::Button::new(label));
+                let response = if !on {
+                    match reason {
+                        Some(r) => response.on_disabled_hover_text(r),
+                        None => response,
+                    }
+                } else {
+                    response
+                };
+                if response.clicked() {
                     picked = Some(label.clone());
                 }
             }
@@ -1431,7 +1450,7 @@ fn key_live(body: &mut PropBody, k: &KeyProps, acts: &mut Vec<PropAct>) {
             return;
         }
         let tip = format!("Machine\nRendering on {}", k.machine_effective);
-        r.row("Machine", &tip, |ui| {
+        r.row(&marked_label("Machine", !k.inherited), &tip, |ui| {
             let items: Vec<_> = k
                 .machines
                 .iter()
@@ -1458,35 +1477,47 @@ fn key_live(body: &mut PropBody, k: &KeyProps, acts: &mut Vec<PropAct>) {
     });
     section(body, "Key", KEY_SECTIONS[1], None, |r| {
         dropdown_row(r, "key-model", "Model", "Model\nKey engine", 0, &[k.model.as_str()]);
-        if let Some(v) = choice_row(r, "key-vram", "VRAM profile", "VRAM profile\nNeither caps memory.", &k.vram, &k.vram_choices) {
+        let vram = marked_label("VRAM profile", k.overridden.vram);
+        if let Some(v) = choice_row(r, "key-vram", &vram, "VRAM profile\nNeither caps memory.", &k.vram, &k.vram_choices) {
             push(KeyAct::Vram(v));
         }
-        if let Some(v) = choice_row(r, "key-temporal", "Temporal", "Temporal\nNeighbouring frames seen by the key", &k.temporal, &k.temporal_choices) {
+        let temporal = marked_label("Temporal", k.overridden.temporal);
+        if let Some(v) = choice_row(r, "key-temporal", &temporal, "Temporal\nNeighbouring frames seen by the key", &k.temporal, &k.temporal_choices) {
             push(KeyAct::Temporal(v));
         }
     });
     section(body, "Key", KEY_SECTIONS[2], None, |r| {
-        if let Some(v) = choice_row(r, "key-hint-mode", "Hint mode", "Hint mode\nHow hints guide the key", &k.hint_mode, &k.hint_mode_choices) {
+        let mode = marked_label("Hint mode", k.overridden.hint_mode);
+        if let Some(v) = choice_row(r, "key-hint-mode", &mode, "Hint mode\nHow hints guide the key", &k.hint_mode, &k.hint_mode_choices) {
             push(KeyAct::HintMode(v));
         }
-        if let Some(v) = number_row(r, "Hint quality", "Hint quality", "key-hint-quality", k.hint_quality, NumSpec::new(0.95, 0.0, 1.0, 0.01, 3), true, None, true) {
+        let quality = marked_label("Hint quality", k.overridden.hint_quality);
+        if let Some(v) = number_row(r, &quality, "Hint quality", "key-hint-quality", k.hint_quality, NumSpec::new(0.95, 0.0, 1.0, 0.01, 3), true, None, true) {
             push(KeyAct::HintQuality(v as f32));
         }
-        if let Some(v) = check_row(r, "Carry hint", "Carry hint\nUse the hint between temporal windows", k.carry_hint) {
+        let carry = marked_label("Carry hint", k.overridden.carry_hint);
+        if let Some(v) = check_row(r, &carry, "Carry hint\nUse the hint between temporal windows", k.carry_hint) {
             push(KeyAct::CarryHint(v));
         }
-        if let Some(v) = number_row(r, "Carry quality", "Carry hint quality · between temporal windows", "key-carry-quality", k.carry_hint_quality, NumSpec::new(0.95, 0.0, 1.0, 0.01, 3), true, None, true) {
+        let carry_quality = marked_label("Carry quality", k.overridden.carry_hint_quality);
+        if let Some(v) = number_row(r, &carry_quality, "Carry hint quality · between temporal windows", "key-carry-quality", k.carry_hint_quality, NumSpec::new(0.95, 0.0, 1.0, 0.01, 3), true, None, true) {
             push(KeyAct::CarryHintQuality(v as f32));
         }
     });
     section(body, "Key", KEY_SECTIONS[3], None, |r| {
-        if let Some(v) = number_row(r, "Despill strength", "Despill strength", "key-despill", k.despill, NumSpec::unit_float(0.5), true, None, true) {
+        let despill = marked_label("Despill strength", k.overridden.despill);
+        if let Some(v) = number_row(r, &despill, "Despill strength", "key-despill", k.despill, NumSpec::unit_float(0.5), true, None, true) {
             push(KeyAct::Despill(v as f32));
         }
     });
     section(body, "Key", KEY_SECTIONS[4], None, |r| {
-        if let Some(v) = check_row(r, "Linear cutout", "Linear cutout\nUse a linear cutout for supported output", k.cutout_linear) {
+        let cutout = marked_label("Linear cutout", k.overridden.cutout_linear);
+        if let Some(v) = check_row(r, &cutout, "Linear cutout\nUse a linear cutout for supported output", k.cutout_linear) {
             push(KeyAct::CutoutLinear(v));
+        }
+        let overrides = key_override_names(k);
+        if !overrides.is_empty() {
+            r.readonly("Shot overrides", &overrides.join(", "));
         }
         if let Some(label) = &k.reset_label {
             if button_row(r, "Overrides", "Return this shot's changed values", label, true, "") {
@@ -1517,14 +1548,40 @@ fn frames_text(s: &StageProps) -> String {
     if s.stale { format!("{n} · out of date") } else { n }
 }
 
+fn marked_label(label: &str, overridden: bool) -> String {
+    if overridden { format!("{label} *") } else { label.to_owned() }
+}
+
+fn key_override_names(k: &KeyProps) -> Vec<&'static str> {
+    let o = &k.overridden;
+    [
+        (k.machine.is_some(), "Machine"),
+        (o.vram, "VRAM profile"),
+        (o.temporal, "Temporal"),
+        (o.hint_mode, "Hint mode"),
+        (o.hint_quality, "Hint quality"),
+        (o.carry_hint, "Carry hint"),
+        (o.carry_hint_quality, "Carry quality"),
+        (o.despill, "Despill strength"),
+        (o.cutout_linear, "Linear cutout"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect()
+}
+
 fn hint_live(body: &mut PropBody, h: &HintProps, acts: &mut Vec<PropAct>) {
     let mut push = |a: HintAct| acts.push(PropAct::Hint(a));
     let mut paths: Vec<PropAct> = Vec::new();
     let err = property::Status::Error;
     let warn = property::Status::Warning;
     section(body, "Hint", "Hint", None, |r| {
+        r.readonly("Work", "Pre-matte and hint run on the local worker. Key runs on the client assigned to this clip.");
         if let Some(v) = check_row(r, "Bypass hint", "Bypass hint\nKey without a hint; your hint settings and frames are kept", h.bypass) {
             push(HintAct::Bypass(v));
+        }
+        if !h.route.overrides.is_empty() {
+            r.readonly("Shot overrides", &h.route.overrides.join(", "));
         }
         if let Some(label) = &h.route.reset_label {
             let tip = format!("Return this shot's own hint settings ({})", h.route.overrides.join(", "));
@@ -1705,8 +1762,11 @@ fn hint_live(body: &mut PropBody, h: &HintProps, acts: &mut Vec<PropAct>) {
             }
         });
     }
-    if let Some(m) = &h.movie {
-        section(body, "Hint", "Import source", None, |r| {
+    section(body, "Hint", "Import source", None, |r| {
+        if button_row(r, "Movie", "Choose a companion alpha or mask movie", "Choose movie…", true, "") {
+            push(HintAct::ChooseMovie);
+        }
+        if let Some(m) = &h.movie {
             let click = path_row(r, "Movie", "Companion movie", &m.path.to_string_lossy(), false);
             path_acts(click, &m.path, &mut paths);
             let sel = usize::from(m.as_mask);
@@ -1729,12 +1789,14 @@ fn hint_live(body: &mut PropBody, h: &HintProps, acts: &mut Vec<PropAct>) {
             if button_row(r, "Cancel", "Drop the picked movie", "Cancel import", true, "") {
                 push(HintAct::CancelMovie);
             }
-        });
-    }
+        }
+    });
     acts.extend(paths);
 }
 
 const FPS_PRESETS: [f64; 8] = [23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0];
+const EXISTING_EXPORT_SUPPORT: &str = "Existing Key export writes selected video outputs only; audio is not included.";
+const VIDEO_EXPORT_NOTE: &str = "Audio is not included. Files: <clip>_<output>_<in>-<out>.<mp4|mov|webm>; an existing file is never replaced.";
 
 fn exr_label(s: &str) -> String {
     if s == "none" { "None".to_owned() } else { s.to_uppercase() }
@@ -1748,13 +1810,21 @@ fn output_row_live(rows: &mut PropRows, name: &str, enabled: bool, selected: boo
             .interact(cols.row, ui.scope_id().with(("deliver-out-row", name)), Sense::click())
             .on_hover_text("Select to edit its format below");
         let mut on = enabled;
-        let check = ui.add(Check::new(&mut on, Some(name)).at(cols.label.min));
+        let check = ui.add(Check::new(&mut on, None).at(cols.label.min));
         let t = tokens(ui);
         let p = ui.painter().clone();
+        let name_rect = Rect::from_min_max(egui::pos2(check.rect.max.x + 6.0, check.rect.top()), cols.label.max);
+        paint_line(&p, name_rect, line(&p, name, ty::label(), 16.0, name_rect.width()), 16.0, Align::Min, t.text_primary, 0.0);
+        let value_rect = Rect::from_min_max(
+            egui::pos2(cols.control.min.x.max(check.rect.max.x + 8.0), cols.control.min.y),
+            cols.control.max,
+        );
+        ui.interact(value_rect, ui.scope_id().with(("deliver-out-summary", name)), Sense::hover())
+            .on_hover_text(summary);
         paint_line(
             &p,
-            cols.control,
-            line(&p, summary, ty::mono(), 14.0, cols.control.width()),
+            value_rect,
+            line(&p, summary, ty::mono(), 14.0, value_rect.width()),
             14.0,
             Align::Min,
             if selected { t.text_primary } else { t.text_secondary },
@@ -1833,13 +1903,21 @@ fn deliver_live(body: &mut PropBody, d: &DeliverProps, acts: &mut Vec<PropAct>) 
     });
     section_with(body, "Deliver", "Outputs", badge, Some(menu), |r| {
         for (i, o) in d.outputs.iter().enumerate() {
-            let (on, clicked) = output_row_live(r, &o.title, o.enabled, i == sel, &o.summary);
+            let title = marked_label(&o.title, o.enabled_overridden || o.format_overridden || o.delivery_overridden);
+            let (on, clicked) = output_row_live(r, &title, o.enabled, i == sel, &o.summary);
             if let Some(v) = on {
                 push(DeliverAct::SetEnabled { output: i, on: v });
             }
             if clicked {
                 new_sel = i;
             }
+        }
+        if let Some(existing) = &d.confirm_existing {
+            if !existing.is_empty() { r.readonly("Existing results", &existing.join(", ")); }
+            r.message(warn, &format!("The full workflow may rerun Pre-matte, Hint and Key. {EXISTING_EXPORT_SUPPORT}"));
+        }
+        if !d.overridden.is_empty() {
+            r.readonly("Shot overrides", &d.overridden.join(", "));
         }
         for why in &d.out_of_date_why {
             r.message(warn, why);
@@ -1865,14 +1943,16 @@ fn deliver_live(body: &mut PropBody, d: &DeliverProps, acts: &mut Vec<PropAct>) 
                 r.readonly("Output", "Not written · tick it in Outputs");
                 return;
             }
-            r.row_or_stacked("File type", "File type\nImage sequence or one video file", 174.0, |ui| {
+            let kind_label = marked_label("File type", o.delivery_overridden);
+            r.row_or_stacked(&kind_label, "File type\nImage sequence or one video file", 174.0, |ui| {
                 if let Some(v) = seg_row(ui, "File type", &["Image sequence", "Video file"], usize::from(o.video.is_some())) {
                     push(DeliverAct::SetKind { output: sel, video: v == 1 });
                 }
             });
             match &o.video {
                 None => {
-                    r.row("Format", "Format\nImage format of every frame", |ui| {
+                    let format_label = marked_label("Format", o.format_overridden);
+                    r.row(&format_label, "Format\nImage format of every frame", |ui| {
                         if let Some(v) = seg_row(ui, "Format", &["EXR", "PNG"], usize::from(!o.exr)) {
                             push(DeliverAct::SetSeqFormat { output: sel, exr: v == 0 });
                         }
@@ -1882,7 +1962,8 @@ fn deliver_live(body: &mut PropBody, d: &DeliverProps, acts: &mut Vec<PropAct>) 
                         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                         let cur = d.compression_choices.iter().position(|c| *c == d.compression).unwrap_or(0);
                         let tip = format!("Compression\n{}", d.compression_note);
-                        if let Some(i) = dropdown_row(r, "deliver-compression", "Compression", &tip, cur, &refs) {
+                        let compression = marked_label("Compression", d.compression_overridden);
+                        if let Some(i) = dropdown_row(r, "deliver-compression", &compression, &tip, cur, &refs) {
                             if let Some(c) = d.compression_choices.get(i) {
                                 push(DeliverAct::SetCompression(c.clone()));
                             }
@@ -1928,18 +2009,21 @@ fn deliver_live(body: &mut PropBody, d: &DeliverProps, acts: &mut Vec<PropAct>) 
                     },
                 };
                 let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-                if let Some(i) = dropdown_row(r, "deliver-fps", "Frame rate", "Frame rate\nShared by every video output", cur, &refs) {
+                let fps_label = marked_label("Frame rate", d.fps_overridden);
+                if let Some(i) = dropdown_row(r, "deliver-fps", &fps_label, "Frame rate\nShared by every video output", cur, &refs) {
                     if i == 0 {
                         push(DeliverAct::UseSourceFps);
                     } else if let Some(f) = FPS_PRESETS.get(i - 1) {
                         push(DeliverAct::SetFps(*f));
                     }
                 }
-                r.row48_tip("Range", "Range\nIn/Out frames, or only the frames the Key run finished", |ui| {
+                let range_label = marked_label("Range", d.done_frames_overridden);
+                r.row48_tip(&range_label, "Range\nIn/Out frames, or only the frames the Key run finished", |ui| {
                     if let Some(v) = seg_row(ui, "Range", &["In/Out", "Done frames"], usize::from(d.done_frames)) {
                         push(DeliverAct::SetRange { done_frames: v == 1 });
                     }
                 });
+                r.readonly("Video export", VIDEO_EXPORT_NOTE);
             }
         });
     }
@@ -1947,7 +2031,8 @@ fn deliver_live(body: &mut PropBody, d: &DeliverProps, acts: &mut Vec<PropAct>) 
     if d.has_video {
         let dest = PathBuf::from(&d.dest_resolved);
         section_with(body, "Deliver", "Destination", None, None, |r| {
-            let click = path_row(r, "Output", "Output folder", &d.dest_resolved, false);
+            let output_label = marked_label("Output", d.dest_overridden);
+            let click = path_row(r, &output_label, "Output folder", &d.dest_resolved, false);
             path_acts(click, &dest, &mut paths);
             if button_row(r, "Folder", "Choose where video files are written", "Choose folder…", true, "") {
                 push(DeliverAct::ChooseExportDir);
@@ -2185,11 +2270,19 @@ fn media_live(body: &mut PropBody, m: &MediaProps, acts: &mut Vec<PropAct>) {
 
 fn review_live(body: &mut PropBody, v: &ReviewProps, acts: &mut Vec<PropAct>) {
     let mut push = |a: ReviewAct| acts.push(PropAct::Review(a));
+    let has_result = !v.frames.is_empty() || v.last_run.is_some();
     section(body, "Review", "Result", None, |r| {
-        for (name, frames) in &v.frames {
-            r.readonly(name, frames);
+        if has_result {
+            for (name, frames) in &v.frames {
+                r.readonly(name, frames);
+            }
+            r.readonly("Last run", v.last_run.as_deref().unwrap_or("Unknown"));
+        } else {
+            r.readonly("Result", "No result yet · Key this shot to review it.");
+            if button_row(r, "Key", "Open Key for this shot", "Go to Key", true, "") {
+                push(ReviewAct::GoToKey);
+            }
         }
-        r.readonly("Last run", v.last_run.as_deref().unwrap_or("Unknown"));
     });
     section(body, "Review", "Compare", None, |r| {
         let views: Vec<&str> = v.views.iter().map(String::as_str).collect();
@@ -2213,21 +2306,49 @@ fn review_live(body: &mut PropBody, v: &ReviewProps, acts: &mut Vec<PropAct>) {
             }
         });
     });
-    section(body, "Review", "Checks", None, |r| {
-        let missing = if v.missing_frames == 0 { "None".to_owned() } else { v.missing_frames.to_string() };
-        r.readonly("Missing frames", &missing);
-        let range = match v.out_of_range {
-            None => "Not measured".to_owned(),
-            Some((0, 0)) => "None".to_owned(),
-            Some((lo, hi)) => format!("{lo} below 0 · {hi} above 1"),
-        };
-        r.readonly("Out of range", &range);
-    });
+    if has_result {
+        section(body, "Review", "Checks", None, |r| {
+            let missing = if v.missing_frames == 0 { "None".to_owned() } else { v.missing_frames.to_string() };
+            r.readonly("Missing frames", &missing);
+            let range = match v.out_of_range {
+                None => "Not measured".to_owned(),
+                Some((0, 0)) => "None".to_owned(),
+                Some((lo, hi)) => format!("{lo} below 0 · {hi} above 1"),
+            };
+            r.readonly("Out of range", &range);
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::KEY_SECTIONS;
+    use super::*;
+    use egui::{Event, PointerButton, Pos2, RawInput, Rect, Vec2};
+
+    fn live_frame(ctx: &egui::Context, fx: &Fixture, lp: &LiveProps, events: Vec<Event>) -> (Vec<egui::epaint::ClippedShape>, Vec<PropAct>) {
+        let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 900.0))), events, ..Default::default() };
+        let mut acts = vec![];
+        let mut output = ctx.run_ui(raw, |ui| acts = draw_live(ui, ui.max_rect(), fx, lp));
+        output.textures_delta.clear();
+        (output.shapes, acts)
+    }
+
+    fn find_text(shapes: &[egui::epaint::ClippedShape], want: &str) -> Option<Pos2> {
+        fn find(shape: &egui::Shape, want: &str) -> Option<Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == want => Some(t.pos + t.galley.size() * 0.5),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, want)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|s| find(&s.shape, want))
+    }
+
+    fn click(ctx: &egui::Context, fx: &Fixture, lp: &LiveProps, p: Pos2) -> Vec<PropAct> {
+        live_frame(ctx, fx, lp, vec![Event::PointerMoved(p)]);
+        live_frame(ctx, fx, lp, vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+        live_frame(ctx, fx, lp, vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Default::default() }]).1
+    }
 
     #[test]
     fn shot_props_key_section_order_matches_the_shot_spec() {
@@ -2235,5 +2356,59 @@ mod tests {
             KEY_SECTIONS,
             ["Render", "Key engine", "Hint", "Despill", "Cutout"]
         );
+    }
+
+    #[test]
+    fn companion_movie_picker_is_a_clickable_hint_property_without_a_selection() {
+        let ctx = egui::Context::default();
+        let fx = Fixture { stage: "Hint".into(), live: true, ..Default::default() };
+        let lp = LiveProps { hint: Some(HintProps::default()), ..Default::default() };
+        let (shapes, _) = live_frame(&ctx, &fx, &lp, vec![]);
+        let p = find_text(&shapes, "Choose movie…").expect("movie choice in Hint properties");
+        assert!(click(&ctx, &fx, &lp, p).contains(&PropAct::Hint(HintAct::ChooseMovie)));
+    }
+
+    #[test]
+    fn review_compare_controls_remain_visible_without_a_result() {
+        let ctx = egui::Context::default();
+        let fx = Fixture { stage: "Review".into(), live: true, ..Default::default() };
+        let lp = LiveProps { review: Some(ReviewProps::default()), ..Default::default() };
+        let (shapes, _) = live_frame(&ctx, &fx, &lp, vec![]);
+        assert!(find_text(&shapes, "No result yet · Key this shot to review it.").is_some());
+        assert!(find_text(&shapes, "Compare").is_some());
+        let p = find_text(&shapes, "Go to Key").expect("empty-state action");
+        assert!(click(&ctx, &fx, &lp, p).contains(&PropAct::Review(ReviewAct::GoToKey)));
+    }
+
+    #[test]
+    fn hint_properties_explain_where_each_stage_runs() {
+        let ctx = egui::Context::default();
+        let fx = Fixture { stage: "Hint".into(), live: true, ..Default::default() };
+        let lp = LiveProps { hint: Some(HintProps::default()), ..Default::default() };
+        let (shapes, _) = live_frame(&ctx, &fx, &lp, vec![]);
+        assert!(find_text(&shapes, "Work").is_some());
+        assert!(find_text(&shapes, "Pre-matte and hint run on the local worker. Key runs on the client assigned to this clip.").is_some());
+    }
+
+    #[test]
+    fn override_fields_are_marked_and_listed() {
+        let mut key = KeyProps::default();
+        key.overridden.hint_mode = true;
+        key.overridden.despill = true;
+        assert!(marked_label("Hint mode", key.overridden.hint_mode).ends_with(" *"));
+        assert_eq!(key_override_names(&key), ["Hint mode", "Despill strength"]);
+        let ctx = egui::Context::default();
+        let fx = Fixture { stage: "Key".into(), live: true, ..Default::default() };
+        let lp = LiveProps { key: Some(key), ..Default::default() };
+        let (shapes, _) = live_frame(&ctx, &fx, &lp, vec![]);
+        assert!(find_text(&shapes, "Hint mode *").is_some());
+        assert!(find_text(&shapes, "Despill strength *").is_some());
+        assert!(find_text(&shapes, "Shot overrides").is_some());
+    }
+
+    #[test]
+    fn deliver_confirmation_describes_only_supported_export_types() {
+        assert_eq!(EXISTING_EXPORT_SUPPORT, "Existing Key export writes selected video outputs only; audio is not included.");
+        assert_eq!(VIDEO_EXPORT_NOTE, "Audio is not included. Files: <clip>_<output>_<in>-<out>.<mp4|mov|webm>; an existing file is never replaced.");
     }
 }

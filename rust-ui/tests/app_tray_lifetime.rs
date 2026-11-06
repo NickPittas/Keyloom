@@ -1,6 +1,6 @@
 //! A13: tray lifetime. Real `App::frame` + fake worker (stdlib Python, no GPU), a channel-fed tray instead of a desktop tray.
-//! Close hides to the tray while the driver keeps working; Show restores; both Quit routes ask first and stop the endpoint, then the
-//! workers; a failed tray leaves Close as a normal quit. Run through tools/isolated-test.sh, one test per command.
+//! Close hides to the tray while the driver keeps working; Show restores; both Quit routes ask first and stop the workers, then the endpoint,
+//! and a failed tray leaves Close as a normal quit. Run through tools/isolated-test.sh, one test per command.
 use ck::scheduler::JobState;
 use ck::ui::tray::{Tray, TrayCmd};
 use ck::ui::{App, AppOptions};
@@ -100,7 +100,11 @@ fn run(ctx: &egui::Context, app: &mut App, events: Vec<Event>) {
         events,
         ..Default::default()
     };
-    let mut out = ctx.run_ui(raw, |ui| app.frame(ui));
+    let mut native_frame = eframe::Frame::_new_kittest();
+    let mut out = ctx.run_ui(raw, |ui| {
+        eframe::App::logic(app, ui.ctx(), &mut native_frame);
+        app.frame(ui);
+    });
     out.textures_delta.clear();
 }
 
@@ -235,7 +239,7 @@ fn first_close_shows_the_tray_note_before_hiding() {
     assert!(!e.base.join("tray-note-shown").exists());
 }
 
-/// Quit while a job runs: the question appears; "Stop work, then quit" stops the endpoint, then the workers, then the window closes.
+/// Quit while a job runs: the question appears; "Stop work, then quit" stops the workers, settles receive work, then stops the endpoint.
 fn quit_route(tag: &str, via_tray: bool) {
     let (_e, ctx, mut app) = with_job(tag, "slow1", 5);
     let (tray, tx) = Tray::channel();
@@ -265,10 +269,11 @@ fn quit_route(tag: &str, via_tray: bool) {
     let [stop, _keep, _quit] = app.close_rects()[..] else { panic!("three buttons: {:?}", app.close_rects()) };
     click_on(&ctx, &mut app, stop.center());
     assert_eq!(app.close_state(), ck::ui::CloseState::Stopping);
-    assert_eq!(app.shutdown_steps(), ["endpoint", "workers"]);
+    assert_eq!(app.shutdown_steps(), ["workers"]);
     let end = Instant::now() + Duration::from_secs(20);
     loop {
         if frame(&ctx, &mut app, false, vec![]).iter().any(|c| matches!(c, ViewportCommand::Close)) {
+            assert_eq!(app.shutdown_steps(), ["workers", "endpoint"]);
             break;
         }
         assert!(Instant::now() < end, "never closed: {:?}", app.ai().stopping_lines());
@@ -277,12 +282,12 @@ fn quit_route(tag: &str, via_tray: bool) {
 }
 
 #[test]
-fn tray_quit_asks_then_stops_endpoint_then_workers() {
+fn tray_quit_asks_then_stops_workers_then_endpoint() {
     quit_route("quit-tray", true);
 }
 
 #[test]
-fn file_quit_asks_then_stops_endpoint_then_workers() {
+fn file_quit_asks_then_stops_workers_then_endpoint() {
     quit_route("quit-file", false);
 }
 

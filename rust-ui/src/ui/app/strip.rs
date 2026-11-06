@@ -2,7 +2,8 @@
 //! `activity::Model`. It is shown as the status-bar Activity popover (`activity_popover`) or as the old fixed
 //! strip (`activity_strip`); both paint the same details list and carry out the same buttons.
 use super::*;
-use crate::ui::activity::{self, Act, Cancel, Level, Step};
+use crate::ui::activity::{self, Cancel, Level, Step};
+use crate::ui::controls::activity::{self as control, Action, ActivityItem, ActivityState, ItemKind, JobState, NoticeLevel};
 
 #[derive(Default)]
 pub struct StripState {
@@ -10,14 +11,21 @@ pub struct StripState {
     /// Steps injected by tests (the real sources need a worker or a decode failure).
     pub extra: Vec<Step>,
     pub rect: Option<egui::Rect>,
+    pub activity: ActivityState,
 }
 
-/// Everything the Activity popover and the strip show, gathered once for the open clip.
+struct GlobalActivityItem {
+    id: u64,
+    kind: ItemKind,
+    title: String,
+    detail: String,
+    actions: &'static [Action],
+    job: Option<String>,
+}
+
+    /// The open clip's Activity model, used for its status-bar summary.
 pub(crate) struct ActivitySnapshot {
-    pub clip: Clip,
     pub model: activity::Model,
-    /// Other clips with unfinished work.
-    pub others: usize,
 }
 
 impl App {
@@ -35,9 +43,9 @@ impl App {
         note("hint", self.hint_note_text().map(str::to_owned));
         note("media", self.media.note.clone());
         if self.ai.lock_attention(clip) {
-            note("lock", Some("A hint lock on this clip needs a decision: open Details.".into()));
+            note("lock", Some("A hint lock on this clip needs a decision: open Activity to release it.".into()));
         }
-        let (sched, others) = self.ai.activity_steps(&clip.folder);
+        let (sched, others) = self.ai.activity_steps(&clip.root);
         steps.extend(sched);
         if let Some((phase, done, total)) = self.imp.progress_of(clip) {
             let mut s = Step::new("import", if phase == "compress" { "Compress frames" } else { "Extract frames" }, Level::Active);
@@ -78,8 +86,8 @@ impl App {
     /// The open clip's activity (None with no clip open). `&mut` because the lock and viewer reads refresh state.
     pub(crate) fn activity_snapshot(&mut self) -> Option<ActivitySnapshot> {
         let clip = self.clip().cloned()?;
-        let (steps, others) = self.activity_inputs(&clip);
-        Some(ActivitySnapshot { model: activity::build(steps), clip, others })
+        let (steps, _) = self.activity_inputs(&clip);
+        Some(ActivitySnapshot { model: activity::build(steps) })
     }
 
     /// Status-bar Activity item: the head step's one-line text and its fraction when it reports a total.
@@ -100,140 +108,163 @@ impl App {
     pub(crate) fn activity_toggle(&mut self) {
         self.strip.open = !self.strip.open;
     }
+    pub(crate) fn activity_open_on(&mut self, tab: usize, anchor: egui::Rect) {
+        self.activity_anchor = Some(anchor);
+        self.strip.open = true;
+        self.strip.activity.tab = tab.min(2);
+    }
     pub(crate) fn activity_is_open(&self) -> bool {
         self.strip.open
     }
 
-    /// The Activity popover above `anchor` (the status-bar item). Callable from any page, Focus included.
-    /// Escape or a click outside it (and outside `anchor`, whose own click toggles it) closes it.
+    pub(crate) fn route_status(&mut self, out: crate::ui::controls::statusbar::StatusOut) {
+        let Some(segment) = out.clicked else { return };
+        let anchor = out.segments.iter().find(|(s, _)| *s == segment).map(|(_, r)| *r);
+        use crate::ui::controls::statusbar::Segment;
+        match segment {
+            Segment::Activity | Segment::Notices => {
+                let tab = if segment == Segment::Notices { 2 } else { 0 };
+                if self.strip.open && self.strip.activity.tab == tab { self.strip.open = false; }
+                else if let Some(anchor) = anchor { self.activity_open_on(tab, anchor); }
+            }
+            Segment::Queue => {
+                self.board_page.fx.qtab = "waiting".into();
+                self.board_page.fx.drawer = 1;
+                self.goto_page(0);
+            }
+            Segment::Cpu | Segment::Ram | Segment::Gpu | Segment::Vram => self.goto_page(2),
+        }
+    }
+
+    fn global_activity_items(&self) -> Vec<GlobalActivityItem> {
+        let mut rows = Vec::new();
+        if let Some(project) = &self.project {
+            for clip in &project.clips {
+                let (steps, _) = self.ai.activity_steps(&clip.root);
+                for step in steps {
+                    let id = activity_id(&format!("job:{}:{}", clip.folder, step.id));
+                    let kind = match step.level {
+                        Level::Active => JobState::Running((step.total > 0).then(|| step.done.min(step.total) as f32 / step.total as f32)),
+                        Level::Queued => JobState::Queued,
+                        Level::Done | Level::Warn => JobState::Done,
+                        Level::Error => JobState::Failed,
+                    };
+                    let mut detail = Vec::new();
+                    for part in [&step.pc, &step.phase, &step.message] {
+                        if !part.is_empty() { detail.push(part.as_str()); }
+                    }
+                    let job = match step.cancel { Cancel::Job(id) if kind != JobState::Done => Some(id), _ => None };
+                    rows.push(GlobalActivityItem {
+                        id,
+                        kind: ItemKind::Job(kind),
+                        title: format!("{} · {}", clip.display_name, step.stage),
+                        detail: detail.join(" · "),
+                        actions: if kind == JobState::Failed { &[Action::Dismiss] } else if job.is_some() { &[Action::Cancel] } else { &[] },
+                        job,
+                    });
+                }
+                if let Some((phase, done, total)) = self.imp.progress_of(clip) {
+                    let state = if phase == "compress" { "Compress frames" } else { "Extract frames" };
+                    rows.push(GlobalActivityItem {
+                        id: activity_id(&format!("import:{}", clip.folder)),
+                        kind: ItemKind::Job(JobState::Running((total > 0).then_some(done.min(total) as f32 / total as f32))),
+                        title: format!("{} · {state}", clip.display_name),
+                        detail: "This computer".into(),
+                        actions: &[],
+                        job: None,
+                    });
+                } else if let CardState::Failed(message) = self.imp.card_state(clip) {
+                    rows.push(GlobalActivityItem {
+                        id: activity_id(&format!("import:{}", clip.folder)),
+                        kind: ItemKind::Job(JobState::Failed),
+                        title: format!("{} · Extract frames", clip.display_name),
+                        detail: message,
+                        actions: &[Action::Dismiss],
+                        job: None,
+                    });
+                } else if matches!(self.imp.card_state(clip), CardState::Waiting) {
+                    rows.push(GlobalActivityItem {
+                        id: activity_id(&format!("import:{}", clip.folder)),
+                        kind: ItemKind::Job(JobState::Queued),
+                        title: format!("{} · Extract frames", clip.display_name),
+                        detail: "Waiting for its turn to extract…".into(),
+                        actions: &[],
+                        job: None,
+                    });
+                }
+            }
+            for (i, note) in project.notes.iter().enumerate() {
+                rows.push(notice_row(&format!("project:{i}:{note}"), "Project note", note, NoticeLevel::Info));
+            }
+        }
+        for (key, title, detail) in [
+            ("ai", "AI", self.ai.notice.as_deref()),
+            ("pending", "Notice", self.ai.pending_note()),
+            ("load", "Project", self.load_error.as_deref()),
+            ("startup", "Startup", self.opts.startup_notice.as_deref()),
+            ("save", "Save", self.save_error.as_deref()),
+            ("import", "Import", self.imp.notice_text()),
+            ("hint", "Hint", self.hint_note_text()),
+            ("media", "Media", self.media.note.as_deref()),
+        ] {
+            if let Some(detail) = detail.filter(|s| !s.is_empty()) {
+                rows.push(notice_row(key, title, detail, NoticeLevel::Warning));
+            }
+        }
+        rows.extend(self.strip.extra.iter().map(|step| {
+            let kind = match step.level {
+                Level::Active => JobState::Running((step.total > 0).then(|| step.done.min(step.total) as f32 / step.total as f32)),
+                Level::Queued => JobState::Queued,
+                Level::Done | Level::Warn => JobState::Done,
+                Level::Error => JobState::Failed,
+            };
+            GlobalActivityItem { id: activity_id(&format!("test:{}", step.id)), kind: ItemKind::Job(kind), title: step.stage.clone(), detail: step.message.clone(), actions: &[], job: None }
+        }));
+        rows
+    }
+
+    pub(crate) fn notice_count(&self) -> u32 {
+        self.active_notice_text().len() as u32
+    }
+
+    pub(crate) fn active_notice_text(&self) -> Vec<String> {
+        self.global_activity_items().into_iter().filter(|row| matches!(row.kind, ItemKind::Notice(_)) && !self.strip.activity.is_acknowledged(row.id)).map(|row| row.detail).collect()
+    }
+
+    pub(crate) fn failure_count(&self) -> u32 {
+        let rows = self.global_activity_items();
+        let items: Vec<_> = rows.iter().map(GlobalActivityItem::as_item).collect();
+        self.strip.activity.unacknowledged_failures(&items) as u32
+    }
+
+    /// Project-wide Activity popover above the status bar.
     pub(crate) fn activity_popover(&mut self, ui: &mut Ui, anchor: egui::Rect) {
         if !self.strip.open {
             return;
         }
-        if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.strip.open = false;
-            return;
-        }
-        let Some(snap) = self.activity_snapshot() else { return };
-        let (act, rect) = self.activity_details(ui.ctx(), anchor, anchor.width().max(360.0), &snap);
-        self.apply_activity(&act);
-        // A press on another Foreground layer (a combo list opened from a row) is not outside.
-        let outside = ui.ctx().input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten()).is_some_and(|p| {
-            !rect.contains(p) && !anchor.contains(p) && ui.ctx().layer_id_at(p).is_none_or(|l| l.order != egui::Order::Foreground)
-        });
-        if outside {
-            self.strip.open = false;
-        }
-    }
-
-    /// Carries out the buttons drawn this frame by the line buttons or the details list.
-    fn apply_activity(&mut self, act: &Act) {
-        match &act.cancel {
-            Some(Cancel::Job(id)) => self.ai.cancel(id),
-            Some(Cancel::Ram) => {
-                if let Some(v) = &mut self.viewer {
-                    v.pause();
-                }
-            }
-            _ => {}
-        }
-        if act.open_queue {
-            self.back_requested = true;
-        }
-    }
-
-    /// The old fixed strip (inside its fixed bottom panel); its Details open upward from the strip.
-    pub(super) fn activity_strip(&mut self, ui: &mut Ui) {
-        let Some(snap) = self.activity_snapshot() else { return };
-        let act = activity::paint(ui, &snap.model, self.strip.open, snap.others);
-        self.apply_activity(&act);
-        if act.toggle_details {
-            self.strip.open = !self.strip.open;
-        }
-        if self.strip.open {
-            if let Some(r) = self.strip.rect {
-                let (d, _) = self.activity_details(ui.ctx(), r, (r.width() - 24.0).max(100.0), &snap);
-                self.apply_activity(&d);
-            }
-        }
-    }
-
-    /// Details list in a popup opening upward from `anchor`: capped, scrolling, one row per step id.
-    /// Returns the buttons pressed in it (job rows act on their own) and the popup's rect.
-    #[allow(deprecated)] // egui 0.37 wants IdSalt for areas; a fixed salt string is all this needs
-    fn activity_details(&mut self, ctx: &egui::Context, anchor: egui::Rect, width: f32, snap: &ActivitySnapshot) -> (Act, egui::Rect) {
-        let mut act = Act::default();
-        let jobs = self.ai.job_ids();
-        let room = (anchor.min.y - 60.0).max(80.0);
-        let area = egui::Area::new(egui::Id::new("activity_details"))
-            .order(egui::Order::Foreground)
-            .pivot(egui::Align2::LEFT_BOTTOM)
-            .fixed_pos(anchor.left_top())
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width(width);
-                    egui::ScrollArea::vertical().id_salt("activity_details_scroll").max_height(activity::DETAILS_MAX_H.min(room)).auto_shrink([false, true]).show(ui, |ui| {
-                        if snap.others > 0 && ui.link(RichText::new(format!("{} other clip{} running · Queue", snap.others, if snap.others == 1 { "" } else { "s" })).size(12.0)).clicked() {
-                            act.open_queue = true;
-                        }
-                        let notice = self.imp.notice_text().map(str::to_owned);
-                        if let Some(t) = &notice {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(t).color(theme::warn(ui)).size(12.0));
-                                if ui.small_button("Dismiss").clicked() {
-                                    self.imp.dismiss_notice();
-                                }
-                            });
-                        }
-                        if snap.model.list.is_empty() && notice.is_none() {
-                            ui.label(RichText::new("Nothing has run on this clip yet.").color(theme::text_dim(ui)));
-                        }
-                        for s in &snap.model.list {
-                            if jobs.contains(&s.id) {
-                                self.ai.activity_row(ui, &s.id);
-                            } else {
-                                let col = match s.level {
-                                    Level::Error => theme::error(ui),
-                                    Level::Warn => theme::warn(ui),
-                                    _ => theme::text_dim(ui),
-                                };
-                                let mut t = s.stage.clone();
-                                for p in [&s.pc, &s.phase, &s.message] {
-                                    if !p.is_empty() {
-                                        t.push_str(" · ");
-                                        t.push_str(p);
-                                    }
-                                }
-                                // Same progress wording as the old strip (activity.rs progress row).
-                                if s.total > 0 {
-                                    t.push_str(&format!(" · {}/{}", s.done.min(s.total), s.total));
-                                } else if s.level == Level::Active {
-                                    t.push_str(" · working…");
-                                }
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.add(egui::Label::new(RichText::new(t).color(col).size(12.0)).wrap());
-                                    if s.cancel == Cancel::Ram && s.level == Level::Active && ui.small_button("Cancel").clicked() {
-                                        act.cancel = Some(Cancel::Ram);
-                                    }
-                                    if s.id == "decode" && ui.small_button("Retry").clicked() {
-                                        if let Some(v) = self.viewer.as_mut() {
-                                            v.retry_failed();
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                        self.ai.hint_lock_ui(ui, &snap.clip);
-                        if let Some(g) = self.ai.gate_result() {
-                            self.ai.output_lock_recovery_ui(ui, &g);
-                            if let Some(n) = self.ai.notice.clone().filter(|_| g.main.is_err()) {
-                                ui.label(RichText::new(n).color(theme::warn(ui)).size(12.0));
-                            }
-                        }
-                    });
+        let clip = self.clip().cloned();
+        let rows = self.global_activity_items();
+        let items: Vec<_> = rows.iter().filter(|row| !matches!(row.kind, ItemKind::Notice(_)) || !self.strip.activity.is_acknowledged(row.id)).map(GlobalActivityItem::as_item).collect();
+        let out = control::activity_popover(ui.ctx(), anchor, &mut self.strip.activity, &items);
+        if let Some(clip) = clip.filter(|clip| self.ai.lock_attention(clip)) {
+            let screen = ui.ctx().content_rect();
+            let popover_x = anchor.left().min(screen.right() - 480.0).max(screen.left());
+            let response = egui::Area::new(ui.scope_id().with("hint-lock-recovery"))
+                .order(egui::Order::Foreground)
+                .pivot(egui::Align2::LEFT_BOTTOM)
+                .fixed_pos(egui::pos2(popover_x + 480.0 + 8.0, anchor.top()))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(360.0);
+                        self.ai.hint_lock_ui(ui, &clip)
+                    })
                 });
-            });
-        (act, area.response.rect)
+            ui.ctx().move_to_top(response.response.layer_id);
+        }
+        if out.closed { self.strip.open = false; }
+        if let Some((id, Action::Cancel)) = out.action {
+            if let Some(job) = rows.iter().find(|row| row.id == id).and_then(|row| row.job.as_deref()) { self.ai.cancel(job); }
+        }
     }
 
     /// Rectangle of the strip from the last frame (layout tests).
@@ -246,4 +277,21 @@ impl App {
     pub fn activity_inject_for_test(&mut self, steps: Vec<Step>) {
         self.strip.extra = steps;
     }
+}
+
+impl GlobalActivityItem {
+    fn as_item(&self) -> ActivityItem<'_> {
+        ActivityItem { id: self.id, kind: self.kind, title: &self.title, detail: &self.detail, time: "", actions: self.actions }
+    }
+}
+
+fn activity_id(source: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn notice_row(source: &str, title: &str, detail: &str, level: NoticeLevel) -> GlobalActivityItem {
+    GlobalActivityItem { id: activity_id(&format!("notice:{source}:{detail}")), kind: ItemKind::Notice(level), title: title.into(), detail: detail.into(), actions: &[Action::Dismiss], job: None }
 }

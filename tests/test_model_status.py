@@ -2,6 +2,7 @@
 import hashlib
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import backend.model_status as ms  # noqa: E402
-from backend.model_catalog import Artifact, Catalog, FileSpec, hf_hub_cache_dir  # noqa: E402
+from backend.model_catalog import Artifact, Catalog, FileSpec, hf_hub_cache_dir, hf_hub_cache_dirs  # noqa: E402
 
 
 def git_blob_sha1(data: bytes) -> str:
@@ -286,6 +287,11 @@ class TestStartupContract:
     def test_roots_use_install_paths_module_defaults(self, monkeypatch, tmp_path):
         from backend import install_paths, v2_paths
 
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+        monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf-explicit"))
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
         fake = SimpleNamespace(user_data=None, cache=None)
         monkeypatch.setattr(install_paths, "discover", lambda: fake)
         monkeypatch.setattr(install_paths, "platform_user_data", lambda: tmp_path / "platform-data")
@@ -296,6 +302,12 @@ class TestStartupContract:
         resolved = ms.Roots.defaults()
         assert resolved.data_dir == tmp_path / "platform-data"
         assert resolved.cache_dir == tmp_path / "platform-cache" / "model-provision"
+        assert resolved.legacy_models_dirs == (tmp_path / "xdg-data" / "Keyloom" / "EngineV2",)
+        assert resolved.hf_caches == (
+            tmp_path / "hf-explicit", tmp_path / "hf-home" / "hub",
+            tmp_path / "home" / ".cache" / "huggingface" / "hub")
+        configured = ms.Roots.defaults(hf_cache=tmp_path / "explicit-override")
+        assert configured.hf_caches == (tmp_path / "explicit-override", *resolved.hf_caches)
 
     def test_summary_ready_required(self, roots):
         art_dir = roots.data_dir / "model"
@@ -313,3 +325,123 @@ class TestStartupContract:
         assert sc.status(["opt"])["summary"]["ready_required"] is None
         (roots.data_dir / "model" / "w.bin").unlink()
         assert sc.status()["summary"]["ready_required"] is False
+
+
+def test_legacy_data_and_compatible_hf_snapshot_bind_exact_read_only_paths(roots, tmp_path, monkeypatch):
+    from backend.app_models import AppModels
+
+    explicit = tmp_path / "hf-explicit"
+    hf_home = tmp_path / "hf-home"
+    fake_home = tmp_path / "user-home"
+    monkeypatch.setenv("HF_HUB_CACHE", str(explicit))
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    assert hf_hub_cache_dirs() == (
+        explicit, hf_home / "hub", fake_home / ".cache" / "huggingface" / "hub")
+
+    legacy_files = write_files(tmp_path / "old-data" / "module" / "weights", {"w.bin": b"legacy"})
+    snapshot_files = write_files(tmp_path / "placeholder", {"w.bin": b"snapshot"})
+    legacy = hf_snapshot_artifact("birefnet-legacy", legacy_files, "module/weights")
+    cached = hf_snapshot_artifact("birefnet-cached", snapshot_files, "module/weights")
+    key = Artifact(id="corridorkey-weights", label="Key", capability="key", kind="hf_files",
+                   required_profile=True, layout_root="v2_models_dir", layout_rel="weights",
+                   repo_id="t/key", revision="c" * 40, revision_status="pinned",
+                   files=tuple(write_files(tmp_path / "key-spec", {"w.bin": b"key"})))
+    bundled = hf_snapshot_artifact("gvm", [FileSpec("w.bin", "w.bin", 7, None, None, False, True)],
+                                   "gvm_core/weights")
+    mat_file = FileSpec("matanyone2.pth", "matanyone2.pth", 9, None, None, False, True)
+    matanyone = Artifact(id="matanyone2", label="MatAnyone2", capability="matanyone2",
+                         kind="http_file", required_profile=False, layout_root="data_dir",
+                         layout_rel="modules/MatAnyone2Module/checkpoints", url="https://example.test/model",
+                         revision="v1.0.0", revision_status="pinned", files=(mat_file,))
+    optional = hf_snapshot_artifact(
+        "birefnet-missing", [FileSpec("w.bin", "w.bin", 8, None, None, False, True)], "optional")
+    other_revision = "b" * 40
+    cached_root = hf_home / "hub" / "models--t--birefnet-cached" / "snapshots" / other_revision
+    (cached_root / "w.bin").parent.mkdir(parents=True, exist_ok=True)
+    (cached_root / "w.bin").write_bytes(b"snapshot")
+    old_key = tmp_path / "old-models" / "weights"
+    old_key.mkdir(parents=True)
+    (old_key / "w.bin").write_bytes(b"key")
+    bundle_root = tmp_path / "bundle" / "CorridorKeyV2"
+    bundled_model = bundle_root.parent / "gvm_core" / "weights"
+    bundled_model.mkdir(parents=True)
+    (bundled_model / "w.bin").write_bytes(b"bundled")
+    matanyone_root = bundle_root.parent / "pretrained_models"
+    matanyone_root.mkdir(parents=True)
+    (matanyone_root / "matanyone2.pth").write_bytes(b"matanyone")
+    roots = replace(roots, legacy_models_dirs=(tmp_path / "old-models",),
+                    v2_package_root=bundle_root,
+                    legacy_data_dirs=(tmp_path / "old-data", bundle_root, bundle_root.parent),
+                    hf_caches=hf_hub_cache_dirs())
+    catalog = make_catalog(legacy, cached, key, optional, bundled, matanyone)
+    app_models = AppModels(roots, catalog)
+
+    legacy_status = app_models.checker.check_artifact(legacy)
+    legacy_binding = app_models.resolve("birefnet", legacy.id)
+    assert legacy_status["present"] is True
+    assert legacy_status["path"] == str(tmp_path / "old-data" / "module" / "weights")
+    assert legacy_status["can_delete"] is False
+    assert legacy_binding.paths[legacy.id] == Path(legacy_status["path"])
+    assert legacy_binding.files == (Path(legacy_status["path"]) / "w.bin",)
+
+    cached_status = app_models.checker.check_artifact(cached)
+    cached_binding = app_models.resolve("birefnet", cached.id)
+    assert cached_status["present"] is True
+    assert cached_status["path"] == str(cached_root)
+    assert cached_status["can_delete"] is False
+    assert cached_binding.paths[cached.id] == cached_root
+    assert cached_binding.files == (cached_root / "w.bin",)
+
+    key_status = app_models.checker.check_artifact(key)
+    key_binding = app_models.resolve("key")
+    assert key_status["present"] is True
+    assert key_status["path"] == str(old_key)
+    assert key_status["can_delete"] is False
+    assert key_binding.paths[key.id] == old_key
+    assert key_binding.files == (old_key / "w.bin",)
+    assert key_binding.ready is True
+    assert app_models.resolve("birefnet", optional.id).ready is False
+
+    bundled_status = app_models.checker.check_artifact(bundled)
+    assert bundled_status["path"] == str(bundled_model)
+    assert bundled_status["present"] is True
+    mat_status = app_models.checker.check_artifact(matanyone)
+    mat_binding = app_models.resolve("matanyone2")
+    assert mat_status["path"] == str(matanyone_root)
+    assert mat_status["present"] is True
+    assert mat_binding.paths[matanyone.id] == matanyone_root / "matanyone2.pth"
+
+
+def test_flat_videomama_candidate_binds_legacy_loader_layout(roots, tmp_path):
+    from dataclasses import replace
+    from backend.app_models import AppModels
+
+    config = b"config"
+    weights = b"weights"
+    art = Artifact(
+        id="videomama", label="VideoMaMa", capability="videomama", kind="hf_snapshot",
+        required_profile=False, layout_root="data_dir",
+        layout_rel="VideoMaMaInferenceModule/checkpoints", repo_id="t/videomama",
+        revision="a" * 40, revision_status="pinned",
+        files=(FileSpec("unet/config.json", "VideoMaMa/unet/config.json", len(config), None, None, False, True),
+               FileSpec("unet/diffusion_pytorch_model.safetensors",
+                        "VideoMaMa/unet/diffusion_pytorch_model.safetensors",
+                        len(weights), None, None, False, True)),
+        path_remap={"unet/": "VideoMaMa/unet/"})
+    prior_data = tmp_path / "old-module-data"
+    checkpoint_root = prior_data / art.layout_rel
+    flat = checkpoint_root / "VideoMaMa"
+    flat.mkdir(parents=True)
+    (flat / "config.json").write_bytes(config)
+    (flat / "diffusion_pytorch_model.safetensors").write_bytes(weights)
+    roots = replace(roots, legacy_data_dirs=(prior_data,))
+    catalog = make_catalog(art)
+    app_models = AppModels(roots, catalog)
+
+    status = app_models.checker.check_artifact(art)
+    binding = app_models.resolve("videomama")
+    assert status["present"] is True
+    assert status["path"] == str(checkpoint_root)
+    assert binding.paths[art.id] == flat
+    assert binding.files == (flat / "config.json", flat / "diffusion_pytorch_model.safetensors")

@@ -2,12 +2,13 @@
 //! real picture and timeline in the page's regions, and turns the page's acts into viewer/App calls.
 //! Not routed yet: `workspace` stays the production path until the cutover.
 use super::*;
-use super::hint::{DeliverCmd, DeliverOutput, DeliverView, HintCmd, HintEdit, HintStage, HintView};
+use super::hint::{self, DeliverCmd, DeliverOutput, DeliverView, HintCmd, HintEdit, HintStage, HintView};
 use super::media::{MediaCmd, MediaSource, MediaView};
 use crate::hints::{Final, Producer};
 use crate::project::View as PV;
+use crate::tasks::{TaskJob, TaskKind};
 use crate::ui::activity::{self, Cancel, Level};
-use crate::ui::ai::{KeyCmd, KeyEdit, KeyFix, KeyView};
+use crate::ui::ai::{IntentView, KeyCmd, KeyEdit, KeyFix, KeyView};
 use crate::ui::annotate::Tool;
 use crate::ui::controls::transport::Action;
 use crate::ui::controls::viewer_toolbar as tb;
@@ -65,6 +66,40 @@ fn key_cmd_of(a: KeyAct) -> KeyCmd {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hint_movie_choice_reaches_the_picker_command() {
+        assert!(matches!(hint_cmd_of(HintAct::ChooseMovie), Ok(HintCmd::ChooseMovie)));
+    }
+
+    #[test]
+    fn key_menu_keeps_the_disabled_intent_reason() {
+        let intent = IntentView {
+            intent: Intent::Replace,
+            label: "Replace".into(),
+            enabled: false,
+            reason: Some("The result is in use.".into()),
+        };
+        let (label, enabled, reason, cmd) = key_menu_item(&intent, None);
+        assert_eq!(label, "Replace");
+        assert!(!enabled);
+        assert_eq!(reason.as_deref(), Some("The result is in use."));
+        assert!(matches!(cmd, KeyCmd::RequestReplace));
+    }
+
+    #[test]
+    fn task_cards_follow_task_kind_and_publish_target() {
+        assert_eq!(task_card_kind(TaskKind::PrematteHint, None), Some("hint"));
+        assert_eq!(task_card_kind(TaskKind::SamPreview, None), None);
+        assert_eq!(task_card_kind(TaskKind::Gvm, None), Some("prematte"));
+        assert_eq!(task_card_kind(TaskKind::Gvm, Some(std::path::Path::new("/clip/AlphaHint"))), Some("hint"));
+        assert_eq!(card_kind("Pre-matte hint", None), Some("hint"));
+    }
+}
+
 fn media_cmd_of(a: MediaAct) -> MediaCmd {
     match a {
         MediaAct::InputLinear(b) => MediaCmd::SetInputLinear(b),
@@ -96,6 +131,7 @@ fn key_again(kv: &KeyView) -> Go {
     let pick = |w: Intent| kv.intents.iter().find(|i| i.enabled && i.intent == w);
     match pick(Intent::NewVersion).or_else(|| pick(Intent::Resume)) {
         Some(i) => Go::Key(KeyCmd::Submit(i.intent)),
+        None if pick(Intent::Replace).is_some() => Go::Key(KeyCmd::RequestReplace),
         None => Go::Notice(kv.intents.iter().find_map(|i| i.reason.clone()).unwrap_or_else(|| "Choose how to key again from the ⋯ menu".into())),
     }
 }
@@ -108,6 +144,15 @@ fn key_fix(f: KeyFix, kv: &KeyView) -> Go {
         KeyFix::Relink => Go::Media(MediaCmd::Relink),
         KeyFix::ResultActions => key_again(kv),
     }
+}
+
+fn key_menu_item(i: &IntentView, replace_pending: Option<usize>) -> (String, bool, Option<String>, KeyCmd) {
+    let (label, cmd) = match (i.intent, replace_pending) {
+        (Intent::Replace, Some(n)) => (format!("Confirm replace ({n} files)"), KeyCmd::ConfirmReplace),
+        (Intent::Replace, None) => (i.label.clone(), KeyCmd::RequestReplace),
+        (w, _) => (i.label.clone(), KeyCmd::Submit(w)),
+    };
+    (label, i.enabled, i.reason.clone(), cmd)
 }
 
 fn key_bar(kv: &KeyView) -> StageBar {
@@ -127,16 +172,12 @@ fn key_bar(kv: &KeyView) -> StageBar {
     b.cancel = kv.cancel_job.as_ref().map(|_| Go::Key(KeyCmd::CancelJob));
     if kv.result_exists {
         for i in kv.intents.iter().filter(|i| i.intent != Intent::New) {
-            let (label, cmd) = match (i.intent, kv.replace_pending) {
-                (Intent::Replace, Some(n)) => (format!("Confirm replace ({n} files)"), KeyCmd::ConfirmReplace),
-                (Intent::Replace, None) => (i.label.clone(), KeyCmd::RequestReplace),
-                (w, _) => (i.label.clone(), KeyCmd::Submit(w)),
-            };
-            p.menu.push((label, i.enabled));
+            let (label, enabled, reason, cmd) = key_menu_item(i, kv.replace_pending);
+            p.menu.push((label, enabled, reason));
             b.menu.push(Go::Key(cmd));
         }
         if kv.replace_pending.is_some() {
-            p.menu.push(("Cancel replace".into(), true));
+            p.menu.push(("Cancel replace".into(), true, None));
             b.menu.push(Go::Key(KeyCmd::CancelReplace));
         }
     }
@@ -157,7 +198,7 @@ fn media_bar(mv: &MediaView) -> StageBar {
             p.primary_enabled = c.plan.is_ok();
             p.primary_reason = c.plan.as_ref().err().cloned();
             b.primary = Some(Go::Media(MediaCmd::StartSequenceImport));
-            p.menu.push(("Cancel import".into(), true));
+            p.menu.push(("Cancel import".into(), true, None));
             b.menu.push(Go::Media(MediaCmd::CancelSequenceImport));
         }
     } else if let Some(d) = &mv.extract {
@@ -188,7 +229,7 @@ fn hint_bar(hv: &HintView, head: Option<&activity::Step>) -> StageBar {
         p.blocker = Some((g.reason.clone(), None));
     }
     let mut item = |label: &str, on: bool, cmd: HintCmd| {
-        p.menu.push((label.to_string(), on));
+        p.menu.push((label.to_string(), on, None));
         b.menu.push(Go::Hint(cmd));
     };
     item("Import movie", hv.import.as_ref().is_some_and(|a| a.enabled), HintCmd::ImportMovie);
@@ -256,6 +297,7 @@ fn unknown(what: &str, id: &str) -> String {
 /// A Hint act as the Hint command it stands for.
 fn hint_cmd_of(a: HintAct) -> Result<HintCmd, String> {
     Ok(match a {
+        HintAct::ChooseMovie => HintCmd::ChooseMovie,
         HintAct::Bypass(b) => HintCmd::Edit(HintEdit::Bypass(b)),
         HintAct::Producer(s) => HintCmd::Edit(HintEdit::Producer(by_id(&Producer::ALL, &s, producer_id).ok_or_else(|| unknown("producer", &s))?)),
         HintAct::BirefnetVariant(v) => HintCmd::Edit(HintEdit::BirefnetVariant(v)),
@@ -337,7 +379,7 @@ fn deliver_bar(dv: &DeliverView, head: Option<&activity::Step>) -> StageBar {
         b.secondary = Some(Go::Deliver(DeliverCmd::ExportExisting));
     }
     let mut item = |label: &str, on: bool, cmd: DeliverCmd| {
-        p.menu.push((label.into(), on));
+        p.menu.push((label.into(), on, None));
         b.menu.push(Go::Deliver(cmd));
     };
     item("Export existing", dv.export_existing.enabled, DeliverCmd::ExportExisting);
@@ -453,6 +495,7 @@ fn deliver_props_of(dv: &DeliverView) -> DeliverProps {
                 delivery_overridden: o.delivery_overridden,
             })
             .collect(),
+        confirm_existing: dv.confirm.as_ref().map(|c| c.existing.clone()),
         compression: dv.compression.value.clone(),
         compression_choices: dv.compression.choices.iter().map(|s| s.to_string()).collect(),
         compression_note: dv.compression.shared_note.into(),
@@ -487,12 +530,25 @@ fn deliver_props_of(dv: &DeliverView) -> DeliverProps {
 }
 
 /// Card kind of an activity step: the Key job, a pre-matte run or a hint run/import (other steps are no cards).
-fn card_kind(stage: &str) -> Option<&'static str> {
+fn card_kind(stage: &str, job: Option<&TaskJob>) -> Option<&'static str> {
+    if let Some(job) = job {
+        return task_card_kind(job.kind, job.publish_dir.as_deref());
+    }
     match stage {
         "Key" => Some("key"),
-        s if s.starts_with("Pre-matte") => Some("prematte"),
-        s if s.starts_with("Hint") => Some("hint"),
+        s if s.starts_with("Pre-matte") && !s.to_lowercase().contains("hint") => Some("prematte"),
+        s if s.to_lowercase().contains("hint") => Some("hint"),
         _ => None,
+    }
+}
+
+fn task_card_kind(kind: TaskKind, publish_dir: Option<&std::path::Path>) -> Option<&'static str> {
+    match kind {
+        TaskKind::Gvm | TaskKind::Birefnet | TaskKind::Chroma | TaskKind::SamTrack => {
+            Some(if publish_dir.and_then(std::path::Path::file_name).is_some_and(|n| n == "AlphaHint") { "hint" } else { "prematte" })
+        }
+        TaskKind::Matanyone2 | TaskKind::Videomama | TaskKind::PrematteHint | TaskKind::ImportHint => Some("hint"),
+        TaskKind::SamPreview | TaskKind::ExportVideo | TaskKind::PrepareSource => None,
     }
 }
 
@@ -591,11 +647,12 @@ impl App {
             fx.shot_id = clip.folder.clone();
             fx.shot = clip.display_name.clone();
             fx.stage = self.tab.label().to_string();
+            fx.clip_stage = match clip.state { ClipState::Masked => "mask", ClipState::Ready => "ready", ClipState::Complete => "done", _ => "raw" }.into();
             if let Some(p) = &self.project {
                 fx.project = p.display_name.clone();
             }
             // Running job of this clip: the active head step of the activity model (same source as the old strip).
-            let (steps, _) = self.ai.activity_steps(&clip.folder);
+            let (steps, _) = self.ai.activity_steps(&clip.root);
             if let Some(h) = activity::build(steps).head.filter(|h| h.level == Level::Active) {
                 fx.job_label = Some(h.stage);
                 fx.busy_percent = (h.total > 0).then(|| (h.done * 100 / h.total).min(100) as u8);
@@ -671,9 +728,20 @@ impl App {
         }
         self.refresh_shot_page();
         let acts = self.shot_page.ui(ui);
-        if let (Some(l), Some(v)) = (self.shot_page.layout(), self.viewer.as_mut()) {
-            v.image_ui(ui, l.viewer);
-            v.timeline_ui(ui, l.timeline);
+        if let Some(l) = self.shot_page.layout() {
+            let mut viewer_rect = l.viewer;
+            if self.tab == crate::ui::Tab::Hint && !hint::tools_for(self.hint.cfg.guide).is_empty() {
+                let strip = egui::Rect::from_min_max(viewer_rect.min, egui::pos2(viewer_rect.left() + hint::STRIP_W, viewer_rect.bottom()));
+                let rest = egui::Rect::from_min_max(egui::pos2(strip.right(), viewer_rect.top()), viewer_rect.max);
+                viewer_rect = rest;
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(strip).layout(egui::Layout::top_down(egui::Align::Center)).id_salt("hint_tool_strip"));
+                child.set_clip_rect(strip);
+                self.hint_tool_strip(&mut child);
+            }
+            if let Some(v) = self.viewer.as_mut() {
+                v.image_ui(ui, viewer_rect);
+                v.timeline_ui(ui, l.timeline);
+            }
         }
         if let Some(r) = self.shot_page.graph_rect() {
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).layout(egui::Layout::top_down(egui::Align::Min)).id_salt("shot_graph"));
@@ -803,7 +871,7 @@ impl App {
             },
             Tab::Media => self.media_view().map(|m| media_bar(&m)).unwrap_or_default(),
             Tab::Hint => {
-                let head = activity::build(self.ai.activity_steps(&clip.folder).0).head.filter(|h| h.level == Level::Active);
+                let head = activity::build(self.ai.activity_steps(&clip.root).0).head.filter(|h| h.level == Level::Active);
                 match self.hint_view() {
                     Some(hv) => hint_bar(&hv, head.as_ref()),
                     None => {
@@ -823,7 +891,7 @@ impl App {
                 b
             }
             Tab::Deliver => {
-                let head = activity::build(self.ai.activity_steps(&clip.folder).0).head.filter(|h| h.level == Level::Active);
+                let head = activity::build(self.ai.activity_steps(&clip.root).0).head.filter(|h| h.level == Level::Active);
                 match self.deliver_view() {
                     Some(dv) => deliver_bar(&dv, head.as_ref()),
                     None => {
@@ -913,14 +981,23 @@ impl App {
         }
     }
 
-    /// `None` = "No result yet": no manifest and no output frames on disk.
+    /// Result rows may be empty; the Review controls are still useful before the first Key run.
     fn shot_review_props(&self, clip: &Clip) -> Option<ReviewProps> {
         let v = self.viewer.as_ref()?;
-        let outs: Vec<(&str, usize)> = VIEW_NAMES.iter().filter(|(_, w)| matches!(w, PV::Fg | PV::Matte | PV::Comp | PV::Processed)).map(|(n, w)| (*n, v.index.view_frames(*w))).filter(|(_, n)| *n > 0).collect();
-        if outs.is_empty() && clip.manifest.is_none() {
-            return None;
-        }
-        let total = clip.input_files.len();
+        let expected: Vec<&str> = clip.manifest.as_ref().and_then(|m| m.source_stems.as_ref())
+            .map(|stems| stems.iter().map(String::as_str).collect())
+            .or_else(|| {
+                let range = clip.manifest.as_ref()?.range.as_ref()?;
+                let start = clip.input_files.iter().position(|f| f.0 == range.in_stem)?;
+                let end = clip.input_files.iter().position(|f| f.0 == range.out_stem)?;
+                (start <= end).then(|| clip.input_files[start..=end].iter().map(|f| f.0.as_str()).collect())
+            })
+            .unwrap_or_else(|| clip.input_files.iter().map(|f| f.0.as_str()).collect());
+        let outs: Vec<(&str, usize)> = VIEW_NAMES.iter()
+            .filter(|(_, w)| matches!(w, PV::Fg | PV::Matte | PV::Comp | PV::Processed))
+            .map(|(n, w)| (*n, expected.iter().filter(|stem| v.index.view_has(*w, stem)).count()))
+            .filter(|(_, n)| *n > 0).collect();
+        let total = expected.len();
         let name = |w: PV| VIEW_NAMES.iter().find(|(_, x)| *x == w).map_or("Input", |(n, _)| *n).to_string();
         Some(ReviewProps {
             frames: outs.iter().map(|(n, c)| (n.to_string(), format!("{c} of {}", total.max(*c)))).collect(),
@@ -954,7 +1031,7 @@ impl App {
         let mut out = vec![];
         for (kind, title, node) in [("prematte", "Pre-matte", Node::PreMatte), ("hint", "Hint", Node::Hint), ("key", "Key", Node::Key)] {
             let stale = self.stage_pending(node);
-            if let Some(s) = steps.iter().find(|s| card_kind(&s.stage) == Some(kind)) {
+            if let Some(s) = steps.iter().find(|s| card_kind(&s.stage, self.ai.task_job(&s.id).as_deref()) == Some(kind)) {
                 let mut meta = String::new();
                 for p in [&s.pc, &s.phase, &s.message].into_iter().filter(|p| !p.is_empty()) {
                     if !meta.is_empty() {
@@ -1063,7 +1140,7 @@ impl App {
                     BarAct::Secondary => bar.secondary.take(),
                     BarAct::Cancel => bar.cancel.take(),
                     BarAct::Fix => bar.fix.take(),
-                    BarAct::Menu(label) => bar.props.menu.iter().position(|(l, _)| *l == label).filter(|&i| bar.props.menu[i].1).and_then(|i| bar.menu.get(i).cloned()),
+                    BarAct::Menu(label) => bar.props.menu.iter().position(|(l, _, _)| *l == label).filter(|&i| bar.props.menu[i].1).and_then(|i| bar.menu.get(i).cloned()),
                 };
                 if let Some(go) = go {
                     self.shot_go(ctx, &clip, go);
@@ -1183,5 +1260,83 @@ impl App {
         let o = DisplayOpts { channel: s.channel, gain: s.gain as f32, gamma: s.gamma as f32, background: s.background, wipe_horizontal: horizontal };
         v.set_display(o);
         self.shot_display(Some(o));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::Intent;
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn png(path: &std::path::Path) {
+        let mut encoder = png::Encoder::new(fs::File::create(path).unwrap(), 4, 4);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header().unwrap().write_image_data(&[0; 48]).unwrap();
+    }
+
+    fn app_with_clip(tag: &str, with_result: bool) -> (egui::Context, App, PathBuf) {
+        let base = std::env::temp_dir().join(format!("ck-shot-wire-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let project = base.join("project");
+        let clip = project.join("clips/shot");
+        fs::create_dir_all(clip.join("Frames")).unwrap();
+        for n in 1101..=1105 { png(&clip.join(format!("Frames/f_{n}.png"))); }
+        fs::write(clip.join(".video_metadata.json"), r#"{"fps":24.0,"width":4,"height":4}"#).unwrap();
+        let native = if with_result {
+            let result = base.join("result");
+            fs::create_dir_all(&result).unwrap();
+            png(&result.join("shot_1102.png"));
+            fs::write(result.join(crate::project::MANIFEST_NAME), json!({
+                "version": 3, "engine": "corridorkey-v2", "clip_id": "clip-id", "enabled_outputs": ["matte"],
+                "formats": {"matte": "png"}, "range": {"in_point": 1, "out_point": 2, "in_stem": "f_1102", "out_stem": "f_1103"},
+                "source_stems": ["f_1102", "f_1103"], "files": {"matte": ["shot_1102.png", "shot_1103.png"]}, "complete": false
+            }).to_string()).unwrap();
+            json!({"clip_id": "clip-id", "key_result": {"manifest_dir": result}})
+        } else { json!({}) };
+        fs::write(clip.join("clip.json"), native.to_string()).unwrap();
+        fs::write(project.join("project.json"), r#"{"version":2,"clips":["shot"]}"#).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { project: Some(project), open_clip: Some("shot".into()), tab: Some(Tab::Review), ..Default::default() });
+        if app.clip().is_none() { app.open_clip(&ctx, 0); }
+        (ctx, app, base)
+    }
+
+    #[test]
+    fn review_counts_only_the_manifest_range() {
+        let (_ctx, app, base) = app_with_clip("review-range", true);
+        let clip = app.clip().unwrap().clone();
+        let review = app.shot_review_props(&clip).expect("the manifest provides a review");
+        assert_eq!(review.frames, [("Matte".into(), "1 of 2".into())]);
+        assert_eq!(review.missing_frames, 1);
+        drop(app);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn live_header_stage_comes_from_the_clip_state() {
+        let (_ctx, mut app, base) = app_with_clip("header-stage", false);
+        app.refresh_shot_page();
+        assert_eq!(app.shot_page.fx.clip_stage, "raw");
+        drop(app);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn replace_only_key_again_requests_the_replace_confirmation() {
+        let (ctx, mut app, base) = app_with_clip("replace-only", false);
+        let project = app.project.as_ref().unwrap().clone();
+        let clip = app.clip().unwrap().clone();
+        let settings = app.settings_page().saved().clone();
+        let mut view = app.ai.key_view(&clip, &project, &settings);
+        view.intents = vec![crate::ui::ai::IntentView { intent: Intent::Replace, label: "Replace".into(), enabled: true, reason: None }];
+        assert!(matches!(key_again(&view), Go::Key(KeyCmd::RequestReplace)));
+        drop(app);
+        drop(ctx);
+        let _ = fs::remove_dir_all(base);
     }
 }

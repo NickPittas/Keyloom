@@ -54,7 +54,6 @@ pub struct Fixture {
     pub ui_scale: f64,
     pub background: bool,
     pub start_at_login: bool,
-    pub reduce_motion: bool,
     pub shared_name: String,
     pub shared_folder: String,
     pub tracker_model: String,
@@ -68,8 +67,6 @@ pub struct GpuFixture {
     pub name: String,
     pub memory: String,
     pub enabled: bool,
-    pub keying: bool,
-    pub hints: bool,
 }
 
 impl Default for GpuFixture {
@@ -78,8 +75,6 @@ impl Default for GpuFixture {
             name: String::new(),
             memory: String::new(),
             enabled: false,
-            keying: false,
-            hints: false,
         }
     }
 }
@@ -90,15 +85,11 @@ fn default_gpus() -> Vec<GpuFixture> {
             name: "RTX 4090".into(),
             memory: "24 GB".into(),
             enabled: true,
-            keying: true,
-            hints: true,
         },
         GpuFixture {
             name: "RTX 3090".into(),
             memory: "24 GB".into(),
             enabled: false,
-            keying: false,
-            hints: false,
         },
     ]
 }
@@ -125,7 +116,6 @@ impl Default for Fixture {
             ui_scale: 1.00,
             background: false,
             start_at_login: false,
-            reduce_motion: false,
             shared_name: "NAS".into(),
             shared_folder: "/mnt/nas".into(),
             tracker_model: "Base+ (324 MB)".into(),
@@ -166,7 +156,6 @@ fn empty_fixture() -> Fixture {
         ui_scale: 0.0,
         background: false,
         start_at_login: false,
-        reduce_motion: false,
         shared_name: String::new(),
         shared_folder: String::new(),
         tracker_model: String::new(),
@@ -364,7 +353,7 @@ impl Page {
                 t.text_primary,
                 Align::Min,
             );
-            draw_pane(ui, width, &mut self.fx, full.width() < 1200.0);
+            draw_pane(ui, width, &mut self.fx);
         });
     }
 }
@@ -519,7 +508,7 @@ fn check_row(
     })
 }
 
-fn draw_pane(ui: &mut Ui, width: f32, fx: &mut Fixture, compact: bool) {
+fn draw_pane(ui: &mut Ui, width: f32, fx: &mut Fixture) {
     match fx.pane.as_str() {
         "Playback" => {
             section(ui, width, "Decoding", false, |ui| {
@@ -613,9 +602,6 @@ fn draw_pane(ui: &mut Ui, width: f32, fx: &mut Fixture, compact: bool) {
                     Some("Start at sign-in\nEnable Keep running in the background first"),
                     "",
                 ) {
-                    fx.dirty = true;
-                }
-                if check_row(ui, width, &mut fx.reduce_motion, "Reduce motion", None, "") {
                     fx.dirty = true;
                 }
             });
@@ -774,7 +760,7 @@ fn draw_pane(ui: &mut Ui, width: f32, fx: &mut Fixture, compact: bool) {
         "GPUs" => {
             section(ui, width, "Hardware", false, |ui| {
                 for (index, gpu) in fx.gpus.iter_mut().enumerate() {
-                    if draw_gpu_row(ui, width, index, gpu, compact) {
+                    if draw_gpu_row(ui, width, index, gpu) {
                         fx.dirty = true;
                     }
                     draw_gpu_details(ui, width);
@@ -827,32 +813,13 @@ fn draw_gpu_row(
     width: f32,
     index: usize,
     gpu: &mut GpuFixture,
-    compact: bool,
 ) -> bool {
     let (row, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
     let y = row.top() + 1.0;
     let label = format!("GPU {index} · {} · {}", gpu.name, gpu.memory);
-    let mut changed = ui
+    let changed = ui
         .add(Check::new(&mut gpu.enabled, Some(&label)).at(egui::pos2(row.left() + 8.0, y)))
         .changed();
-    let role_x = row.left() + if compact { 296.0 } else { 304.0 };
-    let first = "Use for keying";
-    let role_w = 20.0
-        + line(ui.painter(), first, ty::label(), 16.0, f32::INFINITY)
-            .size()
-            .x;
-    let mut keying = Check::new(&mut gpu.keying, Some(first)).at(egui::pos2(role_x, y));
-    let role_gap = if compact { 8.0 } else { 16.0 };
-    let mut hints = Check::new(&mut gpu.hints, Some("Use for hints"))
-        .at(egui::pos2(role_x + role_w + role_gap, y));
-    let key_tip = format!("Use for keying\nEnable GPU {index} first");
-    let hints_tip = format!("Use for hints\nEnable GPU {index} first");
-    if !gpu.enabled {
-        keying = keying.disabled(&key_tip);
-        hints = hints.disabled(&hints_tip);
-    }
-    changed |= ui.add(keying).changed();
-    changed |= ui.add(hints).changed();
     changed
 }
 
@@ -1555,5 +1522,20 @@ mod tests {
         assert_eq!(page.fx.pane, "AI defaults");
         assert_eq!(page.fx.despill, 0.650);
         assert!(page.fx.dirty);
+    }
+
+    #[test]
+    fn g2_removed_fixture_settings_are_not_drawn() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::ui::fonts::install(&ctx);
+        let mut page = Page::new();
+        for (pane, absent) in [("Appearance", "Reduce motion"), ("GPUs", "Keying"), ("GPUs", "Hints")] {
+            page.fx.pane = pane.into();
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, 800.0))), ..Default::default() }, |ui| page.ui(ui));
+            let labels = out.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().filter_map(|(_, n)| n.label()).collect::<Vec<_>>();
+            assert!(!labels.contains(&absent), "{absent} should remain removed from {pane}");
+            out.textures_delta.clear();
+        }
     }
 }

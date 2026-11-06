@@ -353,6 +353,16 @@ def hf_hub_cache_dir() -> Path:
     return Path.home() / ".cache" / "huggingface" / "hub"
 
 
+def hf_hub_cache_dirs() -> tuple[Path, ...]:
+    """Current and formerly configured HF hub roots, in preference order."""
+    roots = [hf_hub_cache_dir()]
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        roots.append(Path(hf_home).expanduser() / "hub")
+    roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+    return tuple(dict.fromkeys(roots))
+
+
 def hf_cache_snapshot_path(cache_dir: Path, repo_id: str, revision: str, filename: str) -> Path:
     """Expected blob-backed snapshot path for a pinned revision (stdlib only).
 

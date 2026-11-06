@@ -79,6 +79,7 @@ pub struct Thumbs {
     ready: HashMap<Stamp, Arc<DisplayFrame>>,
     tex: HashMap<Stamp, TextureHandle>,
     failed: HashMap<Stamp, String>,
+    stamps: HashMap<PathBuf, (std::time::Instant, Stamp)>,
 }
 
 impl Thumbs {
@@ -91,6 +92,7 @@ impl Thumbs {
             ready: HashMap::new(),
             tex: HashMap::new(),
             failed: HashMap::new(),
+            stamps: HashMap::new(),
         }
     }
 
@@ -99,7 +101,7 @@ impl Thumbs {
         // Drop entries whose frame changed on disk before deciding what is still wanted.
         let live: Vec<Stamp> = clips
             .iter()
-            .filter_map(|c| thumb_path(c).map(|p| stamp(&p)))
+            .filter_map(|c| thumb_path(c).map(|p| self.stamp_cached(&p)))
             .collect();
         self.tex.retain(|k, _| live.contains(k));
         self.ready.retain(|k, _| live.contains(k));
@@ -108,7 +110,7 @@ impl Thumbs {
             .iter()
             .filter_map(|c| {
                 let p = thumb_path(c)?;
-                let st = stamp(&p);
+                let st = self.stamp_cached(&p);
                 if self.tex.contains_key(&st) || self.failed.contains_key(&st) {
                     None
                 } else {
@@ -124,10 +126,21 @@ impl Thumbs {
         }
     }
 
+    fn stamp_cached(&mut self, path: &PathBuf) -> Stamp {
+        if let Some((at, st)) = self.stamps.get(path) {
+            if at.elapsed() < std::time::Duration::from_secs(2) {
+                return st.clone();
+            }
+        }
+        let st = stamp(path);
+        self.stamps.insert(path.clone(), (std::time::Instant::now(), st.clone()));
+        st
+    }
+
     /// Absorb finished decodes. Call once per frame before drawing cards.
     pub fn tick(&mut self) {
         while let Some(d) = self.loader.take() {
-            let st = stamp(&d.key.path);
+            let st = self.stamp_cached(&d.key.path);
             match d.result {
                 Ok(f) => {
                     self.ready.insert(st, f);
@@ -142,7 +155,7 @@ impl Thumbs {
     /// The texture for this clip's frame, once decoded. Uploads on first use.
     pub fn texture(&mut self, ctx: &egui::Context, clip: &Clip) -> Option<&TextureHandle> {
         let path = thumb_path(clip)?;
-        let st = stamp(&path);
+        let st = self.stamp_cached(&path);
         if !self.tex.contains_key(&st) {
             let f = self.ready.remove(&st)?;
             let img = ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
@@ -159,6 +172,7 @@ impl Thumbs {
     /// Why this clip has no thumbnail (unreadable first frame), if that is known.
     pub fn failed(&self, clip: &Clip) -> Option<&str> {
         let path = thumb_path(clip)?;
-        self.failed.get(&stamp(&path)).map(String::as_str)
+        let st = self.stamps.get(&path).map(|(_, st)| st)?;
+        self.failed.get(st).map(String::as_str)
     }
 }

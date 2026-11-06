@@ -7,6 +7,8 @@ from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
 import PIL.Image
+from pathlib import Path
+
 import torch
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
@@ -874,7 +876,9 @@ class VideoInferencePipeline:
                 base_model_path, subfolder="vae", variant="fp16", local_files_only=True
             )
             self.unet = UNetSpatioTemporalConditionModel.from_pretrained(
-                unet_checkpoint_path, subfolder="unet", local_files_only=True
+                unet_checkpoint_path,
+                subfolder=None if Path(unet_checkpoint_path, "config.json").is_file() else "unet",
+                local_files_only=True,
             )
         except Exception as e:
             raise IOError(

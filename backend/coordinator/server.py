@@ -133,9 +133,7 @@ class Api:
             auto = b.pop("automatic", False) if isinstance(b, dict) else False
             if not isinstance(auto, bool):
                 bad("automatic must be a boolean")
-            if self.accepting is not None and not self.accepting():
-                raise ApiError(409, "not_free" if auto else "not_receiving", "this PC is not taking jobs from other PCs (Receive jobs is off)")
-            return s.submit(inst, b, only_if_free=auto)
+            return s.submit(inst, b, only_if_free=auto, accepting=self.accepting)
         obj(b, "cancel", ())
         return s.cancel(inst, m[1])
 

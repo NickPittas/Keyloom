@@ -17,9 +17,14 @@ pub const OUTPUT_FORMATS: [&str; 2] = ["exr", "png"];
 pub const EXR_COMPRESSIONS: [&str; 4] = ["dwab", "piz", "zip", "none"];
 pub const MODEL: &str = "corridorkey_v2";
 
-/// Two decimals, as an f64 that prints exactly (`0.95`, not `0.949999988…`): equality with the engine's dict.
+/// Two decimals for editing controls that advertise hundredth precision.
 pub fn r2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
+}
+
+/// Three decimals, as an f64 that prints exactly (`0.951`, not `0.950999…`).
+pub fn r3(x: f64) -> f64 {
+    (x * 1000.0).round() / 1000.0
 }
 
 /// `InferenceParams.to_dict()` (same names and defaults as `backend/service/core.py`).
@@ -200,10 +205,10 @@ pub fn seed(clip: &Clip, project: &Project, st: &Settings) -> (Params, OutputCfg
     let mut p = Params {
         vram_profile: a.vram_profile.clone(),
         hint_mode: a.hint_mode.clone(),
-        hint_quality: r2(a.hint_quality as f64),
+        hint_quality: r3(a.hint_quality as f64),
         carry_hint: a.carry_hint,
-        carry_hint_quality: r2(a.carry_hint_quality as f64),
-        despill_strength: r2(a.despill_strength as f64),
+        carry_hint_quality: r3(a.carry_hint_quality as f64),
+        despill_strength: r3(a.despill_strength as f64),
         cutout_linear: a.cutout_linear,
         temporal_window: a.temporal_window.clone(),
         ..Default::default()
@@ -265,6 +270,32 @@ pub fn seed(clip: &Clip, project: &Project, st: &Settings) -> (Params, OutputCfg
             OutputCfg::default()
         });
     (params, out, notes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn g2_seed_preserves_three_decimal_ai_defaults() {
+        let root = std::env::temp_dir().join(format!("ck-workflow-g2-{}", std::process::id()));
+        let frames = root.join("clips/shot/Frames");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&frames).unwrap();
+        std::fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
+        std::fs::write(root.join("clips/shot/clip.json"), "{}").unwrap();
+        std::fs::write(frames.join("frame0001.png"), include_bytes!("../tests/fixtures/shot-plate.png")).unwrap();
+        let project = load_project(&root, &LoadOptions::default()).unwrap();
+        let mut settings = Settings::default();
+        settings.ai.hint_quality = 0.951;
+        settings.ai.carry_hint_quality = 0.951;
+        settings.ai.despill_strength = 0.651;
+        let (params, _, _) = seed(&project.clips[0], &project, &settings);
+        assert_eq!(params.hint_quality, 0.951);
+        assert_eq!(params.carry_hint_quality, 0.951);
+        assert_eq!(params.despill_strength, 0.651);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// The hint-consumption mode a clip implies when nothing was chosen explicitly: a saved, non-bypassed hint
@@ -1022,6 +1053,9 @@ fn build(
 /// Persist what a submitted job used: `clip_id` (once), `workflow`, `output_values` and the result folder.
 /// Atomic, other keys preserved. Call before `Scheduler::submit`; on `Err` nothing was queued.
 pub fn commit(clip: &Clip, plan: &Plan, params: &Params, out: &OutputCfg) -> Result<(), String> {
+    if plan.job.clip_root != abs(&clip.root) {
+        return Err("the plan belongs to another clip".into());
+    }
     update_json(&clip.meta_path, |m: &mut Map<String, Value>| {
         if plan.clip_id_is_new || !m.contains_key("clip_id") {
             m.insert("clip_id".into(), json!(plan.clip_id));

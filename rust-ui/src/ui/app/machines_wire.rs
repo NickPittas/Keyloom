@@ -18,7 +18,7 @@ fn meters(m: &FxMachine) -> page::Meters {
 
 /// The Board's assignment id of a connection's machine (`network:<namespace>/<installation>`), when known.
 fn placement_id(cr: &ConnRow) -> Option<String> {
-    cr.namespace.as_ref().zip(cr.installation_ids.first()).map(|(ns, i)| format!("network:{ns}/{i}"))
+    cr.default_target.clone().or_else(|| cr.namespace.as_ref().zip(cr.installation_ids.first()).map(|(ns, i)| format!("network:{ns}/{i}")))
 }
 
 fn short_url(u: &str) -> String {
@@ -35,6 +35,15 @@ impl App {
     /// open requests (service status, scan seed, joined list) are re-armed here.
     pub(super) fn machines_entered(&mut self) {
         self.machines_page.reset_entry();
+        let default = self.settings.saved().network.default_submit.clone();
+        if !default.is_empty() {
+            let (own_net, own_iid) = self.own_net_ids();
+            let rows = self.remote.conn_rows(self.settings.saved(), own_net.as_deref(), own_iid.as_deref());
+            match rows.iter().find(|r| r.creds.to_string_lossy() == default).and_then(placement_id) {
+                Some(id) => self.ai.placement = Placement::Target(id),
+                None => self.machines_page.set_notice(Some("The saved default connection has no known target machine yet.".into())),
+            }
+        }
     }
 
     /// Rebuild the page's data from what the app already holds (cheap; every frame the page is open). Sends nothing.
@@ -74,6 +83,7 @@ impl App {
             allow_joins: snap.allow_join,
             service_state_text: running_text,
             service_error: snap.error.clone(),
+            discovery_error: snap.discovery_error.clone(),
             service_mode: match snap.mode {
                 crate::network_setup::ServiceMode::AppHosted => page::ServiceMode::AppHosted,
                 crate::network_setup::ServiceMode::Starting | crate::network_setup::ServiceMode::Checking => page::ServiceMode::Checking,
@@ -82,6 +92,10 @@ impl App {
                 crate::network_setup::ServiceMode::Stopped => page::ServiceMode::Legacy { running: false },
                 crate::network_setup::ServiceMode::Running => page::ServiceMode::Legacy { running: true },
             },
+            can_start: snap.can_start,
+            can_stop: snap.can_stop,
+            can_remove: snap.can_remove,
+            can_refresh: snap.can_refresh,
             addresses: snap.addresses.clone(),
             receive_jobs: saved.network.receives(),
             endpoint_inactive: inactive,
@@ -94,13 +108,13 @@ impl App {
             certificate_id: snap.certificate.clone().unwrap_or_default(),
         };
 
-        let mut notes: Vec<String> = snap.note.iter().cloned().collect();
+        let mut notes: Vec<(String, bool)> = snap.note.iter().cloned().map(|n| (n, snap.note_is_error)).collect();
         let mut others = Vec::new();
         for cr in &conns {
             let key = cr.creds.to_string_lossy().into_owned();
             let pid = placement_id(cr);
             let fx = pid.as_ref().and_then(|p| machines.iter().find(|m| &m.id == p));
-            notes.extend(cr.notes.iter().map(|n| format!("{}: {n}", cr.name)));
+            notes.extend(cr.notes.iter().map(|n| (format!("{}: {n}", cr.name), true)));
             others.push(page::OtherRow {
                 kind_local: saved.network.connections().iter().any(|c| c.credentials == key && c.local_host),
                 name: cr.name.clone(),
@@ -212,6 +226,7 @@ impl App {
                 }
             }
             Act::RemoveConnectionConfirmed(creds) => self.remove_connection_confirmed(&creds),
+            Act::DismissNotice => self.machines_page.dismiss_notice(),
             _ => {}
         }
     }
@@ -225,8 +240,11 @@ impl App {
             Some(id) if self.ai.scheduler().targets().iter().any(|t| t.local && t.id == id) => (Placement::Target(id), String::new()),
             Some(key) => {
                 let conns = self.remote.conn_rows(self.settings.saved(), own_net.as_deref(), own_iid.as_deref());
-                let machine = conns.iter().find(|c| c.creds.to_string_lossy() == key).and_then(placement_id);
-                (machine.map_or(Placement::Auto, Placement::Target), key)
+                let Some(machine) = conns.iter().find(|c| c.creds.to_string_lossy() == key).and_then(placement_id) else {
+                    self.machines_page.set_notice(Some("That connection has no known machine to use as the default.".into()));
+                    return;
+                };
+                (Placement::Target(machine), key)
             }
         };
         self.ai.placement = placement;
@@ -243,7 +261,7 @@ impl App {
         }
         let name = self.conn_name(creds);
         if let Some(why) = self.remote.remove_blocker(creds) {
-            self.ai.notice = Some(format!("Connection not removed: {why}."));
+            self.machines_page.set_notice(Some(format!("Connection not removed: {why}.")));
         } else if !self.remote.leave(creds) {
             self.finish_remove(creds, Some(format!("{name} still lists this PC; retire it from that PC's Clients page.")));
         }

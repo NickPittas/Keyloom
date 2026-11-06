@@ -94,7 +94,12 @@ pub struct LocalLive {
     pub allow_joins: bool,
     pub service_state_text: String,
     pub service_error: Option<String>,
+    pub discovery_error: Option<String>,
     pub service_mode: ServiceMode,
+    pub can_start: bool,
+    pub can_stop: bool,
+    pub can_remove: bool,
+    pub can_refresh: bool,
     pub addresses: Vec<(String, String)>,
     pub receive_jobs: bool,
     pub endpoint_inactive: Option<String>,
@@ -166,7 +171,7 @@ pub struct Live {
     pub default_automatic: bool,
     pub joined: Vec<JoinedRow>,
     pub joined_state: JoinedState,
-    pub notes: Vec<String>,
+    pub notes: Vec<(String, bool)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +198,7 @@ pub enum Act {
     DefaultMachine(Option<String>),
     Recheck(String),
     RemoveConnectionConfirmed(String),
+    DismissNotice,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +213,7 @@ pub struct Page {
     pub fx: Fixture,
     pub live_mode: bool,
     live: Live,
+    notice: Option<String>,
     name: String,
     name_dirty: bool,
     selected_key: Option<String>,
@@ -234,6 +241,7 @@ impl Page {
             fx: Fixture { local_open: true, other_open: true, joined_open: true, ..Fixture::default() },
             live_mode: true,
             live: Live::default(),
+            notice: None,
             name: String::new(),
             name_dirty: false,
             selected_key: None,
@@ -256,6 +264,10 @@ impl Page {
         self.live_mode = true;
     }
 
+    pub fn set_notice(&mut self, notice: Option<String>) { self.notice = notice; }
+    pub fn dismiss_notice(&mut self) { self.notice = None; }
+    pub fn notice_text(&self) -> Option<&str> { self.notice.as_deref() }
+
     /// The page was just opened again (the app keeps one page for the session): re-arm the open requests so the
     /// service status, scan seed and joined list reload. Each request is still sent once per entry.
     pub fn reset_entry(&mut self) {
@@ -277,6 +289,7 @@ impl Page {
             name: live.local.name.clone(),
             live,
             live_mode: false,
+            notice: None,
             selected_key,
             confirm,
             open_page_sent: true,
@@ -354,10 +367,11 @@ impl Page {
         let local_table_h = table_height(1, local_table_w < 1256.0);
         let other_table_h = table_height(self.live.others.len(), local_table_w < 1256.0);
         let joined_body_h = self.joined_body_height(local_table_w < 808.0);
-        let notes_h = self.live.notes.len() as f32 * 24.0;
+        let notes_h = (self.live.notes.len() + usize::from(self.notice.is_some())) as f32 * 24.0;
         let local_h = if self.fx.local_open {
             24.0 + 2.0 + 72.0
                 + self.live.local.service_error.iter().count() as f32 * 24.0
+                + self.live.local.discovery_error.iter().count() as f32 * 24.0
                 + self.live.local.receive_summary.len() as f32 * 24.0
                 + self.live.local.held_attempts.len() as f32 * 24.0
                 + local_table_h + 2.0 + 24.0 + self.local_details_height() + 3.0
@@ -374,8 +388,13 @@ impl Page {
         let origin = content_rect.min - egui::vec2(8.0, 0.0);
         draw_text(&page, Rect::from_min_size(origin + egui::vec2(8.0, 4.0), egui::vec2(w - 16.0, 20.0)), "Machines", ty::title(), 20.0, t.text_primary, Align::Min);
         let mut y = origin.y + 28.0;
-        for note in &self.live.notes {
-            draw_text(&page, Rect::from_min_size(egui::pos2(origin.x + 16.0, y), egui::vec2(w - 32.0, 24.0)), note, ty::small(), 14.0, t.error, Align::Min);
+        for (note, is_error) in &self.live.notes {
+            draw_text(&page, Rect::from_min_size(egui::pos2(origin.x + 16.0, y), egui::vec2(w - 32.0, 24.0)), note, ty::small(), 14.0, if *is_error { t.error } else { t.text_secondary }, Align::Min);
+            y += 24.0;
+        }
+        if let Some(notice) = self.notice.as_deref() {
+            draw_text(&page, Rect::from_min_size(egui::pos2(origin.x + 16.0, y), egui::vec2(w - 120.0, 24.0)), notice, ty::small(), 14.0, t.error, Align::Min);
+            if ui.add(buttons::ghost_button("Dismiss").at(egui::pos2(origin.x + w - 92.0, y))).clicked() { acts.push(Act::DismissNotice); }
             y += 24.0;
         }
         self.local_section(&mut page, t, origin.x, y, w, local_table_h, acts);
@@ -393,10 +412,11 @@ impl Page {
         let local_table_w = (w - 32.0).max(0.0);
         let local_table_h = table_height(1, local_table_w < 1256.0);
         let other_table_h = table_height(self.live.others.len(), local_table_w < 1256.0);
-        let notes_h = self.live.notes.len() as f32 * 24.0;
+        let notes_h = (self.live.notes.len() + usize::from(self.notice.is_some())) as f32 * 24.0;
         let local_h = if self.fx.local_open {
             24.0 + 2.0 + 72.0
                 + self.live.local.service_error.iter().count() as f32 * 24.0
+                + self.live.local.discovery_error.iter().count() as f32 * 24.0
                 + self.live.local.receive_summary.len() as f32 * 24.0
                 + self.live.local.held_attempts.len() as f32 * 24.0
                 + local_table_h + 2.0 + 24.0 + self.local_details_height() + 3.0
@@ -496,12 +516,16 @@ impl Page {
             draw_text(ui, Rect::from_min_size(egui::pos2(x + 16.0, status_extra_y), egui::vec2(w - 32.0, 24.0)), error, ty::small(), 14.0, t.error, Align::Min);
             status_extra_y += 24.0;
         }
+        if let Some(error) = local.discovery_error.as_deref() {
+            draw_text(ui, Rect::from_min_size(egui::pos2(x + 16.0, status_extra_y), egui::vec2(w - 32.0, 24.0)), error, ty::small(), 14.0, t.error, Align::Min);
+            status_extra_y += 24.0;
+        }
         for summary in &local.receive_summary {
             draw_text(ui, Rect::from_min_size(egui::pos2(x + 16.0, status_extra_y), egui::vec2(w - 32.0, 24.0)), summary, ty::small(), 14.0, t.text_secondary, Align::Min);
             status_extra_y += 24.0;
         }
 
-        let mut table_y = row_y + 72.0 + local.service_error.iter().count() as f32 * 24.0 + local.receive_summary.len() as f32 * 24.0;
+        let mut table_y = row_y + 72.0 + (local.service_error.iter().count() + local.discovery_error.iter().count()) as f32 * 24.0 + local.receive_summary.len() as f32 * 24.0;
         for held in &local.held_attempts {
             if !self.live_mode {
                 let banner_y = table_y;
@@ -568,6 +592,7 @@ impl Page {
         let rect = Rect::from_min_size(egui::pos2(x + 16.0, y), egui::vec2(w - 16.0, if self.fx.other_open { 24.0 } else { 25.0 }));
         if disclosure(ui, rect, "machines-other", "Other machines", self.fx.other_open, true, 0.0).clicked() { self.fx.other_open = !self.fx.other_open; }
         if !self.fx.other_open { return; }
+        let local = &self.live.local;
 
         let actions_y = y + 26.0;
         if self.live.scan.scanning {
@@ -594,30 +619,29 @@ impl Page {
 
         if self.live_mode {
             let mut right = x + w;
-            if matches!(self.live.local.service_mode, ServiceMode::Legacy { .. }) {
+            if local.can_remove {
                 let remove = buttons::destructive_button("Remove service…");
                 let remove_w = remove.natural_width(ui);
                 let remove_response = ui.add(remove.at(egui::pos2(right - remove_w, actions_y + 1.0)));
                 right -= remove_w + 4.0;
                 if remove_response.clicked() { self.confirm = Some(Confirmation { kind: Confirm::RemoveService, ids: Vec::new(), names: Vec::new(), connection_key: None }); self.fx.dialog = Some(Confirm::RemoveService); }
-                match self.live.local.service_mode {
-                    ServiceMode::Legacy { running: true } => {
-                        let stop = buttons::secondary_button("Stop").width(64.0);
-                        let response = ui.add(stop.at(egui::pos2(right - 64.0, actions_y + 1.0)));
-                        right -= 68.0;
-                        if response.clicked() { acts.push(Act::StopService); }
-                    }
-                    ServiceMode::Legacy { running: false } => {
-                        let start = buttons::secondary_button("Start").width(64.0);
-                        let response = ui.add(start.at(egui::pos2(right - 64.0, actions_y + 1.0)));
-                        right -= 68.0;
-                        if response.clicked() { acts.push(Act::StartService); }
-                    }
-                    _ => {}
-                }
             }
-            let refresh = ui.add(buttons::icon_button(Icon::Refresh, buttons::IconButtonSize::Normal22, "Refresh service state").at(egui::pos2(right - 22.0, actions_y + 1.0)));
-            if refresh.clicked() { acts.push(Act::RefreshService); }
+            if local.can_stop {
+                let stop = buttons::secondary_button("Stop").width(64.0);
+                let response = ui.add(stop.at(egui::pos2(right - 64.0, actions_y + 1.0)));
+                right -= 68.0;
+                if response.clicked() { acts.push(Act::StopService); }
+            }
+            if local.can_start {
+                let start = buttons::secondary_button("Start").width(64.0);
+                let response = ui.add(start.at(egui::pos2(right - 64.0, actions_y + 1.0)));
+                right -= 68.0;
+                if response.clicked() { acts.push(Act::StartService); }
+            }
+            if local.can_refresh {
+                let refresh = ui.add(buttons::icon_button(Icon::Refresh, buttons::IconButtonSize::Normal22, "Refresh service state").at(egui::pos2(right - 22.0, actions_y + 1.0)));
+                if refresh.clicked() { acts.push(Act::RefreshService); }
+            }
         } else {
             let remove = buttons::destructive_button("Remove service…");
             let remove_w = remove.natural_width(ui);
@@ -1043,7 +1067,12 @@ fn sample_live() -> Live {
         allow_joins: true,
         service_state_text: "Receiving on".into(),
         service_error: None,
+        discovery_error: None,
         service_mode: ServiceMode::Legacy { running: true },
+        can_start: false,
+        can_stop: true,
+        can_remove: true,
+        can_refresh: true,
         addresses: vec![("192.168.1.20:7410".into(), "LAN".into())],
         receive_jobs: true,
         endpoint_inactive: None,

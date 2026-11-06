@@ -307,6 +307,10 @@ pub struct Conn {
     pub receive: bool,
     /// This PC's name on the network.
     pub name: String,
+    /// The connected host's last advertised machine name, saved for offline display.
+    pub host_name: String,
+    /// The host's saved network identity, available before the first connection answer.
+    pub network_id: String,
     /// Known https addresses of the host, sent on connect and refreshed while online.
     pub endpoints: Vec<String>,
     /// The user's pick, already first in `endpoints` (empty = automatic).
@@ -335,6 +339,8 @@ pub struct ConnRow {
     /// The routing key the `Action` variants use.
     pub creds: PathBuf,
     pub name: String,
+    /// Target id retained in settings when the connection is offline.
+    pub default_target: Option<String>,
     pub namespace: Option<String>,
     pub installation_ids: Vec<String>,
     pub enabled: bool,
@@ -674,6 +680,9 @@ impl Remote {
         self.target_host.clone_from(&c.target_host);
         self.legacy_ns.clone_from(&c.legacy_ns);
         self.legacy_id.clone_from(&c.legacy_id);
+        if self.network_id.is_none() && !c.network_id.is_empty() {
+            self.network_id = Some(c.network_id.clone());
+        }
     }
     /// This connection can carry a shot for PC `iid`: any PC of a normal network, only its own PC for a destination.
     pub(crate) fn fits(&self, iid: &str) -> bool {
@@ -959,8 +968,9 @@ impl Remote {
                 self.endpoints_inflight = false;
                 self.sent_endpoints = sent; // retry only when addresses or the preferred one change, or the link reconnects
                 self.sent_prefer = prefer;
-                if let Err(e) = r {
-                    self.status = Some(format!("Could not update host addresses: {}", err_text(&e)));
+                match r {
+                    Ok(_) => self.clear_status("Could not update host addresses:"),
+                    Err(e) => self.status = Some(format!("Could not update host addresses: {}", err_text(&e))),
                 }
             }
             (Pend::Leave, r) => {
@@ -1077,7 +1087,11 @@ impl Remote {
                 if let Some(j) = self.jobs.iter_mut().find(|j| j.job_id.as_deref() == Some(jid.as_str())) { j.inflight = false; }
             }
             (Pend::Cancel(_), Ok(_)) => {}
-            (Pend::Destination, Ok(_)) => self.publish = Publish::Done,
+            (Pend::Destination, Ok(_)) => {
+                self.publish = Publish::Done;
+                self.clear_status("Could not tell ");
+                self.clear_status("This PC's address could not be prepared for ");
+            }
             (Pend::Destination, Err(e)) => self.destination_failed(&e),
         }
     }
@@ -1167,6 +1181,10 @@ impl Remote {
     fn destination_failed(&mut self, e: &LinkError) {
         self.publish = Publish::Stopped; // told again after the next reconnect (same offer), never in a loop
         self.status = Some(format!("Could not tell {} this PC's address: {}", self.label(), err_text(e)));
+    }
+
+    fn clear_status(&mut self, prefix: &str) {
+        if self.status.as_deref().is_some_and(|s| s.starts_with(prefix)) { self.status = None; }
     }
 
     fn publish_endpoint(&mut self) {
@@ -1341,7 +1359,10 @@ impl Remote {
         let owner = c.to_string_lossy().into_owned();
         let add = self.jobs.iter().map(|j| sent_entry(&owner, json!({"submission_id": j.submission_id, "submission": j.submission, "submission_attempted": j.submission_attempted, "installation": j.installation, "namespace": j.namespace, "project_root": j.project_root, "clip_root": j.clip_root, "submitted_at": j.submitted_at, "stages": j.stages, "cursor": j.cursor, "active_stage": j.active_stage, "cancel_requested": j.cancel_requested, "on": j.on, "done": j.done, "total": j.total, "reason": j.reason, "job_id": j.job_id, "folder": j.folder, "name": j.name, "state": j.state}))).collect();
         match crate::queue::replace(&hp, |e| e.kind == "sent" && e.owner == owner, add) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.clear_status("Could not save the list of sent jobs");
+                true
+            }
             Err(e) => {
                 self.status = Some(format!("Could not save the list of sent jobs ({e}); they cannot be followed after a restart."));
                 false
@@ -1546,9 +1567,18 @@ impl Remote {
         let (status_text, connected) = self.status_line(cfg);
         let notes = self.notes();
         let installs = self.other_installations(own);
+        let host_name = installs.iter().find(|i| i.id == self.public_host()).map(|i| i.name.trim()).filter(|n| !n.is_empty())
+            .or_else(|| { let n = cfg.host_name.trim(); (!n.is_empty()).then_some(n) })
+            .map(str::to_owned).unwrap_or_else(|| self.label());
+        let default_target = self.ns().and_then(|ns| {
+            let iid = (!self.public_host().is_empty()).then(|| self.public_host().to_owned())
+                .or_else(|| installs.first().map(|i| i.id.clone()))?;
+            Some(format!("network:{ns}/{iid}"))
+        });
         ConnRow {
             creds: PathBuf::from(&self.key),
-            name: self.label(),
+            name: host_name,
+            default_target,
             namespace: self.ns(),
             installation_ids: installs.iter().map(|i| i.id.clone()).collect(),
             enabled: cfg.enabled,
@@ -1639,6 +1669,40 @@ mod discovery_tests {
         r.installs = vec![inst("X1"), inst("X2"), inst("B")];
         let left: Vec<String> = r.other_installations(&["X2".to_owned()]).into_iter().map(|i| i.id).collect();
         assert_eq!(left, ["B"]);
+    }
+
+    #[test]
+    fn c4_default_target_uses_saved_host_id_while_offline() {
+        let mut r = Remote::blank(Source::Off, "connection.json".into());
+        r.cached_ns = Some("network-a".into());
+        r.target_host = "host-id".into();
+        let row = r.conn_row(&Conn::default());
+        assert_eq!(row.default_target.as_deref(), Some("network:network-a/host-id"));
+        r.legacy_ns = "legacy-network".into();
+        r.legacy_id = "legacy-host".into();
+        assert_eq!(r.conn_row(&Conn::default()).default_target.as_deref(), Some("network:legacy-network/legacy-host"));
+    }
+
+    #[test]
+    fn c13_connection_name_prefers_live_then_saved_host_name() {
+        let mut r = Remote::blank(Source::Off, "connection.json".into());
+        r.target_host = "host-id".into();
+        r.installs = vec![Install { id: "host-id".into(), name: "Live host".into(), gpu: None, connected: true, last_seen_s: None, stats: Value::Null, receiving: None, busy: None, held: None, received: Instant::now() }];
+        let cfg = Conn { host_name: "Saved host".into(), ..Conn::default() };
+        assert_eq!(r.conn_row(&cfg).name, "Live host");
+        r.installs.clear();
+        assert_eq!(r.conn_row(&cfg).name, "Saved host");
+    }
+
+    #[test]
+    fn c2_success_clears_only_its_own_remote_error() {
+        let mut r = Remote::blank(Source::Off, String::new());
+        r.status = Some("Could not update host addresses: offline".into());
+        r.clear_status("Could not update host addresses:");
+        assert!(r.status.is_none());
+        r.status = Some("Could not tell another PC this PC's address: offline".into());
+        r.clear_status("Could not update host addresses:");
+        assert!(r.status.is_some());
     }
     fn gpu(util: Option<f64>, used: u64, total: u64) -> Value {
         let mut g = json!({"uuid": "GPU-1", "vram_used_bytes": used, "vram_total_bytes": total});

@@ -612,6 +612,27 @@ impl Scheduler {
     pub fn busy(&self) -> bool {
         self.jobs.iter().any(|e| e.state.fences()) || self.tasks.iter().any(|t| t.state.fences())
     }
+    /// Catalog ids loaded by jobs that are queued, running or still fenced.
+    pub fn active_model_usage(&self) -> (Vec<String>, bool) {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut unknown = false;
+        for _ in self.jobs.iter().filter(|e| e.state.fences()) {
+            match &self.models {
+                ModelState::Known(models) => match models.key_files() {
+                    Ok(files) => ids.extend(files.into_keys()),
+                    Err(_) => unknown = true,
+                },
+                _ => unknown = true,
+            }
+        }
+        for task in self.tasks.iter().filter(|e| e.state.fences()) {
+            match self.model_task_files(&task.job) {
+                Some(files) => ids.extend(files.into_keys()),
+                None => unknown = true,
+            }
+        }
+        (ids.into_iter().collect(), unknown)
+    }
     /// Lost tasks whose writer is not proven stopped.
     pub fn task_attention(&self) -> Vec<TaskEntry> {
         self.tasks

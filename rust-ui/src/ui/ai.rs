@@ -179,6 +179,7 @@ struct Tracked {
     warnings: Vec<String>,
     job_id: String,
     folder: String,
+    clip_root: PathBuf,
     name: String,
     /// Task kind label ("" = a Key job).
     label: String,
@@ -719,6 +720,7 @@ pub struct BatchDialogRow {
     pub can_include: bool,
     pub accept: Option<String>,
     pub offer: Option<String>,
+    pub reuse_note: Option<String>,
     pub reuse: bool,
     pub mismatch: bool,
     pub reset_to_preset: bool,
@@ -789,6 +791,7 @@ pub struct AiUi {
     /// two projects that both have a `shot-01` clip never share an assignment.
     clients: BTreeMap<PathBuf, Option<String>>,
     pub notice: Option<String>,
+    notice_roots: Vec<PathBuf>,
     /// Recompute cues for the Key / delivery cards: `Some(pulse 0..1)` = stale (set each frame by the Hint feedback tick).
     pub stale_key: Option<f32>,
     pub stale_deliver: Option<f32>,
@@ -969,6 +972,7 @@ impl AiUi {
             assignment: Placement::Auto,
             clients: BTreeMap::new(),
             notice,
+            notice_roots: vec![],
             stale_key: None,
             stale_deliver: None,
             disk_gen: 0,
@@ -1020,18 +1024,18 @@ impl AiUi {
         self.disk_gen += 1;
         &mut self.sched
     }
-    /// Generated masks of `folder` were deleted: forget the SAM previews, bump the disk generation (the gates
+    /// Generated masks of this clip were deleted: forget the SAM previews, bump the disk generation (the gates
     /// re-evaluate against the rescanned clip) and return every job id known now, so a result that arrives late
     /// from one of them is never shown again.
-    pub fn forget_masks(&mut self, folder: &str) -> Vec<String> {
+    pub fn forget_masks(&mut self, clip_root: &Path) -> Vec<String> {
         self.disk_gen += 1;
-        let gone: Vec<String> = self.tk.previews.iter().filter(|(_, p)| p.folder == folder).map(|(k, _)| k.clone()).collect();
+        let gone: Vec<String> = self.tk.previews.iter().filter(|(_, p)| p.clip_root == clip_root).map(|(k, _)| k.clone()).collect();
         for k in gone {
             if let Some(p) = self.tk.previews.remove(&k) {
                 p.mask_png.parent().map(tasks::drop_staging);
             }
         }
-        self.tracked.iter().filter(|t| t.folder == folder).map(|t| t.job_id.clone()).collect()
+        self.tracked.iter().filter(|t| t.clip_root == clip_root).map(|t| t.job_id.clone()).collect()
     }
     /// A job is queued, starting or running, or a Lost writer is still fencing its folder.
     pub fn busy(&self) -> bool {
@@ -1106,6 +1110,8 @@ impl AiUi {
     pub fn forget_project(&mut self) {
         self.drafts.clear();
         self.batch = None;
+        self.gate = Gate::default();
+        self.replace_confirm = false;
     }
 
     pub fn draft(&mut self, clip: &Clip, project: &Project, st: &Settings) -> &mut Draft {
@@ -1162,7 +1168,15 @@ impl AiUi {
                 self.batch = None;
                 self.block_reason = Some(w);
             }
-            None => self.confirm_batch(),
+            None => { self.confirm_batch(); self.clear_auto_wait_notice_if_empty(); }
+        }
+    }
+
+    fn clear_auto_wait_notice_if_empty(&mut self) {
+        if !self.auto_pending.is_empty() { return; }
+        if let Some(notice) = &mut self.notice {
+            *notice = notice.split(". ").filter(|part| !part.contains("waiting for a free PC")).collect::<Vec<_>>().join(". ");
+            if notice.is_empty() { self.notice = None; }
         }
     }
 
@@ -1181,6 +1195,18 @@ impl AiUi {
                     if self.sched.state_of(&id).is_some_and(|s| s.is_terminal()) =>
                 {
                     self.on_task_end(&id);
+                    if self.notice.as_deref().is_some_and(|m| m.starts_with("Queued ")) && self.notice_roots.iter().all(|root| {
+                        !self.tracked.iter().any(|t| &t.clip_root == root && self.sched.state_of(&t.job_id).is_some_and(|s| !s.is_terminal()))
+                    }) {
+                        self.notice_roots.clear();
+                        if let Some(notice) = &mut self.notice {
+                            let keep: Vec<_> = notice.split(". ")
+                                .filter(|part| part.contains("Not queued:") || (part.contains("waiting for a free PC") && !self.auto_pending.is_empty()))
+                                .collect();
+                            *notice = keep.join(". ");
+                            if notice.is_empty() { self.notice = None; }
+                        }
+                    }
                     (id, false)
                 }
                 SchedEvent::Preview {
@@ -1357,6 +1383,7 @@ impl AiUi {
             warnings: vec![],
             job_id: id.clone(),
             folder: clip.folder.clone(),
+            clip_root: clip.root.clone(),
             name: clip.display_name.clone(),
             label: String::new(),
         });
@@ -1875,6 +1902,7 @@ impl AiUi {
                 let status = live_job.as_ref().map(|(_, text)| text.clone())
                     .or_else(|| problem.as_ref().map(|(text, _)| text.clone()))
                     .or_else(|| offer.clone())
+                    .or_else(|| r.reuse_note())
                     .unwrap_or_else(|| if no_machine { "No machine".into() } else if matches!(r.clip.state, ClipState::Masked) { "Hint first".into() } else { "—".into() });
                 let job = live_job.map(|(job, _)| job)
                     .or_else(|| blocked.then_some(BatchDialogJob::Blocked))
@@ -1900,6 +1928,7 @@ impl AiUi {
                     can_include,
                     accept: problem.as_ref().filter(|(_, ok)| *ok).map(|_| "OK".to_owned()),
                     offer,
+                    reuse_note: r.reuse_note(),
                     reuse: r.reuse,
                     mismatch: matches!(r.offer.as_ref().map(|o| &o.compat), Some(crate::hints::Compat::Mismatch(_))),
                     reset_to_preset: !r.overrides.is_empty(),
@@ -2185,8 +2214,8 @@ impl AiUi {
 
     /// True when the pick was saved, so the caller must re-read the clip (in-memory snapshots lack the new mode).
     /// Ids of this clip's tracked tasks (to find the ones a submit just added).
-    pub fn task_ids(&self, folder: &str) -> Vec<String> {
-        self.tracked.iter().filter(|t| t.folder == folder && !t.label.is_empty()).map(|t| t.job_id.clone()).collect()
+    pub fn task_ids(&self, clip_root: &Path) -> Vec<String> {
+        self.tracked.iter().filter(|t| t.clip_root == clip_root && !t.label.is_empty()).map(|t| t.job_id.clone()).collect()
     }
 
     /// The scheduler's last-event stamp of a task: for a finished task, when it finished.
@@ -2200,10 +2229,10 @@ impl AiUi {
     }
 
     /// Tasks of this clip that ended `Complete`: (job id, kind, publish folder name).
-    pub fn completed_tasks(&self, folder: &str) -> Vec<(String, crate::tasks::TaskKind, String)> {
+    pub fn completed_tasks(&self, clip_root: &Path) -> Vec<(String, crate::tasks::TaskKind, String)> {
         self.tracked
             .iter()
-            .filter(|t| t.folder == folder)
+            .filter(|t| t.clip_root == clip_root)
             .filter_map(|t| {
                 let e = self.sched.task(&t.job_id)?;
                 matches!(&e.state, JobState::Done { info, .. } if info.outcome == crate::worker::Outcome::Complete).then(|| {
@@ -2527,7 +2556,9 @@ impl AiUi {
         let (mut params, out) = (d.params.clone(), d.out.clone());
         params.input_is_linear = linear;
         let sig = format!(
-            "{}|{params:?}|{out:?}|{range:?}|{:?}|{:?}|{:?}|{}|{}|{}",
+            "{}|{}|{}|{params:?}|{out:?}|{range:?}|{:?}|{:?}|{:?}|{}|{}|{}",
+            project.root.display(),
+            clip.root.display(),
             clip.folder,
             project.output_location,
             clip.output_values,
@@ -2969,8 +3000,9 @@ impl AiUi {
         self.tracked
             .iter()
             .rev()
-            .filter(|t| t.folder == clip.folder && t.label.is_empty())
+            .filter(|t| t.label.is_empty())
             .filter_map(|t| self.sched.job(&t.job_id))
+            .filter(|e| e.job.clip_root == clip.root)
             .find(|e| !e.cancel_requested && matches!(e.state, JobState::Queued | JobState::Dispatching { .. } | JobState::Running { .. }))
             .map(|e| e.job.job_id.clone())
     }
@@ -3128,7 +3160,7 @@ impl AiUi {
         };
 
         // Newest Key job of this shot: its progress, or how the last one ended.
-        let job = self.tracked.iter().rev().filter(|t| t.folder == clip.folder && t.label.is_empty()).find_map(|t| self.sched.job(&t.job_id));
+        let job = self.tracked.iter().rev().filter(|t| t.label.is_empty()).find_map(|t| self.sched.job(&t.job_id).filter(|e| e.job.clip_root == clip.root));
         let on = |t: &str| self.placement_text(&Placement::Target(t.to_owned()));
         let (mut status_line, mut busy_percent) = (None, None);
         if let Some(e) = job {
@@ -3622,6 +3654,7 @@ impl AiUi {
         }
         let Some(b) = self.batch.take() else { return };
         let rows = b.rows;
+        let notice_roots: Vec<_> = rows.iter().filter(|r| r.plan().is_some()).map(|r| r.clip.root.clone()).collect();
         let reused: Vec<String> = rows.iter().filter(|r| r.plan().is_some()).filter_map(|r| r.reuse_note()).collect();
         let (mut queued, mut waiting, mut errs) = (0, 0, vec![]);
         let mut per_client: BTreeMap<String, usize> = BTreeMap::new();
@@ -3656,6 +3689,7 @@ impl AiUi {
         if !errs.is_empty() {
             m += &format!(" Not queued: {}", errs.join(" "));
         }
+        self.notice_roots = notice_roots;
         self.notice = Some(m);
     }
 
@@ -3766,6 +3800,7 @@ impl AiUi {
                 self.push_waiting(a);
             }
         }
+        self.clear_auto_wait_notice_if_empty();
         self.auto_wait = self.auto_pending.iter().any(|a| !a.paused).then(|| {
             let clients = if self.auto_clients > 0 { "every client is busy or over 50%" } else { "no client with Connect + Accept work is online" };
             [self.local_wait(local), Some(clients.to_owned())].into_iter().flatten().collect::<Vec<_>>().join("; ")
@@ -3969,6 +4004,7 @@ impl AiUi {
     /// Drop the Automatic shots still waiting for a free PC.
     pub fn cancel_auto(&mut self) {
         self.auto_pending.clear();
+        self.clear_auto_wait_notice_if_empty();
     }
 
     fn network_row(&mut self, project: &Project, st: &Settings, preset_name: Option<&str>, r: &BatchRow, plan: &Plan, target: Option<String>) -> Result<NetSubmit, String> {
@@ -4052,9 +4088,9 @@ impl AiUi {
         let run = || -> Result<(), String> {
             for st in stages {
                 let after: Vec<String> = done.last().cloned().into_iter().collect();
-                let (id, folder, label) = match &st {
-                    Stage::Task(t) => (t.job_id.clone(), t.clip_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), t.kind.label().to_string()),
-                    Stage::Key(k) => (k.job_id.clone(), k.clip_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), String::new()),
+                let (id, clip_root, folder, label) = match &st {
+                    Stage::Task(t) => (t.job_id.clone(), t.clip_root.clone(), t.clip_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), t.kind.label().to_string()),
+                    Stage::Key(k) => (k.job_id.clone(), k.clip_root.clone(), k.clip_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), String::new()),
                 };
                 match st {
                     Stage::Task(t) => self.sched.submit_task(t, after).map_err(|e| self.net_submit_error(&label, &e))?,
@@ -4063,7 +4099,7 @@ impl AiUi {
                         .submit(Submit { job: k, placement: Placement::Target(local.clone()), after, min_vram_gb: None })
                         .map_err(|e| self.net_submit_error("Key", &e))?,
                 }
-                self.tracked.push(Tracked { warnings: vec![], job_id: id.clone(), folder: folder.clone(), name: format!("{folder} (network)"), label });
+                self.tracked.push(Tracked { warnings: vec![], job_id: id.clone(), folder: folder.clone(), clip_root, name: format!("{folder} (network)"), label });
                 done.push(id);
             }
             Ok(())
@@ -4266,6 +4302,9 @@ impl AiUi {
         self.sched.needs_attention().is_empty()
             && self.sched.task_attention().is_empty()
             && !self.sched.running()
+    }
+    pub fn active_model_usage(&self) -> (Vec<String>, bool) {
+        self.sched.active_model_usage()
     }
     /// The app's model snapshot changed (a check ended: startup, Check/Verify, root change, finished Install/Repair/
     /// Delete). Buttons and the scheduler read this one record; no worker is asked anything.
@@ -4774,6 +4813,25 @@ mod tests {
         assert!(row(Compat::Mismatch("generation settings differ".into())).offer_text().unwrap().contains("generation settings differ"));
         assert!(row(Compat::Missing).offer_text().is_none(), "nothing to reuse, nothing to ask");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn tracked_task_ids_are_scoped_to_the_clip_root() {
+        let mut ai = AiUi::new(&Settings::default(), None);
+        for (job_id, root) in [
+            ("project-a", std::path::PathBuf::from("/tmp/project-a/clips/shot-01")),
+            ("project-b", std::path::PathBuf::from("/tmp/project-b/clips/shot-01")),
+        ] {
+            ai.tracked.push(Tracked {
+                warnings: vec![], job_id: job_id.into(), folder: "shot-01".into(), clip_root: root,
+                name: job_id.into(), label: "SAM preview".into(),
+            });
+        }
+        let a = std::path::Path::new("/tmp/project-a/clips/shot-01");
+        let b = std::path::Path::new("/tmp/project-b/clips/shot-01");
+        assert_eq!(ai.task_ids(a), ["project-a"]);
+        assert_eq!(ai.task_ids(b), ["project-b"]);
+        assert_eq!(ai.forget_masks(a), ["project-a"], "cleanup only returns this project's task ids");
     }
     fn auto_fixture(tag: &str, n: usize) -> (AiUi, std::path::PathBuf) {
         let d = std::env::temp_dir().join(format!("ck-auto-{tag}-{}", std::process::id()));

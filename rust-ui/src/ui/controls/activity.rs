@@ -140,7 +140,9 @@ pub fn activity_popover(ctx: &Context, anchor: Rect, state: &mut ActivityState, 
     let modal = egui::Modal::new(id).area(area).backdrop_color(Color32::TRANSPARENT).frame(egui::Frame::NONE).show(ctx, |ui| {
         paint(ui, rect, state, items, None, fresh)
     });
-    let should_close = modal.should_close();
+    // Status-bar trigger clicks are routed by the caller; the modal must not also treat them as outside dismissals.
+    let trigger_clicked = ctx.input(|i| i.pointer.any_released() && i.pointer.interact_pos().is_some_and(|p| anchor.contains(p)));
+    let should_close = !fresh && !trigger_clicked && modal.should_close();
     let mut out = modal.inner;
     if should_close { out.closed = true }
     if out.closed {

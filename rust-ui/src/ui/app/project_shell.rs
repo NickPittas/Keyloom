@@ -4,7 +4,7 @@ use super::*;
 use crate::ui::controls::{
     self, buttons, dialog,
     menus::{self, Menu, MenuBar, MenuBarRight, MenuItem},
-    scroll, statusbar, TabKind, TabStrip,
+    scroll, statusbar, StageStatus, TabKind, TabStrip,
 };
 use crate::ui::icons::{self, Icon, IconSize};
 use crate::ui::tokens::tokens;
@@ -15,7 +15,7 @@ use serde_json::json;
 /// Dev page fixtures (screenshots only): the optional top-level `"shell"` object of the fixture file
 /// (`--board-`, `--models-`, `--settings-`, `--machines-` or `--shot-fixture`), read once per run:
 /// `"shell": { "project": "Night_exterior_greenscreen", "saved": true, "models_missing": 0 }`.
-/// It draws the menu bar's project name and Saved state, and the Models button ("N models missing" alert when > 0).
+/// It draws the menu bar's project name and Saved state, and the Models page tab's cached attention state.
 /// A real open project and the Board fixture's own project win over it.
 /// Also the project-open status bar (mockups: "0 waiting", notices 0, CPU 7 %, RAM 34.7 / 123.5 GB, GPU0 21 %,
 /// VRAM 3.6 / 24.0 GB). Absent fields keep those defaults; the GPU bar fills from `gpu_pct`.
@@ -234,7 +234,6 @@ pub(super) const PAGES: [(&str, Icon, &str); 5] = [
     ("Models", Icon::Models, "Ctrl+Shift+4"),
     ("Settings", Icon::Settings, "Ctrl+Shift+5"),
 ];
-const NA: &str = "Not available yet";
 
 /// Shell state that lives between frames (dialogs, Start focus, row tooltip).
 #[derive(Default)]
@@ -296,7 +295,7 @@ impl App {
     }
 
     /// Per frame: does any adopted clip's draft (open or not) differ from what disk holds?
-    fn refresh_draft_dirty(&mut self) {
+    pub(super) fn refresh_draft_dirty(&mut self) {
         // Shots changed by a deliberate action (Batch reset, confirmed queue with overrides) are tracked like opened ones.
         for f in self.ai.take_touched() {
             self.draft_clips.insert(f);
@@ -422,9 +421,11 @@ impl App {
                 return false;
             }
         }
-        self.path_input = path.display().to_string();
-        self.load(ctx);
-        true
+        let previous_path = std::mem::replace(&mut self.path_input, path.display().to_string());
+        if self.load(ctx) { true } else {
+            self.path_input = previous_path;
+            false
+        }
     }
 
     /// File > New project: pending edits are saved first (refused if that fails), then only a destination
@@ -454,6 +455,10 @@ impl App {
     /// leaves the open project, its drafts and the disk untouched.
     pub(super) fn new_project_window(&mut self, ctx: &egui::Context) {
         let Some((parent, mut name)) = self.new_project_draft.take() else { return };
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.new_project_error = None;
+            return;
+        }
         let (mut create, mut cancel) = (false, false);
         egui::Window::new("New project").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
             ui.label(RichText::new(format!("An empty project folder is created in {}", parent.display())).color(theme::text_dim(ui)));
@@ -513,8 +518,18 @@ impl App {
         use egui::Modifiers;
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         for (i, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].into_iter().enumerate() {
-            if ctx.input_mut(|inp| inp.consume_key(cs, k)) {
-                self.goto_page(i);
+            if !ctx.text_edit_focused() {
+                let physical = ctx.input_mut(|inp| {
+                    let before = inp.events.len();
+                    inp.events.retain(|event| !matches!(event,
+                        egui::Event::Key { physical_key: Some(physical), pressed: true, modifiers, .. }
+                            if *physical == k && modifiers.command && modifiers.shift && !modifiers.alt
+                    ));
+                    inp.events.len() != before
+                });
+                if physical || ctx.input_mut(|inp| inp.consume_key(cs, k)) {
+                    self.goto_page(i);
+                }
             }
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Comma)) {
@@ -528,6 +543,11 @@ impl App {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
             self.request_pick(ctx, PickKind::Project);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::I)) {
+            self.request_pick(ctx, PickKind::Folder);
+        } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::I)) {
+            self.request_pick(ctx, PickKind::Clips);
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
             self.quit_request(ctx);
@@ -548,6 +568,8 @@ impl App {
             4
         } else if self.clients_open {
             2
+        } else if self.board_selected {
+            0
         } else if (self.viewer.is_some() && self.open.is_some()) || self.shot_fx.is_some() {
             1
         } else if self.project.is_some() || self.board_fx.is_some() {
@@ -571,6 +593,8 @@ impl App {
         if p >= PAGES.len() || self.page_block(p).is_some() {
             return;
         }
+        if p == 0 { self.board_selected = true; }
+        if p == 1 { self.board_selected = false; }
         if p != 4 && self.settings_open {
             self.close_settings();
         }
@@ -588,10 +612,6 @@ impl App {
         }
         if p == 4 && !self.settings_open {
             self.open_settings();
-        }
-        if p == 0 && self.viewer.is_some() {
-            self.viewer = None;
-            self.open = None;
         }
     }
 
@@ -634,17 +654,21 @@ impl App {
             MenuItem::sep(),
             off(has, need_project, MenuItem::new("Save project").shortcut("Ctrl+S")),
             off(has, need_project, MenuItem::new("Project output folder…")),
+            off(has, need_project, MenuItem::new("Import shots…").shortcut("Ctrl+I")),
+            off(has, need_project, MenuItem::new("Import folder…").shortcut("Ctrl+Shift+I")),
             MenuItem::sep(),
             MenuItem::new("Quit").shortcut("Ctrl+Q"),
         ];
         if busy {
-            for i in [0, 1, 3] {
+            for i in [0, 1, 3, 7, 8] {
                 file[i] = file[i].disabled(busy_why);
             }
         }
+        let on_board = self.page_now() == 0;
+        let has_shots = self.project.as_ref().is_some_and(|p| !p.clips.is_empty());
         let edit = [
-            MenuItem::new("Select all shots").shortcut("Ctrl+A").disabled(NA),
-            MenuItem::new("Assign selected shots").shortcut("Ctrl+Shift+A").disabled(NA),
+            off(on_board && has_shots, "Open a project with shots first", MenuItem::new("Select all shots").shortcut("Ctrl+A")),
+            off(on_board && !self.selected.is_empty(), "Select shots first", MenuItem::new("Assign selected shots").shortcut("Ctrl+Shift+A")),
         ];
         let view = [
             off(shot, need_shot, MenuItem::new("Fit")),
@@ -673,13 +697,13 @@ impl App {
         window.extend([
             MenuItem::sep(),
             off(shot, need_shot, MenuItem::new("Properties").shortcut("P")),
-            MenuItem::new("Bottom panel").disabled(NA),
-            MenuItem::new("Queue").disabled(NA),
-            MenuItem::new("Activity").disabled(NA),
+            off(shot, need_shot, MenuItem::new("Bottom panel")),
+            off(has, need_project, MenuItem::new("Queue")),
+            MenuItem::new("Activity"),
             MenuItem::sep(),
-            MenuItem::new("Reset panel sizes").disabled(NA),
+            off(shot, need_shot, MenuItem::new("Reset panel sizes")),
         ]);
-        let help = [MenuItem::new("Keyboard shortcuts").disabled(NA)];
+        let help: [MenuItem<'static>; 0] = [];
         let menus = [
             Menu { label: "File", items: &file },
             Menu { label: "Edit", items: &edit },
@@ -692,23 +716,45 @@ impl App {
         let project = self.project.as_ref().map(|p| p.display_name.clone()).or_else(|| self.board_fx.as_ref().map(|b| b.fx.project.clone())).or_else(|| shell.map(|s| s.project.clone())).unwrap_or_default();
         let unsaved = match (&self.board_fx, shell) { (Some(b), _) => b.fx.saved == 0, (None, Some(s)) if !has => !s.saved, _ => has && self.unsaved() };
         let out = MenuBar::new(&menus, MenuBarRight { project: &project, unsaved }).dot_only(compact).at(full.min).width(full.width()).show(ui);
+        self.menu_open = out.open;
         let clicked = out.clicked;
 
-        // ---- toolbar: page tabs left, Models button right
+        // ---- toolbar: page tabs
         let bar = Rect::from_min_max(pos2(full.min.x, full.min.y + 24.0), pos2(full.max.x, full.min.y + 60.0));
         ui.painter().rect_filled(bar, 0.0, t.bg_app);
         ui.painter().rect_filled(Rect::from_min_max(pos2(bar.min.x, bar.max.y - 1.0), bar.max), 0.0, t.border_divider);
+        let (models_attention, models_missing) = match shell {
+            Some(s) => (s.models_missing > 0, Some(s.models_missing)),
+            None => (self.models.startup_error_or_missing(), self.models.missing_count()),
+        };
         let tips: Vec<String> = PAGES
             .iter()
+            .enumerate()
             .zip(&blocks)
-            .map(|((n, _, k), b)| match b { Some(why) => format!("{n}\n{why}"), None => format!("{n}\n{k}") })
+            .map(|((i, (n, _, k)), b)| {
+                if let Some(why) = b { return format!("{n}\n{why}") }
+                if i == 3 && models_attention {
+                    let reason = models_missing.filter(|n| *n > 0).map_or_else(
+                        || "Models need attention".to_owned(),
+                        |n| format!("{n} required model{} missing", if n == 1 { "" } else { "s" }),
+                    );
+                    format!("Models\n{reason}\n{k}")
+                } else {
+                    format!("{n}\n{k}")
+                }
+            })
             .collect();
         let tabs: Vec<controls::Tab> = PAGES
             .iter()
             .zip(&blocks)
             .zip(&tips)
-            .map(|(((n, ic, _), b), tip)| {
-                let tab = controls::Tab::new(n).icon(*ic);
+            .enumerate()
+            .map(|(i, (((n, ic, _), b), tip))| {
+                let mut tab = controls::Tab::new(n).icon(*ic);
+                if i == 3 && models_attention {
+                    if let Some(n) = models_missing.filter(|n| *n > 0) { tab = tab.badge(n.min(u32::MAX as usize) as u32); }
+                    tab = tab.status(StageStatus::Blocked);
+                }
                 if b.is_some() { tab.disabled(tip) } else { tab.tip(tip) }
             })
             .collect();
@@ -727,26 +773,6 @@ impl App {
         if active != before {
             self.goto_page(active);
         }
-        let (attention, missing) = match shell {
-            Some(s) => (s.models_missing > 0, Some(s.models_missing)),
-            None => (self.models.startup_error_or_missing(), self.models.missing_count()),
-        };
-        let label = match (attention, missing) {
-            (false, _) => "Models".to_owned(),
-            (true, Some(1)) => "1 model missing".to_owned(),
-            (true, Some(n)) => format!("{n} models missing"),
-            (true, None) => "Models need attention".to_owned(),
-        };
-        let probe = buttons::ghost_button(&label);
-        let w = (probe.natural_width(ui) + if attention { 12.0 } else { 22.0 }).ceil(); // lead: 6 dot + 6 gap, or 16 icon + 6 gap
-        let mut btn = buttons::ghost_button(&label).width(w).at(pos2(bar.max.x - 8.0 - w, bar.min.y + 10.0));
-        btn = if attention { btn.alert() } else { btn.with_icon(Icon::Models) };
-        let models = ui.add(btn);
-        menus::tooltip(&models, "", None, &self.models.startup_label());
-        if models.clicked() {
-            self.goto_page(3);
-        }
-
         // ---- menu actions
         let Some(path) = clicked else { return };
         match (path[0], path.get(1).copied().unwrap_or(usize::MAX)) {
@@ -764,10 +790,18 @@ impl App {
             (0, 3) => self.shell.path_dialog = Some(self.path_input.clone()),
             (0, 5) => self.report_save(),
             (0, 6) => self.shell.out_dialog = Some(self.loc.root.display().to_string()),
-            (0, 8) => self.quit_request(&ctx),
+            (0, 7) => { self.request_pick(&ctx, PickKind::Clips); }
+            (0, 8) => { self.request_pick(&ctx, PickKind::Folder); }
+            (0, 10) => self.quit_request(&ctx),
+            (1, 0) => {
+                self.selected = (0..self.project.as_ref().map_or(0, |p| p.clips.len())).collect();
+            }
+            (1, 1) => self.key_selected(&ctx),
             (2, i) => {
                 if i == 5 {
-                    self.focus_mode = !self.focus_mode;
+                    let focus = !self.shot_page.focus();
+                    self.shot_page.set_focus(focus);
+                    self.focus_mode = focus;
                 } else if let Some(v) = &mut self.viewer {
                     match i {
                         0 => v.fit(),
@@ -784,23 +818,39 @@ impl App {
                 }
             }
             (4, i) if i < PAGES.len() => self.goto_page(i),
-            (4, 6) => self.props_sheet = !self.props_sheet,
+            (4, 6) => {
+                self.shot_page.toggle_drawer();
+                self.props_sheet = self.shot_page.drawer_open();
+            }
+            (4, 7) => {
+                self.shot_page.set_dock_expanded(!self.shot_page.dock_expanded());
+            }
+            (4, 8) => {
+                self.board_page.fx.qtab = "waiting".into();
+                self.board_page.fx.drawer = 1;
+                self.goto_page(0);
+            }
+            (4, 9) => self.activity_toggle(),
+            (4, 11) => {
+                ctx.memory_mut(|m| m.reset_areas());
+                self.graph_collapsed = false;
+                self.graph_short_open = true;
+            }
             _ => {}
         }
     }
 
     /// Start status bar (§7.4, §8.8): activity and notices only.
-    pub(super) fn start_status(&mut self, ui: &mut Ui) {
+    pub(super) fn start_status(&mut self, ui: &mut Ui) -> statusbar::StatusOut {
         let w = ui.ctx().content_rect().width();
         let width = if w >= 1600.0 { statusbar::Width::Wide } else if w >= 1200.0 { statusbar::Width::Medium } else { statusbar::Width::Compact };
         if let Some(s) = shell_fixture(&self.opts) {
             // Dev fixture: the project-open bar from the mockups, through the same control the Board draws.
             let meters = statusbar::Meters { cpu: s.cpu, ram_used: s.ram_used, ram_total: s.ram_total, gpu_pct: s.gpu_pct, gpu_label: &s.gpu_label, vram_used: s.vram_used, vram_total: s.vram_total };
-            statusbar::status_bar(ui, &statusbar::StatusData { notices: s.notices, queue_waiting: Some(s.waiting), meters: Some(meters), ..Default::default() }, width);
-            return;
+            return statusbar::status_bar(ui, &statusbar::StatusData { notices: s.notices, queue_waiting: Some(s.waiting), meters: Some(meters), ..Default::default() }, width);
         }
-        let notices = self.recent.fixture_notices.unwrap_or_else(|| u32::from(self.ai.notice.is_some()) + u32::from(self.load_error.is_some()));
-        statusbar::status_bar(ui, &statusbar::StatusData { notices, start: true, ..Default::default() }, width);
+        let notices = self.recent.fixture_notices.unwrap_or_else(|| self.notice_count());
+        statusbar::status_bar(ui, &statusbar::StatusData { notices, failures: self.failure_count(), start: true, ..Default::default() }, width)
     }
 
     /// Open Recent row `i`: a missing folder opens the Locate / Remove dialog instead (§7.4).
@@ -1153,7 +1203,11 @@ mod tests {
 
     fn click(ctx: &egui::Context, app: &mut App, label: &str) {
         let out = frame(ctx, app, vec![]);
-        let b = node(&out, label).unwrap_or_else(|| panic!("no {label}")).bounds().unwrap();
+        let nodes = &out.platform_output.accesskit_update.as_ref().unwrap().nodes;
+        let n = nodes.iter().find(|(_, n)| n.role() == egui::accesskit::Role::MenuItem && n.label() == Some(label))
+            .or_else(|| nodes.iter().find(|(_, n)| n.label() == Some(label)))
+            .unwrap_or_else(|| panic!("no {label}"));
+        let b = n.1.bounds().unwrap();
         let at = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
         let btn = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
         frame(ctx, app, vec![egui::Event::PointerMoved(at)]);
@@ -1240,6 +1294,179 @@ mod tests {
         assert!(!app.unsaved(), "Ctrl+S saved the output folder");
         frame(&ctx, &mut app, key(Key::Q, egui::Modifiers::COMMAND));
         assert!(app.quitting);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn project_with_clip(parent: &Path, name: &str) -> PathBuf {
+        let root = parent.join(name);
+        let frames = root.join("clips/shot/Frames");
+        std::fs::create_dir_all(&frames).unwrap();
+        std::fs::write(root.join("project.json"), r#"{"version":2}"#).unwrap();
+        std::fs::write(root.join("clips/shot/clip.json"), "{}").unwrap();
+        std::fs::write(frames.join("frame0001.png"), include_bytes!("../../../tests/fixtures/shot-plate.png")).unwrap();
+        root
+    }
+
+    #[test]
+    fn g2_project_picker_and_board_navigation_keep_the_open_shot_until_replacement() {
+        let (ctx, mut app, d, _) = start_app("g2-navigation", None);
+        let current = project_with_clip(&d, "current");
+        let next = d.join("next");
+        std::fs::create_dir_all(&next).unwrap();
+        std::fs::write(next.join("project.json"), r#"{"version":2}"#).unwrap();
+        assert!(app.open_project_path(&ctx, current.clone()));
+        assert_eq!(app.project.as_ref().unwrap().clips.len(), 1);
+        app.open_clip(&ctx, 0);
+        assert!(app.viewer.is_some());
+        app.goto_page(0);
+        assert_eq!(app.page_now(), 0);
+        assert!(app.viewer.is_some());
+        app.goto_page(1);
+        assert_eq!(app.page_now(), 1);
+        assert_eq!(app.open, Some(0));
+        app.held_pick = Some((PickKind::Project, vec![next.clone()]));
+        app.import_tick(&ctx);
+        assert_eq!(app.project_root(), Some(next.as_path()));
+        assert_eq!(app.page_now(), 0);
+        assert!(app.viewer.is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn g2_failed_project_open_keeps_the_current_shot() {
+        let (ctx, mut app, d, _) = start_app("g2-open-failure", None);
+        let current = project_with_clip(&d, "current");
+        assert!(app.open_project_path(&ctx, current.clone()));
+        app.open_clip(&ctx, 0);
+        assert!(!app.open_project_path(&ctx, d.join("missing")));
+        assert_eq!(app.project_root(), Some(current.as_path()));
+        assert_eq!(app.open, Some(0));
+        assert!(app.viewer.is_some());
+        assert!(app.load_error.is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn g2_global_status_opens_project_activity_and_notices_with_failure_count() {
+        let (ctx, mut app, d, _) = start_app("g2-global-activity", None);
+        app.recent.fixture_notices = None;
+        app.opts.startup_notice = Some("Startup warning".into());
+        app.activity_inject_for_test(vec![
+            crate::ui::activity::Step::new("g2-job", "Keying shot", crate::ui::activity::Level::Error),
+        ]);
+        assert_eq!(app.notice_count(), 1);
+        assert_eq!(app.failure_count(), 1);
+        let out = frame(&ctx, &mut app, vec![]);
+        assert!(node(&out, "No jobs running, 1 unacknowledged failures").is_some());
+        assert!(node(&out, "1 notices").is_some());
+        click(&ctx, &mut app, "No jobs running, 1 unacknowledged failures");
+        assert!(app.activity_is_open());
+        assert_eq!(app.strip.activity.tab, 0);
+        let activity = frame(&ctx, &mut app, vec![]);
+        let labels = activity.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().filter_map(|(_, n)| n.label()).collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| label.contains("Keying shot")));
+        assert!(app.active_notice_text().iter().any(|notice| notice == "Startup warning"));
+        click(&ctx, &mut app, "1 notices");
+        assert!(app.activity_is_open());
+        assert_eq!(app.strip.activity.tab, 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn g2_queue_and_hardware_status_route_to_their_pages() {
+        let (ctx, mut app, d, _) = start_app("g2-status-routes", None);
+        let project = d.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("project.json"), r#"{"version":2}"#).unwrap();
+        assert!(app.open_project_path(&ctx, project));
+        use crate::ui::controls::statusbar::{Segment, StatusOut};
+        app.route_status(StatusOut { clicked: Some(Segment::Queue), segments: vec![] });
+        assert_eq!(app.page_now(), 0);
+        assert_eq!(app.board_page.fx.qtab, "waiting");
+        app.route_status(StatusOut { clicked: Some(Segment::Gpu), segments: vec![] });
+        assert_eq!(app.page_now(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn g2_new_project_escape_cancels_and_overlays_own_settings_escape() {
+        let (ctx, mut app, d, _) = start_app("g2-escape", None);
+        app.ask_project_name(d.clone());
+        frame(&ctx, &mut app, key(Key::Escape, egui::Modifiers::NONE));
+        assert!(app.new_project_draft.is_none());
+        app.open_settings();
+        frame(&ctx, &mut app, vec![]);
+        click(&ctx, &mut app, "File");
+        assert!(app.menu_open);
+        frame(&ctx, &mut app, key(Key::Escape, egui::Modifiers::NONE));
+        assert!(app.settings_open, "Escape over a menu must not close Settings");
+        assert!(!app.menu_open, "Escape closes the menu first");
+        app.activity_open_on(0, Rect::from_min_size(pos2(8.0, 8.0), vec2(480.0, 420.0)));
+        frame(&ctx, &mut app, key(Key::Escape, egui::Modifiers::NONE));
+        assert!(app.settings_open, "Escape over Activity must not close Settings");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn g2_menu_actions_use_live_shot_state_and_remove_unapproved_help_placeholder() {
+        let (ctx, mut app, d, _) = start_app("g2-menus", None);
+        let project = project_with_clip(&d, "project");
+        assert!(app.open_project_path(&ctx, project));
+        app.open_clip(&ctx, 0);
+        frame(&ctx, &mut app, vec![]);
+        click(&ctx, &mut app, "Window");
+        let window = frame(&ctx, &mut app, vec![]);
+        let labels: Vec<_> = window.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().filter_map(|(_, n)| n.label()).collect();
+        assert!(window.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().any(|(_, n)| n.role() == egui::accesskit::Role::MenuItem && n.label() == Some("Properties")));
+        for approved in ["Properties", "Bottom panel", "Queue", "Activity", "Reset panel sizes"] {
+            assert!(labels.contains(&approved), "missing approved Window item: {approved}");
+        }
+        assert!(!labels.contains(&"Keyboard shortcuts"));
+        assert!(!app.shot_page.drawer_open());
+        click(&ctx, &mut app, "Properties");
+        assert!(app.shot_page.drawer_open());
+        assert!(app.props_sheet);
+        click(&ctx, &mut app, "View");
+        click(&ctx, &mut app, "Focus mode");
+        assert!(app.shot_page.focus());
+        assert!(app.focus_mode);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn g2_import_shortcut_and_file_menu_request_the_same_pick_kinds() {
+        let (ctx, mut app, d, kinds) = start_app("g2-import-shortcuts", None);
+        let project = d.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("project.json"), r#"{"version":2}"#).unwrap();
+        assert!(app.open_project_path(&ctx, project));
+        for (mods, want) in [
+            (egui::Modifiers::COMMAND, PickKind::Clips),
+            (egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, PickKind::Folder),
+        ] {
+            frame(&ctx, &mut app, key(Key::I, mods));
+            for _ in 0..200 {
+                if kinds.lock().unwrap().last() == Some(&want) { break }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                frame(&ctx, &mut app, vec![]);
+            }
+            assert_eq!(kinds.lock().unwrap().last(), Some(&want));
+        }
+        for (label, want) in [("Import shots…", PickKind::Clips), ("Import folder…", PickKind::Folder)] {
+            click(&ctx, &mut app, "File");
+            let out = frame(&ctx, &mut app, vec![]);
+            let labels = out.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().filter_map(|(_, n)| n.label()).collect::<Vec<_>>();
+            assert!(labels.contains(&label));
+            let before = kinds.lock().unwrap().len();
+            click(&ctx, &mut app, label);
+            for _ in 0..200 {
+                if kinds.lock().unwrap().len() > before && !app.dialog_active() { break }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                frame(&ctx, &mut app, vec![]);
+            }
+            assert_eq!(kinds.lock().unwrap().len(), before + 1);
+            assert_eq!(kinds.lock().unwrap().last(), Some(&want));
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

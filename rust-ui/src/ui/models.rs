@@ -29,6 +29,7 @@ struct Artifact {
     path: Option<String>,
     state: Option<String>,
     present: Option<bool>,
+    can_delete: Option<bool>,
     verified: Option<bool>,
     ready: Option<bool>,
     verify_note: Option<String>,
@@ -67,6 +68,7 @@ impl Artifact {
         self.path = models::string(v, "path");
         self.state = models::string(v, "state");
         self.present = models::flag(v, "present");
+        self.can_delete = models::flag(v, "can_delete");
         self.verified = models::flag(v, "verified");
         self.ready = models::flag(v, "ready");
         self.verify_note = models::string(v, "verify_note");
@@ -210,8 +212,10 @@ pub struct PageData {
     pub local_runtime_note: Option<String>,
     /// This computer's worker, in words.
     pub worker_text: Option<String>,
-    /// Why Install required / Install all / Refresh are unavailable right now.
+    /// Why Install all / Refresh are unavailable right now.
     pub install_block: Option<String>,
+    /// Why Install required is unavailable right now.
+    pub required_block: Option<String>,
     pub refresh_block: Option<String>,
 }
 
@@ -223,6 +227,7 @@ pub enum Request {
     DownloadAll,
     Cancel,
     Delete(String),
+    Repair(String),
     Refresh,
 }
 
@@ -253,7 +258,8 @@ pub struct Page {
     cancel_acknowledged: bool,
     last_outcome: Option<(String, bool)>,
     required_ready: Option<bool>,
-    assets_in_use: bool,
+    assets_in_use: BTreeSet<String>,
+    asset_usage_unknown: bool,
     startup_error: Option<String>,
     catalog_version: Option<u64>,
     initialized: bool,
@@ -295,7 +301,8 @@ impl Page {
             cancel_acknowledged: false,
             last_outcome: None,
             required_ready: None,
-            assets_in_use: false,
+            assets_in_use: BTreeSet::new(),
+            asset_usage_unknown: false,
             startup_error,
             catalog_version: None,
             initialized: false,
@@ -405,8 +412,9 @@ impl Page {
 
     /// `blocked`: a job is queued or running (or a fence is unresolved) on this PC's worker. Nothing else blocks
     /// a model change: an idle worker holds no model file.
-    pub fn set_asset_safety(&mut self, blocked: bool, unresolved_fences: bool) {
-        self.assets_in_use = blocked;
+    pub fn set_asset_safety(&mut self, active_models: Vec<String>, usage_unknown: bool, unresolved_fences: bool) {
+        self.assets_in_use = active_models.into_iter().collect();
+        self.asset_usage_unknown = usage_unknown;
         self.unresolved_worker_fences = unresolved_fences;
     }
 
@@ -435,10 +443,11 @@ impl Page {
         if self.active.is_some() || self.cancel_job.is_some() {
             return;
         }
-        if is_asset_mutation(&action) && self.assets_in_use {
-            let message = "Stop all workers and resolve any outstanding job fences before changing model files.".to_string();
-            self.last_outcome = Some((message, false));
-            return;
+        if let Some(ids) = self.action_change_ids(&action) {
+            if let Some(message) = self.change_block(&ids) {
+                self.last_outcome = Some((message, false));
+                return;
+            }
         }
         if matches!(action, Action::Check) {
             self.required_ready = None;
@@ -767,6 +776,7 @@ impl Page {
                     r.current_artifact =
                         models::string(&v, "artifact").or_else(|| r.current_artifact.clone());
                     r.bytes_total = models::number(&v, "bytes_total");
+                    r.progress = None;
                 }
             }
             Some("progress") => {
@@ -1007,11 +1017,12 @@ impl Page {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 let idle = !self.busy();
-                let can_change = idle && !self.assets_in_use;
-                if ui.add_enabled_ui(can_change, |ui| theme::primary_button(ui, "Install required models")).inner.on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
+                let required_change = self.change_block(&self.profile_change_ids(&Profile::Required)).is_none();
+                let full_change = self.change_block(&self.profile_change_ids(&Profile::Full)).is_none();
+                if ui.add_enabled_ui(idle && required_change, |ui| theme::primary_button(ui, "Install required models")).inner.on_disabled_hover_text("A queued or running job uses one of these models, or its model use is unresolved.").clicked() {
                     self.request_ui(Request::InstallRequired, ui.ctx());
                 }
-                if ui.add_enabled(can_change, egui::Button::new("Install full profile")).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
+                if ui.add_enabled(idle && full_change, egui::Button::new("Install full profile")).on_disabled_hover_text("A queued or running job uses one of these models, or its model use is unresolved.").clicked() {
                     self.request_ui(Request::DownloadAll, ui.ctx());
                 }
                 if ui.add_enabled(idle, egui::Button::new("Verify all")).clicked() {
@@ -1027,12 +1038,15 @@ impl Page {
             if let Some(w) = &self.worker {
                 ui.label(RichText::new(w.label()).color(theme::text_dim(ui))).on_hover_text("With Receive jobs on, this computer starts its worker ahead of work so it can report its GPU and accept jobs. An idle worker holds no model files and never blocks anything; Install, Repair and Delete only wait for a running job.");
             }
-            if self.assets_in_use {
-                ui.colored_label(theme::error(ui), "Install, Repair and Delete are disabled while a job is queued or running on this PC's worker.");
-                if self.unresolved_worker_fences {
-                    ui.colored_label(theme::error(ui), "Unresolved Key job fences still block model changes. Return to Key to resolve them.");
-                }
-            } else if self.busy() {
+            if self.asset_usage_unknown {
+                ui.colored_label(theme::error(ui), "Model use could not be resolved for a queued or running job, so model changes are disabled.");
+            } else if !self.assets_in_use.is_empty() {
+                ui.colored_label(theme::error(ui), format!("Queued or running jobs use: {}.", self.assets_in_use.iter().cloned().collect::<Vec<_>>().join(", ")));
+            }
+            if self.unresolved_worker_fences {
+                ui.colored_label(theme::error(ui), "Unresolved job fences still block model changes. Return to Key to resolve them.");
+            }
+            if self.busy() {
                 ui.colored_label(theme::error(ui), "One model operation at a time; wait for it to finish before starting another.");
             }
             if let Some(r) = &self.active {
@@ -1103,27 +1117,72 @@ impl Page {
     /// A download/repair/delete is changing model files: the catalog ids it touches (empty = a whole profile).
     /// Only jobs that load one of those models wait; everything else keeps running.
     pub fn models_changing(&self) -> Option<Vec<String>> {
-        match &self.active.as_ref()?.action {
-            Action::Download(id) | Action::Repair(id) | Action::Delete(id) => Some(vec![id.clone()]),
-            Action::DownloadProfile(_) => Some(vec![]),
-            _ => None,
-        }
+        let ids = self.action_change_ids(&self.active.as_ref()?.action)?;
+        (!ids.is_empty()).then_some(ids)
     }
     pub fn take_readiness_changed(&mut self) -> bool {
         std::mem::take(&mut self.readiness_changed)
     }
 
     /// Why no install/delete can start now (one operation at a time, or a job on this PC's worker).
-    fn change_block(&self) -> Option<String> {
-        if self.busy() { Some(ONE_AT_A_TIME.into()) } else if self.assets_in_use { Some(JOB_RUNNING.into()) } else { None }
+    fn change_block(&self, ids: &[String]) -> Option<String> {
+        if self.busy() {
+            Some(ONE_AT_A_TIME.into())
+        } else if self.asset_usage_unknown || self.unresolved_worker_fences || ids.iter().any(|id| self.assets_in_use.contains(id)) {
+            Some(JOB_RUNNING.into())
+        } else {
+            None
+        }
     }
 
     fn download_block(&self, a: &Artifact) -> Option<String> {
-        if is_local_runtime(a) { Some(LOCAL_RUNTIME.into()) } else { self.change_block() }
+        if is_local_runtime(a) { Some(LOCAL_RUNTIME.into()) } else { self.change_block(&self.download_change_ids(&a.id)) }
+    }
+
+    fn action_change_ids(&self, action: &Action) -> Option<Vec<String>> {
+        match action {
+            Action::Download(id) => Some(self.download_change_ids(id)),
+            Action::Repair(id) | Action::Delete(id) => Some(vec![id.clone()]),
+            Action::DownloadProfile(profile) => Some(self.profile_change_ids(profile)),
+            _ => None,
+        }
+    }
+
+    fn refresh_action(&self) -> Action {
+        if self.artifacts.is_empty() { Action::Catalog } else { Action::Check }
+    }
+
+    fn download_change_ids(&self, id: &str) -> Vec<String> {
+        self.artifact_closure_ids(&[id.to_owned()]).into_iter()
+            .filter(|id| self.artifacts.get(id).is_none_or(|a| a.present != Some(true)))
+            .collect()
+    }
+
+    fn artifact_closure_ids(&self, ids: &[String]) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        let mut pending = ids.to_vec();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) { continue; }
+            if let Some(artifact) = self.artifacts.get(&id) {
+                pending.extend(artifact.dependencies.iter().cloned());
+            }
+        }
+        seen.into_iter().collect()
+    }
+
+    fn profile_change_ids(&self, profile: &Profile) -> Vec<String> {
+        let selected: Vec<String> = self.artifacts.values()
+            .filter(|a| (matches!(profile, Profile::Full) || a.required_profile) && a.present != Some(true))
+            .map(|a| a.id.clone())
+            .collect();
+        self.artifact_closure_ids(&selected).into_iter()
+            .filter(|id| self.artifacts.get(id).is_none_or(|a| a.present != Some(true)))
+            .collect()
     }
 
     fn delete_block(&self, a: &Artifact) -> Option<String> {
-        if let Some(r) = self.download_block(a) { return Some(r) }
+        if let Some(r) = self.change_block(std::slice::from_ref(&a.id)) { return Some(r) }
+        if a.can_delete == Some(false) { return Some("Only files in the managed model store can be deleted.".into()) }
         (!matches!(a.state.as_deref(), Some("installed" | "partial")))
             .then(|| "Only installed or partial assets can be deleted.".into())
     }
@@ -1148,13 +1207,13 @@ impl Page {
                     return Err(ONE_AT_A_TIME.into());
                 }
                 self.required_ready = None;
-                self.start(Action::Check, ctx);
+                self.start(self.refresh_action(), ctx);
             }
             Request::InstallRequired | Request::DownloadAll => {
-                if let Some(e) = self.change_block() {
+                let profile = if full { Profile::Full } else { Profile::Required };
+                if let Some(e) = self.change_block(&self.profile_change_ids(&profile)) {
                     return Err(e);
                 }
-                let profile = if full { Profile::Full } else { Profile::Required };
                 self.start(Action::DownloadProfile(profile), ctx);
             }
             Request::Download(id) => {
@@ -1171,6 +1230,13 @@ impl Page {
                 }
                 self.confirm_delete = None;
                 self.start(Action::Delete(id), ctx);
+            }
+            Request::Repair(id) => {
+                let a = self.artifacts.get(&id).ok_or_else(|| format!("Unknown model: {id}"))?;
+                if let Some(e) = self.delete_block(a) {
+                    return Err(e);
+                }
+                self.start(Action::Repair(id), ctx);
             }
         }
         Ok(())
@@ -1197,8 +1263,6 @@ impl Page {
             });
             let state = if downloading {
                 ModelState::Downloading
-            } else if let Some(e) = &a.last_error {
-                ModelState::Error(e.clone())
             } else {
                 match a.present { Some(true) => ModelState::Present, Some(false) => ModelState::Missing, None => ModelState::Unknown }
             };
@@ -1225,7 +1289,7 @@ impl Page {
                 probe_imports: a.probe_imports.clone(),
                 notes: a.notes.clone(),
                 requires: a.dependencies.iter().map(|id| (id.clone(), self.artifacts.get(id).map_or_else(|| id.clone(), |d| d.label.clone()))).collect(),
-                issues: a.problems.clone(),
+                issues: a.problems.iter().cloned().chain(a.last_error.iter().cloned()).collect(),
                 local_runtime: local,
                 runtime_note: missing_runtime.then(|| {
                     let base = if a.kind == "local_package" { "Runtime repair required; the model helper cannot install this package." } else { "Runtime repair required: restore vendored engine code with the app runtime." };
@@ -1279,7 +1343,8 @@ impl Page {
             startup_error: self.startup_error.clone(),
             local_runtime_note: sam2_missing.then(|| "Runtime repair required: SAM2 checkpoint downloads do not install its pinned Python package. Repair the runtime to supply this dependency.".into()),
             worker_text: self.worker.as_ref().map(WorkerActivity::label),
-            install_block: self.change_block(),
+            install_block: self.change_block(&self.profile_change_ids(&Profile::Full)),
+            required_block: self.change_block(&self.profile_change_ids(&Profile::Required)),
             refresh_block: self.busy().then(|| ONE_AT_A_TIME.into()),
         }
     }
@@ -1357,9 +1422,10 @@ impl Page {
                 ui.label(RichText::new("Local runtime code/packages cannot be installed or deleted here; update or repair the app runtime.").color(theme::text_dim(ui)));
             } else {
                 ui.add_space(4.0);
-                let can_change = actions_enabled && !self.assets_in_use;
+                let can_change = actions_enabled && self.change_block(std::slice::from_ref(&item.id)).is_none();
+                let can_download = actions_enabled && self.download_block(&item).is_none();
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(can_change, egui::Button::new(RichText::new("Download").color(ui.visuals().text_color())).fill(if item.present != Some(true) { theme::accent_mark(ui) } else { theme::card_fill(ui) })).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
+                    if ui.add_enabled(can_download, egui::Button::new(RichText::new("Download").color(ui.visuals().text_color())).fill(if item.present != Some(true) { theme::accent_mark(ui) } else { theme::card_fill(ui) })).on_disabled_hover_text("A queued or running job uses this model or one of its missing dependencies.").clicked() {
                         self.request_ui(Request::Download(item.id.clone()), ui.ctx());
                     }
                     if ui.add_enabled(actions_enabled, egui::Button::new("Verify")).on_hover_text("Optional: re-hash the files against the catalog. The app never needs it.").clicked() {
@@ -1368,8 +1434,8 @@ impl Page {
                     if ui.add_enabled(can_change, egui::Button::new("Repair")).on_disabled_hover_text("A job is running on the worker; wait for it to finish.").clicked() {
                         self.start(Action::Repair(item.id.clone()), ui.ctx());
                     }
-                    let deletable = can_change && matches!(item.state.as_deref(), Some("installed" | "partial"));
-                    if ui.add_enabled(deletable, egui::Button::new(RichText::new("Delete…").color(theme::error(ui)))).on_disabled_hover_text("Only installed or partial assets can be deleted, and not while a job runs on the worker.").clicked() {
+                    let deletable = can_change && item.can_delete != Some(false) && matches!(item.state.as_deref(), Some("installed" | "partial"));
+                    if ui.add_enabled(deletable, egui::Button::new(RichText::new("Delete…").color(theme::error(ui)))).on_disabled_hover_text("Only installed model files can be deleted, and only when no job uses them.").clicked() {
                         self.confirm_delete = Some(item.id.clone());
                     }
                 });
@@ -2076,12 +2142,13 @@ mod tests {
     #[test]
     fn asset_mutation_is_blocked_only_by_a_job_or_an_unresolved_fence() {
         let mut page = Page::from_runtime(Err("unused".into()));
-        page.set_asset_safety(true, false);
-        assert!(page.assets_in_use && !page.unresolved_worker_fences);
-        page.set_asset_safety(true, true);
+        page.set_asset_safety(vec!["key".into()], false, false);
+        assert_eq!(page.assets_in_use, BTreeSet::from(["key".into()]));
+        assert!(!page.unresolved_worker_fences);
+        page.set_asset_safety(vec!["key".into()], false, true);
         assert!(page.unresolved_worker_fences);
-        page.set_asset_safety(false, false);
-        assert!(!page.assets_in_use);
+        page.set_asset_safety(Vec::new(), false, false);
+        assert!(page.assets_in_use.is_empty());
     }
 
     #[test]
@@ -2106,12 +2173,76 @@ mod tests {
         // The page only sees "a job runs or is queued"; the worker's own state (idle, starting, stopped) is a label.
         let mut page = Page::from_runtime(Err("unused".into()));
         for activity in [WorkerActivity::Idle, WorkerActivity::Stopped] {
-            page.set_asset_safety(false, false);
+            page.set_asset_safety(Vec::new(), false, false);
             page.set_worker_activity(Some(activity));
-            assert!(!page.assets_in_use);
+            assert!(page.assets_in_use.is_empty());
         }
-        page.set_asset_safety(true, false);
+        page.set_asset_safety(vec!["key".into()], false, false);
         page.set_worker_activity(Some(WorkerActivity::Working("Key".into())));
-        assert!(page.assets_in_use);
+        assert!(!page.assets_in_use.is_empty());
+    }
+
+    #[test]
+    fn only_selected_missing_model_dependencies_gate_downloads() {
+        let mut page = Page::from_runtime(Err("unused".into()));
+        page.apply_json(serde_json::json!({"event":"catalog","artifacts":[
+            {"artifact":"producer","kind":"hf_files","depends":["shared"]},
+            {"artifact":"shared","kind":"hf_files","depends":[]},
+            {"artifact":"other","kind":"hf_files","depends":[]}
+        ]}));
+        for id in ["producer", "shared", "other"] {
+            page.artifacts.get_mut(id).unwrap().apply_status(&serde_json::json!({"artifact":id,"state":"missing","present":false}));
+        }
+        page.set_asset_safety(vec!["shared".into()], false, false);
+        assert!(page.request(Request::Download("producer".into()), &egui::Context::default()).is_err());
+        assert!(page.request(Request::Download("other".into()), &egui::Context::default()).is_ok());
+        page.set_asset_safety(vec!["shared".into()], false, true);
+        assert!(page.request(Request::Download("other".into()), &egui::Context::default()).is_err());
+    }
+
+    #[test]
+    fn artifact_start_clears_previous_transfer_progress() {
+        let mut page = Page::from_runtime(Err("unused".into()));
+        page.active = Some(Running {
+            action: Action::DownloadProfile(Profile::Full),
+            operation_id: None,
+            job: Job::disconnected(),
+            terminal: None,
+            malformed: None,
+            current_artifact: Some("first".into()),
+            bytes_total: Some(100),
+            progress: Some(Progress { unit: "bytes", done: 80, total: Some(100) }),
+        });
+        page.apply_json(serde_json::json!({"event":"artifact-start","artifact":"second","bytes_total":200}));
+        let active = page.active.as_ref().unwrap();
+        assert_eq!(active.current_artifact.as_deref(), Some("second"));
+        assert_eq!(active.bytes_total, Some(200));
+        assert_eq!(active.progress, None);
+    }
+
+    #[test]
+    fn transfer_error_keeps_missing_presence_retryable() {
+        let mut page = Page::from_runtime(Err("unused".into()));
+        page.apply_json(serde_json::json!({"event":"catalog","artifacts":[
+            {"artifact":"optional","label":"Optional model","kind":"hf_files","depends":[]}
+        ]}));
+        let artifact = page.artifacts.get_mut("optional").unwrap();
+        artifact.apply_status(&serde_json::json!({"artifact":"optional","state":"missing","present":false}));
+        artifact.last_error = Some("network unavailable".into());
+        let view = page.page_data();
+        assert_eq!(view.groups[0].models[0].state, ModelState::Missing);
+        assert!(view.groups[0].models[0].issues.iter().any(|issue| issue == "network unavailable"));
+        assert!(page.download_block(&page.artifacts["optional"]).is_none());
+        assert!(page.request(Request::Download("optional".into()), &egui::Context::default()).is_ok());
+    }
+
+    #[test]
+    fn refresh_retries_catalog_when_inventory_is_empty() {
+        let mut page = Page::from_runtime(Err("temporary helper failure".into()));
+        assert!(matches!(page.refresh_action(), Action::Catalog));
+        page.apply_json(serde_json::json!({"event":"catalog","artifacts":[
+            {"artifact":"optional","kind":"hf_files","depends":[]}
+        ]}));
+        assert!(matches!(page.refresh_action(), Action::Check));
     }
 }

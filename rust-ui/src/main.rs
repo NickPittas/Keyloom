@@ -170,13 +170,18 @@ fn main() -> eframe::Result {
         "keyloom-ui",
         native,
         Box::new(move |cc| {
+            let app = App::new(cc, o.clone());
+            #[cfg(windows)]
+            let mut app = app;
             #[cfg(windows)]
             if let Some(dir) = instance_dir.clone() {
-                if let Err(e) = ck::background::watch_windows(cc, dir, start_background) {
-                    o.startup_notice = Some(format!("Background window control is unavailable: {e}"));
+                if let Err(e) = ck::background::watch_windows(cc, dir, start_background && app.has_tray()) {
+                    let notice = format!("Background window control is unavailable: {e}");
+                    let combined = app.ai().notice.clone().map_or(notice.clone(), |previous| format!("{previous}\n{notice}"));
+                    app.ai_mut().notice = Some(combined);
                 }
             }
-            Ok(Box::new(App::new(cc, o.clone())))
+            Ok(Box::new(app))
         }),
     );
     drop(_lock); // held for the whole run

@@ -45,10 +45,11 @@ impl App {
         let mut machines = Vec::new();
         for target in &targets {
             let offline = !target.enabled || matches!(&target.status, crate::scheduler::TargetStatus::Down(_) | crate::scheduler::TargetStatus::Refused(_) | crate::scheduler::TargetStatus::Stopping | crate::scheduler::TargetStatus::Stopped);
-            let state = if target.busy_with.is_some() { "busy" } else if offline { "offline" } else { "idle" };
+            let job = run_job(&target.id);
+            let state = if target.busy_with.is_some() || !job.is_empty() { "busy" } else if offline { "offline" } else { "idle" };
             let gpu = target.id.strip_prefix("local-").and_then(|s| s.parse().ok());
             let (gp, vr, cpu, ram, vramt, ramt, _) = machine_data(local_sample, gpu);
-            machines.push(super::super::board::FxMachine { id: target.id.clone(), name: if targets.iter().filter(|t| t.local).count() > 1 { format!("This machine - {}", target.id) } else { "This machine".into() }, local: 1, state: state.into(), job: run_job(&target.id), gpu: gp, vram: vr, cpu, ram, vramt, ramt, telemetry_status: local_telemetry.clone() });
+            machines.push(super::super::board::FxMachine { id: target.id.clone(), name: if targets.iter().filter(|t| t.local).count() > 1 { format!("This machine - {}", target.id) } else { "This machine".into() }, local: 1, state: state.into(), job, gpu: gp, vram: vr, cpu, ram, vramt, ramt, telemetry_status: local_telemetry.clone() });
         }
         let candidates = self.remote.automatic_candidates(self.settings.saved(), self.settings.store_path());
         for (id, name) in candidates {

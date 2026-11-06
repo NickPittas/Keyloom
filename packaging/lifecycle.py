@@ -1091,6 +1091,31 @@ def prune_versions(prefix: Path, receipt: dict) -> None:
             receipt["versions"].remove(v)
 
 
+def prune_model_copies(version_dir: Path) -> dict:
+    """Best-effort model-cache cleanup after old application versions are removed."""
+    app = version_dir / "app"
+    env = clean_env(PYTHONPATH=str(app))
+    try:
+        r = run_logged([str(descriptor_python(version_dir)), "-I", "-B", "-c",
+                        "import json,sys; sys.path.insert(0,sys.argv[1]); from backend.model_prune import prune_unused_model_copies as p; print(json.dumps(p()))",
+                        str(app)],
+                       "models-prune", cwd=str(app), env=env, timeout=INNER_TIMEOUT)
+        if r.returncode:
+            raise InstallError(f"model prune exited with code {r.returncode}")
+        entries = json.loads(r.stdout)
+        removed = [x for x in entries if "error" not in x]
+        errors = sum("error" in x for x in entries)
+        total = sum(int(x["bytes"]) for x in removed)
+        for x in removed:
+            say(f"[models-prune] removed {x['path']} ({int(x['bytes'])} bytes)")
+        say(f"[models-prune] total: {len(removed)} removed, {total} bytes, {errors} errors")
+        return {"removed": len(removed), "bytes": total, "errors": errors}
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        say(f"[models-prune] failed: {msg}")
+        return {"error": msg}
+
+
 def activate(prefix: Path, version: str, *, shortcuts: bool = True, selfcheck: bool = True, reused: bool = False) -> dict:
     """Validate, then switch as one unit. Any failure (even Ctrl-C) restores the previous pointer,
     shortcuts and receipt, so `current` never dangles.
@@ -1138,9 +1163,10 @@ def activate(prefix: Path, version: str, *, shortcuts: bool = True, selfcheck: b
         if version not in receipt["versions"]:
             receipt["versions"].append(version)
         prune_versions(prefix, receipt)
+        models_pruned = prune_model_copies(vdir)
         atomic_write_json(prefix / RECEIPT, receipt)
         # Never fails activation; the outcome is recorded in receipt network.setup. A build without the in-app endpoint keeps the service.
-        net = network_step(vdir, prefix, receipt)
+        net = dict(network_step(vdir, prefix, receipt), models_pruned=models_pruned)
     except BaseException as e:
         log_exc("activation failed", e)
         try:
@@ -1681,6 +1707,7 @@ def cmd_install(a) -> int:
         result["models"] = "interrupted" if rc == 130 else "failed"
         raise
     finally:
+        result["models_pruned"] = net.pop("models_pruned", {"error": "model prune summary unavailable"})
         result["network"] = net  # this run's own result: activate() returned it, so it is never a previous run's receipt
         atomic_write_json(prefix / "install-result.json", dict(result, version=version, exit_code=rc))
         print_summary(prefix, dict(result, version=version), rc)

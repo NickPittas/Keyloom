@@ -41,6 +41,38 @@ const HINT_TOOLS_H: f32 = 160.0;
 const GRAPH_HEADER: f32 = 32.0;
 const MIN_VIEWER: f32 = 300.0;
 
+fn saved_export_root(clip: &Clip) -> Option<PathBuf> {
+    clip.native.get("delivery")
+        .and_then(|v| serde_json::from_value::<crate::presets::PipelineExport>(v.clone()).ok())
+        .and_then(|e| e.root)
+}
+
+#[cfg(test)]
+mod board_export_tests {
+    use super::*;
+
+    #[test]
+    fn board_exports_use_the_clips_saved_delivery_root() {
+        let base = std::env::temp_dir().join(format!("ck-board-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join("project");
+        let clip = project.join("clips/shot");
+        std::fs::create_dir_all(clip.join("Frames")).unwrap();
+        let mut png = png::Encoder::new(std::fs::File::create(clip.join("Frames/f_1101.png")).unwrap(), 4, 4);
+        png.set_color(png::ColorType::Rgb);
+        png.set_depth(png::BitDepth::Eight);
+        png.write_header().unwrap().write_image_data(&[0; 48]).unwrap();
+        std::fs::write(clip.join(".video_metadata.json"), r#"{"fps":24.0,"width":4,"height":4}"#).unwrap();
+        let export = base.join("shot_delivery");
+        std::fs::write(clip.join("clip.json"), serde_json::json!({"ck_native":{"delivery":{"root":export}}}).to_string()).unwrap();
+        std::fs::write(project.join("project.json"), r#"{"version":2,"clips":["shot"]}"#).unwrap();
+
+        let loaded = crate::project::load_project(&project, &crate::project::LoadOptions::default()).unwrap();
+        assert_eq!(saved_export_root(&loaded.clips[0]), Some(export));
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Media,
@@ -183,6 +215,7 @@ struct ShotRemove {
 }
 
 pub struct App {
+    board_disk: std::collections::HashMap<PathBuf, (Instant, Option<bool>, bool)>,
     opts: AppOptions,
     project: Option<Project>,
     path_input: String,
@@ -196,6 +229,9 @@ pub struct App {
     node: Node,
     focus_mode: bool,
     props_sheet: bool,
+    /// Board/Shot page selection while a shot viewer is retained across navigation.
+    board_selected: bool,
+    menu_open: bool,
     /// Status-bar item that opened the Activity popover (its rect anchors it).
     activity_anchor: Option<egui::Rect>,
     /// Per-clip (by folder) graph layout and view; kept across Back/open, not persisted.
@@ -292,6 +328,8 @@ pub struct App {
     close: CloseState,
     /// The user chose Quit anyway, or all graceful work has stopped: a close request now goes through.
     close_force: bool,
+    /// A logic-only close was cancelled and must be handled by the next rendered frame.
+    close_pending: bool,
     /// Explicit Quit was chosen: closing really closes even in background mode.
     pub(super) quitting: bool,
     /// The system tray icon (`None` = no tray: Close quits). Closing the window hides it only while this exists.
@@ -300,7 +338,7 @@ pub struct App {
     tray_note: bool,
     /// The tray's Quit was chosen: the next drawn frame runs the normal Quit (save, then the running-job question).
     quit_pending: bool,
-    /// Shutdown steps in the order they ran (`endpoint`, then `workers`).
+    /// Shutdown steps in the order they ran (`workers`, then `endpoint`).
     shutdown_log: Vec<&'static str>,
     close_rects: Vec<egui::Rect>,
     /// Output-location editor for the open project (Deliver tab).
@@ -340,7 +378,10 @@ impl App {
         let (ctx, wake) = (cc.egui_ctx.clone(), app.driver.as_ref().map(|d| d.waker(&cc.egui_ctx)));
         match super::tray::Tray::start(std::sync::Arc::new(move || match &wake { Some(w) => w(), None => ctx.request_repaint() })) {
             Ok(t) => app.tray = Some(t),
-            Err(e) => app.ai.notice = Some(format!("No system tray ({e}): closing the window quits Keyloom.")),
+            Err(e) => {
+                app.ai.notice = Some(format!("No system tray ({e}): closing the window quits Keyloom."));
+                app.opts.start_background = false;
+            }
         }
         app.release_shared();
         app
@@ -448,6 +489,7 @@ impl App {
             None => project_shell::Recent::load(settings.store_path()),
         };
         let mut app = App {
+            board_disk: Default::default(),
             path_input: opts
                 .project
                 .as_ref()
@@ -464,6 +506,8 @@ impl App {
             node: Node::Media,
             focus_mode: false,
             props_sheet: false,
+            board_selected: false,
+            menu_open: false,
             activity_anchor: None,
             graphs: Default::default(),
             graph_collapsed: false,
@@ -548,6 +592,7 @@ impl App {
             ai: driver::Held::new(AiUi::new(&settings_saved, opts.repo.as_deref())),
             close: CloseState::None,
             close_force: false,
+            close_pending: false,
             quitting: false,
             tray: None,
             tray_note: false,
@@ -571,6 +616,9 @@ impl App {
             last_ctx: None,
             thumbs: None,
         };
+        if let Some(target) = crate::remote_set::RemoteSet::saved_default_target(app.settings.saved(), app.settings.store_path().map(Path::new)) {
+            app.ai.placement = crate::scheduler::Placement::Target(target);
+        }
         app.ai.set_presets_file(crate::presets::file_beside(app.settings.store_path()));
         if opts.project.is_some() {
             app.load(ctx);
@@ -607,16 +655,23 @@ impl App {
         app
     }
 
-    fn load(&mut self, ctx: &egui::Context) {
-        self.viewer = None;
-        self.open = None;
-        self.selected.clear();
+    fn load(&mut self, ctx: &egui::Context) -> bool {
         let lo = LoadOptions {
             global_output_dir: self.opts.global_output_dir.clone(),
         };
         let prev = self.project.as_ref().map(|p| p.root.clone());
-        match load_project(&PathBuf::from(self.path_input.trim()), &lo) {
-            Ok(p) => {
+        let p = match load_project(&PathBuf::from(self.path_input.trim()), &lo) {
+            Ok(p) => p,
+            Err(e) => {
+                self.load_error = Some(e);
+                ctx.request_repaint();
+                return false;
+            }
+        };
+        self.viewer = None;
+        self.open = None;
+        self.selected.clear();
+        {
                 // Same-root reloads (import progress) keep unsaved drafts, their baselines and the location.
                 let switched = prev.as_ref() != Some(&p.root);
                 self.summaries = p.clips.iter().map(card_summary).collect();
@@ -629,19 +684,13 @@ impl App {
                     self.init_location();
                 }
                 self.record_recent();
-            }
-            Err(e) => {
-                self.summaries.clear();
-                self.project = None;
-                self.load_error = Some(e);
-                self.forget_project_state();
-            }
         }
         // A reload of the same project keeps a waiting plan; switching projects forgets it (its "open
         // project" destination would otherwise still point at the old one).
         self.imp
             .project_changed(self.project.as_ref().map(|p| p.root.as_path()));
         ctx.request_repaint();
+        true
     }
 
     /// A different project is loading: nothing keyed by clip folder may carry over (same names, other project).
@@ -718,6 +767,7 @@ impl App {
         v.looping = st.playback.loop_default;
         self.viewer = Some(v);
         self.open = Some(i);
+        self.board_selected = false;
         let saved = self
             .project
             .as_ref()
@@ -775,6 +825,9 @@ impl App {
             return;
         }
         self.shortcuts(ctx);
+        if self.menu_open || self.activity_is_open() {
+            return;
+        }
         self.new_project_window(ctx);
         // A focused graph node is a button, not text entry: shortcuts (F, B, 1-5, Esc…) must keep working there.
         if ctx.egui_wants_keyboard_input() {
@@ -800,6 +853,14 @@ impl App {
             }
             return;
         }
+        if self.page_now() == 0 {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::A)) {
+                self.key_selected(ctx);
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::A)) {
+                self.selected = (0..self.project.as_ref().map_or(0, |p| p.clips.len())).collect();
+            }
+            return;
+        }
         if self.viewer.is_none() {
             return;
         }
@@ -813,7 +874,7 @@ impl App {
     // ------------------------------------------------------------------ board
 
     fn refresh_board_status(&mut self) {
-        let Some(project) = self.project.as_ref() else { return };
+        if self.project.is_none() { return; }
         let now = Instant::now();
         let meters = self.local_meters(now);
         let targets = self.ai.scheduler().targets();
@@ -825,7 +886,7 @@ impl App {
                 super::models::WorkerActivity::Idle | super::models::WorkerActivity::Stopped => String::new(),
             }
         };
-        let notices = project.notes.len() as u32 + u32::from(self.ai.notice.is_some()) + u32::from(self.ai.pending_note().is_some()) + u32::from(self.load_error.is_some()) + u32::from(self.opts.startup_notice.is_some()) + u32::from(self.save_error.is_some());
+        let notices = self.notice_count();
         let activity = match self.activity_summary() {
             Some((t, _)) if self.open.is_some() => t,
             _ => activity,
@@ -844,11 +905,11 @@ impl App {
         let remote_jobs = self.remote.jobs_snapshot();
         let mut machines = self.machine_rows(now, &queue, &remote_jobs);
         let waiting_roots: BTreeSet<_> = self.ai.waiting_roots().into_iter().collect();
-        let waiting_count = self.ai.waiting_count() as u32;
-        let waiting: Vec<usize> = project.clips.iter().enumerate().filter_map(|(i, c)| waiting_roots.contains(&c.root).then_some(i)).collect();
         let running = queue.iter().flat_map(|s| &s.runs).filter(|r| r.rows.iter().any(|x| x.executing)).count() as u32 + remote_jobs.iter().filter(|j| j.running).count() as u32;
         let finished = self.ai.finished_count(&queue) as u32 + remote_jobs.iter().filter(|j| !j.active).count() as u32;
         let mut cards = Vec::with_capacity(project.clips.len());
+        let live_roots: std::collections::HashSet<_> = project.clips.iter().map(|c| c.root.clone()).collect();
+        self.board_disk.retain(|root, _| live_roots.contains(root));
         let mut activity = String::new();
         for clip in &project.clips {
             let import_state = self.imp.card_state(clip);
@@ -902,20 +963,24 @@ impl App {
                 else if clip.input_files.is_empty() { ("No frames".into(), "No source frames are available for this shot.".into()) }
                 else if let Some(error) = self.thumbs.as_ref().and_then(|t| t.failed(clip)) { ("Unreadable frame".into(), error.to_owned()) }
                 else { ("Loading preview…".into(), "The first source frame is still being decoded.".into()) };
-            let source_available = match &clip.source { Source::Video { path } => Some(path.exists()), Source::Sequence { dir, .. } => Some(dir.exists()), Source::Missing => Some(false) };
-            let exports_available = crate::pipeline::export_dir(clip, &project.root, self.hint.board_export_root()).is_dir();
+            let (source_available, exports_available) = match self.board_disk.get(&clip.root) {
+                Some((at, source, exports)) if now.duration_since(*at) < std::time::Duration::from_secs(2) => (*source, *exports),
+                _ => {
+                    let source = match &clip.source { Source::Video { path } => Some(path.exists()), Source::Sequence { dir, .. } => Some(dir.exists()), Source::Missing => Some(false) };
+                    let exports = crate::pipeline::export_dir(clip, &project.root, saved_export_root(clip).as_deref()).is_dir();
+                    self.board_disk.insert(clip.root.clone(), (now, source, exports));
+                    (source, exports)
+                }
+            };
             if activity.is_empty() { activity = import_activity.unwrap_or_default(); }
             let q = u8::from(job == "q");
             let r = u8::from(job == "r");
             cards.push(super::board::FxShot { n: clip.display_name.clone(), st: match clip.state { ClipState::Masked => "mask", ClipState::Ready => "ready", ClipState::Complete => "done", _ => "raw" }.into(), meta, s: status, pc, dot: String::new(), job, prog, err, q, r, thumb, thumb_aspect, thumb_label, thumb_tooltip, source_available, exports_available, resume });
         }
+        let waiting: Vec<usize> = project.clips.iter().enumerate().filter_map(|(i, clip)| (waiting_roots.contains(&clip.root) || cards[i].job == "q").then_some(i)).collect();
+        let waiting_count = waiting.len() as u32;
         let meters = self.local_meters(now);
-        let mut notice_text = project.notes.clone();
-        notice_text.extend(self.ai.notice.iter().cloned());
-        notice_text.extend(self.ai.pending_note().map(str::to_owned));
-        notice_text.extend(self.load_error.iter().cloned());
-        notice_text.extend(self.opts.startup_notice.iter().cloned());
-        notice_text.extend(self.save_error.iter().cloned());
+        let notice_text = self.active_notice_text();
         let notices = notice_text.len() as u32;
         if activity.is_empty() && self.imp.busy() { activity = self.imp.busy_what().to_owned(); }
         if activity.is_empty() { activity = queue.iter().filter(|s| s.root == project.root).flat_map(|s| s.runs.iter().flat_map(|r| r.rows.iter().filter(|x| x.executing).map(|x| format!("{} - {} {}", s.title, x.heading, x.cell.text)))).next().unwrap_or_default(); }
@@ -990,7 +1055,7 @@ impl App {
                     if let Some((path,select_file)) = source.filter(|(path,_)| path.exists()) { reveal(path,select_file,&mut self.ai); }
                 },
                 super::board::Act::RevealExports(i) => if let Some((clip,root)) = self.project.as_ref().and_then(|p|p.clips.get(i).map(|c|(c,p.root.as_path()))) {
-                    let path = crate::pipeline::export_dir(clip,root,self.hint.board_export_root());
+                    let path = crate::pipeline::export_dir(clip,root,saved_export_root(clip).as_deref());
                     if path.is_dir() { reveal(&path,false,&mut self.ai); }
                 },
                 super::board::Act::Remove(i) => self.ask_remove_shot(i),
@@ -1030,6 +1095,14 @@ impl App {
     fn shot_block(&self, c: &Clip) -> Option<String> {
         if matches!(self.imp.card_state(c), CardState::Busy(..) | CardState::Waiting) {
             return Some(format!("{} is being extracted. Wait for it to finish, then remove it.", c.display_name));
+        }
+        if self.ai.external_writer(&c.root) {
+            return Some(format!("{} is being written by a companion import. Wait for it to finish, then remove it.", c.display_name));
+        }
+        if self.project.as_ref().is_some_and(|p| self.remote.jobs_snapshot().iter().any(|j| {
+            j.active && j.project_root.as_deref() == Some(&p.root) && j.clip_root.as_deref() == Some(&c.root)
+        })) {
+            return Some(format!("{} is being written by another computer. Wait for it to finish, then remove it.", c.display_name));
         }
         self.ai
             .clip_busy(&c.root)
@@ -1170,13 +1243,6 @@ impl App {
                 });
             });
         }
-        // The one activity strip: fixed height on every tab, in Focus and with the graph collapsed. Declared
-        // first among the bottom panels, so it sits directly above the system metrics.
-        let strip = Panel::bottom("activity")
-            .exact_size(super::activity::STRIP_H)
-            .frame(egui::Frame::new().fill(theme::card_fill(ui)).inner_margin(egui::Margin::symmetric(10, 4)).stroke(egui::Stroke::new(1.0, theme::panel_edge(ui))))
-            .show(ui, |ui| self.activity_strip(ui));
-        self.strip.rect = Some(strip.response.rect);
         if !focus {
             if !narrow || self.props_sheet {
                 Panel::right("props")
@@ -1200,7 +1266,7 @@ impl App {
             let short = ui.available_height() < 560.0;
             self.graph_short = short;
             let min_viewer = if narrow || short { 290.0 } else { MIN_VIEWER }; // 900x640: the action cards must keep their buttons visible
-            let max_h = (ui.available_height() - 34.0 - super::activity::STRIP_H - tools_h - min_viewer).max(graph_min);
+            let max_h = (ui.available_height() - 34.0 - tools_h - min_viewer).max(graph_min);
             if if short { !self.graph_short_open } else { self.graph_collapsed } {
                 Panel::bottom("graph_collapsed")
                     .frame(egui::Frame::new().fill(theme::canvas_fill(ui)).inner_margin(8))
@@ -2035,17 +2101,24 @@ impl App {
 
     /// Active work cancels the close request; graceful stop keeps the window updating until it exits.
     fn close_tick(&mut self, ctx: &egui::Context) {
+        let requested = std::mem::take(&mut self.close_pending)
+            || ctx.input(|i| i.viewport().close_requested());
         // A generated-frames deletion is running: keep the window open so its receive block finishes.
-        if ctx.input(|i| i.viewport().close_requested()) && self.hint_delete_open() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.hint_delete_open() {
+            self.close_force = false;
+            if requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                crate::background::show(ctx);
+            }
             return;
         }
         // Close hides to the tray (Quit is the tray entry or File > Quit); without a tray it falls through to a normal close.
-        if ctx.input(|i| i.viewport().close_requested())
+        if requested
             && !self.close_force
             && !self.quitting
             && self.close == CloseState::None
             && self.tray.is_some()
+            && self.settings.saved().interface.background
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.tray_note_marker().is_some_and(|m| !m.exists()) {
@@ -2055,7 +2128,15 @@ impl App {
             }
             return;
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.close_force {
+        if requested && !self.close_force {
+            self.refresh_draft_dirty();
+            if self.project.is_some() && self.unsaved() {
+                if let Err(e) = self.save_project() {
+                    self.ai.notice = Some(format!("Not closing: {e}"));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    return;
+                }
+            }
             let (jobs, alive, models) = (
                 self.ai.running_jobs(),
                 self.ai.workers_alive() || !self.inbound.quiescent(),
@@ -2071,9 +2152,13 @@ impl App {
                         self.close = CloseState::Stopping;
                     }
                 }
+            } else {
+                self.close_force = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
-        if self.close == CloseState::Stopping && self.ai.all_stopped() && self.inbound.quiescent() && !self.models.busy() {
+        if self.close == CloseState::Stopping && self.ai.all_stopped() && self.inbound.shutdown_settled() && !self.models.busy() {
+            self.stop_endpoint();
             self.close_force = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -2144,11 +2229,10 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
-    /// Ordered shutdown: the endpoint stops accepting first, then the workers are told to stop (their own cancel/unload/recovery).
+    /// Stop accepting new received work, then let the inbound report and workers settle before closing the endpoint.
     fn begin_shutdown(&mut self) {
-        self.stop_endpoint();
-        self.ai.begin_stop();
         self.inbound.shutdown_requested();
+        self.ai.begin_stop();
         self.shutdown_log.push("workers");
     }
 
@@ -2343,10 +2427,16 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.net_logic(ctx);
         self.tray_tick(ctx); // logic() still runs while the window is hidden
-        // A close request while minimized/hidden reaches only logic() (eframe skips ui()),
-        // and eframe would close the window right away. Cancel it and restore the window so
-        // the rendered frame's close_tick runs its guards (deletion, hide-to-tray, active work).
-        if ctx.input(|i| i.viewport().close_requested()) {
+        // A close request in a logic-only pass needs the same guards as a rendered close.
+        if ctx.input(|i| i.viewport().close_requested())
+            && (self.hint_delete_open() || !self.close_force)
+        {
+            if self.hint_delete_open() {
+                self.close_force = false;
+                self.close_pending = false;
+            } else {
+                self.close_pending = true;
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             crate::background::show(ctx);
         }
@@ -2357,6 +2447,9 @@ impl eframe::App for App {
                 crate::background::show(ctx);
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        if self.opts.start_background && !self.has_tray() {
+            self.opts.start_background = false;
         }
         if self.opts.start_background {
             if ctx.cumulative_frame_nr() > 0 {
@@ -2520,7 +2613,9 @@ impl App {
             dropped
         };
         // Clip-level dialogs (relink, hint movie/sequence, export folder) answer inside the open clip.
-        if self.in_workspace()
+        if self.held_pick.as_ref().is_some_and(|(kind, _)| *kind == PickKind::Project) {
+            self.apply_pick(ctx);
+        } else if self.in_workspace()
             && !self.settings_open
             && matches!(
                 self.held_pick.as_ref().map(|h| h.0),
@@ -2810,13 +2905,17 @@ impl App {
     }
 
     /// Save the edited network settings and hand them to the driver.
-    fn net_save(&mut self, what: &str) {
+    fn net_save(&mut self, what: &str) -> bool {
+        let save_error = format!("{what}, but the connection settings could not be saved.");
         if self.settings.apply() {
+            if self.machines_page.notice_text() == Some(save_error.as_str()) { self.machines_page.set_notice(None); }
             if let Some(d) = &self.driver {
                 d.publish(self.settings.saved(), self.settings.store_path());
             }
+            true
         } else {
-            self.ai.notice = Some(format!("{what}, but the connection settings could not be saved."));
+            self.machines_page.set_notice(Some(save_error));
+            false
         }
     }
 
@@ -2958,17 +3057,24 @@ impl App {
     fn finish_remove(&mut self, creds: &str, notice: Option<String>) {
         let n = self.net_draft();
         let own = n.connections.iter().any(|c| c.credentials == creds && c.local_host);
+        let was_default = n.default_submit == creds;
         let destination = n.connections.iter().find(|c| c.credentials == creds).map(|c| c.legacy_id.clone()).filter(|l| !l.is_empty());
         n.connections.retain(|c| c.credentials != creds);
+        if was_default {
+            n.default_submit.clear();
+        }
+        if !self.net_save("Removed") {
+            self.settings.open();
+            return;
+        }
+        if was_default {
+            self.ai.placement = crate::scheduler::Placement::Auto;
+        }
         if let Some(pc_id) = destination {
             // The user removed a registered PC's destination: it is not offered again (its registration is Retired from the Clients page).
             let _ = crate::app_api::spawn_call("destination_remove", serde_json::json!({"pc_id": pc_id}));
         }
-        if n.default_submit == creds {
-            n.default_submit.clear();
-        }
         self.remote.remove(creds);
-        self.net_save("Removed");
         if !own {
             for ext in ["", ".session", ".lock", ".network.json"] {
                 let _ = std::fs::remove_file(format!("{creds}{ext}"));
@@ -3091,9 +3197,9 @@ impl App {
                 },
             ),
             PickKind::Project => {
-                self.open_project_path(ctx, paths[0].clone());
-                if let Some(from) = locate {
-                    self.located(from);
+                let opened = self.open_project_path(ctx, paths[0].clone());
+                if opened {
+                    if let Some(from) = locate { self.located(from); }
                 }
             }
             PickKind::Location => {
@@ -3123,7 +3229,7 @@ impl App {
         self.imp.notice_text()
     }
     pub fn in_workspace(&self) -> bool {
-        self.viewer.is_some() && self.open.is_some()
+        self.viewer.is_some() && self.open.is_some() && !self.board_selected
     }
     /// Source-frame count of the open clip (tests).
     pub fn open_frame_count(&self) -> Option<usize> {
@@ -3232,8 +3338,8 @@ impl App {
                 self.key_selected(&ctx);
             }
         }
-        self.models
-            .set_asset_safety(!self.ai.model_asset_mutation_safe(), self.ai.unresolved_model_fences());
+        let (active_models, usage_unknown) = self.ai.active_model_usage();
+        self.models.set_asset_safety(active_models, usage_unknown, self.ai.unresolved_model_fences());
         self.models.set_worker_activity(Some(self.ai.worker_activity()));
         self.models.tick(&ctx);
         self.models.take_readiness_changed();
@@ -3272,30 +3378,29 @@ impl App {
         }
         if self.board_fx.is_none() && self.project.is_some() {
             self.refresh_board_status();
-            let board_visible = self.viewer.is_none() && !self.settings_open && !self.models_open && !self.clients_open
+            let board_visible = (self.viewer.is_none() || self.board_selected) && !self.settings_open && !self.models_open && !self.clients_open
                 && self.settings_fx.is_none() && self.models_fx.is_none() && self.machines_fx.is_none() && self.shot_fx.is_none();
             if board_visible { self.refresh_board_page(&ctx); }
         }
         // Outermost bottom panel: on every page (Board, clip, Settings, Clients, Models), fixed height.
         if self.board_fx.is_some() {
-            Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| if let Some(b) = &self.board_fx { b.status(ui); });
+            let failures = self.failure_count();
+            let status = Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.board_fx.as_ref().map(|b| b.status(ui, failures))).inner;
+            if let Some(status) = status { self.route_status(status); }
             self.metrics_rect = None;
         } else if self.project.is_none() {
             // §7.4: no hardware meters before a project is open; the status bar shows activity and notices only.
-            Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.start_status(ui));
+            let status = Panel::bottom("start_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.start_status(ui)).inner;
+            self.route_status(status);
             self.metrics_rect = None;
         } else {
             // One 22 px status bar carries the CPU/RAM/GPU/VRAM meters (§8.8); no separate metrics footer.
             self.metrics_rect = None;
-            let status = Panel::bottom("board_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.board_page.status(ui)).inner;
-            if let Some(seg) = status.clicked {
-                if matches!(seg, super::controls::statusbar::Segment::Activity | super::controls::statusbar::Segment::Notices) {
-                    self.activity_anchor = status.segments.iter().find(|(s, _)| *s == seg).map(|(_, r)| *r);
-                    self.activity_toggle();
-                }
-            }
+            let failures = self.failure_count();
+            let status = Panel::bottom("board_status").exact_size(22.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.board_page.status(ui, failures)).inner;
+            self.route_status(status);
         }
-        // §7.1: menu bar 24 + toolbar 36 (page tabs, Models button).
+        // §7.1: menu bar 24 + toolbar 36 (page tabs with cached Models attention).
         Panel::top("banner").exact_size(60.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| self.chrome(ui));
         if std::mem::take(&mut self.settings_requested) {
             self.open_settings();
@@ -3380,11 +3485,10 @@ impl App {
             }
         } else if let Some(p) = self.shot_fx.as_mut() {
             egui::CentralPanel::default().show(ui, |ui| p.ui(ui));
-        } else if self.viewer.is_some() && self.open.is_some() {
+        } else if self.viewer.is_some() && self.open.is_some() && !self.board_selected {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.shot_workspace(ui));
             if std::mem::take(&mut self.back_requested) {
-                self.viewer = None;
-                self.open = None;
+                self.board_selected = true;
                 ctx.request_repaint();
             }
         } else {
@@ -4416,15 +4520,89 @@ mod finish_remove_tests {
 
         let ctx = egui::Context::default();
         let mut app = App::with_ctx(&ctx, AppOptions { settings_path: Some(sp.clone()), ..Default::default() });
+        app.ai.placement = crate::scheduler::Placement::Target("network:test/target".into());
         app.finish_remove(&gone, Some("still listed".into()));
 
         let saved = crate::settings::Store::load(Some(sp));
         let left: Vec<&str> = saved.saved().network.connections.iter().map(|c| c.credentials.as_str()).collect();
         assert_eq!(left, [kept.as_str()]);
         assert!(saved.saved().network.default_submit.is_empty(), "the removed default is cleared");
+        assert_eq!(app.ai.placement, crate::scheduler::Placement::Auto, "the paired shot default is cleared too");
         assert!(files.iter().all(|f| !std::path::Path::new(f).exists()), "login and side files are deleted");
         assert!(std::path::Path::new(&kept).exists() && hist.exists() && std::path::Path::new(&attempt).exists());
         assert_eq!(app.ai.notice.as_deref(), Some("still listed"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn c6_machine_notice_is_dismissed_by_the_page_action() {
+        let d = std::env::temp_dir().join(format!("ck-machines-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { settings_path: Some(d.join("settings.json")), ..Default::default() });
+        app.machines_page.set_notice(Some("Connection not removed: busy.".into()));
+        assert!(app.machines_page.notice_text().is_some());
+        app.handle_machines_act(&ctx, crate::ui::machines_page::Act::DismissNotice);
+        assert!(app.machines_page.notice_text().is_none());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn c6_saving_settings_preserves_an_unrelated_machine_notice() {
+        let d = std::env::temp_dir().join(format!("ck-machines-notice-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { settings_path: Some(d.join("settings.json")), ..Default::default() });
+        app.machines_page.set_notice(Some("Connection not removed: still in use.".into()));
+        app.net_action(crate::remote::Action::ReceiveJobs(true));
+        assert_eq!(app.machines_page.notice_text(), Some("Connection not removed: still in use."));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn c4_saved_network_default_restores_placement_at_app_start() {
+        let d = std::env::temp_dir().join(format!("ck-default-placement-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let creds = d.join("login.json").display().to_string();
+        let sp = d.join("settings.json");
+        std::fs::write(&sp, serde_json::json!({"version": 1, "network": {
+            "connections_migrated": true,
+            "default_submit": creds,
+            "connections": [{"credentials": creds, "enabled": true, "network_id": "network-a", "host_installation_id": "host-id"}]
+        }}).to_string()).unwrap();
+
+        let ctx = egui::Context::default();
+        let app = App::with_ctx(&ctx, AppOptions { settings_path: Some(sp), ..Default::default() });
+        assert_eq!(app.ai.placement, crate::scheduler::Placement::Target("network:network-a/host-id".into()));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn c7_failed_settings_save_keeps_connection_and_credentials() {
+        let d = std::env::temp_dir().join(format!("ck-remove-save-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let cfg = d.join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let creds = d.join("login.json").display().to_string();
+        let sp = cfg.join("settings.json");
+        std::fs::write(&sp, serde_json::json!({"version": 1, "network": {"connections_migrated": true, "default_submit": creds, "connections": [{"credentials": creds, "enabled": true}]}}).to_string()).unwrap();
+        for ext in ["", ".session", ".lock", ".network.json"] { std::fs::write(format!("{creds}{ext}"), "keep").unwrap(); }
+
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx, AppOptions { settings_path: Some(sp), ..Default::default() });
+        app.ai.placement = crate::scheduler::Placement::Target("network:test/target".into());
+        std::fs::rename(&cfg, d.join("config-saved")).unwrap();
+        std::fs::write(&cfg, "block directory creation").unwrap();
+        app.finish_remove(&creds, None);
+
+        assert!(app.settings.saved().network.connections.iter().any(|c| c.credentials == creds));
+        assert_eq!(app.settings.saved().network.default_submit, creds);
+        assert_eq!(app.ai.placement, crate::scheduler::Placement::Target("network:test/target".into()));
+        assert!(["", ".session", ".lock", ".network.json"].iter().all(|ext| std::path::Path::new(&format!("{creds}{ext}")).exists()));
+        assert!(app.machines_page.notice_text().is_some_and(|n| n.contains("could not be saved")));
         let _ = std::fs::remove_dir_all(d);
     }
 }

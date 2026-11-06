@@ -930,3 +930,54 @@ def test_cancelled_remapped_snapshot_reuses_verified_staging(roots, monkeypatch)
     final = roots.data_dir / 'checkpoints/VideoMaMa'
     assert (final / 'unet/weights.bin').read_bytes() == b'weights'
     assert (final / '.upstream/README.md').read_bytes() == b'notice'
+
+
+def test_existing_legacy_file_is_seeded_and_only_missing_file_is_fetched(roots, tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    files = {"config.json": b"{}", "weights.bin": b"weights"}
+    art = snapshot_artifact("birefnet-BiRefNet", "modules/BiRefNetModule/checkpoints/BiRefNet",
+                            [make_filespec(name, data) for name, data in files.items()])
+    legacy_data = tmp_path / "prior-data"
+    old_config = legacy_data / art.layout_rel / "config.json"
+    old_config.parent.mkdir(parents=True)
+    old_config.write_bytes(files["config.json"])
+    roots = replace(roots, legacy_data_dirs=(legacy_data,))
+    catalog = Catalog(1, "t", {}, {art.id: art})
+    assert art.repo_id is not None
+    fake_snapshot_repo(monkeypatch, {art.repo_id: files})
+    requests = []
+    original = mp.ProvisionManager._run_download_worker
+
+    def record_request(self, request, artifact):
+        requests.append(request.copy())
+        return original(self, request, artifact)
+
+    monkeypatch.setattr(mp.ProvisionManager, "_run_download_worker", record_request)
+    mgr = manager(catalog, roots)
+
+    assert mgr.op_download([art.id])["ok"] is True
+    assert requests[0]["allow_patterns"] == ["weights.bin"]
+    assert old_config.read_bytes() == files["config.json"]
+    final = roots.data_dir / art.layout_rel
+    assert (final / "config.json").read_bytes() == files["config.json"]
+    assert (final / "weights.bin").read_bytes() == files["weights.bin"]
+
+
+def test_repair_preserves_unowned_files_inside_model_directory(roots, monkeypatch):
+    files = {"config.json": b"{}", "weights.bin": b"new weights"}
+    art = snapshot_artifact("gvm", "gvm/weights",
+                            [make_filespec(name, data) for name, data in files.items()])
+    dest = roots.data_dir / art.layout_rel
+    dest.mkdir(parents=True)
+    (dest / "config.json").write_bytes(files["config.json"])
+    (dest / "weights.bin").write_bytes(b"wrong size")
+    extra = dest / "user-added-lora.pt"
+    extra.write_bytes(b"user data")
+    assert art.repo_id is not None
+    fake_snapshot_repo(monkeypatch, {art.repo_id: files})
+    mgr = manager(Catalog(1, "t", {}, {art.id: art}), roots)
+
+    assert mgr.op_repair([art.id])["ok"] is True
+    assert (dest / "weights.bin").read_bytes() == files["weights.bin"]
+    assert extra.read_bytes() == b"user data"

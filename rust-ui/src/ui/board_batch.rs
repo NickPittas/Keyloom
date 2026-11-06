@@ -47,12 +47,16 @@ fn counts(cards: &[FxShot]) -> Counts {
 fn six_cells(ui: &mut Ui, id: Id, height: f32, width: f32, add: impl FnOnce(&mut [Ui; 6])) {
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let mut row = ui.new_child(UiBuilder::new().id_salt(id).max_rect(rect));
+    let completed_width = (line(ui.painter(), "Completed", ty::chip(), 14.0, f32::INFINITY).size().x + 28.0).round();
+    let mut col_widths = COLS;
+    col_widths[1] -= (completed_width - col_widths[2]).max(0.0);
+    col_widths[2] = completed_width;
     let mut x = rect.left();
     let mut cells = std::array::from_fn(|i| {
         let width = if i == 5 {
-            width - COLS[..5].iter().sum::<f32>()
+            width - col_widths[..5].iter().sum::<f32>()
         } else {
-            COLS[i]
+            col_widths[i]
         };
         let cell_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(width, height));
         x += width;
@@ -296,7 +300,7 @@ fn machine_id(batch: &BatchDialog, pick: usize) -> Option<String> {
 
 fn status_label(text: &str) -> String {
     let mut chars = text.chars();
-    let head: String = chars.by_ref().take(14).collect();
+    let head: String = chars.by_ref().take(8).collect();
     if chars.next().is_some() { format!("{head}…") } else { head }
 }
 
@@ -328,7 +332,9 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
         let galley = line(cells[1].painter(), &row.name, ty::mono(), 16.0, cells[1].max_rect().width() - 8.0);
         paint_line(cells[1].painter(), cells[1].max_rect(), galley, 16.0, Align::Min, t.text_primary, 1.0);
         let stage = match row.stage.as_str() { "mask" => Stage::Mask, "ready" => Stage::Ready, "done" => Stage::Completed, _ => Stage::Raw };
-        chips::stage_chip(&mut cells[2], stage);
+        let stage_rect = cells[2].max_rect();
+        let mut stage_cell = cells[2].new_child(UiBuilder::new().max_rect(stage_rect).layout(Layout::left_to_right(Align::Center)));
+        chips::stage_chip(&mut stage_cell, stage);
 
         let job = match row.job {
             Some(BatchDialogJob::Queued) => Some(Job::Queued),
@@ -345,8 +351,9 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
             chips::job_badge_motion(&mut badge, job, true);
         } else {
             let rect = cells[3].max_rect();
-            let galley = line(cells[3].painter(), "—", ty::label(), 16.0, rect.width());
-            paint_line(cells[3].painter(), rect, galley, 16.0, Align::Min, t.text_tertiary, 0.0);
+            let painter = cells[3].painter().with_clip_rect(rect);
+            let galley = line(&painter, "—", ty::label(), 16.0, rect.width());
+            paint_line(&painter, rect, galley, 16.0, Align::Min, t.text_tertiary, 0.0);
         }
 
         let mut pick = batch.machines.iter().position(|machine| machine.id.as_ref() == row.machine.as_ref()).unwrap_or(items.len());
@@ -368,6 +375,7 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
                 .selected_text(status_label(&row.status))
                 .show_ui(status_cell, |menu| {
                     if let Some(reason) = &row.reason { menu.label(reason); }
+                    if let Some(note) = &row.reuse_note { menu.label(note); }
                     if let Some(accept) = &row.accept {
                         if menu.selectable_label(row.included, accept).clicked() { edits.push(BatchEdit::Include(index, true)); }
                     }
@@ -386,6 +394,10 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
             let color = if row.blocked { t.error } else if row.status == "—" { t.text_tertiary } else { t.text_primary };
             let galley = line(status_cell.painter(), &row.status, ty::label(), 16.0, rect.width());
             paint_line(status_cell.painter(), rect, galley, 16.0, Align::Min, color, 0.0);
+        }
+        if let Some(note) = &row.reuse_note {
+            let rect = status_cell.max_rect();
+            status_cell.interact(rect, egui::Id::unique(("board-batch-reuse-note", index)), Sense::hover()).on_hover_text(note);
         }
     });
 }
@@ -514,7 +526,11 @@ fn footer_count(painter: &egui::Painter, rect: Rect, counts: Counts, t: &super::
     job.append(
         &format!("{} need a machine", counts.blocked),
         0.0,
-        ty::format(ty::small(), t.error, 14.0),
+        ty::format(
+            ty::small(),
+            if counts.blocked > 0 { t.error } else { t.text_secondary },
+            14.0,
+        ),
     );
     job.append(
         &format!(" · {} in queue · {} skipped", counts.queued, counts.skipped),
@@ -690,5 +706,30 @@ mod tests {
                 skipped: 0
             }
         );
+    }
+
+    #[test]
+    fn compatible_hint_reuse_note_is_visible_in_the_row() {
+        let note = "Reusing the existing compatible hint";
+        let row = BatchDialogRow {
+            folder: "shot".into(), name: "Shot".into(), stage: "done".into(), machine: None,
+            job: None, status: note.into(), reason: None, included: true, can_include: true,
+            accept: None, offer: None, reuse_note: Some(note.into()), reuse: true, mismatch: false,
+            reset_to_preset: false, queueable: true, blocked: false,
+        };
+        let batch = BatchDialog { planning: false, preset: None, presets: vec![], machines: vec![], rows: vec![row.clone()] };
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 80.0))), ..Default::default() },
+            |ui| live_row(ui, 0, &row, &batch, &[], 1100.0, &mut vec![]),
+        );
+        fn has_text(shape: &egui::epaint::Shape, wanted: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(text) => text.galley.job.text == wanted,
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, wanted)),
+                _ => false,
+            }
+        }
+        assert!(out.shapes.iter().any(|shape| has_text(&shape.shape, note)), "the automatic reuse note is drawn in the row");
     }
 }

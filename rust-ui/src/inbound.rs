@@ -169,6 +169,10 @@ struct Item {
     not_before: Option<Instant>,
 }
 
+fn clear_matching_note(note: &mut Option<String>, prefix: &str) {
+    if note.as_deref().is_some_and(|s| s.starts_with(prefix)) { *note = None; }
+}
+
 /// A shot running on this PC.
 struct Run {
     job_id: String,
@@ -343,7 +347,7 @@ impl Inbound {
     /// Receive jobs is on and the endpoint runs (this struct only works while it does), nothing held, nothing running or waiting here.
     fn avail(&self, env: &Env) -> (bool, bool, bool) {
         let busy = env.ai.scheduler().running() || !self.queue.is_empty() || !matches!(self.rx, Rx::Idle);
-        (env.settings.network.receives(), busy, self.blocking_held())
+        (env.settings.network.receives() && !self.closing, busy, self.blocking_held())
     }
 
     /// Shots whose outputs just finished (the App re-reads them).
@@ -371,6 +375,12 @@ impl Inbound {
     pub fn quiescent(&self) -> bool {
         matches!(self.rx, Rx::Idle)
     }
+    /// Shutdown can finish only after Receive jobs is disabled on the still-live endpoint.
+    pub fn shutdown_settled(&self) -> bool {
+        self.quiescent()
+            && (!app_api::running()
+                || (self.configuring.is_none() && self.sent_cfg.as_ref().is_some_and(|(receives, _, _)| !receives)))
+    }
     /// Why this PC cannot be changed or removed now (a shot is running here, or one is uncertain).
     pub fn busy_reason(&self) -> Option<String> {
         if !matches!(self.rx, Rx::Idle) {
@@ -394,7 +404,7 @@ impl Inbound {
                     self.reload = true;
                 }
                 "cancelled" => {
-                    self.cancels.insert(job_id.clone());
+                    self.committed_cancel(&job_id);
                     if let Rx::Running(r) = &mut self.rx {
                         if r.job_id == job_id && !r.cancel_sent {
                             Self::cancel_all(r, env);
@@ -411,11 +421,19 @@ impl Inbound {
         self.advance(now, env);
     }
 
+    fn committed_cancel(&mut self, job_id: &str) {
+        self.cancels.insert(job_id.to_owned());
+        self.queue.retain(|item| item.id != job_id);
+    }
+
     /// Receive jobs / join policy / PC name to the endpoint, whenever they differ from what it was last told.
     fn configure(&mut self, env: &Env) {
         if let Some(rx) = &self.configuring {
             match rx.try_recv() {
                 Err(TryRecvError::Empty) => return,
+                Ok(Ok(_)) => {
+                    clear_matching_note(&mut self.note, "The network settings could not be applied");
+                }
                 Ok(Err(e)) => {
                     self.sent_cfg = None;
                     self.note = Some(format!("The network settings could not be applied ({}).", e.message));
@@ -425,7 +443,7 @@ impl Inbound {
             self.configuring = None;
         }
         let n = &env.settings.network;
-        let want = (n.receives(), n.allow_join, truncate(n.name.trim(), 64));
+        let want = (n.receives() && !self.closing, n.allow_join, truncate(n.name.trim(), 64));
         if self.sent_cfg.as_ref() != Some(&want) {
             let mut a = json!({"receive": want.0, "allow_join": want.1});
             if !want.2.is_empty() {
@@ -441,6 +459,9 @@ impl Inbound {
         if let Some(rx) = &self.publishing {
             match rx.try_recv() {
                 Err(TryRecvError::Empty) => return,
+                Ok(Ok(_)) => {
+                    clear_matching_note(&mut self.note, "This PC's entry for the other PCs could not be updated");
+                }
                 Ok(Err(e)) => self.note = Some(format!("This PC's entry for the other PCs could not be updated ({}).", e.message)),
                 _ => {}
             }
@@ -455,6 +476,7 @@ impl Inbound {
         self.last_avail = Some(avail);
         let sample = if let View::Live(s) = env.metrics { Some(s) } else { None };
         let gpu = env.ai.scheduler().targets().into_iter().find(|t| t.local && t.enabled).and_then(|t| t.ready).and_then(|r| r.gpu);
+        if gpu.is_none() || sample.is_none() { clear_matching_note(&mut self.note, "This PC is not offered to other PCs:"); }
         let name = truncate(env.settings.network.name.trim(), 64);
         let mut args = json!({"avail": {"receiving": avail.0, "busy": avail.1, "held": avail.2}});
         if !name.is_empty() {
@@ -463,6 +485,7 @@ impl Inbound {
         if let (Some(g), Some(s)) = (&gpu, sample) {
             match (g.verified_uuid(), s.ram_total.map(|b| b / (1 << 20)).filter(|r| *r > 0)) {
                 (Ok(uuid), Some(ram)) => {
+                    clear_matching_note(&mut self.note, "This PC is not offered to other PCs:");
                     args["gpu"] = json!({"uuid": uuid, "name": truncate(&g.name, 120), "vram_total_mb": ((g.vram_gb * 1024.0) as u64).max(1), "ram_total_mb": ram});
                     self.stats_seq += 1;
                     args["stats"] = stats_args(s, self.stats_seq);
@@ -483,6 +506,7 @@ impl Inbound {
                     match done {
                         Ok(Ok(rows)) => {
                             self.loaded = true;
+                            clear_matching_note(&mut self.note, "The inbox could not be read");
                             for r in rows.as_array().into_iter().flatten() {
                                 let Some(id) = r.get("job_id").and_then(Value::as_str) else { continue };
                                 if self.seen.insert(id.to_owned()) {
@@ -745,6 +769,12 @@ impl Inbound {
     }
 
     fn preflight_passed(&mut self, id: String, pf: Preflight, now: Instant, env: &mut Env) {
+        if self.closing {
+            env.ai.release_network_slot(SLOT);
+            self.seen.remove(&id);
+            self.homes.remove(&id);
+            return;
+        }
         nlog(&format!("shot {id}: preflight passed"));
         let sample = if let View::Live(s) = env.metrics { Some(s) } else { None };
         let uuid = env.ai.scheduler().targets().into_iter().find(|t| t.local && t.enabled).and_then(|t| t.ready).and_then(|r| r.gpu).and_then(|g| g.verified_uuid().ok().map(str::to_owned));
@@ -764,7 +794,7 @@ impl Inbound {
 
     fn begin_prepared(&mut self, id: String, pf: Box<Preflight>, plan: Value, now: Instant, env: &mut Env) {
         // Receive jobs may have been turned off while this shot was being prepared.
-        if !env.settings.network.receives() {
+        if self.closing || !env.settings.network.receives() {
             env.ai.release_network_slot(SLOT);
             self.seen.remove(&id);
             self.homes.remove(&id);
@@ -801,7 +831,11 @@ impl Inbound {
         }
     }
 
-    fn begun(&mut self, id: String, pf: Option<Box<Preflight>>, fail: Option<String>, env: &mut Env) {
+    fn begun(&mut self, id: String, mut pf: Option<Box<Preflight>>, mut fail: Option<String>, env: &mut Env) {
+        if self.closing {
+            pf = None;
+            fail = Some("cancelled because this PC is closing".into());
+        }
         let (folder, project) = self.homes.remove(&id).unwrap_or_default();
         let mut run = Run { job_id: id.clone(), folder, project, stages: vec![], announced: 0, outbox: vec![], seq: 0, last_phase: String::new(), last_done: 0, last_total: 0, last_progress: Instant::now(), inflight: None, retry_at: None, cancel_sent: false, terminal: None };
         match (pf, fail) {
@@ -1155,5 +1189,66 @@ mod tests {
         Inbound::push_terminal(&mut r, "succeeded", "b");
         assert_eq!(r.outbox.len(), 1);
         assert_eq!(r.outbox[0]["data"]["state"], "failed");
+    }
+
+    #[test]
+    fn shutdown_during_begin_reply_never_submits_a_stage() {
+        use crate::contracts::RangeIdentity;
+        use crate::jobs::{JobMode, KeyJob, Require};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let settings = crate::settings::Settings::default();
+        let mut ai = crate::ui::ai::AiUi::new(&settings, None);
+        let metrics = View::Unavailable(String::new());
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let mut env = Env { settings: &settings, settings_path: None, ai: &mut ai, metrics: &metrics, repo: None, python: None, wake: &wake, cfg: Default::default() };
+        let job = KeyJob {
+            job_id: "j".into(),
+            clip_id: "clip-j".into(),
+            clip_root: PathBuf::from("/tmp/clip-j"),
+            range: RangeIdentity { in_point: 0, out_point: 0, in_stem: "1101".into(), out_stem: "1101".into() },
+            params: json!({}),
+            output_config: json!({}),
+            hint_keyframes_abs: None,
+            outputs: BTreeMap::new(),
+            manifest_dir: PathBuf::from("/tmp/outputs"),
+            mode: JobMode::New,
+            publish: "final".into(),
+            path_map: vec![],
+            require: Require { protocol: 1, models: BTreeMap::new() },
+            source_map: vec![],
+            enforce_fixed_window: false,
+            hint_identity: None,
+        };
+        let pf = Box::new(Preflight { job: job.clone(), stages: vec![Stage::Key(job)], first_frame: PathBuf::from("/tmp/clip-j/Frames/f_1101.png"), probes: vec![] });
+        let mut inbound = Inbound::new();
+        inbound.shutdown_requested();
+        inbound.begun("j".into(), Some(pf), None, &mut env);
+
+        let Rx::Running(run) = inbound.rx else { panic!("the reply must be recorded for settlement") };
+        assert!(run.stages.is_empty());
+        assert!(run.terminal.is_some());
+        assert!(env.ai.scheduler().snapshot().is_empty());
+    }
+
+    #[test]
+    fn c9_committed_cancel_removes_waiting_job_before_dispatch() {
+        let mut inbound = Inbound::new();
+        inbound.queue.push_back(Item { id: "job-1".into(), spec: Err("test".into()), not_before: None });
+        inbound.committed_cancel("job-1");
+        assert!(inbound.queue.is_empty());
+        assert!(inbound.cancels.contains("job-1"));
+    }
+
+    #[test]
+    fn c2_success_clears_only_the_matching_inbox_error() {
+        let mut note = Some("The inbox could not be read (offline); trying again.".to_owned());
+        clear_matching_note(&mut note, "The inbox could not be read");
+        assert!(note.is_none());
+        note = Some("The network settings could not be applied (offline).".into());
+        clear_matching_note(&mut note, "The inbox could not be read");
+        assert!(note.is_some());
     }
 }

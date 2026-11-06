@@ -89,6 +89,7 @@ impl App {
             Act::DownloadAll => Request::DownloadAll,
             Act::Cancel => Request::Cancel,
             Act::Delete(id) => Request::Delete(id),
+        Act::Repair(id) => Request::Repair(id),
             Act::Refresh => Request::Refresh,
             Act::Reveal(id) => {
                 match self.models.artifact_path(&id) {
