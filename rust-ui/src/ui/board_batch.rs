@@ -389,9 +389,10 @@ fn live_row(ui: &mut Ui, index: usize, row: &BatchDialogRow, batch: &BatchDialog
             let color = if row.blocked { t.error } else if row.status == "—" { t.text_tertiary } else { t.text_primary };
             let galley = line(status_cell.painter(), &row.status, ty::label(), 16.0, rect.width());
             paint_line(status_cell.painter(), rect, galley, 16.0, Align::Min, color, 0.0);
-            if let Some(note) = &row.reuse_note {
-                status_cell.interact(rect, egui::Id::unique(("board-batch-reuse-note", index)), Sense::hover()).on_hover_text(note);
-            }
+        }
+        if let Some(note) = &row.reuse_note {
+            let rect = status_cell.max_rect();
+            status_cell.interact(rect, egui::Id::unique(("board-batch-reuse-note", index)), Sense::hover()).on_hover_text(note);
         }
     });
 }
