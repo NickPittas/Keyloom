@@ -364,6 +364,19 @@ pub fn viewer_toolbar_forced(ui: &mut Ui, st: &mut ViewerState, layout: Layout, 
     p.rect_filled(Rect::from_min_max(Pos2::new(row.min.x, row.max.y - 1.0), row.max), 0.0, t.border_divider);
     let y = row.min.y + 3.0;
     let compact = layout == Layout::Compact;
+    let mut compact_width = 96.0;
+    let mut hide_bg = false;
+    if compact {
+        let right_width = cluster_width(Layout::Compact, &[]);
+        let left_end = row.min.x + 8.0 + 2.0 * compact_width + 8.0;
+        let right_start = row.max.x - 8.0 - right_width;
+        if right_start < left_end + 8.0 {
+            // Info and gain/gamma have no View-menu entry; Background remains reachable with K.
+            hide_bg = true;
+            let right_width_without_bg = right_width - Slot::Bg.w() - Slot::Div.w();
+            compact_width = (((row.width() - 32.0 - right_width_without_bg) / 2.0).max(48.0)).min(96.0);
+        }
+    }
     if st.view == View::Hint && st.overlay == Overlay::Hint { st.overlay = Overlay::Off; out.changed = true }
 
     // ---- left: View · Overlay -------------------------------------------------------------------------------------------
@@ -380,17 +393,17 @@ pub fn viewer_toolbar_forced(ui: &mut Ui, st: &mut ViewerState, layout: Layout, 
     if compact {
         let closed = VIEW_C[st.view as usize];
         let mut vi = st.view as usize;
-        let mut dd = Dropdown::new("vt-view-c", &mut vi, &items, 96.0).compact().at(Pos2::new(x, y)).name("View").display(closed).font(ValueFont::Small).tip(closed).list_width(180.0);
+        let mut dd = Dropdown::new("vt-view-c", &mut vi, &items, compact_width).compact().at(Pos2::new(x, y)).name("View").display(closed).font(ValueFont::Small).tip(closed).list_width(180.0);
         if let Some(h) = fo.view_list { dd = dd.forced(Vis::Rest, true, false).highlight(h) }
         if dd.show(ui).changed() { st.view = View::ALL[vi]; out.changed = true }
-        x += 96.0 + 8.0;
+        x += compact_width + 8.0;
         let items: Vec<Item> = Overlay::ALL.iter().map(|o| {
             let it = Item::new(o.label());
             if *o == Overlay::Hint && hint_off { it.disabled("Already viewing the hint") } else { it }
         }).collect();
         let closed = OVERLAY_C[st.overlay as usize];
         let mut oi = st.overlay as usize;
-        if Dropdown::new("vt-overlay-c", &mut oi, &items, 96.0).compact().at(Pos2::new(x, y)).name("Overlay").display(closed).font(ValueFont::Small).tip(closed).list_width(140.0).show(ui).changed() {
+        if Dropdown::new("vt-overlay-c", &mut oi, &items, compact_width).compact().at(Pos2::new(x, y)).name("Overlay").display(closed).font(ValueFont::Small).tip(closed).list_width(140.0).show(ui).changed() {
             st.overlay = Overlay::ALL[oi];
             out.changed = true;
         }
@@ -417,7 +430,13 @@ pub fn viewer_toolbar_forced(ui: &mut Ui, st: &mut ViewerState, layout: Layout, 
     } else {
         Vec::new()
     };
-    let slots = cluster(layout, &badge_w);
+    let mut slots = cluster(layout, &badge_w);
+    if hide_bg {
+        // Preserve the existing priority order; these first two controls have no alternate access path.
+        let bg = slots.iter().position(|s| *s == Slot::Bg).unwrap();
+        slots.remove(bg);
+        if bg < slots.len() && slots[bg] == Slot::Div { slots.remove(bg); }
+    }
     let mut x = row.max.x - 8.0 - slots.iter().map(|s| s.w()).sum::<f32>();
     let mut badge_i = 0;
     // Thin space, as the mockup's "38 %" readout: the normal mono space reads wider.
