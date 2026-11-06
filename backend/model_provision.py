@@ -751,7 +751,10 @@ class ProvisionManager:
                        "verified": before["verified"], "ready": before["ready"], "path": before["path"],
                        "note": "already installed; not re-hashed (use verify or repair to re-check)"})
             return True
-        self._seed_existing_files(art, dest)
+        if repair:
+            self._clear_artifact_staging(art, dest)
+        else:
+            self._seed_existing_files(art, dest)
         needed_bytes = self._missing_bytes(art)
         self.emit({"event": "artifact-start", "artifact": art.id,
                    "bytes_total": needed_bytes,
@@ -1038,6 +1041,18 @@ class ProvisionManager:
                     seeded.add(f.layout_path)
                     break
                 target.unlink(missing_ok=True)
+
+    def _clear_artifact_staging(self, art: Artifact, dest: Path) -> None:
+        if art.kind in ("hf_files", "hf_snapshot"):
+            staging = self._hf_staging_dir(art, dest)
+        elif art.kind == "hf_cache_file":
+            staging = self._hf_cache_staging_dir(art)
+        elif art.md5_b64:
+            staging = self._rvm_staging_dir(art)
+        else:
+            staging = self._http_staging_dir(art, dest)
+        self._remove_path(staging, self._asset_root(art))
+        self._seeded_files.pop(art.id, None)
 
     def _publish(self, source: Path, target: Path, root: Path, *,
                  allow_leaf_link: bool, directory: bool, art: Artifact,
