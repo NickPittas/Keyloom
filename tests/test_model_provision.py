@@ -554,7 +554,7 @@ class TestDiskPreflight:
 
         def mutate_after_publish(*args, **kwargs):
             backup = publish(*args, **kwargs)
-            (args[1] / "weights.bin").write_bytes(b"mutated-after-check")
+            args[1].write_bytes(b"mutated-after-check")
             return backup
 
         monkeypatch.setattr(mgr, "_publish", mutate_after_publish)
@@ -756,8 +756,8 @@ class TestEventStream:
              *shared_roots], capture_output=True, text=True, timeout=5, check=False)
         assert crashed.returncode == 77
         assert not final.exists()
-        assert list(final.parent.parent.glob(".weights.*.previous"))
-        assert (final.parent.parent / ".weights.keyloom-publish.json").exists()
+        assert list(final.parent.glob(".weights.bin.*.previous"))
+        assert (final.parent / ".weights.bin.keyloom-publish.json").exists()
 
         recovered = subprocess.run(
             [sys.executable, fixture, "--download", "--profile", "required",
@@ -766,8 +766,8 @@ class TestEventStream:
         events = [json.loads(line) for line in recovered.stdout.splitlines()]
         assert recovered.returncode == 0, recovered.stderr + recovered.stdout
         assert final.read_bytes() == good
-        assert not list(final.parent.parent.glob(".weights.*.previous"))
-        assert not (final.parent.parent / ".weights.keyloom-publish.json").exists()
+        assert not list(final.parent.glob(".weights.bin.*.previous"))
+        assert not (final.parent / ".weights.bin.keyloom-publish.json").exists()
         assert not (roots.cache_dir / "model-operations" / "crash-operation.active").exists()
         assert [event["event"] for event in events][-1] == "op-done"
         assert events[-1]["ok"] is True

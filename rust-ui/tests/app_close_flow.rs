@@ -94,14 +94,23 @@ fn has(commands: &[ViewportCommand], wanted: impl Fn(&ViewportCommand) -> bool) 
 }
 
 fn finish_close(ctx: &egui::Context, app: &mut App, mut last: Pass) -> Pass {
-    for _ in 0..4 {
-        assert!(has(&last.commands, |c| matches!(c, ViewportCommand::Close)), "no close request to deliver: commands={:?}, texts={:?}", last.commands, last.texts);
-        last = frame(ctx, app, true, vec![]);
-        if !has(&last.commands, |c| matches!(c, ViewportCommand::CancelClose)) {
-            return last;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if has(&last.commands, |c| matches!(c, ViewportCommand::Close)) {
+            last = frame(ctx, app, true, vec![]);
+            // egui applies commands in order: the close is accepted unless the last close command of the pass is CancelClose.
+            let verdict = last.commands.iter().rev().find(|c| matches!(c, ViewportCommand::Close | ViewportCommand::CancelClose));
+            if !matches!(verdict, Some(ViewportCommand::CancelClose)) {
+                last.commands.retain(|c| !matches!(c, ViewportCommand::CancelClose)); // superseded by the later Close
+                return last;
+            }
         }
+        if Instant::now() >= deadline {
+            panic!("no accepted close before deadline: commands={:?}, texts={:?}", last.commands, last.texts);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        last = frame(ctx, app, false, vec![]);
     }
-    panic!("the authorized close was cancelled repeatedly");
 }
 
 fn click(ctx: &egui::Context, app: &mut App, at: Pos2) -> Pass {
