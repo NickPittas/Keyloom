@@ -1328,6 +1328,9 @@ impl App {
             // A hint was made from the pre-matte that existed then, so it starts from the pre-matte baseline.
             let from = rc.base_pre.clone();
             let s = rc.inflight.remove(&id).or_else(|| Some(snap_from_job(job.as_deref()?, from.as_ref()?, is_hint)));
+            if rc.inflight.is_empty() && self.hint.note.as_deref().is_some_and(|note| (note.starts_with("Hint") || note.starts_with("Pre-matte")) && note.ends_with(" queued.")) {
+                self.hint.note = None;
+            }
             if let Some(s) = s {
                 if is_guide {
                     rc.base_pre = Some(s);
