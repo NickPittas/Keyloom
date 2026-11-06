@@ -822,10 +822,10 @@ impl App {
         if self.hint_delete_open() {
             return;
         }
+        self.shortcuts(ctx);
         if self.menu_open || self.activity_is_open() {
             return;
         }
-        self.shortcuts(ctx);
         self.new_project_window(ctx);
         // A focused graph node is a button, not text entry: shortcuts (F, B, 1-5, Esc…) must keep working there.
         if ctx.egui_wants_keyboard_input() {

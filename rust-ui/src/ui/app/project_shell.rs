@@ -518,7 +518,7 @@ impl App {
         use egui::Modifiers;
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         for (i, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].into_iter().enumerate() {
-            if ctx.input_mut(|inp| inp.consume_key(cs, k)) {
+            if !ctx.text_edit_focused() && ctx.input_mut(|inp| inp.consume_key(cs, k)) {
                 self.goto_page(i);
             }
         }
