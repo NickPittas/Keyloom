@@ -296,7 +296,7 @@ impl App {
     }
 
     /// Per frame: does any adopted clip's draft (open or not) differ from what disk holds?
-    fn refresh_draft_dirty(&mut self) {
+    pub(super) fn refresh_draft_dirty(&mut self) {
         // Shots changed by a deliberate action (Batch reset, confirmed queue with overrides) are tracked like opened ones.
         for f in self.ai.take_touched() {
             self.draft_clips.insert(f);

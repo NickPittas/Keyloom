@@ -1034,3 +1034,25 @@ fn receive_jobs_off_does_not_dispatch_a_queued_inbox_row() {
     w.b_settings.network.receive_jobs = Some(true);
     w.until("the shot to run once receiving is on", 60, |w| w.history(&job).is_some_and(|e| e.state == "succeeded"));
 }
+
+#[test]
+fn graceful_shutdown_settles_received_job_before_stopping_endpoint() {
+    let _t = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut w) = world("a7-close-settle", json!({"modes": {"key": "hold"}})) else { return };
+    w.until("A to reach B", 40, |w| w.a_set.online());
+    let sid = w.push(1);
+    w.until("the shot to run on B", 40, |w| w.b_in.receiving().is_some() && w.state_of(&sid).as_deref() == Some("started"));
+    let job = job_id(&w, &sid).unwrap();
+
+    w.b_in.shutdown_requested();
+    w.b_ai.begin_stop();
+    w.until("the received result and receive-disable to settle", 60, |w| {
+        w.b_in.shutdown_settled() && w.state_of(&sid).is_some_and(|s| s == "cancelled" || s == "failed")
+    });
+
+    assert!(app_api::running(), "the inbox remains available until its cancellation is recorded");
+    assert!(w.b_in.receiving().is_none());
+    assert_eq!(w.history(&job).expect("durable receive history").state, "cancelled");
+    assert!(!w.b_ai.scheduler().running());
+    w.stop_b();
+}

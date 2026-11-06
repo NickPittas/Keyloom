@@ -343,7 +343,7 @@ impl Inbound {
     /// Receive jobs is on and the endpoint runs (this struct only works while it does), nothing held, nothing running or waiting here.
     fn avail(&self, env: &Env) -> (bool, bool, bool) {
         let busy = env.ai.scheduler().running() || !self.queue.is_empty() || !matches!(self.rx, Rx::Idle);
-        (env.settings.network.receives(), busy, self.blocking_held())
+        (env.settings.network.receives() && !self.closing, busy, self.blocking_held())
     }
 
     /// Shots whose outputs just finished (the App re-reads them).
@@ -370,6 +370,12 @@ impl Inbound {
     /// Nothing is being started or run (an uncertain shot from an earlier run does not hold the app open).
     pub fn quiescent(&self) -> bool {
         matches!(self.rx, Rx::Idle)
+    }
+    /// Shutdown can finish only after Receive jobs is disabled on the still-live endpoint.
+    pub fn shutdown_settled(&self) -> bool {
+        self.quiescent()
+            && (!app_api::running()
+                || (self.configuring.is_none() && self.sent_cfg.as_ref().is_some_and(|(receives, _, _)| !receives)))
     }
     /// Why this PC cannot be changed or removed now (a shot is running here, or one is uncertain).
     pub fn busy_reason(&self) -> Option<String> {
@@ -425,7 +431,7 @@ impl Inbound {
             self.configuring = None;
         }
         let n = &env.settings.network;
-        let want = (n.receives(), n.allow_join, truncate(n.name.trim(), 64));
+        let want = (n.receives() && !self.closing, n.allow_join, truncate(n.name.trim(), 64));
         if self.sent_cfg.as_ref() != Some(&want) {
             let mut a = json!({"receive": want.0, "allow_join": want.1});
             if !want.2.is_empty() {
@@ -745,6 +751,12 @@ impl Inbound {
     }
 
     fn preflight_passed(&mut self, id: String, pf: Preflight, now: Instant, env: &mut Env) {
+        if self.closing {
+            env.ai.release_network_slot(SLOT);
+            self.seen.remove(&id);
+            self.homes.remove(&id);
+            return;
+        }
         nlog(&format!("shot {id}: preflight passed"));
         let sample = if let View::Live(s) = env.metrics { Some(s) } else { None };
         let uuid = env.ai.scheduler().targets().into_iter().find(|t| t.local && t.enabled).and_then(|t| t.ready).and_then(|r| r.gpu).and_then(|g| g.verified_uuid().ok().map(str::to_owned));
@@ -764,7 +776,7 @@ impl Inbound {
 
     fn begin_prepared(&mut self, id: String, pf: Box<Preflight>, plan: Value, now: Instant, env: &mut Env) {
         // Receive jobs may have been turned off while this shot was being prepared.
-        if !env.settings.network.receives() {
+        if self.closing || !env.settings.network.receives() {
             env.ai.release_network_slot(SLOT);
             self.seen.remove(&id);
             self.homes.remove(&id);
@@ -801,7 +813,11 @@ impl Inbound {
         }
     }
 
-    fn begun(&mut self, id: String, pf: Option<Box<Preflight>>, fail: Option<String>, env: &mut Env) {
+    fn begun(&mut self, id: String, mut pf: Option<Box<Preflight>>, mut fail: Option<String>, env: &mut Env) {
+        if self.closing {
+            pf = None;
+            fail = Some("cancelled because this PC is closing".into());
+        }
         let (folder, project) = self.homes.remove(&id).unwrap_or_default();
         let mut run = Run { job_id: id.clone(), folder, project, stages: vec![], announced: 0, outbox: vec![], seq: 0, last_phase: String::new(), last_done: 0, last_total: 0, last_progress: Instant::now(), inflight: None, retry_at: None, cancel_sent: false, terminal: None };
         match (pf, fail) {
@@ -1155,5 +1171,47 @@ mod tests {
         Inbound::push_terminal(&mut r, "succeeded", "b");
         assert_eq!(r.outbox.len(), 1);
         assert_eq!(r.outbox[0]["data"]["state"], "failed");
+    }
+
+    #[test]
+    fn shutdown_during_begin_reply_never_submits_a_stage() {
+        use crate::contracts::RangeIdentity;
+        use crate::jobs::{JobMode, KeyJob, Require};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let settings = crate::settings::Settings::default();
+        let mut ai = crate::ui::ai::AiUi::new(&settings, None);
+        let metrics = View::Unavailable(String::new());
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let mut env = Env { settings: &settings, settings_path: None, ai: &mut ai, metrics: &metrics, repo: None, python: None, wake: &wake, cfg: Default::default() };
+        let job = KeyJob {
+            job_id: "j".into(),
+            clip_id: "clip-j".into(),
+            clip_root: PathBuf::from("/tmp/clip-j"),
+            range: RangeIdentity { in_point: 0, out_point: 0, in_stem: "1101".into(), out_stem: "1101".into() },
+            params: json!({}),
+            output_config: json!({}),
+            hint_keyframes_abs: None,
+            outputs: BTreeMap::new(),
+            manifest_dir: PathBuf::from("/tmp/outputs"),
+            mode: JobMode::New,
+            publish: "final".into(),
+            path_map: vec![],
+            require: Require { protocol: 1, models: BTreeMap::new() },
+            source_map: vec![],
+            enforce_fixed_window: false,
+            hint_identity: None,
+        };
+        let pf = Box::new(Preflight { job: job.clone(), stages: vec![Stage::Key(job)], first_frame: PathBuf::from("/tmp/clip-j/Frames/f_1101.png"), probes: vec![] });
+        let mut inbound = Inbound::new();
+        inbound.shutdown_requested();
+        inbound.begun("j".into(), Some(pf), None, &mut env);
+
+        let Rx::Running(run) = inbound.rx else { panic!("the reply must be recorded for settlement") };
+        assert!(run.stages.is_empty());
+        assert!(run.terminal.is_some());
+        assert!(env.ai.scheduler().snapshot().is_empty());
     }
 }

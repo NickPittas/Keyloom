@@ -215,7 +215,11 @@ impl Drv {
     pub fn frame(&mut self, events: Vec<Event>) {
         let raw = RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1440.0, 2400.0))), events, max_texture_side: Some(16384), ..Default::default() };
         let (ctx, app) = (&self.ctx, &mut self.app);
-        let mut out = ctx.run_ui(raw, |ui| app.frame(ui));
+        let mut native_frame = eframe::Frame::_new_kittest();
+        let mut out = ctx.run_ui(raw, |ui| {
+            eframe::App::logic(app, ui.ctx(), &mut native_frame);
+            app.frame(ui);
+        });
         out.textures_delta.clear();
         self.texts.clear();
         for cs in &out.shapes {

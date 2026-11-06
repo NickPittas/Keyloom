@@ -292,6 +292,8 @@ pub struct App {
     close: CloseState,
     /// The user chose Quit anyway, or all graceful work has stopped: a close request now goes through.
     close_force: bool,
+    /// A logic-only close was cancelled and must be handled by the next rendered frame.
+    close_pending: bool,
     /// Explicit Quit was chosen: closing really closes even in background mode.
     pub(super) quitting: bool,
     /// The system tray icon (`None` = no tray: Close quits). Closing the window hides it only while this exists.
@@ -300,7 +302,7 @@ pub struct App {
     tray_note: bool,
     /// The tray's Quit was chosen: the next drawn frame runs the normal Quit (save, then the running-job question).
     quit_pending: bool,
-    /// Shutdown steps in the order they ran (`endpoint`, then `workers`).
+    /// Shutdown steps in the order they ran (`workers`, then `endpoint`).
     shutdown_log: Vec<&'static str>,
     close_rects: Vec<egui::Rect>,
     /// Output-location editor for the open project (Deliver tab).
@@ -340,7 +342,10 @@ impl App {
         let (ctx, wake) = (cc.egui_ctx.clone(), app.driver.as_ref().map(|d| d.waker(&cc.egui_ctx)));
         match super::tray::Tray::start(std::sync::Arc::new(move || match &wake { Some(w) => w(), None => ctx.request_repaint() })) {
             Ok(t) => app.tray = Some(t),
-            Err(e) => app.ai.notice = Some(format!("No system tray ({e}): closing the window quits Keyloom.")),
+            Err(e) => {
+                app.ai.notice = Some(format!("No system tray ({e}): closing the window quits Keyloom."));
+                app.opts.start_background = false;
+            }
         }
         app.release_shared();
         app
@@ -548,6 +553,7 @@ impl App {
             ai: driver::Held::new(AiUi::new(&settings_saved, opts.repo.as_deref())),
             close: CloseState::None,
             close_force: false,
+            close_pending: false,
             quitting: false,
             tray: None,
             tray_note: false,
@@ -2035,17 +2041,24 @@ impl App {
 
     /// Active work cancels the close request; graceful stop keeps the window updating until it exits.
     fn close_tick(&mut self, ctx: &egui::Context) {
+        let requested = std::mem::take(&mut self.close_pending)
+            || ctx.input(|i| i.viewport().close_requested());
         // A generated-frames deletion is running: keep the window open so its receive block finishes.
-        if ctx.input(|i| i.viewport().close_requested()) && self.hint_delete_open() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.hint_delete_open() {
+            self.close_force = false;
+            if requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                crate::background::show(ctx);
+            }
             return;
         }
         // Close hides to the tray (Quit is the tray entry or File > Quit); without a tray it falls through to a normal close.
-        if ctx.input(|i| i.viewport().close_requested())
+        if requested
             && !self.close_force
             && !self.quitting
             && self.close == CloseState::None
             && self.tray.is_some()
+            && self.settings.saved().interface.background
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if self.tray_note_marker().is_some_and(|m| !m.exists()) {
@@ -2055,7 +2068,15 @@ impl App {
             }
             return;
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.close_force {
+        if requested && !self.close_force {
+            self.refresh_draft_dirty();
+            if self.project.is_some() && self.unsaved() {
+                if let Err(e) = self.save_project() {
+                    self.ai.notice = Some(format!("Not closing: {e}"));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    return;
+                }
+            }
             let (jobs, alive, models) = (
                 self.ai.running_jobs(),
                 self.ai.workers_alive() || !self.inbound.quiescent(),
@@ -2071,9 +2092,13 @@ impl App {
                         self.close = CloseState::Stopping;
                     }
                 }
+            } else {
+                self.close_force = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
-        if self.close == CloseState::Stopping && self.ai.all_stopped() && self.inbound.quiescent() && !self.models.busy() {
+        if self.close == CloseState::Stopping && self.ai.all_stopped() && self.inbound.shutdown_settled() && !self.models.busy() {
+            self.stop_endpoint();
             self.close_force = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -2144,11 +2169,10 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
-    /// Ordered shutdown: the endpoint stops accepting first, then the workers are told to stop (their own cancel/unload/recovery).
+    /// Stop accepting new received work, then let the inbound report and workers settle before closing the endpoint.
     fn begin_shutdown(&mut self) {
-        self.stop_endpoint();
-        self.ai.begin_stop();
         self.inbound.shutdown_requested();
+        self.ai.begin_stop();
         self.shutdown_log.push("workers");
     }
 
@@ -2343,10 +2367,16 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.net_logic(ctx);
         self.tray_tick(ctx); // logic() still runs while the window is hidden
-        // A close request while minimized/hidden reaches only logic() (eframe skips ui()),
-        // and eframe would close the window right away. Cancel it and restore the window so
-        // the rendered frame's close_tick runs its guards (deletion, hide-to-tray, active work).
-        if ctx.input(|i| i.viewport().close_requested()) {
+        // A close request in a logic-only pass needs the same guards as a rendered close.
+        if ctx.input(|i| i.viewport().close_requested())
+            && (self.hint_delete_open() || !self.close_force)
+        {
+            if self.hint_delete_open() {
+                self.close_force = false;
+                self.close_pending = false;
+            } else {
+                self.close_pending = true;
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             crate::background::show(ctx);
         }
@@ -2357,6 +2387,9 @@ impl eframe::App for App {
                 crate::background::show(ctx);
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        if self.opts.start_background && !self.has_tray() {
+            self.opts.start_background = false;
         }
         if self.opts.start_background {
             if ctx.cumulative_frame_nr() > 0 {
