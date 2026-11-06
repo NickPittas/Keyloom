@@ -792,6 +792,7 @@ pub struct AiUi {
     clients: BTreeMap<PathBuf, Option<String>>,
     pub notice: Option<String>,
     notice_roots: Vec<PathBuf>,
+    notice_at: Option<Instant>,
     /// Recompute cues for the Key / delivery cards: `Some(pulse 0..1)` = stale (set each frame by the Hint feedback tick).
     pub stale_key: Option<f32>,
     pub stale_deliver: Option<f32>,
@@ -973,6 +974,7 @@ impl AiUi {
             clients: BTreeMap::new(),
             notice,
             notice_roots: vec![],
+            notice_at: None,
             stale_key: None,
             stale_deliver: None,
             disk_gen: 0,
@@ -1180,6 +1182,28 @@ impl AiUi {
         }
     }
 
+    fn clear_queued_notice(&mut self) {
+        self.notice_roots.clear();
+        self.notice_at = None;
+        if let Some(notice) = &mut self.notice {
+            let keep: Vec<_> = notice.split(". ")
+                .filter(|part| part.contains("Not queued:") || (part.contains("waiting for a free PC") && !self.auto_pending.is_empty()))
+                .collect();
+            *notice = keep.join(". ");
+            if notice.is_empty() { self.notice = None; }
+        }
+    }
+
+    pub fn settle_queued_notice(&mut self, remote_active: &[std::path::PathBuf]) {
+        if !self.notice.as_deref().is_some_and(|m| m.starts_with("Queued "))
+            || self.notice_roots.is_empty()
+            || self.notice_at.is_none_or(|at| at.elapsed() < Duration::from_secs(3))
+            || self.notice_roots.iter().any(|root| remote_active.contains(root))
+            || self.notice_roots.iter().any(|root| self.tracked.iter().any(|t| &t.clip_root == root && self.sched.state_of(&t.job_id).is_some_and(|s| !s.is_terminal())))
+        { return; }
+        self.clear_queued_notice();
+    }
+
     /// Poll workers. Publication and completion come back as `Refresh` so the host re-reads the LOCAL manifest.
     /// Everything that advances work, with no egui involved: called by the runtime driver thread (and by `tick`).
     /// Clip folders the UI must re-read are queued for `take_refreshes`.
@@ -1195,17 +1219,10 @@ impl AiUi {
                     if self.sched.state_of(&id).is_some_and(|s| s.is_terminal()) =>
                 {
                     self.on_task_end(&id);
-                    if self.notice.as_deref().is_some_and(|m| m.starts_with("Queued ")) && self.notice_roots.iter().all(|root| {
+                    if self.notice.as_deref().is_some_and(|m| m.starts_with("Queued ")) && self.notice_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(3)) && self.notice_roots.iter().all(|root| {
                         !self.tracked.iter().any(|t| &t.clip_root == root && self.sched.state_of(&t.job_id).is_some_and(|s| !s.is_terminal()))
                     }) {
-                        self.notice_roots.clear();
-                        if let Some(notice) = &mut self.notice {
-                            let keep: Vec<_> = notice.split(". ")
-                                .filter(|part| part.contains("Not queued:") || (part.contains("waiting for a free PC") && !self.auto_pending.is_empty()))
-                                .collect();
-                            *notice = keep.join(". ");
-                            if notice.is_empty() { self.notice = None; }
-                        }
+                        self.clear_queued_notice();
                     }
                     (id, false)
                 }
@@ -3690,6 +3707,7 @@ impl AiUi {
             m += &format!(" Not queued: {}", errs.join(" "));
         }
         self.notice_roots = notice_roots;
+        self.notice_at = Some(Instant::now());
         self.notice = Some(m);
     }
 

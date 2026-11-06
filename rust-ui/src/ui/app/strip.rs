@@ -140,6 +140,34 @@ impl App {
         let mut rows = Vec::new();
         if let Some(project) = &self.project {
             for clip in &project.clips {
+                for remote in self.remote.jobs_snapshot().into_iter().filter(|j| j.matches_paths(&project.root, &clip.root)) {
+                    let location = remote.on.as_deref().unwrap_or(&remote.network);
+                    let failed = remote.failed();
+                    let kind = if failed {
+                        JobState::Failed
+                    } else if remote.active {
+                        JobState::Running(remote.progress)
+                    } else if remote.state == "done" {
+                        JobState::Done
+                    } else {
+                        JobState::Queued
+                    };
+                    let detail = if failed {
+                        format!("Failed on {location}: {}", remote.reason.as_deref().unwrap_or("Unknown error"))
+                    } else if remote.active {
+                        format!("{} on {location}{}", remote.stage.as_deref().unwrap_or(&remote.state), remote.progress.map(|p| format!(" · {:.0}%", p * 100.0)).unwrap_or_default())
+                    } else {
+                        format!("Completed on {location}")
+                    };
+                    rows.push(GlobalActivityItem {
+                        id: activity_id(&format!("remote:{}", remote.submission_id)),
+                        kind: ItemKind::Job(kind),
+                        title: remote.name,
+                        detail,
+                        actions: if failed { &[Action::Dismiss] } else { &[] },
+                        job: None,
+                    });
+                }
                 let (steps, _) = self.ai.activity_steps(&clip.root);
                 for step in steps {
                     let id = activity_id(&format!("job:{}:{}", clip.folder, step.id));

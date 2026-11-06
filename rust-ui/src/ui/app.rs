@@ -903,6 +903,8 @@ impl App {
         let queue = self.ai.queue_view();
         let now = Instant::now();
         let remote_jobs = self.remote.jobs_snapshot();
+        let remote_active: Vec<std::path::PathBuf> = remote_jobs.iter().filter(|j| j.active).filter_map(|j| j.clip_root.clone()).collect();
+        self.ai.settle_queued_notice(&remote_active);
         let mut machines = self.machine_rows(now, &queue, &remote_jobs);
         let waiting_roots: BTreeSet<_> = self.ai.waiting_roots().into_iter().collect();
         let running = queue.iter().flat_map(|s| &s.runs).filter(|r| r.rows.iter().any(|x| x.executing)).count() as u32 + remote_jobs.iter().filter(|j| j.running).count() as u32;
@@ -928,11 +930,14 @@ impl App {
                 prog = net.progress.map_or(0.0, |p| p * 100.0);
                 if net.failed() {
                     job = "f".into();
-                    status = format!("{} · {} · {}{}", net.network, net.name, state, net.reason.as_deref().filter(|r| !r.is_empty()).map_or_else(String::new, |r| format!(" · {r}")));
+                    let host = net.on.as_deref().filter(|host| !host.is_empty()).unwrap_or(&net.network);
+                    let reason = net.reason.as_deref().filter(|reason| !reason.is_empty()).unwrap_or("no reason given");
+                    status = format!("Failed on {host}: {reason}");
                     err = 1;
                 } else {
                     job = if net.running { if net.progress.is_some() { "r" } else { "p" } } else if state == "queued" { "q" } else { "p" }.into();
-                    status = format!("{} · {} · {}{}", net.network, net.name, net.stage.as_deref().unwrap_or(state), net.progress.map_or_else(String::new, |p| format!(" · {:.0}%", p * 100.0)));
+                    let host = net.on.as_deref().filter(|host| !host.is_empty()).unwrap_or(&net.network);
+                    status = format!("{} on {}{}", net.stage.as_deref().unwrap_or(state), host, net.progress.map_or_else(String::new, |p| format!(" · {:.0}%", p * 100.0)));
                     err = 0;
                 }
             } else if row.is_none() && waiting_roots.contains(&clip.root) {

@@ -166,6 +166,7 @@ pub fn queue_width(window_w: f32) -> Option<f32> {
 
 pub struct Page {
     pub fx: Fixture,
+    queue_w: Option<f32>,
     sel: BTreeSet<usize>,
     menu: Option<usize>,
     hl: usize,
@@ -180,13 +181,13 @@ const MENU_W: f32 = 250.0;
 
 impl Page {
     pub fn new() -> Self {
-        Self { fx: Fixture::default(), sel: BTreeSet::new(), menu: None, hl: 0, assign: usize::MAX, rects: vec![], queue_rect: None, drag_candidate: None, drag: None }
+        Self { fx: Fixture::default(), queue_w: None, sel: BTreeSet::new(), menu: None, hl: 0, assign: usize::MAX, rects: vec![], queue_rect: None, drag_candidate: None, drag: None }
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let fx: Fixture = serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Self { sel: fx.sel.iter().copied().collect(), menu: fx.menu, hl: 0, assign: usize::MAX, rects: vec![], queue_rect: None, drag_candidate: None, drag: None, fx })
+        Ok(Self { sel: fx.sel.iter().copied().collect(), queue_w: None, menu: fx.menu, hl: 0, assign: usize::MAX, rects: vec![], queue_rect: None, drag_candidate: None, drag: None, fx })
     }
 
     pub fn update(&mut self, mut fx: Fixture, selected: &BTreeSet<usize>) {
@@ -249,16 +250,31 @@ impl Page {
         let full = ui.max_rect();
         let window_w = ui.ctx().content_rect().width();
         let qw = queue_width(window_w);
-        let side = qw.unwrap_or(40.0);
+        let max_w = 900.0_f32.min(full.width() - 360.0).max(340.0);
+        let side = qw.map(|_| self.queue_w.unwrap_or(540.0).clamp(340.0, max_w)).unwrap_or(40.0);
         let gcol = Rect::from_min_max(full.min, pos2(full.max.x - side - 1.0, full.max.y));
         let queue = Rect::from_min_max(pos2(gcol.max.x + 1.0, full.min.y), full.max);
         let p = ui.painter().clone();
         p.rect_filled(full, 0, t.bg_panel);
         p.rect_filled(Rect::from_min_size(pos2(gcol.max.x, full.min.y), vec2(1.0, full.height())), 0, t.border_divider);
 
+        if qw.is_some() {
+            let hit = Rect::from_center_size(pos2(gcol.max.x + 0.5, full.center().y), vec2(6.0, full.height()));
+            let response = egui::Area::new(egui::Id::new("board-queue-splitter"))
+                .order(egui::Order::Foreground).fixed_pos(hit.min)
+                .show(ui.ctx(), |ui| {
+                    ui.allocate_exact_size(hit.size(), Sense::click_and_drag()).1
+                }).inner;
+            if response.hovered() || response.dragged() { ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal); }
+            if response.double_clicked() { self.queue_w = None; }
+            else if response.dragged() {
+                if let Some(pointer) = response.interact_pointer_pos() { self.queue_w = Some((full.max.x - pointer.x).clamp(340.0, max_w)); }
+            }
+        }
+
         let n = self.fx.cards.len();
         self.sel.retain(|&i| i < n);
-        let Page { fx, sel, menu, hl, assign, rects, queue_rect, drag_candidate, drag } = self;
+        let Page { fx, sel, menu, hl, assign, rects, queue_rect, drag_candidate, drag, .. } = self;
         *queue_rect = Some(queue);
 
         // ---- toolbar (32 high, controls at y + 4)

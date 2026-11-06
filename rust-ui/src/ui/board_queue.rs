@@ -24,20 +24,13 @@ fn content(ui: &mut Ui, r: Rect, fx: &mut Fixture, overlay: bool, live_ui: &mut 
         let mut body = ui.new_child(UiBuilder::new().max_rect(r));
         body.set_clip_rect(r.intersect(ui.clip_rect()));
         egui::ScrollArea::vertical().id_salt("board-live-waiting").show(&mut body, |ui| live_ui(ui, "waiting"));
-    } else if fx.live && fx.details {
+    } else if fx.live {
         ui.painter().rect_filled(r, 0, if overlay { tokens(ui).bg_overlay } else { tokens(ui).bg_panel });
         let mut body = ui.new_child(UiBuilder::new().max_rect(r));
         body.set_clip_rect(r.intersect(ui.clip_rect()));
-        let back = body.add_sized([body.available_width(), 22.0], egui::Button::new("‹ Machines"));
-        if back.clicked() { fx.details = false; fx.details_explicit = true; }
         egui::ScrollArea::vertical().id_salt("board-live-details").show(&mut body, |ui| live_ui(ui, "details"));
     } else {
-        if fx.live {
-            let button = ui.put(Rect::from_min_size(pos2(r.min.x + 8.0, r.min.y + 4.0), vec2((r.width() - 16.0).max(0.0), 20.0)), egui::Button::new("Details…"));
-            if button.clicked() { fx.details = true; fx.details_explicit = true; }
-            let machines_rect = Rect::from_min_max(pos2(r.min.x, r.min.y + 24.0), r.max);
-            machines(ui, machines_rect, fx, overlay);
-        } else if fx.qtab == "waiting" {
+        if fx.qtab == "waiting" {
             waiting(ui, r, fx, overlay)
         } else {
             machines(ui, r, fx, overlay)
