@@ -18,12 +18,14 @@ pub(super) fn draw(ui: &mut Ui, transport_rect: Rect, timeline_rect: Rect, fx: &
     let window_width = ui.ctx().content_rect().width();
     let layout = if window_width < 1200.0 { Layout::Compact } else { Layout::Wide };
     let mut actions = Vec::new();
+    if fx.live {
+        meta(ui, transport_rect, fx, layout);
+    }
     let mut controls_ui = part(ui, transport_rect, "transport");
     if let Some(a) = controls::transport::transport(&mut controls_ui, &mut state, layout).action {
         actions.push(a);
     }
     if fx.live {
-        meta(ui, transport_rect, fx, layout);
         return actions;
     }
     let cached = fx.cached.as_slice();
@@ -66,7 +68,13 @@ fn meta(ui: &Ui, rect: Rect, fx: &Fixture, layout: Layout) {
         (rect.left() + 88.0, rect.width() / 2.0 - if ui.ctx().content_rect().width() < 1600.0 { 98.0 } else { 96.0 })
     };
     let y = rect.top() + 7.0;
-    let clip = Rect::from_min_size(pos2(x, y), vec2(room.max(0.0), 14.0));
+    let total = ui.painter().layout_no_wrap(format!("/ {}", fx.last), ty::small(), t.text_primary);
+    let cx = (rect.center().x - (142.0 + 10.0 + 64.0 + 6.0 + total.size().x) / 2.0).round();
+    let room = room.min(cx - 8.0 - x);
+    if room <= 0.0 {
+        return;
+    }
+    let clip = Rect::from_min_size(pos2(x, y), vec2(room, 14.0));
     ui.painter().with_clip_rect(clip).rect_filled(clip, 0.0, t.bg_panel);
     ui.painter().with_clip_rect(clip).galley(pos2(x, y), g.clone(), t.text_tertiary);
     if compact && fx.drawer {
