@@ -903,8 +903,6 @@ impl App {
         let queue = self.ai.queue_view();
         let now = Instant::now();
         let remote_jobs = self.remote.jobs_snapshot();
-        let remote_active: Vec<std::path::PathBuf> = remote_jobs.iter().filter(|j| j.active).filter_map(|j| j.clip_root.clone()).collect();
-        self.ai.settle_queued_notice(&remote_active);
         let mut machines = self.machine_rows(now, &queue, &remote_jobs);
         let waiting_roots: BTreeSet<_> = self.ai.waiting_roots().into_iter().collect();
         let running = queue.iter().flat_map(|s| &s.runs).filter(|r| r.rows.iter().any(|x| x.executing)).count() as u32 + remote_jobs.iter().filter(|j| j.running).count() as u32;
@@ -3382,6 +3380,9 @@ impl App {
             self.net_tick(now, &wake);
         }
         if self.board_fx.is_none() && self.project.is_some() {
+            // Every page: a remote batch's "Queued…" notice must clear even while a shot is open.
+            let remote_active: Vec<std::path::PathBuf> = self.remote.jobs_snapshot().into_iter().filter(|j| j.active).filter_map(|j| j.clip_root).collect();
+            self.ai.settle_queued_notice(&remote_active);
             self.refresh_board_status();
             let board_visible = (self.viewer.is_none() || self.board_selected) && !self.settings_open && !self.models_open && !self.clients_open
                 && self.settings_fx.is_none() && self.models_fx.is_none() && self.machines_fx.is_none() && self.shot_fx.is_none();

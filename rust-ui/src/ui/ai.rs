@@ -792,6 +792,7 @@ pub struct AiUi {
     clients: BTreeMap<PathBuf, Option<String>>,
     pub notice: Option<String>,
     notice_roots: Vec<PathBuf>,
+    remote_active_roots: Vec<PathBuf>,
     notice_at: Option<Instant>,
     /// Recompute cues for the Key / delivery cards: `Some(pulse 0..1)` = stale (set each frame by the Hint feedback tick).
     pub stale_key: Option<f32>,
@@ -974,6 +975,7 @@ impl AiUi {
             clients: BTreeMap::new(),
             notice,
             notice_roots: vec![],
+            remote_active_roots: vec![],
             notice_at: None,
             stale_key: None,
             stale_deliver: None,
@@ -1195,6 +1197,7 @@ impl AiUi {
     }
 
     pub fn settle_queued_notice(&mut self, remote_active: &[std::path::PathBuf]) {
+        self.remote_active_roots = remote_active.to_vec();
         if !self.notice.as_deref().is_some_and(|m| m.starts_with("Queued "))
             || self.notice_roots.is_empty()
             || self.notice_at.is_none_or(|at| at.elapsed() < Duration::from_secs(3))
@@ -1219,7 +1222,7 @@ impl AiUi {
                     if self.sched.state_of(&id).is_some_and(|s| s.is_terminal()) =>
                 {
                     self.on_task_end(&id);
-                    if self.notice.as_deref().is_some_and(|m| m.starts_with("Queued ")) && self.notice_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(3)) && self.notice_roots.iter().all(|root| {
+                    if self.notice.as_deref().is_some_and(|m| m.starts_with("Queued ")) && self.notice_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(3)) && !self.notice_roots.iter().any(|root| self.remote_active_roots.contains(root)) && self.notice_roots.iter().all(|root| {
                         !self.tracked.iter().any(|t| &t.clip_root == root && self.sched.state_of(&t.job_id).is_some_and(|s| !s.is_terminal()))
                     }) {
                         self.clear_queued_notice();

@@ -147,13 +147,15 @@ impl App {
                         JobState::Failed
                     } else if remote.active {
                         JobState::Running(remote.progress)
-                    } else if remote.state == "done" {
+                    } else if matches!(remote.state.as_str(), "done" | "succeeded" | "forwarded" | "cancelled") {
                         JobState::Done
                     } else {
                         JobState::Queued
                     };
                     let detail = if failed {
                         format!("Failed on {location}: {}", remote.reason.as_deref().unwrap_or("Unknown error"))
+                    } else if remote.state == "cancelled" {
+                        format!("Cancelled on {location}")
                     } else if remote.active {
                         format!("{} on {location}{}", remote.stage.as_deref().unwrap_or(&remote.state), remote.progress.map(|p| format!(" · {:.0}%", p * 100.0)).unwrap_or_default())
                     } else {
