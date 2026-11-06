@@ -296,7 +296,7 @@ fn machine_id(batch: &BatchDialog, pick: usize) -> Option<String> {
 
 fn status_label(text: &str) -> String {
     let mut chars = text.chars();
-    let head: String = chars.by_ref().take(14).collect();
+    let head: String = chars.by_ref().take(8).collect();
     if chars.next().is_some() { format!("{head}…") } else { head }
 }
 
