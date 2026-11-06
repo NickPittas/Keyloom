@@ -3367,7 +3367,7 @@ impl App {
         }
         if self.board_fx.is_none() && self.project.is_some() {
             self.refresh_board_status();
-            let board_visible = self.viewer.is_none() && !self.settings_open && !self.models_open && !self.clients_open
+            let board_visible = (self.viewer.is_none() || self.board_selected) && !self.settings_open && !self.models_open && !self.clients_open
                 && self.settings_fx.is_none() && self.models_fx.is_none() && self.machines_fx.is_none() && self.shot_fx.is_none();
             if board_visible { self.refresh_board_page(&ctx); }
         }
