@@ -518,7 +518,11 @@ fn footer_count(painter: &egui::Painter, rect: Rect, counts: Counts, t: &super::
     job.append(
         &format!("{} need a machine", counts.blocked),
         0.0,
-        ty::format(ty::small(), t.error, 14.0),
+        ty::format(
+            ty::small(),
+            if counts.blocked > 0 { t.error } else { t.text_secondary },
+            14.0,
+        ),
     );
     job.append(
         &format!(" · {} in queue · {} skipped", counts.queued, counts.skipped),
