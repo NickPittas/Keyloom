@@ -903,8 +903,6 @@ impl App {
         let remote_jobs = self.remote.jobs_snapshot();
         let mut machines = self.machine_rows(now, &queue, &remote_jobs);
         let waiting_roots: BTreeSet<_> = self.ai.waiting_roots().into_iter().collect();
-        let waiting_count = self.ai.waiting_count() as u32;
-        let waiting: Vec<usize> = project.clips.iter().enumerate().filter_map(|(i, c)| waiting_roots.contains(&c.root).then_some(i)).collect();
         let running = queue.iter().flat_map(|s| &s.runs).filter(|r| r.rows.iter().any(|x| x.executing)).count() as u32 + remote_jobs.iter().filter(|j| j.running).count() as u32;
         let finished = self.ai.finished_count(&queue) as u32 + remote_jobs.iter().filter(|j| !j.active).count() as u32;
         let mut cards = Vec::with_capacity(project.clips.len());
@@ -968,6 +966,8 @@ impl App {
             let r = u8::from(job == "r");
             cards.push(super::board::FxShot { n: clip.display_name.clone(), st: match clip.state { ClipState::Masked => "mask", ClipState::Ready => "ready", ClipState::Complete => "done", _ => "raw" }.into(), meta, s: status, pc, dot: String::new(), job, prog, err, q, r, thumb, thumb_aspect, thumb_label, thumb_tooltip, source_available, exports_available, resume });
         }
+        let waiting: Vec<usize> = project.clips.iter().enumerate().filter_map(|(i, clip)| (waiting_roots.contains(&clip.root) || cards[i].job == "q").then_some(i)).collect();
+        let waiting_count = waiting.len() as u32;
         let meters = self.local_meters(now);
         let notice_text = self.active_notice_text();
         let notices = notice_text.len() as u32;
