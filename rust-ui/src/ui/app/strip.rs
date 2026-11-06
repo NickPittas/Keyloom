@@ -140,7 +140,7 @@ impl App {
         let mut rows = Vec::new();
         if let Some(project) = &self.project {
             for clip in &project.clips {
-                let (steps, _) = self.ai.activity_steps(&clip.folder);
+                let (steps, _) = self.ai.activity_steps(&clip.root);
                 for step in steps {
                     let id = activity_id(&format!("job:{}:{}", clip.folder, step.id));
                     let kind = match step.level {
